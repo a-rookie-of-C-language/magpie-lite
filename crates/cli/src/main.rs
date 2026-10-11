@@ -57,6 +57,11 @@ enum Command {
         /// Model as the gateway names it: `deepseek/deepseek-chat`.
         model: String,
     },
+    /// Point Goose at the gateway, on a model.
+    Goose {
+        /// Model as the gateway names it: `deepseek/deepseek-chat`.
+        model: String,
+    },
     /// Point OpenCode at the gateway, on a model.
     #[command(name = "opencode")]
     OpenCode {
@@ -331,6 +336,12 @@ async fn main() -> Result<()> {
             let path = agents::gemini::wire(&model, cfg.port, &cfg.token)?;
             println!("Gemini CLI wired onto {model} ({})", path.display());
             println!("restart Gemini CLI for the change to take effect");
+        }
+        Command::Goose { model } => {
+            let cfg = load_config(&cli.config)?;
+            let path = agents::goose::wire(&model, cfg.port, &cfg.token)?;
+            println!("Goose wired onto {model} ({})", path.display());
+            println!("restart Goose for the provider and model changes to take effect");
         }
         Command::OpenCode { model } => {
             let cfg = load_config(&cli.config)?;

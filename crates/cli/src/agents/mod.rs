@@ -4,6 +4,7 @@
 pub mod claude;
 pub mod codex;
 pub mod gemini;
+pub mod goose;
 pub mod opencode;
 pub mod zed;
 
@@ -34,6 +35,11 @@ pub fn list() -> Vec<AgentInfo> {
             id: "gemini",
             name: "Gemini CLI",
             installed: gemini::installed(),
+        },
+        AgentInfo {
+            id: "goose",
+            name: "Goose",
+            installed: goose::installed(),
         },
         AgentInfo {
             id: "opencode",
@@ -128,6 +134,67 @@ mod tests {
             "other providers survive"
         );
         assert!(text.contains("name = \"zhipu\""));
+    }
+
+    #[test]
+    fn goose_wire_handles_both_config_layouts() {
+        let dir = tempdir();
+        let old = dir.join("old-config.yaml");
+        std::fs::write(
+            &old,
+            "GOOSE_PROVIDER: openai\nGOOSE_MODEL: gpt-5\nGOOSE_MODE: auto\nother: kept\n",
+        )
+        .unwrap();
+        goose::wire_at(&old, "deepseek/deepseek-chat", 3426, "tok").expect("wire old layout");
+
+        let config: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&old).unwrap()).unwrap();
+        assert_eq!(config["GOOSE_PROVIDER"], "magpie-lite");
+        assert_eq!(config["GOOSE_MODEL"], "deepseek/deepseek-chat");
+        assert_eq!(config["GOOSE_MODE"], "auto");
+        assert_eq!(config["other"], "kept");
+        assert!(config.get("active_provider").is_none());
+
+        let new = dir.join("new-config.yaml");
+        std::fs::write(
+            &new,
+            "GOOSE_PROVIDER: openai\nGOOSE_MODEL: gpt-5\nGOOSE_MODE: auto\nactive_provider: openai\nproviders:\n  openai:\n    enabled: true\n    model: gpt-5\n    configured: true\n    extra: keep\nother: kept\n",
+        )
+        .unwrap();
+        goose::wire_at(&new, "group/daily-coding", 3426, "tok").expect("wire new layout");
+
+        let config: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&new).unwrap()).unwrap();
+        assert_eq!(config["active_provider"], "magpie-lite");
+        assert_eq!(config["GOOSE_MODE"], "auto");
+        assert_eq!(config["other"], "kept");
+        assert!(config.get("GOOSE_PROVIDER").is_none());
+        assert!(config.get("GOOSE_MODEL").is_none());
+        assert_eq!(config["providers"]["openai"]["extra"], "keep");
+        let provider = &config["providers"]["magpie-lite"];
+        assert_eq!(provider["enabled"], true);
+        assert_eq!(provider["configured"], true);
+        assert_eq!(provider["model"], "group/daily-coding");
+
+        let provider_path = new
+            .parent()
+            .unwrap()
+            .join("custom_providers")
+            .join("magpie-lite.json");
+        let provider: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&provider_path).unwrap()).unwrap();
+        assert_eq!(provider["engine"], "openai");
+        assert_eq!(provider["base_url"], "http://127.0.0.1:3426/v1");
+        assert_eq!(provider["headers"]["Authorization"], "Bearer tok");
+        assert_eq!(provider["dynamic_models"], false);
+        assert_eq!(
+            provider["models"],
+            serde_json::json!([{
+                "name": "group/daily-coding",
+                "context_limit": 128000,
+                "reasoning": false
+            }])
+        );
     }
 
     #[test]
