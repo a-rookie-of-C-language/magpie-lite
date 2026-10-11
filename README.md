@@ -16,12 +16,12 @@ Zed ─────────┘   Chat + Responses +
 
 - **Gateway** at `127.0.0.1:3426` speaking **OpenAI Chat Completions** (`/v1/chat/completions`), **OpenAI Responses** (`/v1/responses`), **Anthropic Messages** (`/v1/messages`), and **Gemini generateContent** (`/v1beta/models/...`)
 - **Cross-protocol translation** through a neutral IR: requests, replies, and **SSE streams** — text, tool calls, reasoning deltas, usage
-- **Providers** from one TOML file: Chat-compatible, Responses-compatible, Anthropic, or Gemini upstreams; console CRUD, credential rotation and cooldown editing with immediate runtime updates
+- **Providers** from one TOML file: Chat-compatible, Responses-compatible, Anthropic, or Gemini upstreams; console CRUD, bounded model discovery and connection checks, credential rotation and cooldown editing with immediate runtime updates
 - **Model routing**: `deepseek/deepseek-chat` by provider id, `group/daily-coding` route chains, bare names by provider model lists, default provider fallback
 - **Multi-key pools**: repeat `--api-key`; requests rotate across keys, rejected/rate-limited keys are retried before route fallback, and `402`/`429` starts a cooldown from `Retry-After`, common duration/reset headers, absolute reset timestamps, or JSON error-body retry delays (60s fallback, per-provider `key_cooldown_ms` / `--key-cooldown-ms` override; `0` disables it)
 - **Failover**: ordered provider fallbacks and routing-group routes, tried before any reply bytes are streamed when the active provider is rate limited, out of quota, overloaded, or unreachable
 - **Local authentication**: every non-health route requires the configured token as Bearer, Anthropic `x-api-key`, or Gemini `x-goog-api-key`; `/health` stays public
-- **Web console**: open `http://127.0.0.1:3426/`, enter the local token, and manage routing groups or inspect provider totals, routing providers and groups, key-slot totals and active cooldowns, available models, recent requests, and recent usage; prompts, replies, and real keys never enter history or the page
+- **Web console**: open `http://127.0.0.1:3426/`, enter the local token, and manage providers and routing groups, discover upstream models, test draft connections, or inspect provider totals, routing providers and groups, key-slot totals and active cooldowns, available models, recent requests, and recent usage; prompts, replies, and saved keys are never returned to the page or persisted in request history
 - **Request statistics**: token-protected `/stats`, `/config`, and `magpie-lite stats` show provider and per-key totals, token usage, statuses, latency, active secret-free key cooldowns, and recent request metadata (including which key slot served it, never the key); `recent_usage` adds provider/model aggregates over the recent window, and optional sanitized JSONL history keeps that window across restarts while process totals stay process-local
 - **Agent wiring**: `magpie-lite claude <model>` (settings.json env block), `magpie-lite codex <model>` (config.toml provider table, native `wire_api = "responses"`), `magpie-lite crush <model>` (custom OpenAI-compatible provider and large-model pick), `magpie-lite gemini <model>` (`~/.gemini/settings.json` plus `.env`), `magpie-lite goose <model>` (custom OpenAI-compatible provider plus the active model), `magpie-lite opencode <model>` (`~/.config/opencode/opencode.json` provider block), `magpie-lite zed <model>` (OpenAI-compatible provider in Zed settings; the token goes in Zed provider settings or `MAGPIE_LITE_API_KEY`, not `settings.json`)
 - **Conformance tests** for every translation direction, and end-to-end tests over real HTTP with mock Chat and Gemini upstreams
@@ -93,6 +93,52 @@ IDs permit ASCII letters, digits, hyphens and underscores; `group` is reserved. 
 `/config` returns `credential_count` (zero for no upstream auth), effective `key_cooldown_ms`, and nullable `key_cooldown_override_ms`. Endpoint/protocol/key-pool changes start a new process-local rotation schedule; metadata changes keep active cooldowns. A delayed quota rejection from an old request cannot cool a replacement key. Credentials remain in the local TOML file; a separate secret store is still planned.
 
 Successful edits return the secret-free `/config` snapshot. Invalid provider IDs, protocols, URLs, models, keys, and fallback routes return 400. Duplicate providers return 409; missing providers return 404. Changes are persisted through the same atomic config update used by routing groups.
+
+## Discovering models and testing providers
+
+The provider editor offers **Discover models** and **Test connection** for both
+saved providers and unsaved drafts. Discovery appends unique IDs to the draft
+model list; it does not remove manually entered IDs. Save explicitly to publish
+that list. Testing uses the chosen test model, or the first draft model, and sends
+`Reply with OK.` as a non-streaming generation request with a 64-output-token
+limit. It may incur provider charges. A successful test checks the selected
+protocol's response envelope, not model quality or support for tools/images.
+
+Both endpoints require the local gateway token:
+
+| Method | Endpoint | Body / response |
+|---|---|---|
+| POST | `/config/provider-tools/models` | `{"provider": <provider-edit-json>}`; 200 with `{"models":["model-id"]}` |
+| POST | `/config/provider-tools/test` | `{"provider": <provider-edit-json>,"model":"model-id"}`; 200 with `ok`, `protocol`, `model` and `elapsed_ms` |
+
+The draft uses the provider-edit fields above. An omitted/null `api_keys` reuses
+credentials of the saved provider with the same ID; explicit keys replace them
+for this operation only, and `[]` sends no authentication. Unknown IDs with no
+keys are unauthenticated. Checks validate the draft endpoint/keys/model without
+requiring its unsaved fallback references to resolve. They work even when the
+server was started without a writable configuration path.
+
+Catalog endpoints are `/models` for Chat/Responses, `/v1/models` for Anthropic,
+and `/models` for Gemini, relative to each protocol's documented base URL.
+Anthropic uses `has_more` / `last_id` with `after_id` pagination; Gemini uses
+`nextPageToken` / `pageToken`, strips `models/` from IDs and includes only models
+advertising `generateContent`. Anthropic API keys use `x-api-key` plus
+`anthropic-version` for both discovery and normal inference. Gemini uses
+`x-goog-api-key`; Chat/Responses use Bearer authentication.
+
+Each operation has a 30-second overall deadline, 5-second connection timeout,
+10-second per-request timeout, 1 MiB cumulative success-body limit, at most
+20 catalog pages per credential and 5000 unique models. At most the first eight
+configured credentials are attempted, in saved order, retrying only HTTP
+401/402/403/429/500/502/503/504. Redirects are not followed. Errors expose only
+sanitized diagnostics and HTTP status codes, never upstream bodies or URLs.
+Responses that echo provider credentials as model IDs are rejected.
+
+Checks do not save configuration, alter live key rotation/cooldowns, log model
+outputs or add gateway usage totals. Provider-side accounting is independent.
+Catalogs unsupported by a compatible service can still be entered manually;
+stream-only/specialized authentication services need a future probe adapter.
+The current tests use isolated local HTTP fixtures, not paid live vendor keys.
 
 ## Editing routing groups
 

@@ -537,11 +537,13 @@
                 </div>
                 <div class="field"><label for="provider-models">Model IDs</label><textarea id="provider-models" class="token-input" placeholder="deepseek-chat&#10;deepseek-reasoner" aria-describedby="provider-models-help"></textarea><p id="provider-models-help" class="group-help">One upstream model ID per line. Listed models appear in the agent catalog; explicit provider/model routes also work for unlisted models.</p></div>
                 <div class="field"><label for="provider-key-mode">API keys</label><select id="provider-key-mode" class="token-input" aria-describedby="provider-key-help"><option value="keep">Keep existing keys</option><option value="replace">Replace key pool</option><option value="clear">No upstream authentication</option></select><p id="provider-key-help" class="group-help">Saved keys are never displayed. Choose Replace to rotate credentials, or No upstream authentication for a local service.</p></div>
-                <div id="provider-keys-field" class="field" hidden><label for="provider-keys">New key pool</label><textarea id="provider-keys" class="token-input" autocomplete="off" spellcheck="false" aria-describedby="provider-keys-help"></textarea><p id="provider-keys-help" class="group-help">One API key per line, in rotation order. These values are sent only when you save.</p></div>
+                <div id="provider-keys-field" class="field" hidden><label for="provider-keys">New key pool</label><textarea id="provider-keys" class="token-input" autocomplete="off" spellcheck="false" aria-describedby="provider-keys-help"></textarea><p id="provider-keys-help" class="group-help">One API key per line, in rotation order. These values are sent when you save, discover models or test a connection.</p></div>
                 <div class="editor-grid">
                   <div class="field"><label for="provider-fallback">Fallback routes (optional)</label><textarea id="provider-fallback" class="token-input" placeholder="backup/model&#10;group/daily" aria-describedby="provider-fallback-help"></textarea><p id="provider-fallback-help" class="group-help">One route per line, tried in order. Providers and groups must already exist.</p></div>
                   <div class="field"><label for="provider-cooldown">Key cooldown in milliseconds (optional)</label><input id="provider-cooldown" class="token-input" type="number" min="0" step="1" placeholder="Gateway default" aria-describedby="provider-cooldown-help"><p id="provider-cooldown-help" class="group-help">Leave blank to inherit the gateway default. Use 0 to disable cooldown.</p><label class="switch"><input id="provider-default" type="checkbox">Make default provider</label><p class="group-help">To switch defaults, select this option on the provider you want to use.</p></div>
                 </div>
+                <div class="field"><label for="provider-test-model">Test model (optional)</label><input id="provider-test-model" class="token-input" list="provider-discovered-models" placeholder="First listed model" aria-describedby="provider-tools-help"><datalist id="provider-discovered-models"></datalist><p id="provider-tools-help" class="group-help">Discovery appends model IDs to this draft. Testing sends a small generation request (up to 64 output tokens) and may incur provider charges. Neither operation saves configuration or changes gateway usage/cooldowns.</p></div>
+                <div class="group-actions"><button id="provider-discover" type="button" class="button secondary">Discover models</button><button id="provider-test" type="button" class="button secondary">Test connection</button></div>
                 <div class="group-actions"><button id="provider-save" type="submit" class="button">Save provider</button><button id="provider-cancel" type="button" class="button secondary">Cancel</button></div>
               </form>
               <p id="provider-message" class="console-message" role="status" aria-live="polite"></p>
@@ -649,6 +651,10 @@
       providerSave: document.getElementById("provider-save"),
       providerCancel: document.getElementById("provider-cancel"),
       providerMessage: document.getElementById("provider-message"),
+      providerDiscover: document.getElementById("provider-discover"),
+      providerTest: document.getElementById("provider-test"),
+      providerTestModel: document.getElementById("provider-test-model"),
+      providerDiscoveredModels: document.getElementById("provider-discovered-models"),
       routingRows: document.getElementById("routing-rows"),
       routingEmpty: document.getElementById("routing-empty"),
       groupEditor: document.getElementById("group-editor"),
@@ -963,6 +969,8 @@
       elements.providerKeyMode.value = provider ? "keep" : "replace";
       elements.providerKeyMode.querySelector('[value="keep"]').disabled = !provider;
       elements.providerKeys.value = "";
+      elements.providerTestModel.value = "";
+      elements.providerDiscoveredModels.replaceChildren();
       keyModeChanged();
       elements.providerMessage.textContent = "";
       elements.providerEditor.hidden = false;
@@ -974,6 +982,7 @@
       elements.providerEditor.hidden = true;
       elements.providerEditor.reset();
       elements.providerKeys.value = "";
+      elements.providerDiscoveredModels.replaceChildren();
       keyModeChanged();
       elements.providerNew.focus();
     }
@@ -1019,9 +1028,7 @@
     elements.providerEditor.addEventListener("keydown", event => {
       if (event.key === "Escape" && !groupBusy) { event.preventDefault(); closeProviderEditor(); }
     });
-    elements.providerEditor.addEventListener("submit", async event => {
-      event.preventDefault();
-      if (groupBusy) return;
+    function providerDraft() {
       const cooldown = elements.providerCooldown.value;
       if (cooldown !== "" && (!Number.isSafeInteger(Number(cooldown)) || Number(cooldown) < 0)) {
         elements.providerMessage.textContent = "Cooldown must be a non-negative whole number.";
@@ -1046,6 +1053,52 @@
           return;
         }
       } else if (elements.providerKeyMode.value === "clear") body.api_keys = [];
+      return body;
+    }
+
+    async function providerTool(operation) {
+      if (groupBusy || !elements.providerEditor.reportValidity()) return;
+      const provider = providerDraft();
+      if (!provider) return;
+      const model = elements.providerTestModel.value.trim() || provider.models[0];
+      if (operation === "test" && !model) {
+        elements.providerMessage.textContent = "Choose a test model or discover models first.";
+        elements.providerTestModel.focus();
+        return;
+      }
+      const session = sessionRevision;
+      setGroupBusy(true, operation === "test" ? "Testing…" : "Discovering…");
+      elements.providerMessage.textContent = operation === "test" ? "Testing a small generation request…" : "Fetching provider models…";
+      try {
+        const result = await authorized("/config/provider-tools/" + operation, {
+          method: "POST", body: JSON.stringify({ provider, ...(model ? { model } : {}) })
+        });
+        if (session !== sessionRevision) return;
+        if (operation === "models") {
+          elements.providerModels.value = [...new Set([...provider.models, ...result.models])].join("\n");
+          elements.providerDiscoveredModels.replaceChildren(...result.models.map(id => {
+            const option = document.createElement("option"); option.value = id; return option;
+          }));
+          elements.providerMessage.textContent = result.models.length + " models discovered. Draft updated; click Save provider to persist.";
+        } else {
+          elements.providerMessage.textContent = "Connection verified for " + result.model + " (" + result.elapsed_ms + " ms). Configuration was not saved.";
+        }
+      } catch (error) {
+        if (session !== sessionRevision) return;
+        if (error.unauthorized) disconnect(true);
+        elements.providerMessage.textContent = error.message;
+        if (error.unauthorized) setMessage(error.message);
+      } finally {
+        setGroupBusy(false);
+      }
+    }
+    elements.providerDiscover.addEventListener("click", () => providerTool("models"));
+    elements.providerTest.addEventListener("click", () => providerTool("test"));
+    elements.providerEditor.addEventListener("submit", async event => {
+      event.preventDefault();
+      if (groupBusy) return;
+      const body = providerDraft();
+      if (!body) return;
       const path = editingProvider === null ? "/config/providers" : "/config/providers/" + encodeURIComponent(editingProvider);
       await mutateProvider(path, editingProvider === null ? "POST" : "PUT", body, "Provider saved. New requests use it immediately.");
     });
@@ -1071,19 +1124,19 @@
       elements.groupNew.focus();
     }
 
-    function setGroupBusy(busy) {
+    function setGroupBusy(busy, label = "Saving…") {
       groupBusy = busy;
       elements.providerEditor.setAttribute("aria-busy", String(busy));
       for (const control of elements.providerEditor.elements) control.disabled = busy;
       elements.providerNew.disabled = busy;
       for (const button of elements.routingRows.querySelectorAll("button")) button.disabled = busy;
-      elements.providerSave.textContent = busy ? "Saving…" : "Save provider";
+      elements.providerSave.textContent = busy ? label : "Save provider";
       elements.groupEditor.setAttribute("aria-busy", String(busy));
       for (const control of elements.groupEditor.elements) control.disabled = busy;
       elements.groupNew.disabled = busy;
       elements.signOut.disabled = busy;
       for (const button of elements.groupList.querySelectorAll("button")) button.disabled = busy;
-      elements.groupSave.textContent = busy ? "Saving…" : "Save group";
+      elements.groupSave.textContent = busy ? label : "Save group";
     }
 
     async function mutateGroup(path, method, body, success) {
@@ -1198,6 +1251,7 @@
       elements.providerEditor.hidden = true;
       elements.providerEditor.reset();
       elements.providerKeys.value = "";
+      elements.providerDiscoveredModels.replaceChildren();
       elements.providerMessage.textContent = "";
       editingProvider = null;
       routingSnapshot = null;

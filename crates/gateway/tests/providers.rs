@@ -54,7 +54,7 @@ async fn messages(
 ) -> Json<Value> {
     mock.seen.lock().unwrap().push((
         headers
-            .get("authorization")
+            .get("x-api-key")
             .unwrap()
             .to_str()
             .unwrap()
@@ -204,7 +204,7 @@ async fn provider_crud_persists_and_changes_live_routing_without_disclosing_keys
     {
         let seen = gw.mock.seen.lock().unwrap();
         assert_eq!(seen[0].0, "Bearer private-one");
-        assert_eq!(seen[1].0, "Bearer rotated-secret");
+        assert_eq!(seen[1].0, "rotated-secret");
         assert_eq!(seen[1].1["model"], "second");
     }
     let catalog = snapshot(&gw, "/v1/models").await;

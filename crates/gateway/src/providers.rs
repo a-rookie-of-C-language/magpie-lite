@@ -17,7 +17,7 @@ use crate::upstream;
 /// An explicit empty pool clears credentials for an unauthenticated upstream.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ProviderEdit {
+pub(crate) struct ProviderEdit {
     id: String,
     #[serde(default)]
     name: String,
@@ -34,7 +34,7 @@ struct ProviderEdit {
 }
 
 impl ProviderEdit {
-    fn apply(self, config: &mut Config) -> Result<(), ConfigError> {
+    pub(crate) fn materialize(self, config: &Config) -> ProviderConfig {
         let existing = config.provider(&self.id);
         let (api_key, api_keys) = match self.api_keys {
             Some(keys) => (String::new(), keys),
@@ -42,7 +42,7 @@ impl ProviderEdit {
                 .map(|p| (p.api_key.clone(), p.api_keys.clone()))
                 .unwrap_or_default(),
         };
-        let provider = ProviderConfig {
+        ProviderConfig {
             id: self.id,
             name: self.name,
             protocol: self.protocol,
@@ -53,9 +53,14 @@ impl ProviderEdit {
             fallback: self.fallback,
             key_cooldown_ms: self.key_cooldown_ms,
             key_generation: 0,
-        };
+        }
+    }
+
+    fn apply(self, config: &mut Config) -> Result<(), ConfigError> {
+        let make_default = self.make_default;
+        let provider = self.materialize(config);
         config
-            .set_provider(provider, self.make_default)
+            .set_provider(provider, make_default)
             .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))
     }
 }

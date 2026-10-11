@@ -58,6 +58,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/config/providers/{id}",
             put(crate::providers::update).delete(crate::providers::delete),
         )
+        .route(
+            "/config/provider-tools/models",
+            post(crate::provider_tools::models),
+        )
+        .route(
+            "/config/provider-tools/test",
+            post(crate::provider_tools::test),
+        )
         .route("/config/groups", post(create_group))
         .route(
             "/config/groups/{id}",

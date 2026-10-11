@@ -56,27 +56,37 @@ pub async fn send(
             http.post(format!("{base}/models/{}:{method}", path_escape(model)))
         }
     };
-    match p.protocol {
+    req = authenticate(req, p.protocol, api_key);
+
+    let resp = req.json(body).send().await?;
+    Ok(resp)
+}
+
+/// Shared authentication for inference and administrative provider checks.
+pub(crate) fn authenticate(
+    mut request: reqwest::RequestBuilder,
+    protocol: Protocol,
+    api_key: &str,
+) -> reqwest::RequestBuilder {
+    match protocol {
         Protocol::Chat | Protocol::Responses => {
             if !api_key.is_empty() {
-                req = req.bearer_auth(api_key);
+                request = request.bearer_auth(api_key);
             }
         }
         Protocol::Anthropic => {
-            req = req.header("anthropic-version", "2023-06-01");
+            request = request.header("anthropic-version", "2023-06-01");
             if !api_key.is_empty() {
-                req = req.bearer_auth(api_key);
+                request = request.header("x-api-key", api_key);
             }
         }
         Protocol::Gemini => {
             if !api_key.is_empty() {
-                req = req.header("x-goog-api-key", api_key);
+                request = request.header("x-goog-api-key", api_key);
             }
         }
     }
-
-    let resp = req.json(body).send().await?;
-    Ok(resp)
+    request
 }
 
 /// An upstream error response after its body has been consumed.

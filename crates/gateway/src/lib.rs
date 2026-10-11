@@ -3,6 +3,7 @@
 pub mod config;
 pub mod config_store;
 pub mod cooldown;
+mod provider_tools;
 mod providers;
 pub mod server;
 pub mod upstream;
