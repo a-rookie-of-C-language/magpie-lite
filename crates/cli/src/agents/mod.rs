@@ -4,6 +4,7 @@
 pub mod claude;
 pub mod codex;
 pub mod gemini;
+pub mod opencode;
 
 /// One supported agent, as `magpie-lite ls` shows it.
 pub struct AgentInfo {
@@ -32,6 +33,11 @@ pub fn list() -> Vec<AgentInfo> {
             id: "gemini",
             name: "Gemini CLI",
             installed: gemini::installed(),
+        },
+        AgentInfo {
+            id: "opencode",
+            name: "OpenCode",
+            installed: opencode::installed(),
         },
     ]
 }
@@ -116,6 +122,75 @@ mod tests {
             "other providers survive"
         );
         assert!(text.contains("name = \"zhipu\""));
+    }
+
+    #[test]
+    fn opencode_wire_replaces_only_the_gateway_provider_fields() {
+        let dir = tempdir();
+        let path = dir.join("opencode.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "$schema": "kept",
+  "model": "openai/gpt-4o",
+  "theme": "dark",
+  "provider": {
+    "mine": {
+      "options": {"baseURL": "https://api.example.com/v1", "apiKey": "keep"},
+      "models": {"gpt-4o": {"name": "GPT"}}
+    },
+    "magpie-lite": {
+      "npm": "old-package",
+      "custom": true,
+      "options": {
+        "baseURL": "http://localhost:9999/v1",
+        "apiKey": "old",
+        "headers": {"X-Kept": "yes"}
+      },
+      "models": {"old/model": {"name": "Old"}}
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        opencode::wire_at(&path, "deepseek/deepseek-chat", 3426, "tok").expect("wire");
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["$schema"], "kept");
+        assert_eq!(v["theme"], "dark");
+        assert_eq!(v["model"], "magpie-lite/deepseek/deepseek-chat");
+        assert_eq!(v["provider"]["mine"]["options"]["apiKey"], "keep");
+        assert_eq!(
+            v["provider"]["magpie-lite"]["npm"],
+            "@ai-sdk/openai-compatible"
+        );
+        assert_eq!(v["provider"]["magpie-lite"]["custom"], true);
+        assert_eq!(
+            v["provider"]["magpie-lite"]["options"]["baseURL"],
+            "http://127.0.0.1:3426/v1"
+        );
+        assert_eq!(v["provider"]["magpie-lite"]["options"]["apiKey"], "tok");
+        assert_eq!(
+            v["provider"]["magpie-lite"]["options"]["headers"]["X-Kept"],
+            "yes"
+        );
+        assert_eq!(
+            v["provider"]["magpie-lite"]["models"],
+            serde_json::json!({"deepseek/deepseek-chat": {"name": "deepseek/deepseek-chat"}})
+        );
+    }
+
+    #[test]
+    fn opencode_wire_does_not_write_beside_an_existing_jsonc() {
+        let dir = tempdir();
+        let path = dir.join("opencode.jsonc");
+        std::fs::write(&path, "{\n  // mine\n}\n").unwrap();
+        let err = opencode::wire_at(&path, "deepseek/deepseek-chat", 3426, "tok")
+            .expect_err("JSONC is not rewritten");
+        assert!(err.to_string().contains("JSONC"));
+        assert!(!dir.join("opencode.json").exists());
     }
 
     fn tempdir() -> std::path::PathBuf {

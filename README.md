@@ -4,10 +4,11 @@ One local gateway for every coding agent — a Rust rewrite of [magpie](https://
 
 ```
 Claude Code ─┐                                  ┌─ OpenAI-compatible (DeepSeek, Kimi, GLM, OpenRouter, Ollama, ...)
-Codex ───────┼─▶ magpie-lite gateway ─▶ IR ────▶├─ Anthropic Messages
-Gemini CLI ─┘   Chat + Responses +                └─ Gemini generateContent
-                Anthropic + Gemini
-                translated per provider
+Codex ───────┤                                  ├─ Anthropic Messages
+Gemini CLI ─┤─▶ magpie-lite gateway ─▶ IR ────▶└─ Gemini generateContent
+OpenCode ────┘   Chat + Responses +
+                 Anthropic + Gemini
+                 translated per provider
 ```
 
 ## What works
@@ -18,7 +19,7 @@ Gemini CLI ─┘   Chat + Responses +                └─ Gemini generateCont
 - **Model routing**: `deepseek/deepseek-chat` by provider id, bare names by provider model lists, default provider fallback
 - **Failover**: ordered `--fallback provider/model` routes, tried before any reply bytes are streamed when the active provider is rate limited, out of quota, overloaded, or unreachable
 - **Local authentication**: every model route requires the configured token as Bearer, Anthropic `x-api-key`, or Gemini `x-goog-api-key`; `/health` stays public
-- **Agent wiring**: `magpie-lite claude <model>` (settings.json env block), `magpie-lite codex <model>` (config.toml provider table, native `wire_api = "responses"`), `magpie-lite gemini <model>` (`~/.gemini/settings.json` plus `.env`)
+- **Agent wiring**: `magpie-lite claude <model>` (settings.json env block), `magpie-lite codex <model>` (config.toml provider table, native `wire_api = "responses"`), `magpie-lite gemini <model>` (`~/.gemini/settings.json` plus `.env`), `magpie-lite opencode <model>` (`~/.config/opencode/opencode.json` provider block)
 - **Conformance tests** for every translation direction, and end-to-end tests over real HTTP with mock Chat and Gemini upstreams
 
 ## Quick start
@@ -41,6 +42,7 @@ magpie-lite serve
 magpie-lite claude deepseek/deepseek-chat
 magpie-lite codex deepseek/deepseek-chat
 magpie-lite gemini deepseek/deepseek-chat
+magpie-lite opencode deepseek/deepseek-chat
 ```
 
 Restart the agent after wiring it. Unwire by restoring its own provider (or use your agent switcher).
@@ -62,7 +64,7 @@ Tests are the contract: `crates/core/tests/translation.rs` checks real wire shap
 ## Not yet (the roadmap)
 
 - Routing groups and multi-key provider pools (single-provider fallback already works)
-- More agents (OpenCode, Cursor CLI, ...)
+- More agents (Cursor CLI, Zed, Crush, Goose, ...)
 - A TUI/Web UI
 
 ## Safety
