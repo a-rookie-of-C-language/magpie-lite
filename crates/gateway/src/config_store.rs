@@ -111,7 +111,7 @@ impl ConfigStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::GroupConfig;
+    use crate::config::{GroupConfig, RoutingPolicy};
 
     #[tokio::test]
     async fn save_failure_does_not_publish_a_new_config() {
@@ -126,6 +126,7 @@ mod tests {
                     id: "daily".into(),
                     name: String::new(),
                     routes: vec!["mock/model".into()],
+                    routing: RoutingPolicy::default(),
                 });
                 Ok(())
             })

@@ -179,6 +179,14 @@ struct KeyRotationState {
     cooldowns: BTreeMap<usize, Instant>,
 }
 
+#[derive(Debug)]
+struct GroupRoutingState {
+    policy: RoutingPolicy,
+    routes: Vec<String>,
+    cursor: usize,
+    attempts: Vec<u64>,
+}
+
 /// One active key cooldown. It names only the key's stable slot and when the
 /// slot becomes available again — never the configured key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -196,6 +204,7 @@ pub type KeyCooldownSnapshotMap = BTreeMap<String, BTreeMap<String, KeyCooldownS
 #[derive(Debug, Default)]
 pub struct KeyRotator {
     states: Mutex<BTreeMap<String, KeyRotationState>>,
+    group_states: Mutex<BTreeMap<String, GroupRoutingState>>,
 }
 
 impl KeyRotator {
@@ -247,6 +256,96 @@ impl KeyRotator {
             rotated
         } else {
             available
+        }
+    }
+
+    /// Return a group route order and reset its process-local schedule when its
+    /// policy or configured routes change.
+    pub fn group_order(
+        &self,
+        group_id: &str,
+        policy: RoutingPolicy,
+        routes: &[String],
+    ) -> Vec<(usize, String)> {
+        if routes.is_empty() {
+            return Vec::new();
+        }
+        let mut states = self
+            .group_states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = states
+            .entry(group_id.to_owned())
+            .or_insert_with(|| GroupRoutingState {
+                policy,
+                routes: routes.to_vec(),
+                cursor: 0,
+                attempts: vec![0; routes.len()],
+            });
+        if state.policy != policy || state.routes != routes {
+            *state = GroupRoutingState {
+                policy,
+                routes: routes.to_vec(),
+                cursor: 0,
+                attempts: vec![0; routes.len()],
+            };
+        }
+
+        let indices = match state.policy {
+            RoutingPolicy::Order => (0..routes.len()).collect::<Vec<_>>(),
+            RoutingPolicy::Rotate => {
+                let start = state.cursor % routes.len();
+                state.cursor = (start + 1) % routes.len();
+                (0..routes.len())
+                    .map(|offset| (start + offset) % routes.len())
+                    .collect()
+            }
+            RoutingPolicy::Usage => {
+                let mut indices = (0..routes.len()).collect::<Vec<_>>();
+                indices.sort_by_key(|&index| (state.attempts[index], index));
+                indices
+            }
+        };
+        indices
+            .into_iter()
+            .map(|index| (index, routes[index].clone()))
+            .collect()
+    }
+
+    /// Record one request attempt against a group route. Counts are process-local
+    /// and intentionally reset when the group route configuration changes.
+    pub fn record_group_attempt(
+        &self,
+        group_id: &str,
+        policy: RoutingPolicy,
+        routes: &[String],
+        route_index: usize,
+    ) {
+        if route_index >= routes.len() {
+            return;
+        }
+        let mut states = self
+            .group_states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = states
+            .entry(group_id.to_owned())
+            .or_insert_with(|| GroupRoutingState {
+                policy,
+                routes: routes.to_vec(),
+                cursor: 0,
+                attempts: vec![0; routes.len()],
+            });
+        if state.policy != policy || state.routes != routes {
+            *state = GroupRoutingState {
+                policy,
+                routes: routes.to_vec(),
+                cursor: 0,
+                attempts: vec![0; routes.len()],
+            };
+        }
+        if let Some(attempts) = state.attempts.get_mut(route_index) {
+            *attempts = attempts.saturating_add(1);
         }
     }
 
@@ -321,6 +420,45 @@ impl KeyRotator {
     }
 }
 
+/// How a routing group chooses its next route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingPolicy {
+    /// Try routes in their configured order for every request.
+    #[default]
+    Order,
+    /// Start each request at the next route, then fall back through the rest.
+    Rotate,
+    /// Prefer routes with fewer attempts in this gateway process.
+    Usage,
+}
+
+impl RoutingPolicy {
+    /// The canonical spelling used by config files, APIs, and the CLI.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Order => "order",
+            Self::Rotate => "rotate",
+            Self::Usage => "usage",
+        }
+    }
+}
+
+impl std::str::FromStr for RoutingPolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "order" => Ok(Self::Order),
+            "rotate" | "round_robin" => Ok(Self::Rotate),
+            "usage" | "least_used" => Ok(Self::Usage),
+            _ => Err(format!(
+                "unknown routing policy `{value}`; expected order, rotate or usage"
+            )),
+        }
+    }
+}
+
 /// A named route chain agents can pick as one model id: `group/daily-coding`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupConfig {
@@ -332,6 +470,9 @@ pub struct GroupConfig {
     /// Ordered model routes. The first available one serves the request;
     /// the rest are fallbacks tried before any reply bytes are streamed.
     pub routes: Vec<String>,
+    /// Process-local route selection policy.
+    #[serde(default)]
+    pub routing: RoutingPolicy,
 }
 
 impl GroupConfig {
@@ -407,6 +548,8 @@ pub struct GroupConfigSnapshot {
     pub name: String,
     /// Ordered route chain.
     pub routes: Vec<String>,
+    /// Route selection policy.
+    pub routing: RoutingPolicy,
 }
 
 /// Secret-free routing configuration for the token-protected console.
@@ -603,6 +746,7 @@ impl Config {
                     id: g.id.clone(),
                     name: g.label().to_owned(),
                     routes: g.routes.clone(),
+                    routing: g.routing,
                 })
                 .collect(),
         }
@@ -842,6 +986,7 @@ mod tests {
             id: "daily".into(),
             name: "Daily coding".into(),
             routes: vec!["mock/mock-model".into(), "backup/other".into()],
+            routing: RoutingPolicy::default(),
         });
 
         let snapshot = config.snapshot();
@@ -861,6 +1006,65 @@ mod tests {
         assert!(!json.contains("secret-two"));
         assert!(!json.contains("magpie-lite"));
     }
+    #[test]
+    fn group_routing_policy_parses_aliases_and_defaults_to_order() {
+        assert_eq!(RoutingPolicy::default(), RoutingPolicy::Order);
+        assert_eq!("round_robin".parse(), Ok(RoutingPolicy::Rotate));
+        assert_eq!("least_used".parse(), Ok(RoutingPolicy::Usage));
+        assert_eq!(RoutingPolicy::Rotate.as_str(), "rotate");
+        let group: GroupConfig = toml::from_str(
+            r#"id = "daily"
+routes = ["mock/model"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(group.routing, RoutingPolicy::Order);
+    }
+
+    #[test]
+    fn group_route_scheduler_rotates_and_tracks_usage() {
+        let scheduler = KeyRotator::default();
+        let routes = vec!["a/one".to_owned(), "b/two".to_owned(), "c/three".to_owned()];
+        assert_eq!(
+            scheduler.group_order("daily", RoutingPolicy::Rotate, &routes),
+            vec![
+                (0, "a/one".to_owned()),
+                (1, "b/two".to_owned()),
+                (2, "c/three".to_owned())
+            ]
+        );
+        assert_eq!(
+            scheduler.group_order("daily", RoutingPolicy::Rotate, &routes)[0],
+            (1, "b/two".to_owned())
+        );
+        assert_eq!(
+            scheduler.group_order("daily", RoutingPolicy::Rotate, &routes)[0],
+            (2, "c/three".to_owned())
+        );
+
+        let usage = KeyRotator::default();
+        assert_eq!(
+            usage.group_order("daily", RoutingPolicy::Usage, &routes)[0].0,
+            0
+        );
+        usage.record_group_attempt("daily", RoutingPolicy::Usage, &routes, 0);
+        assert_eq!(
+            usage.group_order("daily", RoutingPolicy::Usage, &routes)[0].0,
+            1
+        );
+        usage.record_group_attempt("daily", RoutingPolicy::Usage, &routes, 1);
+        assert_eq!(
+            usage.group_order("daily", RoutingPolicy::Usage, &routes)[0].0,
+            2
+        );
+
+        let changed = vec!["new/route".to_owned(), "other/route".to_owned()];
+        assert_eq!(
+            usage.group_order("daily", RoutingPolicy::Usage, &changed)[0],
+            (0, "new/route".to_owned())
+        );
+    }
+
     #[test]
     fn provider_cooldown_overrides_the_gateway_default() {
         let config = Config::default();

@@ -2,7 +2,8 @@
 use magpie_agents::lifecycle::Manager;
 use magpie_gateway::agents::AgentService;
 use magpie_gateway::{
-    AppState, Config, ConfigStore, GroupConfig, Protocol, ProviderConfig, build_router,
+    AppState, Config, ConfigStore, GroupConfig, Protocol, ProviderConfig, RoutingPolicy,
+    build_router,
 };
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
@@ -46,6 +47,7 @@ async fn server(enabled: bool) -> Server {
             id: "daily".into(),
             name: "Daily".into(),
             routes: vec!["mock/model".into()],
+            routing: RoutingPolicy::default(),
         }],
         ..Config::default()
     };

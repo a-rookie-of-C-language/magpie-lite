@@ -17,7 +17,7 @@ Zed ─────────┘   Chat + Responses +
 - **Gateway** at `127.0.0.1:3426` speaking **OpenAI Chat Completions** (`/v1/chat/completions`), **OpenAI Responses** (`/v1/responses`), **Anthropic Messages** (`/v1/messages`), and **Gemini generateContent** (`/v1beta/models/...`)
 - **Cross-protocol translation** through a neutral IR: requests, replies, and **SSE streams** — text, tool calls, reasoning deltas, usage
 - **Providers** from one TOML file: Chat-compatible, Responses-compatible, Anthropic, or Gemini upstreams; console CRUD, bounded model discovery and connection checks, credential rotation and cooldown editing with immediate runtime updates
-- **Model routing**: `deepseek/deepseek-chat` by provider id, `group/daily-coding` route chains, bare names by provider model lists, default provider fallback
+- **Model routing**: `deepseek/deepseek-chat` by provider id, `group/daily-coding` route chains with process-local `order`, `rotate`, or `usage` scheduling, bare names by provider model lists, default provider fallback
 - **Multi-key pools**: repeat `--api-key`; requests rotate across keys, rejected/rate-limited keys are retried before route fallback, and `402`/`429` starts a cooldown from `Retry-After`, common duration/reset headers, absolute reset timestamps, or JSON error-body retry delays (60s fallback, per-provider `key_cooldown_ms` / `--key-cooldown-ms` override; `0` disables it)
 - **Failover**: ordered provider fallbacks and routing-group routes, tried before any reply bytes are streamed when the active provider is rate limited, out of quota, overloaded, or unreachable
 - **Local authentication**: every non-health route requires the configured token as Bearer, Anthropic `x-api-key`, or Gemini `x-goog-api-key`; `/health` stays public
@@ -45,6 +45,7 @@ magpie-lite provider add deepseek \
 
 # add a named route chain agents pick as one model
 magpie-lite group add daily-coding \
+  --routing rotate \
   --route deepseek/deepseek-chat \
   --route kimi/moonshot-v1-128k
 
@@ -180,14 +181,18 @@ The web console can create, edit, and delete routing groups. Enter an ID such as
 `daily-coding`, an optional display name, and one `provider/model` route per line
 in fallback order. Agents select `group/daily-coding`. IDs allow ASCII letters,
 digits, hyphens and underscores; routes require an existing provider and a nonempty
-model. Models may be unlisted, for providers that discover them dynamically.
+model. Models may be unlisted, for providers that discover them dynamically. Choose
+`order` to always start at the first route, `rotate` to advance the starting route
+for each request, or `usage` to prefer routes with fewer attempts in this gateway
+process. All remaining routes are still tried as fallbacks before response bytes
+are streamed.
 
 The following endpoints require the same local token as inference routes:
 
 | Method | Endpoint | Body / response |
 |---|---|---|
-| POST | `/config/groups` | `{"id":"daily","name":"Daily","routes":["deepseek/deepseek-chat"]}`; 201 on creation |
-| PUT | `/config/groups/{id}` | Same body with matching ID; replaces name and routes; 200 |
+| POST | `/config/groups` | `{"id":"daily","name":"Daily","routing":"rotate","routes":["deepseek/deepseek-chat"]}`; 201 on creation |
+| PUT | `/config/groups/{id}` | Same body with matching ID; replaces name, routing, and routes; 200 |
 | DELETE | `/config/groups/{id}` | No body; 200 |
 
 Successful edits return the secret-free `/config` snapshot. Invalid input returns

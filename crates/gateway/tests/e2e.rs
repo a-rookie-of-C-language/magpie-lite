@@ -8,7 +8,9 @@ use std::time::Duration;
 use axum::extract::{Path, State};
 use axum::routing::post;
 use axum::{Json, Router};
-use magpie_gateway::{AppState, Config, GroupConfig, Protocol, ProviderConfig, build_router};
+use magpie_gateway::{
+    AppState, Config, GroupConfig, Protocol, ProviderConfig, RoutingPolicy, build_router,
+};
 use serde_json::{Value, json};
 
 #[derive(Clone)]
@@ -640,7 +642,11 @@ async fn spawn_gateway_with_fallback(primary: String, backup: String) -> String 
     format!("http://{addr}")
 }
 
-async fn spawn_gateway_with_group(primary: String, backup: String) -> String {
+async fn spawn_gateway_with_group(
+    primary: String,
+    backup: String,
+    routing: RoutingPolicy,
+) -> String {
     let config = Config {
         port: 0,
         token: "magpie-lite".into(),
@@ -677,6 +683,7 @@ async fn spawn_gateway_with_group(primary: String, backup: String) -> String {
             id: "daily-coding".into(),
             name: "Daily coding".into(),
             routes: vec!["primary/mock-model".into(), "backup/mock-model".into()],
+            routing,
         }],
     };
     let requests = request_log(&config);
@@ -864,7 +871,7 @@ async fn retryable_primary_falls_back_before_streaming() {
 async fn routing_groups_fall_back_in_configured_order() {
     let primary = spawn_rate_limited().await;
     let (backup, last) = spawn_mock().await;
-    let gw = spawn_gateway_with_group(primary, backup).await;
+    let gw = spawn_gateway_with_group(primary, backup, RoutingPolicy::Order).await;
     let client = reqwest::Client::new();
 
     let models = client
@@ -914,6 +921,40 @@ async fn routing_groups_fall_back_in_configured_order() {
         stats["recent_requests"][0]["requested_model"],
         "group/daily-coding"
     );
+}
+
+#[tokio::test]
+async fn routing_groups_rotate_the_starting_route() {
+    let (primary, _) = spawn_mock().await;
+    let (backup, _) = spawn_mock().await;
+    let gw = spawn_gateway_with_group(primary, backup, RoutingPolicy::Rotate).await;
+    let client = reqwest::Client::new();
+
+    for _ in 0..3 {
+        let response = client
+            .post(format!("{gw}/v1/chat/completions"))
+            .bearer_auth("magpie-lite")
+            .json(&json!({
+                "model": "group/daily-coding",
+                "messages": [{"role": "user", "content": "rotate"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let stats: Value = client
+        .get(format!("{gw}/stats"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stats["providers"]["primary"]["requests"], 2);
+    assert_eq!(stats["providers"]["backup"]["requests"], 1);
 }
 
 #[tokio::test]

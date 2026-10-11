@@ -4,7 +4,7 @@ use magpie_agents::lifecycle::{Action, AgentId, Gateway, Manager, state_director
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use magpie_gateway::{Config, GroupConfig, Protocol, ProviderConfig, config_path};
+use magpie_gateway::{Config, GroupConfig, Protocol, ProviderConfig, RoutingPolicy, config_path};
 
 #[derive(Parser)]
 #[command(
@@ -133,6 +133,9 @@ enum GroupCommand {
         /// Ordered routes: the first available model serves the request.
         #[arg(long = "route")]
         routes: Vec<String>,
+        /// Route policy: order, rotate, or usage.
+        #[arg(long, default_value = "order")]
+        routing: RoutingPolicy,
     },
     /// List configured groups.
     List,
@@ -321,13 +324,19 @@ async fn main() -> Result<()> {
             }
         },
         Command::Group { command } => match command {
-            GroupCommand::Add { id, name, routes } => {
+            GroupCommand::Add {
+                id,
+                name,
+                routes,
+                routing,
+            } => {
                 let path = provider_path(&cli.config)?;
                 let mut cfg = Config::load(&path)?;
                 let group = GroupConfig {
                     id: id.clone(),
                     name: name.unwrap_or_default(),
                     routes,
+                    routing,
                 };
                 group.validate()?;
                 for route in &group.routes {
@@ -357,7 +366,12 @@ async fn main() -> Result<()> {
                     } else {
                         g.name.as_str()
                     };
-                    println!("group/{:<18} {}", g.id, label);
+                    println!(
+                        "group/{:<18} {} [routing: {}]",
+                        g.id,
+                        label,
+                        g.routing.as_str()
+                    );
                     for (i, route) in g.routes.iter().enumerate() {
                         let marker = if i == 0 { "route" } else { "fallback" };
                         println!("{:<26} {marker} {route}", "");

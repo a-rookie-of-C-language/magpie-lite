@@ -395,6 +395,14 @@ struct UpstreamRoute {
     provider: Arc<ProviderConfig>,
     model: String,
     api_keys: Vec<(usize, String)>,
+    group_id: Option<String>,
+    group_route_index: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct GroupRoutePlan {
+    id: String,
+    routes: Vec<(usize, String)>,
 }
 
 /// The concrete attempt that served (or last failed) a request.
@@ -512,32 +520,82 @@ impl UpstreamDecoders {
 /// Decode the body and resolve the initial model route.
 fn prepare(
     config: &Config,
+    key_rotation: &crate::config::KeyRotator,
     body: &Value,
     wire: ClientWire,
-) -> Result<(CompletionRequest, UpstreamRoute), (StatusCode, Value)> {
+) -> Result<(CompletionRequest, UpstreamRoute, Option<GroupRoutePlan>), (StatusCode, Value)> {
     let creq = wire.decode_request(body).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             wire.error_body(StatusCode::BAD_REQUEST, &e.to_string()),
         )
     })?;
-    let Some((provider, upstream_model)) = config.resolve(&creq.model) else {
-        let message = format!(
-            "no provider serves model `{}`; add one with `magpie-lite provider add`",
-            creq.model
-        );
-        return Err((
-            StatusCode::NOT_FOUND,
-            wire.error_body(StatusCode::NOT_FOUND, &message),
-        ));
-    };
+
+    let (provider, upstream_model, group_plan, group_route_index) =
+        if let Some(group_id) = creq.model.strip_prefix("group/") {
+            let Some(group) = config.group(group_id) else {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    wire.error_body(
+                        StatusCode::NOT_FOUND,
+                        &format!("no provider serves model `{}`", creq.model),
+                    ),
+                ));
+            };
+            let routes = key_rotation.group_order(group_id, group.routing, &group.routes);
+            let Some((route_index, route)) =
+                routes.first().map(|(index, route)| (*index, route.clone()))
+            else {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    wire.error_body(
+                        StatusCode::NOT_FOUND,
+                        &format!("routing group `{group_id}` has no usable routes"),
+                    ),
+                ));
+            };
+            let Some((provider, upstream_model)) = config.resolve(&route) else {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    wire.error_body(
+                        StatusCode::NOT_FOUND,
+                        &format!("no provider serves model `{}`", creq.model),
+                    ),
+                ));
+            };
+            (
+                provider,
+                upstream_model,
+                Some(GroupRoutePlan {
+                    id: group_id.to_owned(),
+                    routes,
+                }),
+                Some(route_index),
+            )
+        } else {
+            let Some((provider, upstream_model)) = config.resolve(&creq.model) else {
+                let message = format!(
+                    "no provider serves model `{}`; add one with `magpie-lite provider add`",
+                    creq.model
+                );
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    wire.error_body(StatusCode::NOT_FOUND, &message),
+                ));
+            };
+            (provider, upstream_model, None, None)
+        };
+
     Ok((
         creq,
         UpstreamRoute {
             provider: Arc::new(provider.clone()),
             model: upstream_model,
             api_keys: provider.api_key_pool().into_iter().enumerate().collect(),
+            group_id: group_plan.as_ref().map(|plan| plan.id.clone()),
+            group_route_index,
         },
+        group_plan,
     ))
 }
 
@@ -550,6 +608,7 @@ fn upstream_routes(
     key_rotation: &crate::config::KeyRotator,
     initial: UpstreamRoute,
     requested_model: &str,
+    group_plan: Option<&GroupRoutePlan>,
 ) -> Vec<UpstreamRoute> {
     let initial_keys = initial
         .api_keys
@@ -567,15 +626,31 @@ fn upstream_routes(
     let mut out = vec![initial.clone()];
     let mut seen = HashSet::from([initial.provider.id.clone()]);
 
-    let references = config.fallback_references(requested_model, &initial.provider);
-    for reference in &references {
-        let Some((provider, model)) = config.resolve(reference) else {
+    let mut fallback_references = group_plan
+        .map(|plan| {
+            plan.routes
+                .iter()
+                .skip(1)
+                .map(|(_, route)| route.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| config.fallback_references(requested_model, &initial.provider));
+    for reference in fallback_references.drain(..) {
+        let Some((provider, model)) = config.resolve(&reference) else {
             tracing::warn!("fallback `{reference}` does not resolve; skipping");
             continue;
         };
         if !seen.insert(provider.id.clone()) {
             continue;
         }
+        let (group_id, group_route_index) = group_plan
+            .and_then(|plan| {
+                plan.routes
+                    .iter()
+                    .find(|(_, route)| route == &reference)
+                    .map(|(index, _)| (Some(plan.id.clone()), Some(*index)))
+            })
+            .unwrap_or((None, None));
         let api_keys = key_rotation.rotate(
             &provider.id,
             provider.key_generation,
@@ -585,6 +660,8 @@ fn upstream_routes(
             provider: Arc::new(provider.clone()),
             model,
             api_keys,
+            group_id,
+            group_route_index,
         });
     }
     out
@@ -616,10 +693,17 @@ async fn send_with_fallback(
     config: &Config,
     creq: &CompletionRequest,
     initial: UpstreamRoute,
+    group_plan: Option<&GroupRoutePlan>,
     tracker: &RequestTracker,
     wire: ClientWire,
 ) -> Result<(reqwest::Response, UpstreamCandidate), (Box<Response>, UpstreamCandidate)> {
-    let routes = upstream_routes(config, &state.key_rotation, initial, &creq.model);
+    let routes = upstream_routes(
+        config,
+        &state.key_rotation,
+        initial,
+        &creq.model,
+        group_plan,
+    );
     let last_route = routes.len().saturating_sub(1);
     let no_route = routes
         .first()
@@ -630,6 +714,17 @@ async fn send_with_fallback(
         .expect("initial route");
 
     for (route_index, route) in routes.into_iter().enumerate() {
+        if let (Some(group_id), Some(group_route_index)) =
+            (&route.group_id, route.group_route_index)
+            && let Some(group) = config.group(group_id)
+        {
+            state.key_rotation.record_group_attempt(
+                group_id,
+                group.routing,
+                &group.routes,
+                group_route_index,
+            );
+        }
         for (attempt, (key_slot, api_key)) in route.api_keys.iter().enumerate() {
             let candidate = UpstreamCandidate::new(&route, *key_slot);
             let body = upstream::build_request(&route.provider, creq, &route.model);
@@ -779,7 +874,7 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
         }
     };
     let config = state.config.current();
-    let (creq, initial) = match prepare(&config, &body, wire) {
+    let (creq, initial, group_plan) = match prepare(&config, &state.key_rotation, &body, wire) {
         Ok(x) => x,
         Err((status, body)) => return err_response(status, body),
     };
@@ -792,18 +887,27 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
         &initial.model,
         0,
     );
-    let (resp, candidate) =
-        match send_with_fallback(&state, &config, &creq, initial, &tracker, wire).await {
-            Ok((resp, candidate)) => {
-                tracker.set_route(&candidate.provider.id, &candidate.model, candidate.key_slot);
-                (resp, candidate)
-            }
-            Err((response, candidate)) => {
-                tracker.set_route(&candidate.provider.id, &candidate.model, candidate.key_slot);
-                tracker.finish("upstream_error", &Usage::default());
-                return *response;
-            }
-        };
+    let (resp, candidate) = match send_with_fallback(
+        &state,
+        &config,
+        &creq,
+        initial,
+        group_plan.as_ref(),
+        &tracker,
+        wire,
+    )
+    .await
+    {
+        Ok((resp, candidate)) => {
+            tracker.set_route(&candidate.provider.id, &candidate.model, candidate.key_slot);
+            (resp, candidate)
+        }
+        Err((response, candidate)) => {
+            tracker.set_route(&candidate.provider.id, &candidate.model, candidate.key_slot);
+            tracker.finish("upstream_error", &Usage::default());
+            return *response;
+        }
+    };
     let protocol = candidate.provider.protocol;
 
     if !creq.stream {
