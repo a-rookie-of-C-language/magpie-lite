@@ -15,8 +15,8 @@ pub fn installed() -> bool {
     config_path().map(|p| p.exists()).unwrap_or(false)
 }
 
-/// Wire Codex onto the gateway as a provider that speaks Chat Completions
-/// (`wire_api = "chat"`), keeping the rest of the file as it is.
+/// Wire Codex onto the gateway as a provider that speaks its native
+/// Responses API (`wire_api = "responses"`), keeping the rest of the file as it is.
 /// Returns the config path.
 pub fn wire(model: &str, port: u16, token: &str) -> Result<PathBuf> {
     let path = config_path()?;
@@ -57,7 +57,7 @@ pub fn wire_at(path: &Path, model: &str, port: u16, token: &str) -> Result<()> {
         .context("magpie-lite is not a table")?;
     table["name"] = value("magpie-lite");
     table["base_url"] = value(format!("http://127.0.0.1:{port}/v1"));
-    table["wire_api"] = value("chat");
+    table["wire_api"] = value("responses");
     table["experimental_bearer_token"] = value(token);
 
     std::fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))?;

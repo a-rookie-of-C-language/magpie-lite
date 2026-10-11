@@ -110,7 +110,7 @@ mod tests {
         assert!(text.contains("model = \"deepseek/deepseek-chat\""));
         assert!(text.contains("model_provider = \"magpie-lite\""));
         assert!(text.contains("base_url = \"http://127.0.0.1:3426/v1\""));
-        assert!(text.contains("wire_api = \"chat\""));
+        assert!(text.contains("wire_api = \"responses\""));
         assert!(
             text.contains("[model_providers.custom]"),
             "other providers survive"

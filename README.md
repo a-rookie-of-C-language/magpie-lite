@@ -18,7 +18,7 @@ Gemini CLI ─┘   Chat + Responses +                └─ Gemini generateCont
 - **Model routing**: `deepseek/deepseek-chat` by provider id, bare names by provider model lists, default provider fallback
 - **Failover**: ordered `--fallback provider/model` routes, tried before any reply bytes are streamed when the active provider is rate limited, out of quota, overloaded, or unreachable
 - **Local authentication**: every model route requires the configured token as Bearer, Anthropic `x-api-key`, or Gemini `x-goog-api-key`; `/health` stays public
-- **Agent wiring**: `magpie-lite claude <model>` (settings.json env block), `magpie-lite codex <model>` (config.toml provider table, `wire_api = "chat"`), `magpie-lite gemini <model>` (`~/.gemini/settings.json` plus `.env`)
+- **Agent wiring**: `magpie-lite claude <model>` (settings.json env block), `magpie-lite codex <model>` (config.toml provider table, native `wire_api = "responses"`), `magpie-lite gemini <model>` (`~/.gemini/settings.json` plus `.env`)
 - **Conformance tests** for every translation direction, and end-to-end tests over real HTTP with mock Chat and Gemini upstreams
 
 ## Quick start
@@ -61,7 +61,6 @@ Tests are the contract: `crates/core/tests/translation.rs` checks real wire shap
 
 ## Not yet (the roadmap)
 
-- Codex wiring with native `wire_api = "responses"` (the endpoint works; the adapter currently uses the widely compatible Chat dialect)
 - Routing groups and multi-key provider pools (single-provider fallback already works)
 - More agents (OpenCode, Cursor CLI, ...)
 - A TUI/Web UI
