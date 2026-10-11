@@ -20,8 +20,7 @@ use magpie_core::stream::{SseParser, StreamEvent};
 use magpie_core::{anthropic, chat, gemini, responses};
 use serde_json::{Value, json};
 
-use crate::config::ProviderConfig;
-use crate::config::{Config, Protocol};
+use crate::config::{Config, Protocol, ProviderConfig};
 use crate::upstream;
 use crate::usage::{RequestLog, RequestTracker, StatsSnapshot};
 
@@ -33,6 +32,8 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// In-memory request totals and recent history for `/stats`.
     pub requests: Arc<Mutex<RequestLog>>,
+    /// Round-robin cursors for providers with multiple API keys.
+    pub key_rotation: crate::config::KeyRotator,
 }
 
 /// Build the router around a state; what `serve` runs and tests drive.
@@ -120,6 +121,7 @@ pub async fn serve(config: Config, port: Option<u16>) -> anyhow::Result<()> {
         config,
         http,
         requests: Arc::new(Mutex::new(RequestLog::default())),
+        key_rotation: crate::config::KeyRotator::default(),
     });
     let app = build_router(state);
 
@@ -173,12 +175,31 @@ async fn gemini_models(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({"models": models}))
 }
 
-/// A resolved place to send one attempt: a provider and its spelling of
-/// the model. The same IR is re-encoded for every candidate.
+/// A resolved route: one provider/model and the ordered key pool to try
+/// before moving on to the next route.
+#[derive(Debug, Clone)]
+struct UpstreamRoute {
+    provider: Arc<ProviderConfig>,
+    model: String,
+    api_keys: Vec<(usize, String)>,
+}
+
+/// The concrete attempt that served (or last failed) a request.
 #[derive(Debug, Clone)]
 struct UpstreamCandidate {
     provider: Arc<ProviderConfig>,
     model: String,
+    key_slot: usize,
+}
+
+impl UpstreamCandidate {
+    fn new(route: &UpstreamRoute, key_slot: usize) -> Self {
+        Self {
+            provider: route.provider.clone(),
+            model: route.model.clone(),
+            key_slot,
+        }
+    }
 }
 
 /// The agent-facing protocol a request arrived in. Beside decoding, this
@@ -280,7 +301,7 @@ fn prepare(
     state: &AppState,
     body: &Value,
     wire: ClientWire,
-) -> Result<(CompletionRequest, UpstreamCandidate), (StatusCode, Value)> {
+) -> Result<(CompletionRequest, UpstreamRoute), (StatusCode, Value)> {
     let creq = wire.decode_request(body).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -299,21 +320,33 @@ fn prepare(
     };
     Ok((
         creq,
-        UpstreamCandidate {
+        UpstreamRoute {
             provider: Arc::new(provider.clone()),
             model: upstream_model,
+            api_keys: provider.api_key_pool().into_iter().enumerate().collect(),
         },
     ))
 }
 
 /// The initial provider followed by its fallback references, each resolved
-/// with the ordinary model rules. Chains are deliberately one level deep:
-/// `fallback` says where this model goes next, not how to build a graph.
-fn upstream_candidates(
+/// with the ordinary model rules. Every route carries its own rotated key
+/// pool. Chains are deliberately one level deep: `fallback` says where this
+/// model goes next, not how to build a graph.
+fn upstream_routes(
     config: &Config,
-    initial: UpstreamCandidate,
+    key_rotation: &crate::config::KeyRotator,
+    initial: UpstreamRoute,
     requested_model: &str,
-) -> Vec<UpstreamCandidate> {
+) -> Vec<UpstreamRoute> {
+    let initial_keys = initial
+        .api_keys
+        .iter()
+        .map(|(_, key)| key.clone())
+        .collect::<Vec<_>>();
+    let initial = UpstreamRoute {
+        api_keys: key_rotation.rotate(&initial.provider.id, &initial_keys),
+        ..initial
+    };
     let mut out = vec![initial.clone()];
     let mut seen = HashSet::from([initial.provider.id.clone()]);
 
@@ -326,84 +359,111 @@ fn upstream_candidates(
         if !seen.insert(provider.id.clone()) {
             continue;
         }
-        out.push(UpstreamCandidate {
+        let api_keys = key_rotation.rotate(&provider.id, &provider.api_key_pool());
+        out.push(UpstreamRoute {
             provider: Arc::new(provider.clone()),
             model,
+            api_keys,
         });
     }
     out
 }
 
-/// Whether an upstream status is worth spending another provider on.
-fn retryable_status(status: reqwest::StatusCode) -> bool {
+/// Statuses that make the next key in the same provider worth one attempt.
+fn key_retryable_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 401 | 402 | 403 | 429)
+}
+
+/// Whether an upstream status is worth spending another route on.
+fn route_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(
         status.as_u16(),
         402 | 403 | 408 | 429 | 500 | 502 | 503 | 504 | 529
     )
 }
 
-/// Send to the initial provider, then its fallbacks. All routing decisions
-/// happen before a successful response body is streamed, so an agent never
-/// receives a half-finished answer from an abandoned provider.
+/// Send to the initial provider's key pool, then its fallback routes. All
+/// routing decisions happen before a successful response body is streamed, so
+/// an agent never receives a half-finished answer from an abandoned provider.
 async fn send_with_fallback(
     state: &AppState,
     creq: &CompletionRequest,
-    initial: UpstreamCandidate,
+    initial: UpstreamRoute,
     wire: ClientWire,
 ) -> Result<(reqwest::Response, UpstreamCandidate), (Box<Response>, UpstreamCandidate)> {
-    let candidates = upstream_candidates(&state.config, initial, &creq.model);
-    let last = candidates.len().saturating_sub(1);
-    let no_route = candidates.first().cloned().expect("initial candidate");
+    let routes = upstream_routes(&state.config, &state.key_rotation, initial, &creq.model);
+    let last_route = routes.len().saturating_sub(1);
+    let no_route = routes
+        .first()
+        .map(|route| {
+            let key_slot = route.api_keys.first().map(|(slot, _)| *slot).unwrap_or(0);
+            UpstreamCandidate::new(route, key_slot)
+        })
+        .expect("initial route");
 
-    for (attempt, candidate) in candidates.into_iter().enumerate() {
-        let body = upstream::build_request(&candidate.provider, creq, &candidate.model);
-        tracing::debug!(
-            provider = %candidate.provider.id,
-            model = %candidate.model,
-            attempt,
-            "routing upstream"
-        );
+    for (route_index, route) in routes.into_iter().enumerate() {
+        for (attempt, (key_slot, api_key)) in route.api_keys.iter().enumerate() {
+            let candidate = UpstreamCandidate::new(&route, *key_slot);
+            let body = upstream::build_request(&route.provider, creq, &route.model);
+            tracing::debug!(
+                provider = %route.provider.id,
+                model = %route.model,
+                key_slot,
+                route_index,
+                "routing upstream"
+            );
 
-        let resp = match upstream::send(
-            &state.http,
-            &candidate.provider,
-            &body,
-            &candidate.model,
-            creq.stream,
-        )
-        .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                let message = format!("cannot reach {}: {e}", candidate.provider.id);
-                tracing::warn!("{message}");
-                if attempt == last {
-                    return Err((
-                        Box::new(err_response(
-                            StatusCode::BAD_GATEWAY,
-                            wire.error_body(StatusCode::BAD_GATEWAY, &message),
-                        )),
-                        candidate,
-                    ));
+            let resp = match upstream::send(
+                &state.http,
+                &route.provider,
+                api_key,
+                &body,
+                &route.model,
+                creq.stream,
+            )
+            .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let message = format!("cannot reach {}: {e}", route.provider.id);
+                    tracing::warn!("{message}");
+                    if route_index == last_route {
+                        return Err((
+                            Box::new(err_response(
+                                StatusCode::BAD_GATEWAY,
+                                wire.error_body(StatusCode::BAD_GATEWAY, &message),
+                            )),
+                            candidate,
+                        ));
+                    }
+                    // A connection-level failure belongs to the endpoint, not
+                    // to one credential, so try the next route directly.
+                    break;
                 }
+            };
+
+            let status = resp.status();
+            if status.is_success() {
+                return Ok((resp, candidate));
+            }
+            let detail = upstream::error_detail(resp).await;
+            tracing::warn!(
+                "upstream {} key {}: {detail}",
+                route.provider.id,
+                key_slot + 1
+            );
+            if attempt + 1 < route.api_keys.len() && key_retryable_status(status) {
                 continue;
             }
-        };
-
-        let status = resp.status();
-        if status.is_success() {
-            return Ok((resp, candidate));
+            if route_index != last_route && route_retryable_status(status) {
+                break;
+            }
+            let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            return Err((
+                Box::new(err_response(status, wire.error_body(status, &detail))),
+                candidate,
+            ));
         }
-        let detail = upstream::error_detail(resp).await;
-        tracing::warn!("upstream {}: {detail}", candidate.provider.id);
-        if attempt != last && retryable_status(status) {
-            continue;
-        }
-        let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        return Err((
-            Box::new(err_response(status, wire.error_body(status, &detail))),
-            candidate,
-        ));
     }
 
     Err((
@@ -479,14 +539,15 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
         &creq,
         &initial.provider.id,
         &initial.model,
+        0,
     );
     let (resp, candidate) = match send_with_fallback(&state, &creq, initial, wire).await {
         Ok((resp, candidate)) => {
-            tracker.set_route(&candidate.provider.id, &candidate.model);
+            tracker.set_route(&candidate.provider.id, &candidate.model, candidate.key_slot);
             (resp, candidate)
         }
         Err((response, candidate)) => {
-            tracker.set_route(&candidate.provider.id, &candidate.model);
+            tracker.set_route(&candidate.provider.id, &candidate.model, candidate.key_slot);
             tracker.finish("upstream_error", &Usage::default());
             return *response;
         }

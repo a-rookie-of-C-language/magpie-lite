@@ -37,6 +37,7 @@ pub fn build_request(p: &ProviderConfig, req: &CompletionRequest, model: &str) -
 pub async fn send(
     http: &reqwest::Client,
     p: &ProviderConfig,
+    api_key: &str,
     body: &Value,
     model: &str,
     stream: bool,
@@ -57,15 +58,15 @@ pub async fn send(
     };
     match p.protocol {
         Protocol::Chat | Protocol::Responses => {
-            req = req.bearer_auth(&p.api_key);
+            req = req.bearer_auth(api_key);
         }
         Protocol::Anthropic => {
             req = req
-                .bearer_auth(&p.api_key)
+                .bearer_auth(api_key)
                 .header("anthropic-version", "2023-06-01");
         }
         Protocol::Gemini => {
-            req = req.header("x-goog-api-key", &p.api_key);
+            req = req.header("x-goog-api-key", api_key);
         }
     }
 

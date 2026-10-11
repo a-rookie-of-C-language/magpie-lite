@@ -1,7 +1,9 @@
 //! Provider and gateway configuration, one TOML file.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -59,9 +61,14 @@ pub struct ProviderConfig {
     pub protocol: Protocol,
     /// Base URL: chat/responses bases end in `/v1`, Anthropic bases are the root, Gemini bases end in `/v1beta`.
     pub base_url: String,
-    /// API key.
+    /// Compatibility key for configs written before key pools existed.
+    /// It is used only when `api_keys` is empty.
     #[serde(default)]
     pub api_key: String,
+    /// API key pool. Requests start at a rotating key and retry another key
+    /// when this one is rejected, out of quota, or rate limited.
+    #[serde(default)]
+    pub api_keys: Vec<String>,
     /// Known model ids, for bare-name routing and the catalog.
     #[serde(default)]
     pub models: Vec<String>,
@@ -80,6 +87,58 @@ impl ProviderConfig {
         } else {
             &self.name
         }
+    }
+
+    /// The effective key pool, in configured order. The legacy singular key
+    /// keeps old TOML files working; an explicit pool wins.
+    pub fn api_key_pool(&self) -> Vec<String> {
+        let configured = if self.api_keys.is_empty() {
+            vec![self.api_key.clone()]
+        } else {
+            self.api_keys.clone()
+        };
+        let mut keys = Vec::<String>::new();
+        for key in configured {
+            if !keys.iter().any(|k| k.as_str() == key) {
+                keys.push(key.clone());
+            }
+        }
+        if keys.is_empty() {
+            keys.push(String::new());
+        }
+        keys
+    }
+}
+
+/// Round-robin key selection for one gateway process.
+///
+/// The cursor is provider-local and never persisted. Rotation spreads normal
+/// load across a pool; a key-level rejection makes the next key serve that
+/// same request.
+#[derive(Debug, Default)]
+pub struct KeyRotator {
+    cursors: Mutex<BTreeMap<String, usize>>,
+}
+
+impl KeyRotator {
+    /// Return (configured slot, key) pairs rotated to the next starting key.
+    pub fn rotate(&self, provider_id: &str, keys: &[String]) -> Vec<(usize, String)> {
+        if keys.len() < 2 {
+            return keys.iter().cloned().map(|key| (0, key)).collect();
+        }
+        let mut cursors = self
+            .cursors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let start = cursors.entry(provider_id.to_owned()).or_insert(0);
+        let rotated = keys[*start..]
+            .iter()
+            .chain(keys[..*start].iter())
+            .enumerate()
+            .map(|(rotated_slot, key)| ((*start + rotated_slot) % keys.len(), key.clone()))
+            .collect::<Vec<_>>();
+        *start = (*start + 1) % keys.len();
+        rotated
     }
 }
 
@@ -245,4 +304,40 @@ pub fn config_path() -> anyhow::Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("cannot find the user config directory"))?
         .join("magpie-lite");
     Ok(dir.join("config.toml"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_key_pool_keeps_the_legacy_singular_key() {
+        let provider = ProviderConfig {
+            id: "mock".into(),
+            name: String::new(),
+            protocol: Protocol::Chat,
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: "legacy-key".into(),
+            api_keys: Vec::new(),
+            models: Vec::new(),
+            fallback: Vec::new(),
+        };
+
+        assert_eq!(provider.api_key_pool(), vec!["legacy-key".to_owned()]);
+    }
+
+    #[test]
+    fn key_rotation_preserves_configured_slots() {
+        let rotator = KeyRotator::default();
+        let keys = vec!["one".to_owned(), "two".to_owned()];
+
+        assert_eq!(
+            rotator.rotate("mock", &keys),
+            vec![(0, "one".to_owned()), (1, "two".to_owned())]
+        );
+        assert_eq!(
+            rotator.rotate("mock", &keys),
+            vec![(1, "two".to_owned()), (0, "one".to_owned())]
+        );
+    }
 }

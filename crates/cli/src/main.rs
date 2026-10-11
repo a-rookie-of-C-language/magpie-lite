@@ -102,9 +102,9 @@ enum ProviderCommand {
         /// Base URL: chat/responses bases end in `/v1`; Anthropic bases are the root; Gemini bases end in `/v1beta`.
         #[arg(long)]
         base_url: String,
-        /// API key.
-        #[arg(long)]
-        api_key: String,
+        /// API keys; repeat --api-key to build a rotating pool.
+        #[arg(long = "api-key", required = true, num_args = 1)]
+        api_keys: Vec<String>,
         /// Display name.
         #[arg(long)]
         name: Option<String>,
@@ -155,7 +155,7 @@ async fn main() -> Result<()> {
                 id,
                 protocol,
                 base_url,
-                api_key,
+                api_keys,
                 name,
                 models,
                 fallback,
@@ -171,7 +171,8 @@ async fn main() -> Result<()> {
                     name: name.unwrap_or_default(),
                     protocol,
                     base_url,
-                    api_key,
+                    api_key: String::new(),
+                    api_keys,
                     models,
                     fallback,
                 };
@@ -199,12 +200,15 @@ async fn main() -> Result<()> {
                     } else {
                         ""
                     };
+                    let key_count = p.api_key_pool().len();
                     println!(
-                        "{:<14} {:<10} {}{}",
+                        "{:<14} {:<10} {}{} [{} key{}]",
                         p.id,
                         p.protocol.as_str(),
                         p.base_url,
-                        marker
+                        marker,
+                        key_count,
+                        if key_count == 1 { "" } else { "s" }
                     );
                     for m in &p.models {
                         println!("               {}/{}", p.id, m);

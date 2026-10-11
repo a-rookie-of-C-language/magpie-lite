@@ -48,6 +48,9 @@ pub struct RequestRecord {
     pub provider: String,
     /// The provider's spelling of that model.
     pub upstream_model: String,
+    /// Zero-based position in the provider's API-key pool. The key itself is
+    /// deliberately not recorded.
+    pub key_slot: usize,
     /// Whether the agent asked for SSE.
     pub stream: bool,
     /// `ok`, or a short failure kind.
@@ -148,6 +151,7 @@ impl RequestTracker {
         request: &CompletionRequest,
         provider: &str,
         upstream_model: &str,
+        key_slot: usize,
     ) -> Self {
         Self {
             log,
@@ -158,6 +162,7 @@ impl RequestTracker {
                 requested_model: request.model.clone(),
                 provider: provider.to_owned(),
                 upstream_model: upstream_model.to_owned(),
+                key_slot,
                 stream: request.stream,
                 status: "incomplete".to_owned(),
                 latency_ms: 0,
@@ -168,9 +173,10 @@ impl RequestTracker {
     }
 
     /// Replace the route after fallback chooses a different provider.
-    pub fn set_route(&mut self, provider: &str, upstream_model: &str) {
+    pub fn set_route(&mut self, provider: &str, upstream_model: &str, key_slot: usize) {
         self.record.provider = provider.to_owned();
         self.record.upstream_model = upstream_model.to_owned();
+        self.record.key_slot = key_slot;
     }
 
     /// Record the final status. Later calls (including Drop) are no-ops.

@@ -180,6 +180,7 @@ async fn spawn_gateway_with_protocol(upstream_base: String, protocol: Protocol) 
                 }
             ),
             api_key: "test-key".into(),
+            api_keys: Vec::new(),
             models: vec!["mock-model".into()],
             fallback: Vec::new(),
         }],
@@ -191,6 +192,7 @@ async fn spawn_gateway_with_protocol(upstream_base: String, protocol: Protocol) 
         requests: Arc::new(std::sync::Mutex::new(
             magpie_gateway::usage::RequestLog::default(),
         )),
+        key_rotation: magpie_gateway::KeyRotator::default(),
     });
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -372,6 +374,155 @@ async fn spawn_rate_limited() -> String {
     format!("http://{addr}")
 }
 
+#[derive(Clone)]
+struct KeyPoolMock {
+    seen_keys: Arc<Mutex<Vec<String>>>,
+}
+
+async fn key_pool_chat_completions(
+    State(mock): State<KeyPoolMock>,
+    headers: HeaderMap,
+) -> Response {
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let key = authorization
+        .strip_prefix("Bearer ")
+        .unwrap_or_default()
+        .to_owned();
+    mock.seen_keys.lock().unwrap().push(key.clone());
+
+    if key == "first-key" {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": {"message": "first key is rate limited"}})),
+        )
+            .into_response();
+    }
+
+    Json(json!({
+        "id": "chatcmpl-key-pool", "object": "chat.completion", "model": "mock-model",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "second key worked."},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+    }))
+    .into_response()
+}
+
+async fn spawn_key_pool_mock() -> (String, Arc<Mutex<Vec<String>>>) {
+    let seen_keys = Arc::new(Mutex::new(Vec::new()));
+    let mock = KeyPoolMock {
+        seen_keys: seen_keys.clone(),
+    };
+    let app = Router::new()
+        .route("/v1/chat/completions", post(key_pool_chat_completions))
+        .with_state(mock);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), seen_keys)
+}
+
+#[derive(Clone)]
+struct InternalErrorMock {
+    seen_keys: Arc<Mutex<Vec<String>>>,
+}
+
+async fn internal_error_chat_completions(
+    State(mock): State<InternalErrorMock>,
+    headers: HeaderMap,
+) -> Response {
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let key = authorization
+        .strip_prefix("Bearer ")
+        .unwrap_or_default()
+        .to_owned();
+    mock.seen_keys.lock().unwrap().push(key);
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": {"message": "provider is overloaded"}})),
+    )
+        .into_response()
+}
+
+async fn spawn_internal_error_mock() -> (String, Arc<Mutex<Vec<String>>>) {
+    let seen_keys = Arc::new(Mutex::new(Vec::new()));
+    let mock = InternalErrorMock {
+        seen_keys: seen_keys.clone(),
+    };
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(internal_error_chat_completions),
+        )
+        .with_state(mock);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), seen_keys)
+}
+
+async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) -> String {
+    let mut fallback = Vec::new();
+    let mut providers = vec![ProviderConfig {
+        id: "primary".into(),
+        name: "Primary".into(),
+        protocol: Protocol::Chat,
+        base_url: format!("{primary}/v1"),
+        api_key: String::new(),
+        api_keys: vec!["first-key".into(), "second-key".into()],
+        models: vec!["mock-model".into()],
+        fallback: Vec::new(),
+    }];
+    if let Some(backup) = backup {
+        fallback.push("backup/mock-model".into());
+        providers.push(ProviderConfig {
+            id: "backup".into(),
+            name: "Backup".into(),
+            protocol: Protocol::Chat,
+            base_url: format!("{backup}/v1"),
+            api_key: "backup-key".into(),
+            api_keys: Vec::new(),
+            models: vec!["mock-model".into()],
+            fallback: Vec::new(),
+        });
+    }
+    providers[0].fallback = fallback;
+
+    let config = Config {
+        port: 0,
+        token: "magpie-lite".into(),
+        default_provider: "primary".into(),
+        provider: providers,
+        group: Vec::new(),
+    };
+    let state = Arc::new(AppState {
+        config,
+        http: magpie_gateway::upstream::http_client().unwrap(),
+        requests: Arc::new(std::sync::Mutex::new(
+            magpie_gateway::usage::RequestLog::default(),
+        )),
+        key_rotation: magpie_gateway::KeyRotator::default(),
+    });
+    let app = build_router(state);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
 async fn spawn_gateway_with_fallback(primary: String, backup: String) -> String {
     let config = Config {
         port: 0,
@@ -384,6 +535,7 @@ async fn spawn_gateway_with_fallback(primary: String, backup: String) -> String 
                 protocol: Protocol::Chat,
                 base_url: format!("{primary}/v1"),
                 api_key: "primary-key".into(),
+                api_keys: Vec::new(),
                 models: vec!["mock-model".into()],
                 fallback: vec!["backup/mock-model".into()],
             },
@@ -393,6 +545,7 @@ async fn spawn_gateway_with_fallback(primary: String, backup: String) -> String 
                 protocol: Protocol::Chat,
                 base_url: format!("{backup}/v1"),
                 api_key: "backup-key".into(),
+                api_keys: Vec::new(),
                 models: vec!["mock-model".into()],
                 fallback: Vec::new(),
             },
@@ -405,6 +558,7 @@ async fn spawn_gateway_with_fallback(primary: String, backup: String) -> String 
         requests: Arc::new(std::sync::Mutex::new(
             magpie_gateway::usage::RequestLog::default(),
         )),
+        key_rotation: magpie_gateway::KeyRotator::default(),
     });
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -427,6 +581,7 @@ async fn spawn_gateway_with_group(primary: String, backup: String) -> String {
                 protocol: Protocol::Chat,
                 base_url: format!("{primary}/v1"),
                 api_key: "primary-key".into(),
+                api_keys: Vec::new(),
                 models: vec!["mock-model".into()],
                 fallback: Vec::new(),
             },
@@ -436,6 +591,7 @@ async fn spawn_gateway_with_group(primary: String, backup: String) -> String {
                 protocol: Protocol::Chat,
                 base_url: format!("{backup}/v1"),
                 api_key: "backup-key".into(),
+                api_keys: Vec::new(),
                 models: vec!["mock-model".into()],
                 fallback: Vec::new(),
             },
@@ -452,6 +608,7 @@ async fn spawn_gateway_with_group(primary: String, backup: String) -> String {
         requests: Arc::new(std::sync::Mutex::new(
             magpie_gateway::usage::RequestLog::default(),
         )),
+        key_rotation: magpie_gateway::KeyRotator::default(),
     });
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -678,6 +835,95 @@ async fn routing_groups_fall_back_in_configured_order() {
         stats["recent_requests"][0]["requested_model"],
         "group/daily-coding"
     );
+}
+
+#[tokio::test]
+async fn api_key_pools_retry_rate_limits_and_rotate() {
+    let (upstream, seen_keys) = spawn_key_pool_mock().await;
+    let gw = spawn_gateway_with_key_pool(upstream, None).await;
+    let client = reqwest::Client::new();
+
+    let first = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "primary/mock-model",
+            "messages": [{"role": "user", "content": "Weather?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body: Value = first.json().await.unwrap();
+    assert_eq!(
+        first_body["choices"][0]["message"]["content"],
+        "second key worked."
+    );
+
+    // The rate-limited key is retried only within the same request. The next
+    // request starts with the other key, so normal load rotates too.
+    let second = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "primary/mock-model",
+            "messages": [{"role": "user", "content": "Again?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    drop(second.json::<Value>().await.unwrap());
+
+    assert_eq!(
+        *seen_keys.lock().unwrap(),
+        vec![
+            "first-key".to_owned(),
+            "second-key".to_owned(),
+            "second-key".to_owned()
+        ]
+    );
+
+    let stats = client
+        .get(format!("{gw}/stats"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap();
+    let stats: Value = stats.json().await.unwrap();
+    let recent = stats["recent_requests"].as_array().unwrap();
+    assert_eq!(recent[0]["key_slot"], 1);
+    assert_eq!(recent[1]["key_slot"], 1);
+}
+
+#[tokio::test]
+async fn provider_level_failure_skips_the_rest_of_the_key_pool() {
+    let (primary, primary_keys) = spawn_internal_error_mock().await;
+    let (backup, last_backup_request) = spawn_mock().await;
+    let gw = spawn_gateway_with_key_pool(primary, Some(backup)).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "primary/mock-model",
+            "messages": [{"role": "user", "content": "Weather?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "Beijing is sunny."
+    );
+
+    // 500 describes the endpoint, not either credential, so only one key is
+    // spent before the configured route fallback runs.
+    assert_eq!(*primary_keys.lock().unwrap(), vec!["first-key".to_owned()]);
+    assert!(last_backup_request.lock().unwrap().is_some());
 }
 
 #[tokio::test]

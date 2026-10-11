@@ -17,9 +17,10 @@ OpenCode ────┘   Chat + Responses +
 - **Cross-protocol translation** through a neutral IR: requests, replies, and **SSE streams** — text, tool calls, reasoning deltas, usage
 - **Providers** from one TOML file: Chat-compatible, Responses-compatible, Anthropic, or Gemini upstreams
 - **Model routing**: `deepseek/deepseek-chat` by provider id, `group/daily-coding` route chains, bare names by provider model lists, default provider fallback
+- **Multi-key pools**: repeat `--api-key`; requests rotate across keys, and rejected/rate-limited keys are retried before route fallback
 - **Failover**: ordered provider fallbacks and routing-group routes, tried before any reply bytes are streamed when the active provider is rate limited, out of quota, overloaded, or unreachable
 - **Local authentication**: every non-health route requires the configured token as Bearer, Anthropic `x-api-key`, or Gemini `x-goog-api-key`; `/health` stays public
-- **Request statistics**: token-protected `/stats` and `magpie-lite stats` show provider totals, token usage, statuses, latency, and recent request metadata — in memory only, with no prompt/reply text or credentials
+- **Request statistics**: token-protected `/stats` and `magpie-lite stats` show provider totals, token usage, statuses, latency, and recent request metadata (including which key slot served it, never the key) — in memory only, with no prompt/reply text or credentials
 - **Agent wiring**: `magpie-lite claude <model>` (settings.json env block), `magpie-lite codex <model>` (config.toml provider table, native `wire_api = "responses"`), `magpie-lite gemini <model>` (`~/.gemini/settings.json` plus `.env`), `magpie-lite opencode <model>` (`~/.config/opencode/opencode.json` provider block)
 - **Conformance tests** for every translation direction, and end-to-end tests over real HTTP with mock Chat and Gemini upstreams
 
@@ -31,7 +32,7 @@ cargo build --release
 # add a provider
 magpie-lite provider add deepseek \
   --base-url https://api.deepseek.com/v1 \
-  --api-key sk-... \
+  --api-key sk-one... --api-key sk-two... \
   --models deepseek-chat deepseek-reasoner --default \
   --fallback kimi/moonshot-v1-128k
 
@@ -72,7 +73,7 @@ Tests are the contract: `crates/core/tests/translation.rs` checks real wire shap
 
 ## Not yet (the roadmap)
 
-- Multi-key provider pools (routing groups and single-provider fallback already work)
+- Quota-aware cooldown windows and richer per-key totals (round-robin pools and key-slot stats already work)
 - Persistent request history and richer usage views (in-memory `/stats` already works)
 - More agents (Cursor CLI, Zed, Crush, Goose, ...)
 - A TUI/Web UI
