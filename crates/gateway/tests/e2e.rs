@@ -757,3 +757,71 @@ async fn chat_client_stream_over_gemini_upstream() {
     assert_eq!(upstream_req["api_key"], "test-key");
     assert!(upstream_req["body"].get("model").is_none());
 }
+
+#[tokio::test]
+async fn model_routes_require_the_exact_local_token() {
+    let (upstream, last) = spawn_mock().await;
+    let gw = spawn_gateway(upstream).await;
+    let client = reqwest::Client::new();
+
+    let missing = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .json(&json!({
+            "model": "mock/mock-model",
+            "messages": [{"role": "user", "content": "Weather?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+    let body: Value = missing.json().await.unwrap();
+    assert_eq!(body["error"]["code"], 401);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid magpie-lite token")
+    );
+
+    let wrong_gemini = client
+        .post(format!(
+            "{gw}/v1beta/models/mock/mock-model:generateContent"
+        ))
+        .header("x-goog-api-key", "not-the-token")
+        .json(&json!({
+            "contents": [{"role": "user", "parts": [{"text": "Weather?"}]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_gemini.status(), StatusCode::UNAUTHORIZED);
+    let body: Value = wrong_gemini.json().await.unwrap();
+    assert_eq!(body["error"]["status"], "PERMISSION_DENIED");
+
+    assert!(last.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn anthropic_x_api_key_and_public_health_probe_work() {
+    let (upstream, _) = spawn_mock().await;
+    let gw = spawn_gateway(upstream).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{gw}/v1/messages"))
+        .header("x-api-key", "magpie-lite")
+        .json(&json!({
+            "model": "mock/mock-model",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Weather?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let health = client.get(format!("{gw}/health")).send().await.unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+    let body: Value = health.json().await.unwrap();
+    assert_eq!(body["status"], "ok");
+}

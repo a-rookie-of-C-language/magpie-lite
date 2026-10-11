@@ -89,8 +89,7 @@ pub struct Config {
     /// Port to listen on, loopback only.
     #[serde(default = "default_port")]
     pub port: u16,
-    /// The token agents send as their key. Any non-empty bearer is accepted
-    /// today: the gateway is local-only.
+    /// The exact token agents must send as Bearer, `x-api-key`, or `x-goog-api-key`.
     #[serde(default = "default_token")]
     pub token: String,
     /// Provider id used when a model names none.

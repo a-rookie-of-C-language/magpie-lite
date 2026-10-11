@@ -8,8 +8,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, State};
-use axum::http::{StatusCode, header};
+use axum::extract::{Path, Request, State};
+use axum::http::{StatusCode, Uri, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -40,8 +41,71 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1beta/models", get(gemini_models))
         .route("/v1beta/models/{*model}", post(gemini_generate))
         .route("/v1/models", get(list_models))
+        // Every model route above proves it knows the configured local
+        // token before a request can reach a provider. The health probe
+        // below is added after the layer and stays public.
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
         .route("/health", get(health))
         .with_state(state)
+}
+
+/// Require the configured local token on every model route.
+///
+/// Agents send it in the header natural to their protocol: Bearer for
+/// OpenAI-compatible clients, `x-api-key` or Bearer for Anthropic, and
+/// `x-goog-api-key` for Gemini. The comparison is constant-time because a
+/// local process can still attempt timing measurements.
+async fn require_token(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let headers = request.headers();
+    let authorized = bearer_token(headers)
+        .or_else(|| header_token(headers, "x-api-key"))
+        .or_else(|| header_token(headers, "x-goog-api-key"))
+        .is_some_and(|present| constant_time_eq(present, &state.config.token));
+    if !authorized {
+        let status = StatusCode::UNAUTHORIZED;
+        return err_response(status, auth_error_body(request.uri(), status));
+    }
+    next.run(request).await
+}
+
+fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") || token.is_empty() {
+        return None;
+    }
+    Some(token)
+}
+
+fn header_token<'a>(headers: &'a axum::http::HeaderMap, name: &'static str) -> Option<&'a str> {
+    headers.get(name)?.to_str().ok()
+}
+
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+
+    let mut diff = (a.len() ^ b.len()) as u8;
+    for (x, y) in a.bytes().zip(b.bytes()) {
+        diff |= x ^ y;
+    }
+    diff.ct_eq(&0).into()
+}
+
+fn auth_error_body(uri: &Uri, status: StatusCode) -> Value {
+    let path = uri.path();
+    if path.starts_with("/v1beta") {
+        upstream::gemini_error(status, "missing or invalid magpie-lite token")
+    } else if path == "/v1/messages" {
+        upstream::anthropic_error(status, "missing or invalid magpie-lite token")
+    } else if path == "/v1/responses" {
+        upstream::responses_error(status, "missing or invalid magpie-lite token")
+    } else {
+        upstream::chat_error(status, "missing or invalid magpie-lite token")
+    }
 }
 
 /// Run the gateway until the process is stopped.

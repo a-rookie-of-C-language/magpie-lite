@@ -17,6 +17,7 @@ Gemini CLI ─┘   Chat + Responses +                └─ Gemini generateCont
 - **Providers** from one TOML file: Chat-compatible, Responses-compatible, Anthropic, or Gemini upstreams
 - **Model routing**: `deepseek/deepseek-chat` by provider id, bare names by provider model lists, default provider fallback
 - **Failover**: ordered `--fallback provider/model` routes, tried before any reply bytes are streamed when the active provider is rate limited, out of quota, overloaded, or unreachable
+- **Local authentication**: every model route requires the configured token as Bearer, Anthropic `x-api-key`, or Gemini `x-goog-api-key`; `/health` stays public
 - **Agent wiring**: `magpie-lite claude <model>` (settings.json env block), `magpie-lite codex <model>` (config.toml provider table, `wire_api = "chat"`)
 - **Conformance tests** for every translation direction, and end-to-end tests over real HTTP with mock Chat and Gemini upstreams
 
@@ -33,7 +34,8 @@ magpie-lite provider add deepseek \
   --fallback kimi/moonshot-v1-128k
 
 # run the gateway
-magpie-lite serve
+magpie-lite serve# agents use the configured `token` (default: magpie-lite) as their local API key
+
 
 # point agents at it
 magpie-lite claude deepseek/deepseek-chat
