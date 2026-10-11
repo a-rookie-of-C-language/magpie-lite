@@ -61,8 +61,19 @@ pub struct RequestRecord {
     pub usage: UsageSnapshot,
 }
 
-/// Per-provider totals. Missing usage fields count as zero.
+/// Per-key totals inside a provider. Slot names are stable, secret-free ids.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct KeyStats {
+    /// Upstream attempts made with this key, including fallback attempts.
+    pub attempts: u64,
+    /// Attempts that received a successful upstream response.
+    pub successes: u64,
+    /// Attempts that were rejected, failed, or could not connect.
+    pub errors: u64,
+}
+
+/// Per-provider totals. Missing usage fields count as zero.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ProviderStats {
     /// Requests routed to this provider.
     pub requests: u64,
@@ -72,6 +83,8 @@ pub struct ProviderStats {
     pub input_tokens: u64,
     /// Summed reported output tokens.
     pub output_tokens: u64,
+    /// Attempt totals by zero-based key slot.
+    pub keys: BTreeMap<String, KeyStats>,
 }
 
 /// The complete `/stats` response.
@@ -97,6 +110,19 @@ pub struct RequestLog {
 }
 
 impl RequestLog {
+    /// Record one concrete upstream key attempt. Finished request totals are
+    /// counted separately by [`RequestLog::record`].
+    pub fn record_attempt(&mut self, provider: &str, key_slot: usize, status: &str) {
+        let stats = self.providers.entry(provider.to_owned()).or_default();
+        let key = stats.keys.entry(key_slot.to_string()).or_default();
+        key.attempts = key.attempts.saturating_add(1);
+        if status == "ok" {
+            key.successes = key.successes.saturating_add(1);
+        } else {
+            key.errors = key.errors.saturating_add(1);
+        }
+    }
+
     /// Add one finished record and update every aggregate.
     pub fn record(&mut self, record: RequestRecord) {
         self.total_requests = self.total_requests.saturating_add(1);
@@ -170,6 +196,11 @@ impl RequestTracker {
             },
             finished: false,
         }
+    }
+
+    /// Record a concrete upstream attempt without waiting for the full reply.
+    pub fn record_attempt(&self, provider: &str, key_slot: usize, status: &str) {
+        lock(&self.log).record_attempt(provider, key_slot, status);
     }
 
     /// Replace the route after fallback chooses a different provider.

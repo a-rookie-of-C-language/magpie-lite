@@ -776,7 +776,9 @@ async fn retryable_primary_falls_back_before_streaming() {
         .unwrap();
     let stats: Value = stats.json().await.unwrap();
     assert_eq!(stats["total_requests"], 1);
-    assert!(stats["providers"].get("primary").is_none());
+    assert_eq!(stats["providers"]["primary"]["requests"], 0);
+    assert_eq!(stats["providers"]["primary"]["keys"]["0"]["attempts"], 1);
+    assert_eq!(stats["providers"]["primary"]["keys"]["0"]["errors"], 1);
     assert_eq!(stats["providers"]["backup"]["requests"], 1);
     assert_eq!(stats["recent_requests"][0]["provider"], "backup");
 }
@@ -894,6 +896,13 @@ async fn api_key_pools_retry_rate_limits_and_rotate() {
     let recent = stats["recent_requests"].as_array().unwrap();
     assert_eq!(recent[0]["key_slot"], 1);
     assert_eq!(recent[1]["key_slot"], 1);
+    assert_eq!(stats["providers"]["primary"]["requests"], 2);
+    assert_eq!(stats["providers"]["primary"]["keys"]["0"]["attempts"], 1);
+    assert_eq!(stats["providers"]["primary"]["keys"]["0"]["successes"], 0);
+    assert_eq!(stats["providers"]["primary"]["keys"]["0"]["errors"], 1);
+    assert_eq!(stats["providers"]["primary"]["keys"]["1"]["attempts"], 2);
+    assert_eq!(stats["providers"]["primary"]["keys"]["1"]["successes"], 2);
+    assert_eq!(stats["providers"]["primary"]["keys"]["1"]["errors"], 0);
 }
 
 #[tokio::test]
@@ -924,6 +933,18 @@ async fn provider_level_failure_skips_the_rest_of_the_key_pool() {
     // spent before the configured route fallback runs.
     assert_eq!(*primary_keys.lock().unwrap(), vec!["first-key".to_owned()]);
     assert!(last_backup_request.lock().unwrap().is_some());
+
+    let stats = client
+        .get(format!("{gw}/stats"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap();
+    let stats: Value = stats.json().await.unwrap();
+    assert_eq!(stats["providers"]["primary"]["keys"]["0"]["attempts"], 1);
+    assert_eq!(stats["providers"]["primary"]["keys"]["0"]["errors"], 1);
+    assert_eq!(stats["providers"]["backup"]["keys"]["0"]["attempts"], 1);
+    assert_eq!(stats["providers"]["backup"]["keys"]["0"]["successes"], 1);
 }
 
 #[tokio::test]

@@ -389,6 +389,7 @@ async fn send_with_fallback(
     state: &AppState,
     creq: &CompletionRequest,
     initial: UpstreamRoute,
+    tracker: &RequestTracker,
     wire: ClientWire,
 ) -> Result<(reqwest::Response, UpstreamCandidate), (Box<Response>, UpstreamCandidate)> {
     let routes = upstream_routes(&state.config, &state.key_rotation, initial, &creq.model);
@@ -425,6 +426,7 @@ async fn send_with_fallback(
             {
                 Ok(resp) => resp,
                 Err(e) => {
+                    tracker.record_attempt(&route.provider.id, *key_slot, "network_error");
                     let message = format!("cannot reach {}: {e}", route.provider.id);
                     tracing::warn!("{message}");
                     if route_index == last_route {
@@ -443,6 +445,12 @@ async fn send_with_fallback(
             };
 
             let status = resp.status();
+            let attempt_status = if status.is_success() {
+                "ok".to_owned()
+            } else {
+                status.as_u16().to_string()
+            };
+            tracker.record_attempt(&route.provider.id, *key_slot, &attempt_status);
             if status.is_success() {
                 return Ok((resp, candidate));
             }
@@ -541,7 +549,7 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
         &initial.model,
         0,
     );
-    let (resp, candidate) = match send_with_fallback(&state, &creq, initial, wire).await {
+    let (resp, candidate) = match send_with_fallback(&state, &creq, initial, &tracker, wire).await {
         Ok((resp, candidate)) => {
             tracker.set_route(&candidate.provider.id, &candidate.model, candidate.key_slot);
             (resp, candidate)
