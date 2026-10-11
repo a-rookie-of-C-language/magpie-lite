@@ -1524,6 +1524,30 @@ async fn history_survives_restart_without_conversation_or_credentials() {
     std::fs::remove_file(&history_path).ok();
 }
 #[tokio::test]
+async fn console_is_public_while_protected_data_requires_the_token() {
+    let (upstream, _last) = spawn_mock().await;
+    let gw = spawn_gateway(upstream).await;
+    let client = reqwest::Client::new();
+
+    let response = client.get(format!("{gw}/")).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/html; charset=utf-8"
+    );
+    let body = response.text().await.unwrap();
+    assert!(body.contains("magpie-lite console"));
+    assert!(body.contains("Authorization"));
+    assert!(!body.contains("localStorage"), "the token is not persisted");
+    assert!(!body.contains("test-key"), "upstream credentials stay out");
+
+    let alias = client.get(format!("{gw}/ui")).send().await.unwrap();
+    assert_eq!(alias.status(), StatusCode::OK);
+
+    let stats = client.get(format!("{gw}/stats")).send().await.unwrap();
+    assert_eq!(stats.status(), StatusCode::UNAUTHORIZED);
+}
+#[tokio::test]
 async fn model_routes_require_the_exact_local_token() {
     let (upstream, last) = spawn_mock().await;
     let gw = spawn_gateway(upstream).await;

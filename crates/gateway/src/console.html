@@ -1,0 +1,826 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>magpie-lite console</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 15px;
+      line-height: 1.5;
+      background: #070b14;
+      color: #e9eef8;
+      --background: #070b14;
+      --surface: rgba(19, 26, 42, .88);
+      --surface-strong: #131a2a;
+      --surface-soft: rgba(149, 172, 216, .08);
+      --border: rgba(142, 168, 215, .2);
+      --border-strong: rgba(154, 183, 236, .38);
+      --muted: #98a7bd;
+      --accent: #78d3ff;
+      --accent-strong: #37a9e8;
+      --good: #6ee7a8;
+      --warn: #ffd166;
+      --bad: #ff8093;
+      --shadow: 0 24px 70px rgba(3, 7, 18, .45);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      font-family: inherit;
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 12% 0%, rgba(56, 169, 232, .24), transparent 30%),
+        radial-gradient(circle at 88% 8%, rgba(126, 87, 255, .18), transparent 34%),
+        var(--background);
+      color: inherit;
+    }
+
+    button, input {
+      font: inherit;
+    }
+
+    button {
+      cursor: pointer;
+    }
+
+    button:focus-visible, input:focus-visible, a:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    .shell {
+      width: min(1240px, calc(100% - 40px));
+      margin: 0 auto;
+      padding: 40px 0 64px;
+    }
+
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 24px;
+      margin-bottom: 28px;
+    }
+
+    .eyebrow {
+      margin: 0 0 7px;
+      color: var(--accent);
+      font-size: .76rem;
+      font-weight: 750;
+      letter-spacing: .15em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3 { margin: 0; letter-spacing: -.025em; }
+
+    h1 { font-size: clamp(2rem, 5vw, 3.2rem); }
+
+    h2 { font-size: 1.1rem; }
+
+    .tagline {
+      max-width: 680px;
+      margin: 9px 0 0;
+      color: var(--muted);
+    }
+
+    .status-stack {
+      display: grid;
+      justify-items: end;
+      gap: 9px;
+      flex: none;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 34px;
+      padding: 6px 13px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--surface);
+      box-shadow: 0 10px 30px rgba(3, 7, 18, .22);
+      color: var(--muted);
+      font-size: .85rem;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+
+    .pill::before {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+      box-shadow: 0 0 12px currentColor;
+      content: "";
+    }
+
+    .pill.good { color: var(--good); }
+    .pill.bad { color: var(--bad); }
+    .pill.warn { color: var(--warn); }
+    .pill[hidden] { display: none; }
+
+    .login-panel {
+      display: grid;
+      grid-template-columns: minmax(280px, 460px);
+      justify-content: center;
+      padding: 34px 0 12px;
+    }
+
+    .card {
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px);
+    }
+
+    .login-card {
+      padding: 26px;
+    }
+
+    .login-card h2 { margin-bottom: 8px; }
+
+    .login-copy {
+      margin: 0 0 21px;
+      color: var(--muted);
+    }
+
+    .field { display: grid; gap: 7px; }
+
+    .field label { font-weight: 680; }
+
+    .token-input {
+      width: 100%;
+      min-height: 45px;
+      padding: 10px 13px;
+      border: 1px solid var(--border-strong);
+      border-radius: 12px;
+      background: rgba(5, 9, 18, .75);
+      color: #f4f8ff;
+    }
+
+    .form-actions {
+      display: flex;
+      justify-content: flex-end;
+      margin-top: 15px;
+    }
+
+    .button {
+      min-height: 39px;
+      padding: 8px 16px;
+      border: 1px solid transparent;
+      border-radius: 11px;
+      background: linear-gradient(135deg, var(--accent), #5f7cff);
+      color: #061020;
+      font-weight: 750;
+    }
+
+    .button:hover { filter: brightness(1.07); }
+
+    .button:disabled { cursor: wait; opacity: .62; }
+
+    .button.secondary {
+      border-color: var(--border-strong);
+      background: rgba(149, 172, 216, .09);
+      color: #e9eef8;
+    }
+
+    .console-message {
+      min-height: 22px;
+      margin: 10px 0 0;
+      color: var(--muted);
+      font-size: .87rem;
+      text-align: center;
+    }
+
+    .console-message[aria-live="polite"] { color: inherit; }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 16px;
+    }
+
+    .metric {
+      padding: 18px;
+      border: 1px solid var(--border);
+      border-radius: 17px;
+      background: linear-gradient(145deg, rgba(23, 32, 51, .95), rgba(11, 16, 28, .9));
+      box-shadow: 0 18px 45px rgba(3, 7, 18, .22);
+    }
+
+    .metric-label {
+      margin: 0 0 9px;
+      color: var(--muted);
+      font-size: .78rem;
+      font-weight: 700;
+      letter-spacing: .07em;
+      text-transform: uppercase;
+    }
+
+    .metric-value {
+      margin: 0;
+      color: #f7fbff;
+      font-size: clamp(1.45rem, 3vw, 2.15rem);
+      font-variant-numeric: tabular-nums;
+      font-weight: 800;
+      line-height: 1.1;
+    }
+
+    .metric-note {
+      margin: 5px 0 0;
+      color: var(--muted);
+      font-size: .8rem;
+    }
+
+    .panel-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr);
+      gap: 16px;
+      align-items: start;
+    }
+
+    .panel {
+      min-width: 0;
+      overflow: clip;
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      background: var(--surface-strong);
+      box-shadow: 0 18px 50px rgba(3, 7, 18, .2);
+    }
+
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 15px;
+      padding: 17px 19px;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(180deg, rgba(149, 172, 216, .09), transparent);
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex: none;
+    }
+
+    .switch {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--muted);
+      font-size: .82rem;
+      font-weight: 650;
+    }
+
+    .mini-button {
+      min-height: 33px;
+      padding: 5px 11px;
+      border: 1px solid var(--border-strong);
+      border-radius: 9px;
+      background: rgba(149, 172, 216, .1);
+      color: #e9eef8;
+      font-size: .82rem;
+      font-weight: 700;
+    }
+
+    .table-wrap { overflow-x: auto; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-variant-numeric: tabular-nums;
+    }
+
+    th, td {
+      padding: 12px 14px;
+      border-bottom: 1px solid rgba(142, 168, 215, .11);
+      text-align: left;
+      vertical-align: middle;
+      white-space: nowrap;
+    }
+
+    th {
+      color: var(--muted);
+      font-size: .74rem;
+      font-weight: 750;
+      letter-spacing: .07em;
+      text-transform: uppercase;
+    }
+
+    td { max-width: 360px; overflow-wrap: anywhere; }
+
+    tbody tr:last-child td { border-bottom: 0; }
+
+    .empty {
+      padding: 22px 19px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    .status { font-weight: 750; }
+
+    .status.ok, .status.good { color: var(--good); }
+
+    .status.error, .status.bad { color: var(--bad); }
+
+    .status.warn { color: var(--warn); }
+
+    .model-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+      padding: 18px;
+      margin: 0;
+      list-style: none;
+    }
+
+    .model-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 6px 10px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--surface-soft);
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: .78rem;
+    }
+
+    .model-owner {
+      color: var(--muted);
+      font-family: inherit;
+      font-size: .72rem;
+    }
+
+    .stack { display: grid; gap: 16px; }
+
+    .safety {
+      margin: 18px 0 0;
+      color: var(--muted);
+      font-size: .82rem;
+      text-align: center;
+    }
+
+    [hidden] { display: none !important; }
+
+    @media (max-width: 900px) {
+      .shell { width: min(100% - 24px, 1240px); padding-top: 24px; }
+      .topbar { display: grid; justify-content: stretch; }
+      .status-stack { justify-items: start; }
+      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .panel-grid { grid-template-columns: minmax(0, 1fr); }
+    }
+
+    @media (max-width: 540px) {
+      .metrics { grid-template-columns: minmax(0, 1fr); }
+      .login-panel { padding-top: 10px; }
+      .form-actions .button { width: 100%; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      * { scroll-behavior: auto !important; transition: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">local model gateway</p>
+        <h1>magpie-lite</h1>
+        <p class="tagline">One read-only console for model routes, request health, provider totals, and recent token usage.</p>
+      </div>
+      <div class="status-stack">
+        <span id="health-pill" class="pill warn">Checking health</span>
+        <span id="data-pill" class="pill" hidden>Not connected</span>
+      </div>
+    </header>
+
+    <main>
+      <section id="login" class="login-panel" aria-labelledby="login-title">
+        <div class="card login-card">
+          <h2 id="login-title">Connect to this gateway</h2>
+          <p class="login-copy">Enter the local token from your magpie-lite configuration. It stays in this browser tab and is sent only to this origin.</p>
+          <form id="login-form">
+            <div class="field">
+              <label for="token">Gateway token</label>
+              <input id="token" class="token-input" name="token" type="password" autocomplete="off" spellcheck="false" required>
+            </div>
+            <div class="form-actions">
+              <button id="connect" class="button" type="submit">Open console</button>
+            </div>
+          </form>
+          <p id="login-message" class="console-message" role="status" aria-live="polite"></p>
+        </div>
+      </section>
+
+      <section id="console" aria-label="Gateway console" hidden>
+        <section class="metrics" aria-label="Gateway totals">
+          <article class="metric">
+            <p class="metric-label">Process requests</p>
+            <p id="metric-requests" class="metric-value">0</p>
+            <p class="metric-note">Since this gateway started</p>
+          </article>
+          <article class="metric">
+            <p class="metric-label">Errors</p>
+            <p id="metric-errors" class="metric-value">0</p>
+            <p class="metric-note">Final requests not marked ok</p>
+          </article>
+          <article class="metric">
+            <p class="metric-label">Recent tokens</p>
+            <p id="metric-tokens" class="metric-value">0</p>
+            <p id="metric-tokens-note" class="metric-note">Input + output reported</p>
+          </article>
+          <article class="metric">
+            <p class="metric-label">Average latency</p>
+            <p id="metric-latency" class="metric-value">—</p>
+            <p class="metric-note">Recent-history window</p>
+          </article>
+        </section>
+
+        <div class="panel-grid">
+          <div class="stack">
+            <section class="panel" aria-labelledby="providers-title">
+              <div class="panel-header">
+                <h2 id="providers-title">Provider totals</h2>
+                <div class="header-actions">
+                  <button id="refresh" class="mini-button" type="button">Refresh</button>
+                  <button id="sign-out" class="mini-button" type="button">Sign out</button>
+                </div>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th scope="col">Provider</th>
+                      <th scope="col">Requests</th>
+                      <th scope="col">Errors</th>
+                      <th scope="col">Input</th>
+                      <th scope="col">Output</th>
+                      <th scope="col">Key slots</th>
+                    </tr>
+                  </thead>
+                  <tbody id="provider-rows"></tbody>
+                </table>
+              </div>
+              <p id="provider-empty" class="empty" hidden>No provider has served a request in this process yet.</p>
+            </section>
+
+            <section class="panel" aria-labelledby="recent-title">
+              <div class="panel-header">
+                <h2 id="recent-title">Recent requests</h2>
+                <label class="switch"><input id="auto-refresh" type="checkbox" checked> Auto refresh</label>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th scope="col">Time</th>
+                      <th scope="col">Agent</th>
+                      <th scope="col">Selected model</th>
+                      <th scope="col">Route</th>
+                      <th scope="col">Key</th>
+                      <th scope="col">Status</th>
+                      <th scope="col">Latency</th>
+                      <th scope="col">Tokens</th>
+                    </tr>
+                  </thead>
+                  <tbody id="request-rows"></tbody>
+                </table>
+              </div>
+              <p id="request-empty" class="empty" hidden>No requests are in the recent-history window yet.</p>
+              <p id="request-count" class="empty" hidden></p>
+            </section>
+          </div>
+
+          <div class="stack">
+            <section class="panel" aria-labelledby="models-title">
+              <div class="panel-header"><h2 id="models-title">Available models</h2></div>
+              <ul id="model-list" class="model-list"></ul>
+              <p id="model-empty" class="empty" hidden>No models are configured.</p>
+            </section>
+
+            <section class="panel" aria-labelledby="usage-title">
+              <div class="panel-header"><h2 id="usage-title">Recent usage by model</h2></div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th scope="col">Model</th>
+                      <th scope="col">Req</th>
+                      <th scope="col">Err</th>
+                      <th scope="col">In</th>
+                      <th scope="col">Out</th>
+                    </tr>
+                  </thead>
+                  <tbody id="usage-rows"></tbody>
+                </table>
+              </div>
+              <p id="usage-empty" class="empty" hidden>No model usage is in the recent-history window yet.</p>
+            </section>
+          </div>
+        </div>
+        <p id="console-message" class="console-message" role="status" aria-live="polite"></p>
+        <p class="safety">Read-only and secret-free: prompts, replies, upstream API keys, and credentials are never included in `/stats` history.</p>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    "use strict";
+
+    const elements = {
+      healthPill: document.getElementById("health-pill"),
+      dataPill: document.getElementById("data-pill"),
+      login: document.getElementById("login"),
+      loginForm: document.getElementById("login-form"),
+      token: document.getElementById("token"),
+      connect: document.getElementById("connect"),
+      loginMessage: document.getElementById("login-message"),
+      console: document.getElementById("console"),
+      requests: document.getElementById("metric-requests"),
+      errors: document.getElementById("metric-errors"),
+      tokens: document.getElementById("metric-tokens"),
+      tokensNote: document.getElementById("metric-tokens-note"),
+      latency: document.getElementById("metric-latency"),
+      providerRows: document.getElementById("provider-rows"),
+      providerEmpty: document.getElementById("provider-empty"),
+      requestRows: document.getElementById("request-rows"),
+      requestEmpty: document.getElementById("request-empty"),
+      requestCount: document.getElementById("request-count"),
+      modelList: document.getElementById("model-list"),
+      modelEmpty: document.getElementById("model-empty"),
+      usageRows: document.getElementById("usage-rows"),
+      usageEmpty: document.getElementById("usage-empty"),
+      refresh: document.getElementById("refresh"),
+      signOut: document.getElementById("sign-out"),
+      autoRefresh: document.getElementById("auto-refresh"),
+      message: document.getElementById("console-message")
+    };
+
+    let token = "";
+    let refreshTimer = 0;
+    let lastUpdate = "";
+
+    const number = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
+
+    function fmt(value) {
+      const n = Number(value);
+      return Number.isFinite(n) ? number.format(n) : "—";
+    }
+
+    function text(tag, value, className) {
+      const cell = document.createElement(tag);
+      cell.textContent = value === undefined || value === null || value === "" ? "—" : String(value);
+      if (className) cell.className = className;
+      return cell;
+    }
+
+    function row(cells) {
+      const tr = document.createElement("tr");
+      tr.replaceChildren(...cells);
+      return tr;
+    }
+
+    function clear(node) {
+      node.replaceChildren();
+    }
+
+    function setPill(pill, label, tone) {
+      pill.textContent = label;
+      pill.className = `pill ${tone}`;
+    }
+
+    function setMessage(message) {
+      elements.loginMessage.textContent = message;
+      elements.message.textContent = message;
+    }
+
+    async function authorized(path) {
+      const response = await fetch(path, {
+        cache: "no-store",
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (response.status === 401) {
+        const error = new Error("The gateway token was not accepted.");
+        error.unauthorized = true;
+        throw error;
+      }
+      if (!response.ok) {
+        throw new Error(`${path} returned HTTP ${response.status}.`);
+      }
+      return response.json();
+    }
+
+    function renderStats(stats) {
+      const totals = stats.recent_usage?.totals || {};
+      const input = Number(totals.input_tokens || 0);
+      const output = Number(totals.output_tokens || 0);
+
+      elements.requests.textContent = fmt(stats.total_requests);
+      elements.errors.textContent = fmt(stats.errors);
+      elements.tokens.textContent = fmt(input + output);
+      elements.tokensNote.textContent = `${fmt(input)} in · ${fmt(output)} out`;
+      elements.latency.textContent = totals.average_latency_ms === undefined || totals.average_latency_ms === null
+        ? "—"
+        : `${fmt(totals.average_latency_ms)} ms`;
+
+      renderProviders(stats.providers || {});
+      renderRequests(stats.recent_requests || []);
+      renderUsage(stats.recent_usage?.by_model || {});
+    }
+
+    function renderProviders(providers) {
+      clear(elements.providerRows);
+      const entries = Object.entries(providers);
+      elements.providerEmpty.hidden = entries.length !== 0;
+      for (const [id, provider] of entries) {
+        elements.providerRows.append(row([
+          text("td", id),
+          text("td", fmt(provider.requests)),
+          text("td", fmt(provider.errors), Number(provider.errors) > 0 ? "status bad" : "status good"),
+          text("td", fmt(provider.input_tokens)),
+          text("td", fmt(provider.output_tokens)),
+          text("td", keySummary(provider.keys || {}))
+        ]));
+      }
+    }
+
+    function keySummary(keys) {
+      const entries = Object.entries(keys);
+      if (entries.length === 0) return "0";
+      return entries.map(([slot, value]) => {
+        const errors = Number(value.errors || 0);
+        return `slot ${slot}: ${fmt(value.successes)}/${fmt(value.attempts)} ok${errors ? ` (${fmt(errors)} err)` : ""}`;
+      }).join("; ");
+    }
+
+    function renderRequests(requests) {
+      clear(elements.requestRows);
+      const count = requests.length;
+      elements.requestEmpty.hidden = count !== 0;
+      elements.requestCount.hidden = count === 0;
+      if (count === 0) {
+        elements.requestCount.textContent = "";
+        return;
+      }
+
+      const shown = requests.slice(-100).reverse();
+      elements.requestCount.textContent = `Showing the latest ${shown.length} of ${count} records.`;
+      for (const request of shown) {
+        const usage = request.usage || {};
+        const tokens = [usage.input, usage.output].filter(v => v !== undefined && v !== null).map(v => fmt(v)).join(" / ");
+        elements.requestRows.append(row([
+          text("td", formatTime(request.started_unix_ms)),
+          text("td", request.client_protocol),
+          text("td", request.requested_model),
+          text("td", request.provider ? `${request.provider} / ${request.upstream_model}` : "—"),
+          text("td", request.key_slot === undefined ? "—" : `slot ${request.key_slot}`),
+          text("td", request.status, statusClass(request.status)),
+          text("td", `${fmt(request.latency_ms)} ms`),
+          text("td", tokens)
+        ]));
+      }
+    }
+
+    function renderUsage(usage) {
+      clear(elements.usageRows);
+      const entries = Object.entries(usage).sort((a, b) => Number(b[1]?.requests || 0) - Number(a[1]?.requests || 0));
+      elements.usageEmpty.hidden = entries.length !== 0;
+      for (const [model, value] of entries) {
+        elements.usageRows.append(row([
+          text("td", model),
+          text("td", fmt(value.requests)),
+          text("td", fmt(value.errors), Number(value.errors || 0) > 0 ? "status bad" : "status good"),
+          text("td", fmt(value.input_tokens)),
+          text("td", fmt(value.output_tokens))
+        ]));
+      }
+    }
+
+    function renderModels(models) {
+      clear(elements.modelList);
+      const values = Array.isArray(models) ? models : [];
+      elements.modelEmpty.hidden = values.length !== 0;
+      for (const model of values.slice(0, 200)) {
+        const li = document.createElement("li");
+        li.className = "model-chip";
+        const id = document.createElement("span");
+        id.textContent = model.id;
+        const owner = document.createElement("span");
+        owner.className = "model-owner";
+        owner.textContent = model.owned_by || "";
+        li.append(id);
+        if (owner.textContent) li.append(owner);
+        elements.modelList.append(li);
+      }
+    }
+
+    function statusClass(status) {
+      if (status === "ok") return "status ok";
+      return "status error";
+    }
+
+    function formatTime(unixMs) {
+      const date = new Date(Number(unixMs));
+      if (Number.isNaN(date.getTime())) return "—";
+      return date.toLocaleTimeString([], { hour12: false });
+    }
+
+    async function update(silent) {
+      if (!token) return;
+      try {
+        const [stats, models] = await Promise.all([authorized("/stats"), authorized("/v1/models")]);
+        renderStats(stats);
+        renderModels(models.data || []);
+        lastUpdate = new Date().toLocaleTimeString([], { hour12: false });
+        setPill(elements.dataPill, `Live · ${lastUpdate}`, "good");
+        setMessage("");
+      } catch (error) {
+        if (error.unauthorized) {
+          disconnect(true);
+          setMessage(error.message);
+          return;
+        }
+        setPill(elements.dataPill, "Refresh failed", "bad");
+        if (!silent) setMessage(error.message || "Could not refresh gateway data.");
+      }
+    }
+
+    async function checkHealth() {
+      try {
+        const response = await fetch("/health", { cache: "no-store" });
+        setPill(elements.healthPill, response.ok ? "Gateway online" : "Gateway unhealthy", response.ok ? "good" : "bad");
+      } catch (_) {
+        setPill(elements.healthPill, "Gateway offline", "bad");
+      }
+    }
+
+    function startAutoRefresh() {
+      stopAutoRefresh();
+      if (!elements.autoRefresh.checked) return;
+      refreshTimer = window.setInterval(() => {
+        if (document.visibilityState === "visible") update(true);
+      }, 5000);
+    }
+
+    function stopAutoRefresh() {
+      if (refreshTimer) window.clearInterval(refreshTimer);
+      refreshTimer = 0;
+    }
+
+    function disconnect(expired) {
+      token = "";
+      stopAutoRefresh();
+      elements.console.hidden = true;
+      elements.login.hidden = false;
+      elements.dataPill.hidden = true;
+      elements.connect.disabled = false;
+      elements.token.value = "";
+      if (!expired) setMessage("");
+      elements.token.focus();
+    }
+
+    elements.loginForm.addEventListener("submit", async event => {
+      event.preventDefault();
+      const candidate = elements.token.value.trim();
+      if (!candidate) return;
+      token = candidate;
+      elements.connect.disabled = true;
+      setMessage("Connecting…");
+      try {
+        await update(false);
+        if (!token) return;
+        elements.login.hidden = true;
+        elements.console.hidden = false;
+        elements.dataPill.hidden = false;
+        elements.token.value = "";
+        startAutoRefresh();
+      } finally {
+        elements.connect.disabled = false;
+      }
+    });
+
+    elements.refresh.addEventListener("click", () => update(false));
+    elements.signOut.addEventListener("click", () => disconnect(false));
+    elements.autoRefresh.addEventListener("change", startAutoRefresh);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible" && token) update(true);
+    });
+
+    checkHealth();
+    window.setInterval(checkHealth, 10000);
+  </script>
+</body>
+</html>

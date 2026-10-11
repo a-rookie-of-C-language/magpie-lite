@@ -11,7 +11,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Path, Request, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
@@ -24,6 +24,10 @@ use crate::config::{Config, Protocol, ProviderConfig};
 use crate::cooldown::quota_cooldown;
 use crate::upstream;
 use crate::usage::{RequestLog, RequestTracker, StatsSnapshot};
+
+/// The dependency-free local console. It contains no secrets and fetches
+/// protected data only after the user supplies the gateway token.
+const CONSOLE_HTML: &str = include_str!("console.html");
 
 /// Shared handler state.
 pub struct AppState {
@@ -49,9 +53,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/stats", get(stats))
         // Every route above proves it knows the configured local token
         // before a request can reach a provider or read statistics. The
-        // health probe below is added after the layer and stays public.
+        // health probe and secret-free login page below are added after
+        // the layer and stay public; the page itself fetches no protected
+        // data until the user enters the token.
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
         .route("/health", get(health))
+        .route("/", get(console))
+        .route("/ui", get(console))
         .with_state(state)
 }
 
@@ -139,6 +147,12 @@ pub async fn serve(config: Config, port: Option<u16>) -> anyhow::Result<()> {
     println!("magpie-lite gateway listening on http://{addr}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// GET `/` and `/ui` — the static console shell. `/stats` and `/v1/models`
+/// remain token-protected; this response has no gateway or provider secrets.
+async fn console() -> Html<&'static str> {
+    Html(CONSOLE_HTML)
 }
 
 async fn health() -> Json<Value> {
