@@ -166,6 +166,8 @@ pub struct StatsSnapshot {
     pub errors: u64,
     /// Totals by provider id.
     pub providers: BTreeMap<String, ProviderStats>,
+    /// Active key cooldowns by provider id and stable slot number.
+    pub key_cooldowns: crate::config::KeyCooldownSnapshotMap,
     /// Usage totals over the recent-history window.
     pub recent_usage: RecentUsageSummary,
     /// The most recent records, oldest first.
@@ -269,6 +271,7 @@ impl RequestLog {
             total_requests: self.total_requests,
             errors: self.errors,
             providers: self.providers.clone(),
+            key_cooldowns: BTreeMap::new(),
             recent_usage: summarize_recent(&self.recent_requests),
             recent_requests: self.recent_requests.clone(),
         }

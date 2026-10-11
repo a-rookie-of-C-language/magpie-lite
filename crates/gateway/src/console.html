@@ -469,6 +469,7 @@
                       <th scope="col">Input</th>
                       <th scope="col">Output</th>
                       <th scope="col">Key slots</th>
+                      <th scope="col">Cooldowns</th>
                     </tr>
                   </thead>
                   <tbody id="provider-rows"></tbody>
@@ -636,12 +637,12 @@
         ? "—"
         : `${fmt(totals.average_latency_ms)} ms`;
 
-      renderProviders(stats.providers || {});
+      renderProviders(stats.providers || {}, stats.key_cooldowns || {});
       renderRequests(stats.recent_requests || []);
       renderUsage(stats.recent_usage?.by_model || {});
     }
 
-    function renderProviders(providers) {
+    function renderProviders(providers, cooldowns) {
       clear(elements.providerRows);
       const entries = Object.entries(providers);
       elements.providerEmpty.hidden = entries.length !== 0;
@@ -652,9 +653,23 @@
           text("td", fmt(provider.errors), Number(provider.errors) > 0 ? "status bad" : "status good"),
           text("td", fmt(provider.input_tokens)),
           text("td", fmt(provider.output_tokens)),
-          text("td", keySummary(provider.keys || {}))
+          text("td", keySummary(provider.keys || {})),
+          text("td", cooldownSummary(cooldowns[id] || {}))
         ]));
       }
+    }
+
+    function cooldownSummary(cooldowns) {
+      const entries = Object.entries(cooldowns);
+      if (entries.length === 0) return "None";
+      return entries.map(([slot, value]) => `slot ${slot}: ${formatDuration(value.remaining_ms)}`).join("; ");
+    }
+
+    function formatDuration(milliseconds) {
+      const totalSeconds = Math.max(1, Math.ceil(Number(milliseconds) / 1000));
+      if (totalSeconds >= 3600) return `${(totalSeconds / 3600).toFixed(1)} h`;
+      if (totalSeconds >= 60) return `${Math.floor(totalSeconds / 60)}m ${totalSeconds % 60}s`;
+      return `${totalSeconds}s`;
     }
 
     function keySummary(keys) {

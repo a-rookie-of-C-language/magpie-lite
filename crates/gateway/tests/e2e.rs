@@ -973,6 +973,13 @@ async fn api_key_pools_retry_rate_limits_and_rotate() {
     assert_eq!(stats["providers"]["primary"]["keys"]["1"]["attempts"], 3);
     assert_eq!(stats["providers"]["primary"]["keys"]["1"]["successes"], 3);
     assert_eq!(stats["providers"]["primary"]["keys"]["1"]["errors"], 0);
+    let cooldown = &stats["key_cooldowns"]["primary"]["0"];
+    assert!(cooldown["remaining_ms"].as_u64().unwrap() > 0);
+    assert!(cooldown["remaining_ms"].as_u64().unwrap() <= 60_000);
+    assert!(cooldown["until_unix_ms"].as_u64().unwrap() > 0);
+    let serialized = stats.to_string();
+    assert!(!serialized.contains("first-key"));
+    assert!(!serialized.contains("second-key"));
 }
 
 #[tokio::test]
@@ -1538,6 +1545,7 @@ async fn console_is_public_while_protected_data_requires_the_token() {
     let body = response.text().await.unwrap();
     assert!(body.contains("magpie-lite console"));
     assert!(body.contains("Authorization"));
+    assert!(body.contains("Cooldowns"));
     assert!(!body.contains("localStorage"), "the token is not persisted");
     assert!(!body.contains("test-key"), "upstream credentials stay out");
 

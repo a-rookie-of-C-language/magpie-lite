@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -126,6 +126,19 @@ struct KeyRotationState {
     cooldowns: BTreeMap<usize, Instant>,
 }
 
+/// One active key cooldown. It names only the key's stable slot and when the
+/// slot becomes available again — never the configured key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct KeyCooldownSnapshot {
+    /// Unix time in milliseconds when the cooldown ends.
+    pub until_unix_ms: u64,
+    /// Milliseconds left when the snapshot was taken.
+    pub remaining_ms: u64,
+}
+
+/// Active cooldowns by provider id and zero-based key slot.
+pub type KeyCooldownSnapshotMap = BTreeMap<String, BTreeMap<String, KeyCooldownSnapshot>>;
+
 /// Thread-safe key pool scheduler used by the gateway state.
 #[derive(Debug, Default)]
 pub struct KeyRotator {
@@ -167,6 +180,39 @@ impl KeyRotator {
         } else {
             available
         }
+    }
+
+    /// Copy the currently active cooldowns, dropping expired entries.
+    pub fn cooldown_snapshot(&self) -> KeyCooldownSnapshotMap {
+        let now = Instant::now();
+        let wall_now = SystemTime::now();
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let mut out = KeyCooldownSnapshotMap::new();
+        for (provider_id, state) in states.iter_mut() {
+            state.cooldowns.retain(|_, until| *until > now);
+            for (slot, until) in &state.cooldowns {
+                let remaining = until.duration_since(now);
+                let Some(unix) = wall_now
+                    .checked_add(remaining)
+                    .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+                else {
+                    continue;
+                };
+                let slots = out.entry(provider_id.clone()).or_default();
+                slots.insert(
+                    slot.to_string(),
+                    KeyCooldownSnapshot {
+                        until_unix_ms: unix.as_millis().min(u64::MAX as u128) as u64,
+                        remaining_ms: remaining.as_millis().min(u64::MAX as u128) as u64,
+                    },
+                );
+            }
+        }
+        out
     }
 
     /// Avoid a quota-limited or rate-limited key when another key is healthy.
@@ -420,6 +466,27 @@ mod tests {
             rotator.rotate("mock", &keys),
             vec![(1, "two".to_owned()), (0, "one".to_owned())]
         );
+    }
+
+    #[test]
+    fn cooldown_snapshot_reports_slots_and_expires_them() {
+        let rotator = KeyRotator::default();
+        rotator.cool_down("mock", 0, Duration::from_millis(80));
+
+        let snapshot = rotator.cooldown_snapshot();
+        let slot = &snapshot["mock"]["0"];
+        assert!(slot.remaining_ms > 0 && slot.remaining_ms <= 80);
+        assert!(slot.until_unix_ms >= unix_now_ms());
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(rotator.cooldown_snapshot().is_empty());
+    }
+
+    fn unix_now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
     }
 
     #[test]

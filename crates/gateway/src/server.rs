@@ -161,11 +161,12 @@ async fn health() -> Json<Value> {
 
 /// GET /stats — totals and recent request metadata, token-protected.
 async fn stats(State(state): State<Arc<AppState>>) -> Json<StatsSnapshot> {
-    let snapshot = state
+    let mut snapshot = state
         .requests
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .snapshot();
+    snapshot.key_cooldowns = state.key_rotation.cooldown_snapshot();
     Json(snapshot)
 }
 
