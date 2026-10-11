@@ -21,7 +21,7 @@ Zed ─────────┘   Chat + Responses +
 - **Multi-key pools**: repeat `--api-key`; requests rotate across keys, rejected/rate-limited keys are retried before route fallback, and `402`/`429` starts a cooldown from `Retry-After`, common duration/reset headers, absolute reset timestamps, or JSON error-body retry delays (60s fallback, per-provider `key_cooldown_ms` / `--key-cooldown-ms` override; `0` disables it)
 - **Failover**: ordered provider fallbacks and routing-group routes, tried before any reply bytes are streamed when the active provider is rate limited, out of quota, overloaded, or unreachable
 - **Local authentication**: every non-health route requires the configured token as Bearer, Anthropic `x-api-key`, or Gemini `x-goog-api-key`; `/health` stays public
-- **Web console**: open `http://127.0.0.1:3426/`, enter the local token, and manage providers and routing groups, discover upstream models, test draft connections, or inspect provider totals, routing providers and groups, key-slot totals and active cooldowns, available models, recent requests, and recent usage; prompts, replies, and saved keys are never returned to the page or persisted in request history
+- **Web console**: open `http://127.0.0.1:3426/`, enter the local token, and manage Agent connections, providers and routing groups, discover upstream models, test draft connections, or inspect provider totals, routing providers and groups, key-slot totals and active cooldowns, available models, recent requests, and recent usage; prompts, replies, and saved keys are never returned to the page or persisted in request history
 - **Request statistics**: token-protected `/stats`, `/config`, and `magpie-lite stats` show provider and per-key totals, token usage, statuses, latency, active secret-free key cooldowns, and recent request metadata (including which key slot served it, never the key); `recent_usage` adds provider/model aggregates over the recent window, and optional sanitized JSONL history keeps that window across restarts while process totals stay process-local
 - **Agent wiring**: `magpie-lite claude <model>` (settings.json env block), `magpie-lite codex <model>` (config.toml provider table, native `wire_api = "responses"`), `magpie-lite crush <model>` (custom OpenAI-compatible provider and large-model pick), `magpie-lite gemini <model>` (`~/.gemini/settings.json` plus `.env`), `magpie-lite goose <model>` (custom OpenAI-compatible provider plus the active model), `magpie-lite opencode <model>` (`~/.config/opencode/opencode.json` provider block), `magpie-lite zed <model>` (OpenAI-compatible provider in Zed settings; the token goes in Zed provider settings or `MAGPIE_LITE_API_KEY`, not `settings.json`)
 - **Conformance tests** for every translation direction, and end-to-end tests over real HTTP with mock Chat and Gemini upstreams
@@ -72,7 +72,7 @@ magpie-lite serve --history-file 'D:\magpie\history.jsonl'
 # or set history_path in config.toml
 ```
 
-Restart the agent after wiring it. For Zed, also set MAGPIE_LITE_API_KEY to the gateway token in Zed's environment, or enter that token in Zed's AI provider settings. Unwire by restoring the agent's own provider (or use your agent switcher).
+Restart the agent after wiring it. For Zed, also set MAGPIE_LITE_API_KEY to the gateway token in Zed's environment, or enter that token in Zed's AI provider settings. Disconnect through the console or `magpie-lite agent disconnect <id>` to restore the saved original configuration, provided no conflicting edits were made.
 
 ## Editing providers
 
@@ -103,6 +103,15 @@ The CLI and protected HTTP API now share seven adapters through the
 connection, drift and pending recovery. Existing per-agent shorthand commands
 also save a durable backup before writing.
 
+The **Coding agents** panel shows detection, connection, selected model, drift
+and recovery status for all seven agents. Click **Manage**, choose a configured
+route (or type `provider/model` / `group/id`), and **Preview changes**. Review the
+paths, operations and byte counts, then **Confirm connection**. To disconnect,
+choose **Disconnect / restore backup**, preview and **Confirm restoration**.
+Interrupted operations expose a separate, explicitly confirmed recovery action.
+Model/action edits, changed state/routes and sign-out clear reviewed previews.
+A status-read failure disables Agent actions without breaking the other panels.
+
 HTTP management exposes `GET /agents` and
 `POST /agents/{id}/preview|apply|recover`. Apply requires the reviewed preview
 revision. Previews show paths, operations and byte counts, not secrets.
@@ -110,9 +119,9 @@ revision. Previews show paths, operations and byte counts, not secrets.
 Unchanged managed files can be restored byte-for-byte; later user edits are
 refused rather than overwritten. Multi-file operations have explicit journaled
 recovery, not an atomic all-file transaction. Journals retain sensitive baseline
-credentials and are **not encrypted**. The console agent panel and field-level
-restore are still pending. See `docs/agent-lifecycle.md` for commands, API bodies,
-port overrides, backup retention, platform permissions and precise limitations.
+credentials and are **not encrypted**. Selective field-level restore preserving
+later unrelated edits is still pending. See `docs/agent-lifecycle.md` for commands,
+API bodies, port overrides, backup retention, platform permissions and precise limitations.
 
 ## Discovering models and testing providers
 
@@ -212,7 +221,7 @@ Tests are the contract: `crates/core/tests/translation.rs` checks real wire shap
 
 - More agents (Cursor CLI, ...)
 - A TUI
-- Agent lifecycle console panel and selective restoration preserving later unrelated edits
+- Selective Agent restoration preserving later unrelated edits and richer detection/override semantics
 - Broader provider capability metadata and stream-only/specialized connection probes
 - More routing policies, versioned admin API and separate management authentication
 
@@ -225,3 +234,14 @@ Agent configuration operations use reviewed revisions and durable backups, and r
 ## License
 
 MIT, like magpie.
+
+### Browser verification
+
+After `cargo build -p magpie-lite`, run `node --test tests/browser/agents.cjs`
+with Node 18+ and Playwright available. Set `PLAYWRIGHT_MODULE` to an absolute
+Playwright module directory if it is not on Node's module path;
+`PLAYWRIGHT_EXECUTABLE_PATH` optionally selects an installed Chromium browser.
+The runner launches its own gateway on an ephemeral loopback port with
+`MAGPIE_LITE_HOME` set only in the child. It uses a temporary home and configuration,
+never the user's Agent files, and cleans up after stopping that child.
+See `docs/agent-lifecycle.md` for coverage and fixture limitations.

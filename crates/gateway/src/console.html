@@ -173,7 +173,7 @@
     }
 
     .button {
-      min-height: 39px;
+      min-height: 44px;
       padding: 8px 16px;
       border: 1px solid transparent;
       border-radius: 11px;
@@ -284,7 +284,7 @@
     }
 
     .mini-button {
-      min-height: 33px;
+      min-height: 44px;
       padding: 5px 11px;
       border: 1px solid var(--border-strong);
       border-radius: 9px;
@@ -410,6 +410,33 @@
     .provider-name code { display: block; color: var(--muted); font-size: .8rem; }
     .panel-header { flex-wrap: wrap; }
     @media (max-width: 540px) { .editor-grid { grid-template-columns: minmax(0, 1fr); } }
+    .agents-panel { margin-bottom: 16px; }
+    .panel-copy { margin: 0; padding: 16px 20px 0; color: var(--muted); }
+    .agent-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; padding: 20px; margin: 0; list-style: none; }
+    .agent-card { display: grid; align-content: start; gap: 8px; min-width: 0; padding: 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-soft); }
+    .agent-card.selected { border-color: var(--accent); }
+    .agent-card h3 { font-size: 1rem; }
+    .agent-card p { margin: 0; font-size: .87rem; overflow-wrap: anywhere; }
+    .agent-card .button { margin-top: 8px; justify-self: start; }
+    .agent-meta { color: var(--muted); }
+    .agent-editor { display: grid; gap: 16px; margin: 20px; padding: 20px; border: 1px solid var(--border-strong); border-radius: 12px; background: rgba(5, 9, 18, .4); }
+    .agent-editor code, .agent-files li { overflow-wrap: anywhere; }
+    .agent-editor p { margin: 0; }
+    .agent-fields { display: grid; grid-template-columns: minmax(140px, 1fr) minmax(0, 2fr); gap: 16px; }
+    .agent-fields .field { min-width: 0; }
+    .agent-files { margin: 0; padding-left: 20px; color: var(--muted); font-size: .87rem; }
+    .agent-preview { display: grid; gap: 12px; padding: 16px; border: 1px solid var(--border-strong); border-radius: 12px; }
+    .agent-preview-files { display: grid; gap: 8px; list-style: none; margin: 0; padding: 0; }
+    .agent-preview-files li { display: grid; gap: 4px; min-width: 0; }
+    .agent-warning { color: var(--warn); font-size: .87rem; }
+    .agent-message { margin: 0; text-align: left; overflow-wrap: anywhere; }
+    #agent-load-message { padding: 0 20px; text-align: left; overflow-wrap: anywhere; }
+    @media (max-width: 900px) { .agent-list { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (max-width: 540px) {
+      .agent-list, .agent-fields { grid-template-columns: minmax(0, 1fr); }
+      .agent-list { padding: 16px; }
+      .agent-editor { margin: 16px; padding: 16px; }
+    }
   </style>
 </head>
 <body>
@@ -418,7 +445,7 @@
       <div>
         <p class="eyebrow">local model gateway</p>
         <h1>magpie-lite</h1>
-        <p class="tagline">One local console for model routes, request health, provider totals, and recent token usage.</p>
+        <p class="tagline">Connect your coding agents to one backend. Manage providers, model routes, and request health in one place.</p>
       </div>
       <div class="status-stack">
         <span id="health-pill" class="pill warn">Checking health</span>
@@ -466,6 +493,32 @@
             <p id="metric-latency" class="metric-value">—</p>
             <p class="metric-note">Recent-history window</p>
           </article>
+        </section>
+
+        <section class="panel agents-panel" aria-labelledby="agents-title">
+          <div class="panel-header"><h2 id="agents-title">Coding agents</h2><button id="agent-refresh" class="button secondary" type="button">Refresh agents</button></div>
+          <p class="panel-copy">Seven agents, one gateway. Review file paths and byte counts before applying any change. Detection is a local hint, not a running-agent health check.</p>
+          <p id="agent-load-message" class="console-message" role="status" aria-live="polite" aria-atomic="true"></p>
+          <form id="agent-editor" class="agent-editor" hidden aria-labelledby="agent-editor-title">
+            <h3 id="agent-editor-title">Manage agent</h3>
+            <p id="agent-notice" class="agent-meta"></p>
+            <ul id="agent-files" class="agent-files" aria-label="Managed configuration paths"></ul>
+            <div class="agent-fields">
+              <div class="field"><label for="agent-action">Operation</label><select id="agent-action" class="token-input"><option value="connect">Connect / change model</option><option value="disconnect">Disconnect / restore backup</option></select></div>
+              <div id="agent-model-field" class="field"><label for="agent-model">Model route</label><input id="agent-model" class="token-input" list="agent-model-options" autocomplete="off" spellcheck="false" required aria-describedby="agent-model-help" placeholder="provider/model or group/id"><datalist id="agent-model-options"></datalist><p id="agent-model-help" class="agent-meta">Choose a configured route, or enter a provider/model or group/id. Providers and groups must already exist.</p></div>
+            </div>
+            <p class="agent-warning">Backups contain plaintext credentials, not encrypted secrets. Restore refuses conflicting file edits. Project settings and environment variables can override these user-level files.</p>
+            <div class="group-actions"><button id="agent-preview-button" class="button" type="submit">Preview changes</button><button id="agent-recover" class="button secondary danger" type="button" hidden>Recover interrupted operation</button><button id="agent-cancel" class="button secondary" type="button">Cancel</button></div>
+            <section id="agent-preview" class="agent-preview" aria-labelledby="agent-preview-title" hidden>
+              <h3 id="agent-preview-title" tabindex="-1">Review changes</h3>
+              <p id="agent-preview-summary"></p>
+              <ul id="agent-preview-files" class="agent-preview-files"></ul>
+              <p class="agent-meta">File contents and credentials are never shown. If a file or gateway setting changes, this preview must be generated again.</p>
+              <div class="group-actions"><button id="agent-apply" class="button" type="button">Confirm changes</button></div>
+            </section>
+            <p id="agent-message" class="console-message agent-message" role="status" aria-live="polite" aria-atomic="true"></p>
+          </form>
+          <ul id="agent-list" class="agent-list" aria-label="Supported coding agents"></ul>
         </section>
 
         <div class="panel-grid">
@@ -669,6 +722,26 @@
       groupMessage: document.getElementById("group-message"),
       groupList: document.getElementById("group-list"),
       groupEmpty: document.getElementById("group-empty"),
+      agentList: document.getElementById("agent-list"),
+      agentLoadMessage: document.getElementById("agent-load-message"),
+      agentRefresh: document.getElementById("agent-refresh"),
+      agentEditor: document.getElementById("agent-editor"),
+      agentEditorTitle: document.getElementById("agent-editor-title"),
+      agentNotice: document.getElementById("agent-notice"),
+      agentFiles: document.getElementById("agent-files"),
+      agentAction: document.getElementById("agent-action"),
+      agentModelField: document.getElementById("agent-model-field"),
+      agentModel: document.getElementById("agent-model"),
+      agentModelOptions: document.getElementById("agent-model-options"),
+      agentPreviewButton: document.getElementById("agent-preview-button"),
+      agentRecover: document.getElementById("agent-recover"),
+      agentCancel: document.getElementById("agent-cancel"),
+      agentPreview: document.getElementById("agent-preview"),
+      agentPreviewTitle: document.getElementById("agent-preview-title"),
+      agentPreviewSummary: document.getElementById("agent-preview-summary"),
+      agentPreviewFiles: document.getElementById("agent-preview-files"),
+      agentApply: document.getElementById("agent-apply"),
+      agentMessage: document.getElementById("agent-message"),
       modelList: document.getElementById("model-list"),
       modelEmpty: document.getElementById("model-empty"),
       usageRows: document.getElementById("usage-rows"),
@@ -682,10 +755,13 @@
     let token = "";
     let refreshTimer = 0;
     let lastUpdate = "";
+    let editingAgent = null;
+    let agentSnapshot = [];
+    let agentPreview = null;
     let editingGroup = null;
     let editingProvider = null;
     let routingSnapshot = null;
-    let groupBusy = false;
+    let managementBusy = false;
     let dataRevision = 0;
     let sessionRevision = 0;
 
@@ -724,21 +800,31 @@
     }
 
     async function authorized(path, options = {}) {
-      const response = await fetch(path, {
-        cache: "no-store",
-        ...options,
-        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }
-      });
-      if (response.status === 401) {
-        const error = new Error("The gateway token was not accepted.");
-        error.unauthorized = true;
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 30000);
+      try {
+        const response = await fetch(path, {
+          cache: "no-store",
+          ...options,
+          signal: controller.signal,
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }
+        });
+        if (response.status === 401) {
+          const error = new Error("The gateway token was not accepted.");
+          error.unauthorized = true;
+          throw error;
+        }
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          throw new Error(body.error?.message || `Request failed (HTTP ${response.status}).`);
+        }
+        return await response.json();
+      } catch (error) {
+        if (error.name === "AbortError") throw new Error("The gateway request timed out. Refresh status before retrying.");
         throw error;
+      } finally {
+        window.clearTimeout(timeout);
       }
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        throw new Error(body.error?.message || `Request failed (HTTP ${response.status}).`);
-      }
-      return response.json();
     }
 
     function renderStats(stats) {
@@ -843,11 +929,198 @@
     }
 
     function renderRouting(configuration) {
+      if (JSON.stringify(routingSnapshot) !== JSON.stringify(configuration)) invalidateAgentPreview();
       routingSnapshot = configuration;
+      renderAgentModelOptions(configuration);
       elements.groupProviders.textContent = `Configured providers: ${(configuration.providers || []).map(p => p.id).join(", ") || "none"}`;
       renderRoutingProviders(configuration.providers || []);
       renderRoutingGroups(configuration.groups || []);
     }
+
+    function renderAgentModelOptions(configuration) {
+      const routes = new Set();
+      for (const provider of configuration.providers || []) {
+        for (const model of provider.models || []) routes.add(provider.id + "/" + model);
+      }
+      for (const group of configuration.groups || []) routes.add("group/" + group.id);
+      elements.agentModelOptions.replaceChildren(...[...routes].map(route => {
+        const option = document.createElement("option"); option.value = route; return option;
+      }));
+    }
+
+    function currentAgent() {
+      return agentSnapshot.find(agent => agent.id === editingAgent);
+    }
+
+    function invalidateAgentPreview() {
+      const hadPreview = Boolean(agentPreview);
+      agentPreview = null;
+      elements.agentPreview.hidden = true;
+      elements.agentPreviewSummary.textContent = "";
+      clear(elements.agentPreviewFiles);
+      elements.agentApply.disabled = true;
+      if (hadPreview) elements.agentMessage.textContent = "Preview cleared. Review the current changes again before confirming.";
+    }
+
+    function syncAgentControls() {
+      const agent = currentAgent();
+      const connect = elements.agentAction.value === "connect";
+      const pending = Boolean(agent?.recovery_needed);
+      elements.agentEditor.setAttribute("aria-busy", String(managementBusy));
+      for (const control of elements.agentEditor.elements) control.disabled = managementBusy;
+      elements.agentAction.disabled = managementBusy || !agent || pending;
+      elements.agentAction.querySelector('[value="disconnect"]').disabled = !agent?.connected;
+      elements.agentModelField.hidden = !connect || pending;
+      elements.agentModel.required = connect && !pending;
+      elements.agentModel.disabled = managementBusy || !connect || pending || !agent;
+      elements.agentPreviewButton.disabled = managementBusy || !agent || pending;
+      elements.agentPreviewButton.hidden = pending;
+      elements.agentRecover.hidden = !pending;
+      elements.agentRecover.disabled = managementBusy || !agent || !pending;
+      elements.agentApply.disabled = managementBusy || !agentPreview || !agent || pending;
+      elements.agentRefresh.disabled = managementBusy;
+      for (const button of elements.agentList.querySelectorAll("button")) {
+        button.disabled = managementBusy;
+        const selected = button.dataset.agent === editingAgent;
+        button.setAttribute("aria-expanded", String(selected));
+        button.closest(".agent-card").classList.toggle("selected", selected);
+      }
+    }
+
+    function renderAgents(agents) {
+      const previous = currentAgent();
+      agentSnapshot = agents;
+      const agent = currentAgent();
+      if (JSON.stringify(previous) !== JSON.stringify(agent)) invalidateAgentPreview();
+      const focusedAgent = elements.agentList.contains(document.activeElement) ? document.activeElement.dataset.agent : null;
+      clear(elements.agentList);
+      for (const status of agents) {
+        const card = document.createElement("li"); card.className = "agent-card";
+        card.append(text("h3", status.name));
+        const label = status.recovery_needed ? "Recovery needed" : status.drifted ? "Configuration drift" : status.connected ? "Connected" : "Not connected";
+        card.append(text("p", label, "status " + (status.recovery_needed || status.drifted ? "warn" : status.connected ? "good" : "agent-meta")));
+        card.append(text("p", status.detected ? "Detected locally" : "Not detected · can create configuration", "agent-meta"));
+        card.append(text("p", status.model || "No managed model", "agent-meta"));
+        const manage = text("button", "Manage", "button secondary");
+        manage.type = "button"; manage.dataset.agent = status.id;
+        manage.setAttribute("aria-label", "Manage " + status.name);
+        manage.setAttribute("aria-controls", "agent-editor");
+        manage.addEventListener("click", () => openAgentEditor(status.id));
+        card.append(manage); elements.agentList.append(card);
+      }
+      if (agent) {
+        elements.agentNotice.textContent = agent.notice;
+        elements.agentFiles.replaceChildren(...agent.files.map(path => text("li", path)));
+        if (!agent.connected && elements.agentAction.value === "disconnect") elements.agentAction.value = "connect";
+      }
+      syncAgentControls();
+      if (focusedAgent) focusAgent(focusedAgent);
+    }
+
+    function focusAgent(id) {
+      const button = [...elements.agentList.querySelectorAll("button")].find(button => button.dataset.agent === id);
+      (button || elements.agentRefresh).focus({ preventScroll: true });
+    }
+
+    function openAgentEditor(id) {
+      if (managementBusy) return;
+      const agent = agentSnapshot.find(agent => agent.id === id);
+      if (!agent) return;
+      if (!elements.providerEditor.hidden) closeProviderEditor();
+      if (!elements.groupEditor.hidden) closeGroupEditor();
+      invalidateAgentPreview();
+      editingAgent = id;
+      elements.agentEditorTitle.textContent = "Manage " + agent.name;
+      elements.agentNotice.textContent = agent.notice;
+      elements.agentFiles.replaceChildren(...agent.files.map(path => text("li", path)));
+      elements.agentAction.value = "connect";
+      elements.agentModel.value = agent.model || elements.agentModelOptions.firstElementChild?.value || "";
+      elements.agentMessage.textContent = agent.recovery_needed ? "An operation was interrupted. Recovery rolls back a connect or completes a disconnect using its private journal." : agent.drifted ? "A managed file or overriding path changed. Preview will check whether this operation is safe; conflicting edits are never overwritten." : "";
+      elements.agentEditor.hidden = false;
+      syncAgentControls();
+      (agent.recovery_needed ? elements.agentRecover : elements.agentModel).focus();
+    }
+
+    function closeAgentEditor(restoreFocus = true) {
+      const id = editingAgent;
+      invalidateAgentPreview();
+      editingAgent = null;
+      elements.agentEditor.hidden = true;
+      elements.agentEditor.reset();
+      elements.agentMessage.textContent = "";
+      elements.agentNotice.textContent = "";
+      clear(elements.agentFiles);
+      syncAgentControls();
+      if (restoreFocus) focusAgent(id);
+    }
+
+    function agentEdit() {
+      return { action: elements.agentAction.value, ...(elements.agentAction.value === "connect" ? { model: elements.agentModel.value.trim() } : {}) };
+    }
+
+    async function agentOperation(operation) {
+      if (managementBusy || !currentAgent()) return;
+      if (operation === "preview" && !elements.agentEditor.reportValidity()) return;
+      if (operation === "apply" && !agentPreview) return;
+      const id = editingAgent;
+      const edit = agentEdit();
+      const body = operation === "apply" ? { ...edit, revision: agentPreview.revision } : edit;
+      if (operation === "recover" && !window.confirm("Recover the interrupted operation for " + currentAgent().name + "? This uses the private journal to roll back a connect or finish a disconnect. Conflicting edits will not be overwritten.")) return;
+      const session = sessionRevision;
+      ++dataRevision;
+      invalidateAgentPreview();
+      setManagementBusy(true);
+      elements.agentMessage.textContent = operation === "preview" ? "Preparing a private preview; agent files are unchanged…" : operation === "recover" ? "Recovering interrupted operation…" : "Applying reviewed changes…";
+      let result;
+      try {
+        result = await authorized("/agents/" + encodeURIComponent(id) + "/" + operation, {
+          method: "POST", ...(operation === "recover" ? {} : { body: JSON.stringify(body) })
+        });
+        if (session !== sessionRevision) return;
+        if (operation === "preview") {
+          agentPreview = result;
+          elements.agentPreviewTitle.textContent = edit.action === "connect" ? "Review connection" : "Review restoration";
+          elements.agentPreviewSummary.textContent = edit.action === "connect" ? currentAgent().name + " → " + edit.model : "Restore the original files for " + currentAgent().name + ".";
+          elements.agentPreviewFiles.replaceChildren(...result.files.map(file => {
+            const item = document.createElement("li");
+            item.append(text("code", file.path), text("span", file.operation + " · " + fmt(file.before_bytes) + " → " + fmt(file.after_bytes) + " bytes", "agent-meta"));
+            return item;
+          }));
+          elements.agentApply.textContent = edit.action === "connect" ? "Confirm connection" : "Confirm restoration";
+          elements.agentPreview.hidden = false;
+          elements.agentMessage.textContent = "Preview ready. No agent files have been changed.";
+        } else {
+          // The returned status is authoritative even if the following refresh fails.
+          renderAgents(agentSnapshot.map(agent => agent.id === id ? result : agent));
+          elements.agentMessage.textContent = operation === "recover" ? "Recovery complete. " + result.notice : edit.action === "connect" ? "Connected to " + result.model + ". " + result.notice : "Original configuration restored. " + result.notice;
+        }
+      } catch (error) {
+        if (session !== sessionRevision) return;
+        if (error.unauthorized) {
+          disconnect(true); setMessage(error.message); return;
+        }
+        elements.agentMessage.textContent = error.message + (operation === "apply" ? " Preview again before retrying; refresh status if the operation was interrupted." : " Resolve the issue or refresh status before retrying.");
+      } finally {
+        if (session === sessionRevision) setManagementBusy(false);
+      }
+      if (session !== sessionRevision) return;
+      if (operation === "preview" && result) elements.agentPreviewTitle.focus();
+      else {
+        await update(true);
+        if (session === sessionRevision) (!currentAgent() ? elements.agentCancel : currentAgent().recovery_needed ? elements.agentRecover : elements.agentPreviewButton).focus();
+      }
+    }
+
+    elements.agentEditor.addEventListener("submit", event => { event.preventDefault(); agentOperation("preview"); });
+    elements.agentAction.addEventListener("change", () => { invalidateAgentPreview(); syncAgentControls(); });
+    elements.agentModel.addEventListener("input", invalidateAgentPreview);
+    elements.agentApply.addEventListener("click", () => agentOperation("apply"));
+    elements.agentRecover.addEventListener("click", () => agentOperation("recover"));
+    elements.agentCancel.addEventListener("click", () => { if (!managementBusy) closeAgentEditor(); });
+    elements.agentRefresh.addEventListener("click", () => update(false));
+    elements.agentEditor.addEventListener("keydown", event => {
+      if (event.key === "Escape" && !managementBusy) { event.preventDefault(); closeAgentEditor(); }
+    });
 
     function renderRoutingProviders(providers) {
       clear(elements.routingRows);
@@ -861,7 +1134,7 @@
         for (const [label, action] of [["Edit", () => openProviderEditor(provider)], ["Delete", () => deleteProvider(provider)]]) {
           const button = text("button", label, "button secondary" + (label === "Delete" ? " danger" : ""));
           button.type = "button";
-          button.disabled = groupBusy;
+          button.disabled = managementBusy;
           button.setAttribute("aria-label", label + " provider " + provider.id);
           button.addEventListener("click", action);
           buttons.append(button);
@@ -897,12 +1170,12 @@
         const edit = text("button", "Edit", "button secondary");
         edit.type = "button";
         edit.setAttribute("aria-label", `Edit group ${group.id}`);
-        edit.disabled = groupBusy;
+        edit.disabled = managementBusy;
         edit.addEventListener("click", () => openGroupEditor(group));
         const remove = text("button", "Delete", "button secondary danger");
         remove.type = "button";
         remove.setAttribute("aria-label", `Delete group ${group.id}`);
-        remove.disabled = groupBusy;
+        remove.disabled = managementBusy;
         remove.addEventListener("click", () => deleteGroup(group));
         actions.append(edit, remove);
         li.append(id, label, route, actions);
@@ -952,7 +1225,8 @@
     }
 
     function openProviderEditor(provider = null) {
-      if (groupBusy) return;
+      if (managementBusy) return;
+      if (!elements.agentEditor.hidden) closeAgentEditor(false);
       if (!elements.groupEditor.hidden) closeGroupEditor();
       editingProvider = provider?.id ?? null;
       elements.providerEditorTitle.textContent = provider ? "Edit provider" : "New provider";
@@ -965,7 +1239,7 @@
       elements.providerFallback.value = (provider?.fallback || []).join("\n");
       elements.providerCooldown.value = provider?.key_cooldown_override_ms ?? "";
       elements.providerDefault.checked = provider ? routingSnapshot.default_provider === provider.id : !(routingSnapshot?.providers || []).length;
-      elements.providerDefault.disabled = groupBusy;
+      elements.providerDefault.disabled = managementBusy;
       elements.providerKeyMode.value = provider ? "keep" : "replace";
       elements.providerKeyMode.querySelector('[value="keep"]').disabled = !provider;
       elements.providerKeys.value = "";
@@ -990,10 +1264,11 @@
     const lines = value => value.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
 
     async function mutateProvider(path, method, body, success) {
-      if (groupBusy) return;
+      if (managementBusy) return;
       const session = sessionRevision;
       ++dataRevision;
-      setGroupBusy(true);
+      invalidateAgentPreview();
+      setManagementBusy(true);
       elements.providerMessage.textContent = method === "DELETE" ? "Deleting…" : "Saving…";
       let saved = false;
       try {
@@ -1009,7 +1284,7 @@
         elements.providerMessage.textContent = error.message;
         if (error.unauthorized) setMessage(error.message);
       } finally {
-        setGroupBusy(false);
+        if (session === sessionRevision) setManagementBusy(false);
       }
       if (saved && session === sessionRevision) {
         elements.providerNew.focus();
@@ -1018,7 +1293,7 @@
     }
 
     async function deleteProvider(provider) {
-      if (groupBusy || !window.confirm("Delete provider " + provider.id + "? Remove its group and fallback references first. Agents using it will need another route.")) return;
+      if (managementBusy || !window.confirm("Delete provider " + provider.id + "? Remove its group and fallback references first. Agents using it will need another route.")) return;
       await mutateProvider("/config/providers/" + encodeURIComponent(provider.id), "DELETE", null, "Provider deleted and saved.");
     }
 
@@ -1026,7 +1301,7 @@
     elements.providerCancel.addEventListener("click", closeProviderEditor);
     elements.providerKeyMode.addEventListener("change", keyModeChanged);
     elements.providerEditor.addEventListener("keydown", event => {
-      if (event.key === "Escape" && !groupBusy) { event.preventDefault(); closeProviderEditor(); }
+      if (event.key === "Escape" && !managementBusy) { event.preventDefault(); closeProviderEditor(); }
     });
     function providerDraft() {
       const cooldown = elements.providerCooldown.value;
@@ -1057,7 +1332,7 @@
     }
 
     async function providerTool(operation) {
-      if (groupBusy || !elements.providerEditor.reportValidity()) return;
+      if (managementBusy || !elements.providerEditor.reportValidity()) return;
       const provider = providerDraft();
       if (!provider) return;
       const model = elements.providerTestModel.value.trim() || provider.models[0];
@@ -1067,7 +1342,8 @@
         return;
       }
       const session = sessionRevision;
-      setGroupBusy(true, operation === "test" ? "Testing…" : "Discovering…");
+      ++dataRevision;
+      setManagementBusy(true, operation === "test" ? "Testing…" : "Discovering…");
       elements.providerMessage.textContent = operation === "test" ? "Testing a small generation request…" : "Fetching provider models…";
       try {
         const result = await authorized("/config/provider-tools/" + operation, {
@@ -1089,14 +1365,14 @@
         elements.providerMessage.textContent = error.message;
         if (error.unauthorized) setMessage(error.message);
       } finally {
-        setGroupBusy(false);
+        if (session === sessionRevision) setManagementBusy(false);
       }
     }
     elements.providerDiscover.addEventListener("click", () => providerTool("models"));
     elements.providerTest.addEventListener("click", () => providerTool("test"));
     elements.providerEditor.addEventListener("submit", async event => {
       event.preventDefault();
-      if (groupBusy) return;
+      if (managementBusy) return;
       const body = providerDraft();
       if (!body) return;
       const path = editingProvider === null ? "/config/providers" : "/config/providers/" + encodeURIComponent(editingProvider);
@@ -1104,7 +1380,8 @@
     });
 
     function openGroupEditor(group = null) {
-      if (groupBusy) return;
+      if (managementBusy) return;
+      if (!elements.agentEditor.hidden) closeAgentEditor(false);
       if (!elements.providerEditor.hidden) closeProviderEditor();
       editingGroup = group?.id ?? null;
       elements.groupEditorTitle.textContent = group ? "Edit routing group" : "New routing group";
@@ -1124,8 +1401,10 @@
       elements.groupNew.focus();
     }
 
-    function setGroupBusy(busy, label = "Saving…") {
-      groupBusy = busy;
+    function setManagementBusy(busy, label = "Saving…") {
+      managementBusy = busy;
+      syncAgentControls();
+      elements.refresh.disabled = busy;
       elements.providerEditor.setAttribute("aria-busy", String(busy));
       for (const control of elements.providerEditor.elements) control.disabled = busy;
       elements.providerNew.disabled = busy;
@@ -1140,10 +1419,11 @@
     }
 
     async function mutateGroup(path, method, body, success) {
-      if (groupBusy) return;
+      if (managementBusy) return;
       const session = sessionRevision;
       ++dataRevision;
-      setGroupBusy(true);
+      invalidateAgentPreview();
+      setManagementBusy(true);
       elements.groupMessage.textContent = method === "DELETE" ? "Deleting…" : "Saving…";
       let saved = false;
       try {
@@ -1159,7 +1439,7 @@
         elements.groupMessage.textContent = error.message;
         if (error.unauthorized) setMessage(error.message);
       } finally {
-        setGroupBusy(false);
+        if (session === sessionRevision) setManagementBusy(false);
       }
       if (saved && session === sessionRevision) {
         elements.groupNew.focus();
@@ -1168,18 +1448,18 @@
     }
 
     async function deleteGroup(group) {
-      if (groupBusy || !window.confirm(`Delete group/${group.id}? Agents using it will need another model.`)) return;
+      if (managementBusy || !window.confirm(`Delete group/${group.id}? Agents using it will need another model.`)) return;
       await mutateGroup(`/config/groups/${encodeURIComponent(group.id)}`, "DELETE", null, "Group deleted and saved.");
     }
 
     elements.groupNew.addEventListener("click", () => openGroupEditor());
     elements.groupCancel.addEventListener("click", closeGroupEditor);
     elements.groupEditor.addEventListener("keydown", event => {
-      if (event.key === "Escape" && !groupBusy) { event.preventDefault(); closeGroupEditor(); }
+      if (event.key === "Escape" && !managementBusy) { event.preventDefault(); closeGroupEditor(); }
     });
     elements.groupEditor.addEventListener("submit", async event => {
       event.preventDefault();
-      if (groupBusy) return;
+      if (managementBusy) return;
       const body = {
         id: elements.groupId.value.trim(),
         name: elements.groupName.value.trim(),
@@ -1195,22 +1475,34 @@
     });
 
     async function update(silent) {
-      if (!token || groupBusy) return;
+      if (!token || managementBusy) return;
       const revision = ++dataRevision;
       const session = sessionRevision;
       try {
-        const [stats, models, routing] = await Promise.all([
+        const [stats, models, routing, agents] = await Promise.all([
           authorized("/stats"),
           authorized("/v1/models"),
-          authorized("/config")
+          authorized("/config"),
+          authorized("/agents").then(data => ({ data })).catch(error => {
+            if (error.unauthorized) throw error;
+            return { error };
+          })
         ]);
         if (revision !== dataRevision || session !== sessionRevision) return;
         renderStats(stats);
         renderModels(models.data || []);
         renderRouting(routing);
+        if (agents.error) {
+          renderAgents([]);
+          elements.agentLoadMessage.textContent = "Agent status unavailable: " + agents.error.message + " Use Refresh agents to retry. Other console tools remain available.";
+        } else {
+          renderAgents(agents.data.agents || []);
+          elements.agentLoadMessage.textContent = "";
+        }
         lastUpdate = new Date().toLocaleTimeString([], { hour12: false });
         setPill(elements.dataPill, `Live · ${lastUpdate}`, "good");
         setMessage("");
+        return true;
       } catch (error) {
         if (revision !== dataRevision || session !== sessionRevision) return;
         if (error.unauthorized) {
@@ -1248,6 +1540,12 @@
     function disconnect(expired) {
       ++sessionRevision;
       ++dataRevision;
+      closeAgentEditor(false);
+      agentSnapshot = [];
+      clear(elements.agentList);
+      clear(elements.agentModelOptions);
+      elements.agentLoadMessage.textContent = "";
+      setManagementBusy(false);
       elements.providerEditor.hidden = true;
       elements.providerEditor.reset();
       elements.providerKeys.value = "";
@@ -1278,8 +1576,8 @@
       elements.connect.disabled = true;
       setMessage("Connecting…");
       try {
-        await update(false);
-        if (!token) return;
+        const loaded = await update(false);
+        if (!token || !loaded) return;
         elements.login.hidden = true;
         elements.console.hidden = false;
         elements.dataPill.hidden = false;

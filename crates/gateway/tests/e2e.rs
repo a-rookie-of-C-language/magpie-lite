@@ -1559,6 +1559,9 @@ async fn console_is_public_while_protected_data_requires_the_token() {
     assert!(body.contains("Cooldowns"));
     assert!(body.contains("Routing configuration"));
     assert!(body.contains("Routing groups"));
+    assert!(body.contains("Coding agents"));
+    assert!(body.contains("Recover interrupted operation"));
+    assert!(body.contains("Confirm restoration"));
     assert!(!body.contains("localStorage"), "the token is not persisted");
     assert!(!body.contains("test-key"), "upstream credentials stay out");
 
