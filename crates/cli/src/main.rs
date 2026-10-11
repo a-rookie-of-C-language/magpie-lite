@@ -168,11 +168,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve { port, history_file } => {
-            let mut cfg = load_config(&cli.config)?;
-            if let Some(path) = history_file {
-                cfg.history_path = Some(path);
-            }
-            magpie_gateway::serve(cfg, port).await?;
+            let path = provider_path(&cli.config)?;
+            let cfg = Config::load(&path)?;
+            magpie_gateway::serve_with_config_path(cfg, port, Some(path), history_file).await?;
         }
         Command::Provider { command } => match command {
             ProviderCommand::Add {
@@ -267,16 +265,6 @@ async fn main() -> Result<()> {
         },
         Command::Group { command } => match command {
             GroupCommand::Add { id, name, routes } => {
-                if id.is_empty() || id.contains('/') {
-                    anyhow::bail!("group id must be non-empty and contain no `/`");
-                }
-                if routes.is_empty() {
-                    anyhow::bail!("a group needs at least one --route provider/model");
-                }
-                if routes.iter().any(|route| route.starts_with("group/")) {
-                    anyhow::bail!("group routes must name providers directly, not other groups");
-                }
-
                 let path = provider_path(&cli.config)?;
                 let mut cfg = Config::load(&path)?;
                 let group = GroupConfig {
@@ -284,6 +272,13 @@ async fn main() -> Result<()> {
                     name: name.unwrap_or_default(),
                     routes,
                 };
+                group.validate()?;
+                for route in &group.routes {
+                    let provider = route.split_once('/').unwrap().0;
+                    if cfg.provider(provider).is_none() {
+                        anyhow::bail!("unknown provider `{provider}`");
+                    }
+                }
                 match cfg.group.iter().position(|g| g.id == id) {
                     Some(i) => cfg.group[i] = group,
                     None => cfg.group.push(group),

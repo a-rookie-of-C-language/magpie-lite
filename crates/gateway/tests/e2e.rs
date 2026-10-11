@@ -216,7 +216,7 @@ async fn spawn_gateway_with_protocol_and_history(
     };
     let requests = request_log(&config);
     let state = Arc::new(AppState {
-        config,
+        config: magpie_gateway::ConfigStore::new(config, None),
         http: magpie_gateway::upstream::http_client().unwrap(),
         requests,
         key_rotation: magpie_gateway::KeyRotator::default(),
@@ -570,7 +570,7 @@ async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) ->
     };
     let requests = request_log(&config);
     let state = Arc::new(AppState {
-        config,
+        config: magpie_gateway::ConfigStore::new(config, None),
         http: magpie_gateway::upstream::http_client().unwrap(),
         requests,
         key_rotation: magpie_gateway::KeyRotator::default(),
@@ -618,7 +618,7 @@ async fn spawn_gateway_with_fallback(primary: String, backup: String) -> String 
     };
     let requests = request_log(&config);
     let state = Arc::new(AppState {
-        config,
+        config: magpie_gateway::ConfigStore::new(config, None),
         http: magpie_gateway::upstream::http_client().unwrap(),
         requests,
         key_rotation: magpie_gateway::KeyRotator::default(),
@@ -671,7 +671,7 @@ async fn spawn_gateway_with_group(primary: String, backup: String) -> String {
     };
     let requests = request_log(&config);
     let state = Arc::new(AppState {
-        config,
+        config: magpie_gateway::ConfigStore::new(config, None),
         http: magpie_gateway::upstream::http_client().unwrap(),
         requests,
         key_rotation: magpie_gateway::KeyRotator::default(),

@@ -12,7 +12,7 @@ use axum::extract::{Path, Request, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use futures::StreamExt;
 use magpie_core::ir::{CompletionRequest, Usage};
@@ -20,7 +20,8 @@ use magpie_core::stream::{SseParser, StreamEvent};
 use magpie_core::{anthropic, chat, gemini, responses};
 use serde_json::{Value, json};
 
-use crate::config::{Config, Protocol, ProviderConfig};
+use crate::config::{Config, GroupConfig, Protocol, ProviderConfig};
+use crate::config_store::ConfigStore;
 use crate::cooldown::quota_cooldown;
 use crate::upstream;
 use crate::usage::{RequestLog, RequestTracker, StatsSnapshot};
@@ -32,7 +33,7 @@ const CONSOLE_HTML: &str = include_str!("console.html");
 /// Shared handler state.
 pub struct AppState {
     /// The loaded configuration.
-    pub config: Config,
+    pub config: ConfigStore,
     /// The pooled upstream client.
     pub http: reqwest::Client,
     /// In-memory request totals and recent history for `/stats`.
@@ -52,6 +53,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/models", get(list_models))
         .route("/stats", get(stats))
         .route("/config", get(config))
+        .route("/config/groups", post(create_group))
+        .route(
+            "/config/groups/{id}",
+            put(update_group).delete(delete_group),
+        )
         // Every route above proves it knows the configured local token
         // before a request can reach a provider or read statistics. The
         // health probe and secret-free login page below are added after
@@ -79,7 +85,7 @@ async fn require_token(
     let authorized = bearer_token(headers)
         .or_else(|| header_token(headers, "x-api-key"))
         .or_else(|| header_token(headers, "x-goog-api-key"))
-        .is_some_and(|present| constant_time_eq(present, &state.config.token));
+        .is_some_and(|present| constant_time_eq(present, &state.config.current().token));
     if !authorized {
         let status = StatusCode::UNAUTHORIZED;
         return err_response(status, auth_error_body(request.uri(), status));
@@ -125,9 +131,19 @@ fn auth_error_body(uri: &Uri, status: StatusCode) -> Value {
 
 /// Run the gateway until the process is stopped.
 pub async fn serve(config: Config, port: Option<u16>) -> anyhow::Result<()> {
+    serve_with_config_path(config, port, None, None).await
+}
+
+/// Run with persistent console editing and an optional runtime-only history override.
+pub async fn serve_with_config_path(
+    config: Config,
+    port: Option<u16>,
+    config_path: Option<std::path::PathBuf>,
+    history_path: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
     let port = port.unwrap_or(config.port);
     let http = upstream::http_client()?;
-    let requests = match &config.history_path {
+    let requests = match history_path.as_ref().or(config.history_path.as_ref()) {
         Some(path) => {
             let log = RequestLog::open(path)?;
             Arc::new(Mutex::new(log))
@@ -135,7 +151,7 @@ pub async fn serve(config: Config, port: Option<u16>) -> anyhow::Result<()> {
         None => Arc::new(Mutex::new(RequestLog::default())),
     };
     let state = Arc::new(AppState {
-        config,
+        config: ConfigStore::new(config, config_path),
         http,
         requests,
         key_rotation: crate::config::KeyRotator::default(),
@@ -173,12 +189,127 @@ async fn stats(State(state): State<Arc<AppState>>) -> Json<StatsSnapshot> {
 
 /// GET `/config` — secret-free routing metadata for the console.
 async fn config(State(state): State<Arc<AppState>>) -> Json<crate::config::ConfigSnapshot> {
-    Json(state.config.snapshot())
+    Json(state.config.current().snapshot())
+}
+
+fn group_error(status: StatusCode, message: &str) -> Response {
+    err_response(status, upstream::chat_error(status, message))
+}
+
+fn decode_group(bytes: &[u8]) -> Result<GroupConfig, &'static str> {
+    serde_json::from_slice(bytes).map_err(|_| "expected JSON with id, optional name, and routes")
+}
+
+fn validate_group(config: &Config, group: &GroupConfig) -> Result<(), (StatusCode, String)> {
+    group
+        .validate()
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    for route in &group.routes {
+        let provider = route.split_once('/').expect("validated route").0;
+        if config.provider(provider).is_none() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("unknown provider `{provider}`"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn create_group(State(state): State<Arc<AppState>>, bytes: Bytes) -> Response {
+    let group = match decode_group(&bytes) {
+        Ok(group) => group,
+        Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
+    };
+    group_update_response(
+        state
+            .config
+            .update(move |config| {
+                validate_group(config, &group)?;
+                if config.group.iter().any(|existing| existing.id == group.id) {
+                    return Err((StatusCode::CONFLICT, "group already exists".to_owned()));
+                }
+                config.group.push(group);
+                Ok(())
+            })
+            .await,
+        StatusCode::CREATED,
+    )
+}
+
+async fn update_group(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    bytes: Bytes,
+) -> Response {
+    let group = match decode_group(&bytes) {
+        Ok(group) => group,
+        Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
+    };
+    if group.id != id {
+        return group_error(StatusCode::BAD_REQUEST, "body id must match path id");
+    }
+    group_update_response(
+        state
+            .config
+            .update(move |config| {
+                validate_group(config, &group)?;
+                let existing = config
+                    .group
+                    .iter_mut()
+                    .find(|existing| existing.id == id)
+                    .ok_or_else(|| (StatusCode::NOT_FOUND, "group not found".to_owned()))?;
+                *existing = group;
+                Ok(())
+            })
+            .await,
+        StatusCode::OK,
+    )
+}
+
+async fn delete_group(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    group_update_response(
+        state
+            .config
+            .update(move |config| {
+                let index = config
+                    .group
+                    .iter()
+                    .position(|group| group.id == id)
+                    .ok_or_else(|| (StatusCode::NOT_FOUND, "group not found".to_owned()))?;
+                let reference = format!("group/{id}");
+                if config
+                    .provider
+                    .iter()
+                    .any(|provider| provider.fallback.contains(&reference))
+                {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        "group is referenced by a provider fallback".to_owned(),
+                    ));
+                }
+                config.group.remove(index);
+                Ok(())
+            })
+            .await,
+        StatusCode::OK,
+    )
+}
+
+fn group_update_response(
+    result: Result<crate::config::ConfigSnapshot, (StatusCode, String)>,
+    status: StatusCode,
+) -> Response {
+    match result {
+        Ok(snapshot) => (status, Json(snapshot)).into_response(),
+        Err((status, message)) => group_error(status, &message),
+    }
 }
 
 async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {
     let data: Vec<Value> = state
         .config
+        .current()
         .catalog()
         .into_iter()
         .map(|(id, owner)| json!({"id": id, "object": "model", "owned_by": owner}))
@@ -190,6 +321,7 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {
 async fn gemini_models(State(state): State<Arc<AppState>>) -> Json<Value> {
     let models: Vec<Value> = state
         .config
+        .current()
         .catalog()
         .into_iter()
         .map(|(id, owner)| {
@@ -327,7 +459,7 @@ impl UpstreamDecoders {
 
 /// Decode the body and resolve the initial model route.
 fn prepare(
-    state: &AppState,
+    config: &Config,
     body: &Value,
     wire: ClientWire,
 ) -> Result<(CompletionRequest, UpstreamRoute), (StatusCode, Value)> {
@@ -337,7 +469,7 @@ fn prepare(
             wire.error_body(StatusCode::BAD_REQUEST, &e.to_string()),
         )
     })?;
-    let Some((provider, upstream_model)) = state.config.resolve(&creq.model) else {
+    let Some((provider, upstream_model)) = config.resolve(&creq.model) else {
         let message = format!(
             "no provider serves model `{}`; add one with `magpie-lite provider add`",
             creq.model
@@ -421,12 +553,13 @@ fn route_retryable_status(status: reqwest::StatusCode) -> bool {
 /// an agent never receives a half-finished answer from an abandoned provider.
 async fn send_with_fallback(
     state: &AppState,
+    config: &Config,
     creq: &CompletionRequest,
     initial: UpstreamRoute,
     tracker: &RequestTracker,
     wire: ClientWire,
 ) -> Result<(reqwest::Response, UpstreamCandidate), (Box<Response>, UpstreamCandidate)> {
-    let routes = upstream_routes(&state.config, &state.key_rotation, initial, &creq.model);
+    let routes = upstream_routes(config, &state.key_rotation, initial, &creq.model);
     let last_route = routes.len().saturating_sub(1);
     let no_route = routes
         .first()
@@ -494,7 +627,7 @@ async fn send_with_fallback(
                 let cooldown = quota_cooldown(
                     &headers,
                     Some(&error.body),
-                    state.config.key_cooldown_for(&route.provider),
+                    config.key_cooldown_for(&route.provider),
                 );
                 state
                     .key_rotation
@@ -582,7 +715,8 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
             );
         }
     };
-    let (creq, initial) = match prepare(&state, &body, wire) {
+    let config = state.config.current();
+    let (creq, initial) = match prepare(&config, &body, wire) {
         Ok(x) => x,
         Err((status, body)) => return err_response(status, body),
     };
@@ -595,17 +729,18 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
         &initial.model,
         0,
     );
-    let (resp, candidate) = match send_with_fallback(&state, &creq, initial, &tracker, wire).await {
-        Ok((resp, candidate)) => {
-            tracker.set_route(&candidate.provider.id, &candidate.model, candidate.key_slot);
-            (resp, candidate)
-        }
-        Err((response, candidate)) => {
-            tracker.set_route(&candidate.provider.id, &candidate.model, candidate.key_slot);
-            tracker.finish("upstream_error", &Usage::default());
-            return *response;
-        }
-    };
+    let (resp, candidate) =
+        match send_with_fallback(&state, &config, &creq, initial, &tracker, wire).await {
+            Ok((resp, candidate)) => {
+                tracker.set_route(&candidate.provider.id, &candidate.model, candidate.key_slot);
+                (resp, candidate)
+            }
+            Err((response, candidate)) => {
+                tracker.set_route(&candidate.provider.id, &candidate.model, candidate.key_slot);
+                tracker.finish("upstream_error", &Usage::default());
+                return *response;
+            }
+        };
     let protocol = candidate.provider.protocol;
 
     if !creq.stream {

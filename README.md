@@ -21,7 +21,7 @@ Zed ─────────┘   Chat + Responses +
 - **Multi-key pools**: repeat `--api-key`; requests rotate across keys, rejected/rate-limited keys are retried before route fallback, and `402`/`429` starts a cooldown from `Retry-After`, common duration/reset headers, absolute reset timestamps, or JSON error-body retry delays (60s fallback, per-provider `key_cooldown_ms` / `--key-cooldown-ms` override; `0` disables it)
 - **Failover**: ordered provider fallbacks and routing-group routes, tried before any reply bytes are streamed when the active provider is rate limited, out of quota, overloaded, or unreachable
 - **Local authentication**: every non-health route requires the configured token as Bearer, Anthropic `x-api-key`, or Gemini `x-goog-api-key`; `/health` stays public
-- **Web console**: open `http://127.0.0.1:3426/`, enter the local token, and inspect provider totals, routing providers and groups, key-slot totals and active cooldowns, available models, recent requests, and recent usage; prompts, replies, and real keys never enter history or the page
+- **Web console**: open `http://127.0.0.1:3426/`, enter the local token, and manage routing groups or inspect provider totals, routing providers and groups, key-slot totals and active cooldowns, available models, recent requests, and recent usage; prompts, replies, and real keys never enter history or the page
 - **Request statistics**: token-protected `/stats`, `/config`, and `magpie-lite stats` show provider and per-key totals, token usage, statuses, latency, active secret-free key cooldowns, and recent request metadata (including which key slot served it, never the key); `recent_usage` adds provider/model aggregates over the recent window, and optional sanitized JSONL history keeps that window across restarts while process totals stay process-local
 - **Agent wiring**: `magpie-lite claude <model>` (settings.json env block), `magpie-lite codex <model>` (config.toml provider table, native `wire_api = "responses"`), `magpie-lite crush <model>` (custom OpenAI-compatible provider and large-model pick), `magpie-lite gemini <model>` (`~/.gemini/settings.json` plus `.env`), `magpie-lite goose <model>` (custom OpenAI-compatible provider plus the active model), `magpie-lite opencode <model>` (`~/.config/opencode/opencode.json` provider block), `magpie-lite zed <model>` (OpenAI-compatible provider in Zed settings; the token goes in Zed provider settings or `MAGPIE_LITE_API_KEY`, not `settings.json`)
 - **Conformance tests** for every translation direction, and end-to-end tests over real HTTP with mock Chat and Gemini upstreams
@@ -45,7 +45,7 @@ magpie-lite group add daily-coding \
 
 # run the gateway
 magpie-lite serve
-# open the read-only console (models and statistics still require the local token)
+# open the console (models and statistics still require the local token)
 # http://127.0.0.1:3426/
 
 # agents use the configured token (default: magpie-lite) as their local API key
@@ -69,6 +69,39 @@ magpie-lite serve --history-file 'D:\magpie\history.jsonl'
 
 Restart the agent after wiring it. For Zed, also set MAGPIE_LITE_API_KEY to the gateway token in Zed's environment, or enter that token in Zed's AI provider settings. Unwire by restoring the agent's own provider (or use your agent switcher).
 
+## Editing routing groups
+
+The web console can create, edit, and delete routing groups. Enter an ID such as
+`daily-coding`, an optional display name, and one `provider/model` route per line
+in fallback order. Agents select `group/daily-coding`. IDs allow ASCII letters,
+digits, hyphens and underscores; routes require an existing provider and a nonempty
+model. Models may be unlisted, for providers that discover them dynamically.
+
+The following endpoints require the same local token as inference routes:
+
+| Method | Endpoint | Body / response |
+|---|---|---|
+| POST | `/config/groups` | `{"id":"daily","name":"Daily","routes":["deepseek/deepseek-chat"]}`; 201 on creation |
+| PUT | `/config/groups/{id}` | Same body with matching ID; replaces name and routes; 200 |
+| DELETE | `/config/groups/{id}` | No body; 200 |
+
+Successful edits return the secret-free `/config` snapshot. Invalid input returns
+400, missing groups 404, duplicate IDs or referenced group deletions 409. A provider
+fallback that names a group must be changed before that group can be deleted.
+
+Changes are written to the selected `--config` file (or the standard config path)
+using a temporary file and replacement, then become visible to new requests and
+model catalogs immediately. In-flight requests keep their original routing snapshot.
+A failed save leaves the active configuration unchanged. Edits are serialized within
+one gateway process. External file changes are detected before saving and return
+409; restart the gateway to load CLI or manual config edits. Run one gateway process
+per config file: the external-change check does not lock out simultaneous writes
+from other processes. Comments and formatting are rewritten when saving TOML.
+
+`serve --port` and `serve --history-file` remain runtime overrides and are not
+persisted by group edits. Embedded callers using `serve(config, port)` without a
+file path receive 503 for editing; use `serve_with_config_path` to enable it.
+
 ## Layout
 
 | Crate | What it is |
@@ -86,7 +119,7 @@ Tests are the contract: `crates/core/tests/translation.rs` checks real wire shap
 ## Not yet (the roadmap)
 
 - More agents (Cursor CLI, ...)
-- Editing providers, groups, and key cooldowns from the console
+- Editing providers and key cooldowns from the console
 - A TUI
 
 ## Safety

@@ -246,6 +246,33 @@ pub struct GroupConfig {
 }
 
 impl GroupConfig {
+    /// The same rules the CLI and console API enforce.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.id.is_empty()
+            || self
+                .id
+                .chars()
+                .any(|c| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        {
+            anyhow::bail!("group id must contain only ASCII letters, digits, `-`, or `_`");
+        }
+        if self.routes.is_empty() {
+            anyhow::bail!("a group needs at least one route");
+        }
+        if self.routes.iter().any(|route| route.starts_with("group/")) {
+            anyhow::bail!("group routes must name providers directly, not other groups");
+        }
+        for route in &self.routes {
+            let Some((provider, model)) = route.split_once('/') else {
+                anyhow::bail!("group routes must use provider/model");
+            };
+            if provider.is_empty() || model.is_empty() || route.chars().any(char::is_whitespace) {
+                anyhow::bail!("group routes must use non-empty provider/model without whitespace");
+            }
+        }
+        Ok(())
+    }
+
     /// Display name: the given one, or the id.
     pub fn label(&self) -> &str {
         if self.name.is_empty() {
@@ -281,7 +308,7 @@ pub struct ProviderConfigSnapshot {
 /// One routing group as the console may show it.
 #[derive(Debug, Clone, Serialize)]
 pub struct GroupConfigSnapshot {
-    /// `group/<id>` as agents spell it.
+    /// Short id; agents use `group/<id>`.
     pub id: String,
     /// Display name.
     pub name: String,
@@ -367,10 +394,17 @@ impl Config {
 
     /// Save back to the same path, creating parents as needed.
     pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, toml::to_string_pretty(self)?)?;
+        use std::io::Write;
+
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        fs::create_dir_all(parent)?;
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        file.write_all(toml::to_string_pretty(self)?.as_bytes())?;
+        file.as_file().sync_all()?;
+        file.persist(path)?;
         Ok(())
     }
 
