@@ -75,6 +75,73 @@ pub struct KeyStats {
     pub errors: u64,
 }
 
+/// Request and token totals over an arbitrary history window.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RecentUsageStats {
+    /// Completed or failed records in the window.
+    pub requests: u64,
+    /// Records whose final status was not `ok`.
+    pub errors: u64,
+    /// Records for which the provider reported at least one usage field.
+    pub requests_with_usage: u64,
+    /// Summed reported input tokens.
+    pub input_tokens: u64,
+    /// Summed reported output tokens.
+    pub output_tokens: u64,
+    /// Summed reported prompt-cache read tokens.
+    pub cache_read_tokens: u64,
+    /// Summed reported prompt-cache write tokens.
+    pub cache_write_tokens: u64,
+    /// Summed gateway latency.
+    pub total_latency_ms: u64,
+    /// Mean gateway latency, rounded down.
+    pub average_latency_ms: Option<u64>,
+}
+
+impl RecentUsageStats {
+    fn absorb(&mut self, record: &RequestRecord) {
+        self.requests = self.requests.saturating_add(1);
+        if record.status != "ok" {
+            self.errors = self.errors.saturating_add(1);
+        }
+        if record.usage.input.is_some()
+            || record.usage.output.is_some()
+            || record.usage.cache_read.is_some()
+            || record.usage.cache_write.is_some()
+        {
+            self.requests_with_usage = self.requests_with_usage.saturating_add(1);
+        }
+        self.input_tokens = self
+            .input_tokens
+            .saturating_add(record.usage.input.unwrap_or(0));
+        self.output_tokens = self
+            .output_tokens
+            .saturating_add(record.usage.output.unwrap_or(0));
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(record.usage.cache_read.unwrap_or(0));
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(record.usage.cache_write.unwrap_or(0));
+        self.total_latency_ms = self.total_latency_ms.saturating_add(record.latency_ms);
+    }
+
+    fn finish(&mut self) {
+        self.average_latency_ms = self.total_latency_ms.checked_div(self.requests);
+    }
+}
+
+/// Aggregate usage over the recent-history window loaded in this process.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RecentUsageSummary {
+    /// Totals for the whole window.
+    pub totals: RecentUsageStats,
+    /// Totals by provider id.
+    pub by_provider: BTreeMap<String, RecentUsageStats>,
+    /// Totals by the model name the agent selected.
+    pub by_model: BTreeMap<String, RecentUsageStats>,
+}
+
 /// Per-provider totals. Missing usage fields count as zero.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ProviderStats {
@@ -99,6 +166,8 @@ pub struct StatsSnapshot {
     pub errors: u64,
     /// Totals by provider id.
     pub providers: BTreeMap<String, ProviderStats>,
+    /// Usage totals over the recent-history window.
+    pub recent_usage: RecentUsageSummary,
     /// The most recent records, oldest first.
     pub recent_requests: Vec<RequestRecord>,
 }
@@ -200,6 +269,7 @@ impl RequestLog {
             total_requests: self.total_requests,
             errors: self.errors,
             providers: self.providers.clone(),
+            recent_usage: summarize_recent(&self.recent_requests),
             recent_requests: self.recent_requests.clone(),
         }
     }
@@ -220,6 +290,31 @@ impl RequestLog {
             tracing::warn!("could not append request history: {error}");
         }
     }
+}
+
+fn summarize_recent(records: &[RequestRecord]) -> RecentUsageSummary {
+    let mut summary = RecentUsageSummary::default();
+    for record in records {
+        summary.totals.absorb(record);
+        summary
+            .by_provider
+            .entry(record.provider.clone())
+            .or_default()
+            .absorb(record);
+        summary
+            .by_model
+            .entry(record.requested_model.clone())
+            .or_default()
+            .absorb(record);
+    }
+    summary.totals.finish();
+    for stats in summary.by_provider.values_mut() {
+        stats.finish();
+    }
+    for stats in summary.by_model.values_mut() {
+        stats.finish();
+    }
+    summary
 }
 
 /// Tracks one request from routing until its reply or stream finishes.
@@ -343,6 +438,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn recent_usage_summarizes_the_loaded_window() {
+        let mut log = RequestLog::default();
+        log.record(record(1, "ok"));
+        log.record(record(2, "upstream_error"));
+        let mut fallback = record(20, "ok");
+        fallback.provider = "backup".into();
+        fallback.requested_model = "group/daily-coding".into();
+        fallback.usage.cache_read = Some(5);
+        log.record(fallback);
+
+        let summary = log.snapshot().recent_usage;
+        assert_eq!(summary.totals.requests, 3);
+        assert_eq!(summary.totals.errors, 1);
+        assert_eq!(summary.totals.requests_with_usage, 3);
+        assert_eq!(summary.totals.input_tokens, 23);
+        assert_eq!(summary.totals.output_tokens, 26);
+        assert_eq!(summary.totals.cache_read_tokens, 5);
+        assert_eq!(summary.totals.total_latency_ms, 23);
+        assert_eq!(summary.totals.average_latency_ms, Some(7));
+
+        let mock = &summary.by_provider["mock"];
+        assert_eq!(mock.requests, 2);
+        assert_eq!(mock.errors, 1);
+        assert_eq!(mock.input_tokens, 3);
+        assert_eq!(mock.output_tokens, 5);
+
+        let backup = &summary.by_provider["backup"];
+        assert_eq!(backup.requests, 1);
+        assert_eq!(backup.input_tokens, 20);
+        assert_eq!(backup.cache_read_tokens, 5);
+        assert_eq!(summary.by_model["group/daily-coding"].requests, 1);
+    }
     #[test]
     fn history_round_trips_recent_metadata_only() {
         let path = history_path("round-trip");

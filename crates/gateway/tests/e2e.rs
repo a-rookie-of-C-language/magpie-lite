@@ -1396,6 +1396,19 @@ async fn stats_track_nonstream_and_stream_usage() {
     assert_eq!(stats["providers"]["mock"]["input_tokens"], 39);
     assert_eq!(stats["providers"]["mock"]["output_tokens"], 16);
 
+    let recent_usage = &stats["recent_usage"];
+    assert_eq!(recent_usage["totals"]["requests"], 2);
+    assert_eq!(recent_usage["totals"]["errors"], 0);
+    assert_eq!(recent_usage["totals"]["requests_with_usage"], 2);
+    assert_eq!(recent_usage["totals"]["input_tokens"], 39);
+    assert_eq!(recent_usage["totals"]["output_tokens"], 16);
+    assert!(recent_usage["totals"]["average_latency_ms"].is_u64());
+    assert_eq!(recent_usage["by_provider"]["mock"]["requests"], 2);
+    assert_eq!(
+        recent_usage["by_model"]["mock/mock-model"]["input_tokens"],
+        39
+    );
+
     let recent = stats["recent_requests"].as_array().unwrap();
     assert_eq!(recent.len(), 2);
     assert_eq!(recent[0]["client_protocol"], "chat");
@@ -1464,6 +1477,12 @@ async fn history_survives_restart_without_conversation_or_credentials() {
     assert_eq!(stats["errors"], 0);
     assert!(stats["providers"].as_object().unwrap().is_empty());
     assert_eq!(stats["recent_requests"].as_array().unwrap().len(), 1);
+    assert_eq!(stats["recent_usage"]["totals"]["requests"], 1);
+    assert_eq!(stats["recent_usage"]["totals"]["input_tokens"], 31);
+    assert_eq!(
+        stats["recent_usage"]["by_provider"]["mock"]["output_tokens"],
+        12
+    );
 
     let response = client
         .post(format!("{second_gateway}/v1/chat/completions"))
@@ -1489,6 +1508,12 @@ async fn history_survives_restart_without_conversation_or_credentials() {
         .unwrap();
     assert_eq!(stats["total_requests"], 1);
     assert_eq!(stats["providers"]["mock"]["requests"], 1);
+    assert_eq!(stats["recent_usage"]["totals"]["requests"], 2);
+    assert_eq!(stats["recent_usage"]["totals"]["input_tokens"], 62);
+    assert_eq!(
+        stats["recent_usage"]["by_model"]["mock/mock-model"]["output_tokens"],
+        24
+    );
     let recent = stats["recent_requests"].as_array().unwrap();
     assert_eq!(recent.len(), 2);
     let first_started = recent[0]["started_unix_ms"].as_u64().unwrap();
