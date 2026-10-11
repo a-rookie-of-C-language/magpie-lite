@@ -6,7 +6,8 @@ One local gateway for every coding agent — a Rust rewrite of [magpie](https://
 Claude Code ─┐                                  ┌─ OpenAI-compatible (DeepSeek, Kimi, GLM, OpenRouter, Ollama, ...)
 Codex ───────┤                                  ├─ Anthropic Messages
 Gemini CLI ─┤─▶ magpie-lite gateway ─▶ IR ────▶└─ Gemini generateContent
-OpenCode ────┘   Chat + Responses +
+OpenCode ────┤
+Zed ─────────┘   Chat + Responses +
                  Anthropic + Gemini
                  translated per provider
 ```
@@ -21,7 +22,7 @@ OpenCode ────┘   Chat + Responses +
 - **Failover**: ordered provider fallbacks and routing-group routes, tried before any reply bytes are streamed when the active provider is rate limited, out of quota, overloaded, or unreachable
 - **Local authentication**: every non-health route requires the configured token as Bearer, Anthropic `x-api-key`, or Gemini `x-goog-api-key`; `/health` stays public
 - **Request statistics**: token-protected `/stats` and `magpie-lite stats` show provider and per-key totals, token usage, statuses, latency, and recent request metadata (including which key slot served it, never the key) — in memory only, with no prompt/reply text or credentials
-- **Agent wiring**: `magpie-lite claude <model>` (settings.json env block), `magpie-lite codex <model>` (config.toml provider table, native `wire_api = "responses"`), `magpie-lite gemini <model>` (`~/.gemini/settings.json` plus `.env`), `magpie-lite opencode <model>` (`~/.config/opencode/opencode.json` provider block)
+- **Agent wiring**: `magpie-lite claude <model>` (settings.json env block), `magpie-lite codex <model>` (config.toml provider table, native `wire_api = "responses"`), `magpie-lite gemini <model>` (`~/.gemini/settings.json` plus `.env`), `magpie-lite opencode <model>` (`~/.config/opencode/opencode.json` provider block), `magpie-lite zed <model>` (OpenAI-compatible provider in Zed settings; the token goes in Zed provider settings or `MAGPIE_LITE_API_KEY`, not `settings.json`)
 - **Conformance tests** for every translation direction, and end-to-end tests over real HTTP with mock Chat and Gemini upstreams
 
 ## Quick start
@@ -50,12 +51,13 @@ magpie-lite claude group/daily-coding
 magpie-lite codex group/daily-coding
 magpie-lite gemini group/daily-coding
 magpie-lite opencode group/daily-coding
+magpie-lite zed group/daily-coding
 
 # see provider/request/token totals
 magpie-lite stats
 ```
 
-Restart the agent after wiring it. Unwire by restoring its own provider (or use your agent switcher).
+Restart the agent after wiring it. For Zed, also set MAGPIE_LITE_API_KEY to the gateway token in Zed's environment, or enter that token in Zed's AI provider settings. Unwire by restoring the agent's own provider (or use your agent switcher).
 
 ## Layout
 
@@ -75,7 +77,7 @@ Tests are the contract: `crates/core/tests/translation.rs` checks real wire shap
 
 - Provider reset timestamps and body-reported retry delays (`Retry-After` and common `x-ratelimit-reset-*` durations work)
 - Persistent request history and richer usage views (in-memory `/stats` already works)
-- More agents (Cursor CLI, Zed, Crush, Goose, ...)
+- More agents (Cursor CLI, Crush, Goose, ...)
 - A TUI/Web UI
 
 ## Safety

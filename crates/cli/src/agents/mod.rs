@@ -5,6 +5,7 @@ pub mod claude;
 pub mod codex;
 pub mod gemini;
 pub mod opencode;
+pub mod zed;
 
 /// One supported agent, as `magpie-lite ls` shows it.
 pub struct AgentInfo {
@@ -38,6 +39,11 @@ pub fn list() -> Vec<AgentInfo> {
             id: "opencode",
             name: "OpenCode",
             installed: opencode::installed(),
+        },
+        AgentInfo {
+            id: "zed",
+            name: "Zed",
+            installed: zed::installed(),
         },
     ]
 }
@@ -179,6 +185,47 @@ mod tests {
         assert_eq!(
             v["provider"]["magpie-lite"]["models"],
             serde_json::json!({"deepseek/deepseek-chat": {"name": "deepseek/deepseek-chat"}})
+        );
+    }
+
+    #[test]
+    fn zed_wire_replaces_only_the_gateway_provider_fields() {
+        let dir = tempdir();
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"theme":"dark","language_models":{"openai":{"api_url":"https://api.openai.com/v1"},"openai_compatible":{"mine":{"api_url":"https://example.com/v1"},"magpie-lite":{"api_url":"http://localhost:9999/v1","custom_headers":{"X-Kept":"yes"},"unrelated":"kept","available_models":[{"name":"old-route","max_tokens":1000}]}}}}"#,
+        )
+        .unwrap();
+
+        zed::wire_at(&path, "group/daily-coding", 3426, "real-key").expect("wire");
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["theme"], "dark");
+        assert_eq!(
+            v["language_models"]["openai"]["api_url"],
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            v["language_models"]["openai_compatible"]["mine"]["api_url"],
+            "https://example.com/v1"
+        );
+        let provider = &v["language_models"]["openai_compatible"]["magpie-lite"];
+        assert_eq!(provider["api_url"], "http://127.0.0.1:3426/v1");
+        assert_eq!(provider["custom_headers"]["X-Kept"], "yes");
+        assert_eq!(provider["unrelated"], "kept");
+        assert_eq!(
+            provider["available_models"],
+            serde_json::json!([{
+                "name": "group/daily-coding",
+                "display_name": "magpie-lite group/daily-coding",
+                "max_tokens": 128000
+            }])
+        );
+        assert!(
+            !text.contains("real-key"),
+            "gateway token stays out of settings"
         );
     }
 

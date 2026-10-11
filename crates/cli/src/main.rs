@@ -60,6 +60,11 @@ enum Command {
         /// Model as the gateway names it: `deepseek/deepseek-chat`.
         model: String,
     },
+    /// Point Zed at the gateway, on a model.
+    Zed {
+        /// Model as the gateway names it: `deepseek/deepseek-chat`.
+        model: String,
+    },
     /// List the agents this build can wire, and whether they are installed.
     Ls,
     /// Show request and usage statistics from the running gateway.
@@ -326,6 +331,16 @@ async fn main() -> Result<()> {
             let path = agents::opencode::wire(&model, cfg.port, &cfg.token)?;
             println!("OpenCode wired onto {model} ({})", path.display());
             println!("restart OpenCode for the change to take effect");
+        }
+        Command::Zed { model } => {
+            let cfg = load_config(&cli.config)?;
+            let path = agents::zed::wire(&model, cfg.port, &cfg.token)?;
+            println!("Zed wired onto {model} ({})", path.display());
+            println!(
+                "set {} to the gateway token before launching Zed, or enter it in Zed's AI provider settings",
+                agents::zed::API_KEY_ENV_VAR
+            );
+            println!("restart Zed for the change to take effect");
         }
         Command::Ls => {
             for a in agents::list() {
