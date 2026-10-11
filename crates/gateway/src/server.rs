@@ -374,6 +374,11 @@ fn key_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 401 | 402 | 403 | 429)
 }
 
+/// Quota and rate-limit responses should influence later key selection.
+fn quota_limited_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 402 | 429)
+}
+
 /// Whether an upstream status is worth spending another route on.
 fn route_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(
@@ -451,6 +456,13 @@ async fn send_with_fallback(
                 status.as_u16().to_string()
             };
             tracker.record_attempt(&route.provider.id, *key_slot, &attempt_status);
+            if quota_limited_status(status) {
+                state.key_rotation.cool_down(
+                    &route.provider.id,
+                    *key_slot,
+                    state.config.key_cooldown_for(&route.provider),
+                );
+            }
             if status.is_success() {
                 return Ok((resp, candidate));
             }

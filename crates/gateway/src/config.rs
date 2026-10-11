@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -77,6 +78,10 @@ pub struct ProviderConfig {
     /// any of the reply has been sent: models as agents pick them.
     #[serde(default)]
     pub fallback: Vec<String>,
+    /// Override the gateway-wide cooldown applied after this provider marks
+    /// a key out of quota or rate limited.
+    #[serde(default)]
+    pub key_cooldown_ms: Option<u64>,
 }
 
 impl ProviderConfig {
@@ -110,35 +115,74 @@ impl ProviderConfig {
     }
 }
 
-/// Round-robin key selection for one gateway process.
+/// Round-robin and cooldown selection for one gateway process.
 ///
 /// The cursor is provider-local and never persisted. Rotation spreads normal
-/// load across a pool; a key-level rejection makes the next key serve that
-/// same request.
+/// load across a pool; a quota/rate-limit rejection makes the next key serve
+/// that request and cools the rejected key for later requests.
+#[derive(Debug, Default)]
+struct KeyRotationState {
+    cursor: usize,
+    cooldowns: BTreeMap<usize, Instant>,
+}
+
+/// Thread-safe key pool scheduler used by the gateway state.
 #[derive(Debug, Default)]
 pub struct KeyRotator {
-    cursors: Mutex<BTreeMap<String, usize>>,
+    states: Mutex<BTreeMap<String, KeyRotationState>>,
 }
 
 impl KeyRotator {
-    /// Return (configured slot, key) pairs rotated to the next starting key.
+    /// Return `(configured slot, key)` pairs, starting at the next key that is
+    /// not cooling. If every key is cooling, all are returned as a best effort
+    /// rather than leaving the provider with no route.
     pub fn rotate(&self, provider_id: &str, keys: &[String]) -> Vec<(usize, String)> {
         if keys.len() < 2 {
             return keys.iter().cloned().map(|key| (0, key)).collect();
         }
-        let mut cursors = self
-            .cursors
+        let now = Instant::now();
+        let mut states = self
+            .states
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let start = cursors.entry(provider_id.to_owned()).or_insert(0);
-        let rotated = keys[*start..]
+        let state = states.entry(provider_id.to_owned()).or_default();
+        state.cooldowns.retain(|_, until| *until > now);
+
+        let start = state.cursor;
+        let rotated = keys[start..]
             .iter()
-            .chain(keys[..*start].iter())
+            .chain(keys[..start].iter())
             .enumerate()
-            .map(|(rotated_slot, key)| ((*start + rotated_slot) % keys.len(), key.clone()))
+            .map(|(rotated_slot, key)| ((start + rotated_slot) % keys.len(), key.clone()))
             .collect::<Vec<_>>();
-        *start = (*start + 1) % keys.len();
-        rotated
+        state.cursor = (start + 1) % keys.len();
+
+        let available = rotated
+            .iter()
+            .filter(|(slot, _)| !state.cooldowns.contains_key(slot))
+            .cloned()
+            .collect::<Vec<_>>();
+        if available.is_empty() {
+            rotated
+        } else {
+            available
+        }
+    }
+
+    /// Avoid a quota-limited or rate-limited key when another key is healthy.
+    pub fn cool_down(&self, provider_id: &str, key_slot: usize, cooldown: Duration) {
+        if cooldown.is_zero() {
+            return;
+        }
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        states
+            .entry(provider_id.to_owned())
+            .or_default()
+            .cooldowns
+            .insert(key_slot, Instant::now() + cooldown);
     }
 }
 
@@ -178,6 +222,9 @@ pub struct Config {
     /// Provider id used when a model names none.
     #[serde(default)]
     pub default_provider: String,
+    /// Default time to avoid a provider key after quota or rate-limit rejection.
+    #[serde(default = "default_key_cooldown_ms")]
+    pub key_cooldown_ms: u64,
     /// The upstreams.
     #[serde(default)]
     pub provider: Vec<ProviderConfig>,
@@ -190,6 +237,10 @@ fn default_port() -> u16 {
     3426
 }
 
+fn default_key_cooldown_ms() -> u64 {
+    60_000
+}
+
 fn default_token() -> String {
     "magpie-lite".to_owned()
 }
@@ -200,6 +251,7 @@ impl Default for Config {
             port: default_port(),
             token: default_token(),
             default_provider: String::new(),
+            key_cooldown_ms: default_key_cooldown_ms(),
             provider: Vec::new(),
             group: Vec::new(),
         }
@@ -234,6 +286,12 @@ impl Config {
     /// Find a routing group by id.
     pub fn group(&self, id: &str) -> Option<&GroupConfig> {
         self.group.iter().find(|g| g.id == id)
+    }
+
+    /// The cooldown to apply after a provider key is quota-limited or rate
+    /// limited. A provider override wins over the gateway-wide default.
+    pub fn key_cooldown_for(&self, provider: &ProviderConfig) -> Duration {
+        Duration::from_millis(provider.key_cooldown_ms.unwrap_or(self.key_cooldown_ms))
     }
 
     /// Resolve a model name to (upstream, upstream model name).
@@ -321,6 +379,7 @@ mod tests {
             api_keys: Vec::new(),
             models: Vec::new(),
             fallback: Vec::new(),
+            key_cooldown_ms: None,
         };
 
         assert_eq!(provider.api_key_pool(), vec!["legacy-key".to_owned()]);
@@ -339,5 +398,42 @@ mod tests {
             rotator.rotate("mock", &keys),
             vec![(1, "two".to_owned()), (0, "one".to_owned())]
         );
+    }
+
+    #[test]
+    fn key_cooldown_hides_a_slot_until_it_expires() {
+        let rotator = KeyRotator::default();
+        let keys = vec!["one".to_owned(), "two".to_owned()];
+        rotator.rotate("mock", &keys);
+        rotator.rotate("mock", &keys);
+        rotator.cool_down("mock", 0, Duration::from_millis(20));
+
+        assert_eq!(rotator.rotate("mock", &keys), vec![(1, "two".to_owned())]);
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            rotator.rotate("mock", &keys),
+            vec![(1, "two".to_owned()), (0, "one".to_owned())]
+        );
+    }
+
+    #[test]
+    fn provider_cooldown_overrides_the_gateway_default() {
+        let config = Config::default();
+        let mut provider = ProviderConfig {
+            id: "mock".into(),
+            name: String::new(),
+            protocol: Protocol::Chat,
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: String::new(),
+            api_keys: Vec::new(),
+            models: Vec::new(),
+            fallback: Vec::new(),
+            key_cooldown_ms: None,
+        };
+
+        assert_eq!(config.key_cooldown_for(&provider), Duration::from_secs(60));
+        provider.key_cooldown_ms = Some(0);
+        assert_eq!(config.key_cooldown_for(&provider), Duration::ZERO);
     }
 }

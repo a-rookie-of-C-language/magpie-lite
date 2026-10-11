@@ -114,6 +114,9 @@ enum ProviderCommand {
         /// Fallback routes, tried in order when this provider is rate limited, out of quota, or down.
         #[arg(long = "fallback")]
         fallback: Vec<String>,
+        /// Cooldown in milliseconds after a key is quota-limited or rate limited.
+        #[arg(long)]
+        key_cooldown_ms: Option<u64>,
         /// Make this the provider for models that name none.
         #[arg(long)]
         default: bool,
@@ -159,6 +162,7 @@ async fn main() -> Result<()> {
                 name,
                 models,
                 fallback,
+                key_cooldown_ms,
                 default,
             } => {
                 if id == "group" {
@@ -175,6 +179,7 @@ async fn main() -> Result<()> {
                     api_keys,
                     models,
                     fallback,
+                    key_cooldown_ms,
                 };
                 match cfg.provider.iter().position(|p| p.id == id) {
                     Some(i) => cfg.provider[i] = provider,
@@ -201,14 +206,16 @@ async fn main() -> Result<()> {
                         ""
                     };
                     let key_count = p.api_key_pool().len();
+                    let cooldown = cfg.key_cooldown_for(p);
                     println!(
-                        "{:<14} {:<10} {}{} [{} key{}]",
+                        "{:<14} {:<10} {}{} [{} key{}, cooldown {}s]",
                         p.id,
                         p.protocol.as_str(),
                         p.base_url,
                         marker,
                         key_count,
-                        if key_count == 1 { "" } else { "s" }
+                        if key_count == 1 { "" } else { "s" },
+                        cooldown.as_secs_f32()
                     );
                     for m in &p.models {
                         println!("               {}/{}", p.id, m);

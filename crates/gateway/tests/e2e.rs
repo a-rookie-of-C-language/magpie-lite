@@ -166,6 +166,7 @@ async fn spawn_gateway_with_protocol(upstream_base: String, protocol: Protocol) 
     let config = Config {
         port: 0,
         token: "magpie-lite".into(),
+        key_cooldown_ms: 60_000,
         default_provider: "mock".into(),
         provider: vec![ProviderConfig {
             id: "mock".into(),
@@ -183,6 +184,7 @@ async fn spawn_gateway_with_protocol(upstream_base: String, protocol: Protocol) 
             api_keys: Vec::new(),
             models: vec!["mock-model".into()],
             fallback: Vec::new(),
+            key_cooldown_ms: None,
         }],
         group: Vec::new(),
     };
@@ -484,6 +486,7 @@ async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) ->
         api_keys: vec!["first-key".into(), "second-key".into()],
         models: vec!["mock-model".into()],
         fallback: Vec::new(),
+        key_cooldown_ms: None,
     }];
     if let Some(backup) = backup {
         fallback.push("backup/mock-model".into());
@@ -496,6 +499,7 @@ async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) ->
             api_keys: Vec::new(),
             models: vec!["mock-model".into()],
             fallback: Vec::new(),
+            key_cooldown_ms: None,
         });
     }
     providers[0].fallback = fallback;
@@ -503,6 +507,7 @@ async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) ->
     let config = Config {
         port: 0,
         token: "magpie-lite".into(),
+        key_cooldown_ms: 60_000,
         default_provider: "primary".into(),
         provider: providers,
         group: Vec::new(),
@@ -527,6 +532,7 @@ async fn spawn_gateway_with_fallback(primary: String, backup: String) -> String 
     let config = Config {
         port: 0,
         token: "magpie-lite".into(),
+        key_cooldown_ms: 60_000,
         default_provider: "primary".into(),
         provider: vec![
             ProviderConfig {
@@ -538,6 +544,7 @@ async fn spawn_gateway_with_fallback(primary: String, backup: String) -> String 
                 api_keys: Vec::new(),
                 models: vec!["mock-model".into()],
                 fallback: vec!["backup/mock-model".into()],
+                key_cooldown_ms: None,
             },
             ProviderConfig {
                 id: "backup".into(),
@@ -548,6 +555,7 @@ async fn spawn_gateway_with_fallback(primary: String, backup: String) -> String 
                 api_keys: Vec::new(),
                 models: vec!["mock-model".into()],
                 fallback: Vec::new(),
+                key_cooldown_ms: None,
             },
         ],
         group: Vec::new(),
@@ -573,6 +581,7 @@ async fn spawn_gateway_with_group(primary: String, backup: String) -> String {
     let config = Config {
         port: 0,
         token: "magpie-lite".into(),
+        key_cooldown_ms: 60_000,
         default_provider: "primary".into(),
         provider: vec![
             ProviderConfig {
@@ -584,6 +593,7 @@ async fn spawn_gateway_with_group(primary: String, backup: String) -> String {
                 api_keys: Vec::new(),
                 models: vec!["mock-model".into()],
                 fallback: Vec::new(),
+                key_cooldown_ms: None,
             },
             ProviderConfig {
                 id: "backup".into(),
@@ -594,6 +604,7 @@ async fn spawn_gateway_with_group(primary: String, backup: String) -> String {
                 api_keys: Vec::new(),
                 models: vec!["mock-model".into()],
                 fallback: Vec::new(),
+                key_cooldown_ms: None,
             },
         ],
         group: vec![GroupConfig {
@@ -862,25 +873,28 @@ async fn api_key_pools_retry_rate_limits_and_rotate() {
         "second key worked."
     );
 
-    // The rate-limited key is retried only within the same request. The next
-    // request starts with the other key, so normal load rotates too.
-    let second = client
-        .post(format!("{gw}/v1/chat/completions"))
-        .bearer_auth("magpie-lite")
-        .json(&json!({
-            "model": "primary/mock-model",
-            "messages": [{"role": "user", "content": "Again?"}]
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(second.status(), StatusCode::OK);
-    drop(second.json::<Value>().await.unwrap());
+    // The rate-limited key is retried only within the same request. Its 429
+    // also starts the configured cooldown, so following requests avoid it.
+    for expected_content in ["Again?", "Once more?"] {
+        let later = client
+            .post(format!("{gw}/v1/chat/completions"))
+            .bearer_auth("magpie-lite")
+            .json(&json!({
+                "model": "primary/mock-model",
+                "messages": [{"role": "user", "content": expected_content}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(later.status(), StatusCode::OK);
+        drop(later.json::<Value>().await.unwrap());
+    }
 
     assert_eq!(
         *seen_keys.lock().unwrap(),
         vec![
             "first-key".to_owned(),
+            "second-key".to_owned(),
             "second-key".to_owned(),
             "second-key".to_owned()
         ]
@@ -896,12 +910,13 @@ async fn api_key_pools_retry_rate_limits_and_rotate() {
     let recent = stats["recent_requests"].as_array().unwrap();
     assert_eq!(recent[0]["key_slot"], 1);
     assert_eq!(recent[1]["key_slot"], 1);
-    assert_eq!(stats["providers"]["primary"]["requests"], 2);
+    assert_eq!(recent[2]["key_slot"], 1);
+    assert_eq!(stats["providers"]["primary"]["requests"], 3);
     assert_eq!(stats["providers"]["primary"]["keys"]["0"]["attempts"], 1);
     assert_eq!(stats["providers"]["primary"]["keys"]["0"]["successes"], 0);
     assert_eq!(stats["providers"]["primary"]["keys"]["0"]["errors"], 1);
-    assert_eq!(stats["providers"]["primary"]["keys"]["1"]["attempts"], 2);
-    assert_eq!(stats["providers"]["primary"]["keys"]["1"]["successes"], 2);
+    assert_eq!(stats["providers"]["primary"]["keys"]["1"]["attempts"], 3);
+    assert_eq!(stats["providers"]["primary"]["keys"]["1"]["successes"], 3);
     assert_eq!(stats["providers"]["primary"]["keys"]["1"]["errors"], 0);
 }
 
