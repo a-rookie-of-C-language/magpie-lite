@@ -109,6 +109,7 @@ async fn gateway() -> Gateway {
     )
     .await;
     let state = Arc::new(AppState {
+        agents: None,
         config: ConfigStore::new(config, Some(path.clone())),
         http: magpie_gateway::upstream::http_client().unwrap(),
         requests: Arc::new(Mutex::new(magpie_gateway::usage::RequestLog::default())),
@@ -238,6 +239,7 @@ async fn metadata_edit_preserves_legacy_keys_and_cooldown_then_explicit_clear_re
     config.save(&gw.path).unwrap();
     // Refresh this isolated fixture's store before any edits, like gateway startup.
     let state = Arc::new(AppState {
+        agents: None,
         config: ConfigStore::new(config, Some(gw.path.clone())),
         http: magpie_gateway::upstream::http_client().unwrap(),
         requests: Arc::new(Mutex::new(magpie_gateway::usage::RequestLog::default())),

@@ -1,6 +1,6 @@
 //! magpie-lite: one local gateway for every coding agent.
 
-mod agents;
+use magpie_agents::lifecycle::{Action, AgentId, Gateway, Manager, state_directory};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -41,6 +41,11 @@ enum Command {
     Group {
         #[command(subcommand)]
         command: GroupCommand,
+    },
+    /// Preview, connect, disconnect, and recover agent configuration.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
     },
     /// Point Claude Code at the gateway, on a model.
     Claude {
@@ -84,6 +89,36 @@ enum Command {
     Stats,
     /// List the models the configured providers serve.
     Models,
+}
+
+#[derive(Subcommand)]
+enum AgentCommand {
+    /// Show detection, managed connection, drift, and recovery status as JSON.
+    List,
+    /// Preview an operation without touching agent files. The output never contains keys.
+    Preview {
+        agent: AgentId,
+        #[arg(required_unless_present = "disconnect", conflicts_with = "disconnect")]
+        model: Option<String>,
+        /// Preview restoration instead of a connection.
+        #[arg(long)]
+        disconnect: bool,
+    },
+    /// Connect with a durable backup; optionally require a previously reviewed revision.
+    Connect {
+        agent: AgentId,
+        model: String,
+        #[arg(long)]
+        revision: Option<String>,
+    },
+    /// Restore the pre-connection files; refuses to overwrite subsequent user edits.
+    Disconnect {
+        agent: AgentId,
+        #[arg(long)]
+        revision: Option<String>,
+    },
+    /// Roll back an interrupted connect, or finish an interrupted disconnect.
+    Recover { agent: AgentId },
 }
 
 #[derive(Subcommand)]
@@ -161,6 +196,44 @@ fn provider_path(cli: &Option<std::path::PathBuf>) -> Result<std::path::PathBuf>
         Some(p) => Ok(p.clone()),
         None => config_path(),
     }
+}
+
+fn agent_manager(path: &Option<std::path::PathBuf>) -> Result<Manager> {
+    Ok(Manager::native(state_directory(&provider_path(path)?)?)?)
+}
+fn agent_config(
+    path: &Option<std::path::PathBuf>,
+    action: Action,
+    model: Option<&str>,
+) -> Result<Config> {
+    // Restoring/recovering must not depend on a still-valid gateway config.
+    if action == Action::Disconnect {
+        return Ok(Config::default());
+    }
+    let config = load_config(path)?;
+    if !model.is_some_and(|model| config.resolve(model).is_some()) {
+        anyhow::bail!("model does not resolve to a configured provider or routing group");
+    }
+    Ok(config)
+}
+fn agent_apply(
+    path: &Option<std::path::PathBuf>,
+    agent: AgentId,
+    action: Action,
+    model: Option<&str>,
+    revision: Option<&str>,
+) -> Result<()> {
+    let manager = agent_manager(path)?;
+    let config = agent_config(path, action, model)?;
+    let gateway = || Gateway {
+        port: config.port,
+        token: &config.token,
+    };
+    let preview = manager.preview(agent, action, model, gateway())?;
+    let revision = revision.unwrap_or(&preview.revision);
+    let status = manager.apply(agent, action, model, revision, gateway())?;
+    println!("{}", serde_json::to_string_pretty(&status)?);
+    Ok(())
 }
 
 #[tokio::main]
@@ -303,60 +376,123 @@ async fn main() -> Result<()> {
                 println!("removed group `{id}`");
             }
         },
-        Command::Claude { model } => {
-            let cfg = load_config(&cli.config)?;
-            let path = agents::claude::wire(&model, cfg.port, &cfg.token)?;
-            println!("Claude Code wired onto {model} ({})", path.display());
-            println!("restart Claude Code for the change to take effect");
-        }
-        Command::Codex { model } => {
-            let cfg = load_config(&cli.config)?;
-            let path = agents::codex::wire(&model, cfg.port, &cfg.token)?;
-            println!("Codex wired onto {model} ({})", path.display());
-            println!("restart Codex for the change to take effect");
-        }
-        Command::Crush { model } => {
-            let cfg = load_config(&cli.config)?;
-            let path = agents::crush::wire(&model, cfg.port, &cfg.token)?;
-            println!("Crush wired onto {model} ({})", path.display());
-            println!("restart Crush for the provider and model changes to take effect");
-        }
-        Command::Gemini { model } => {
-            let cfg = load_config(&cli.config)?;
-            let path = agents::gemini::wire(&model, cfg.port, &cfg.token)?;
-            println!("Gemini CLI wired onto {model} ({})", path.display());
-            println!("restart Gemini CLI for the change to take effect");
-        }
-        Command::Goose { model } => {
-            let cfg = load_config(&cli.config)?;
-            let path = agents::goose::wire(&model, cfg.port, &cfg.token)?;
-            println!("Goose wired onto {model} ({})", path.display());
-            println!("restart Goose for the provider and model changes to take effect");
-        }
-        Command::OpenCode { model } => {
-            let cfg = load_config(&cli.config)?;
-            let path = agents::opencode::wire(&model, cfg.port, &cfg.token)?;
-            println!("OpenCode wired onto {model} ({})", path.display());
-            println!("restart OpenCode for the change to take effect");
-        }
-        Command::Zed { model } => {
-            let cfg = load_config(&cli.config)?;
-            let path = agents::zed::wire(&model, cfg.port, &cfg.token)?;
-            println!("Zed wired onto {model} ({})", path.display());
-            println!(
-                "set {} to the gateway token before launching Zed, or enter it in Zed's AI provider settings",
-                agents::zed::API_KEY_ENV_VAR
-            );
-            println!("restart Zed for the change to take effect");
-        }
-        Command::Ls => {
-            for a in agents::list() {
-                let state = if a.installed {
-                    "installed"
+        Command::Agent { command } => match command {
+            AgentCommand::List => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&agent_manager(&cli.config)?.statuses()?)?
+                );
+            }
+            AgentCommand::Preview {
+                agent,
+                model,
+                disconnect,
+            } => {
+                let action = if disconnect {
+                    Action::Disconnect
                 } else {
-                    "not found"
+                    Action::Connect
                 };
-                println!("{:<8} {:<12} {}", a.id, a.name, state);
+                let manager = agent_manager(&cli.config)?;
+                let config = agent_config(&cli.config, action, model.as_deref())?;
+                let preview = manager.preview(
+                    agent,
+                    action,
+                    model.as_deref(),
+                    Gateway {
+                        port: config.port,
+                        token: &config.token,
+                    },
+                )?;
+                println!("{}", serde_json::to_string_pretty(&preview)?);
+            }
+            AgentCommand::Connect {
+                agent,
+                model,
+                revision,
+            } => {
+                agent_apply(
+                    &cli.config,
+                    agent,
+                    Action::Connect,
+                    Some(&model),
+                    revision.as_deref(),
+                )?;
+            }
+            AgentCommand::Disconnect { agent, revision } => {
+                agent_apply(
+                    &cli.config,
+                    agent,
+                    Action::Disconnect,
+                    None,
+                    revision.as_deref(),
+                )?;
+            }
+            AgentCommand::Recover { agent } => {
+                let status = agent_manager(&cli.config)?.recover(agent)?;
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            }
+        },
+        Command::Claude { model } => agent_apply(
+            &cli.config,
+            AgentId::Claude,
+            Action::Connect,
+            Some(&model),
+            None,
+        )?,
+        Command::Codex { model } => agent_apply(
+            &cli.config,
+            AgentId::Codex,
+            Action::Connect,
+            Some(&model),
+            None,
+        )?,
+        Command::Crush { model } => agent_apply(
+            &cli.config,
+            AgentId::Crush,
+            Action::Connect,
+            Some(&model),
+            None,
+        )?,
+        Command::Gemini { model } => agent_apply(
+            &cli.config,
+            AgentId::Gemini,
+            Action::Connect,
+            Some(&model),
+            None,
+        )?,
+        Command::Goose { model } => agent_apply(
+            &cli.config,
+            AgentId::Goose,
+            Action::Connect,
+            Some(&model),
+            None,
+        )?,
+        Command::OpenCode { model } => agent_apply(
+            &cli.config,
+            AgentId::Opencode,
+            Action::Connect,
+            Some(&model),
+            None,
+        )?,
+        Command::Zed { model } => agent_apply(
+            &cli.config,
+            AgentId::Zed,
+            Action::Connect,
+            Some(&model),
+            None,
+        )?,
+        Command::Ls => {
+            for agent in agent_manager(&cli.config)?.statuses()? {
+                println!(
+                    "{:<8} {:<12} detected={} connected={} drifted={} recovery={}",
+                    agent.id.id(),
+                    agent.name,
+                    agent.detected,
+                    agent.connected,
+                    agent.drifted,
+                    agent.recovery_needed
+                );
             }
         }
         Command::Stats => {

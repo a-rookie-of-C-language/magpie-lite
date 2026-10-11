@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+magpie-agents = { path = "../agents" }
 magpie-core = { path = "../core" }
 anyhow.workspace = true
 async-stream.workspace = true

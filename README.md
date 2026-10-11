@@ -94,6 +94,26 @@ IDs permit ASCII letters, digits, hyphens and underscores; `group` is reserved. 
 
 Successful edits return the secret-free `/config` snapshot. Invalid provider IDs, protocols, URLs, models, keys, and fallback routes return 400. Duplicate providers return 409; missing providers return 404. Changes are persisted through the same atomic config update used by routing groups.
 
+## Agent connection, restore and recovery
+
+The CLI and protected HTTP API now share seven adapters through the
+`magpie-agents` crate. Use `agent preview <id> <model>`,
+`agent connect <id> <model>`, `agent preview <id> --disconnect`,
+`agent disconnect <id>` and `agent recover <id>`. `agent list` reports managed
+connection, drift and pending recovery. Existing per-agent shorthand commands
+also save a durable backup before writing.
+
+HTTP management exposes `GET /agents` and
+`POST /agents/{id}/preview|apply|recover`. Apply requires the reviewed preview
+revision. Previews show paths, operations and byte counts, not secrets.
+
+Unchanged managed files can be restored byte-for-byte; later user edits are
+refused rather than overwritten. Multi-file operations have explicit journaled
+recovery, not an atomic all-file transaction. Journals retain sensitive baseline
+credentials and are **not encrypted**. The console agent panel and field-level
+restore are still pending. See `docs/agent-lifecycle.md` for commands, API bodies,
+port overrides, backup retention, platform permissions and precise limitations.
+
 ## Discovering models and testing providers
 
 The provider editor offers **Discover models** and **Test connection** for both
@@ -179,7 +199,8 @@ file path receive 503 for editing; use `serve_with_config_path` to enable it.
 |---|---|
 | `crates/core` | The IR and the wire codecs (chat, responses, anthropic, gemini), streaming included |
 | `crates/gateway` | The axum server, model routing, upstream clients, SSE translation |
-| `crates/cli` | The `magpie-lite` binary and per-agent config adapters |
+| `crates/agents` | Shared agent adapters, private preview, revision checks, journals and restoration/recovery |
+| `crates/cli` | The `magpie-lite` binary using the same backend and agent lifecycle as HTTP management |
 
 ## Design
 
@@ -191,15 +212,15 @@ Tests are the contract: `crates/core/tests/translation.rs` checks real wire shap
 
 - More agents (Cursor CLI, ...)
 - A TUI
-- Model discovery and provider connection tests
-- Agent connect/disconnect with backup, restoration and drift detection
+- Agent lifecycle console panel and selective restoration preserving later unrelated edits
+- Broader provider capability metadata and stream-only/specialized connection probes
 - More routing policies, versioned admin API and separate management authentication
 
 See [core parity tracker](docs/core-parity.md) for implementation evidence and remaining reference gaps.
 
 ## Safety
 
-Agent adapters only rewrite the fields that name the gateway, and tests run against explicit paths — never your real home. `MAGPIE_LITE_HOME` redirects agent config lookups when you want it.
+Agent configuration operations use reviewed revisions and durable backups, and refuse later file drift. The test suites run against explicit temporary paths or child processes — never your real home. `MAGPIE_LITE_HOME` redirects agent config lookups in sandboxes and wrappers. Sensitive backups are access-restricted but not encrypted; see `docs/agent-lifecycle.md`.
 
 ## License
 

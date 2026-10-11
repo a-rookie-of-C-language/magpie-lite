@@ -82,7 +82,12 @@ fn read_config(path: &Path) -> Result<YamlValue> {
     if text.trim().is_empty() {
         return Ok(YamlValue::Mapping(Mapping::new()));
     }
-    serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    let config: YamlValue =
+        serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    if !config.is_mapping() {
+        anyhow::bail!("Goose configuration must contain a YAML mapping");
+    }
+    Ok(config)
 }
 
 /// Write Goose's newer `active_provider` plus `providers` layout, preserving
@@ -90,6 +95,12 @@ fn read_config(path: &Path) -> Result<YamlValue> {
 fn set_active_provider(config: &mut YamlValue, model: &str) -> Result<()> {
     set_top(config, "active_provider", PROVIDER_ID);
 
+    if config
+        .get("providers")
+        .is_some_and(|providers| !providers.is_mapping())
+    {
+        anyhow::bail!("Goose providers must contain a YAML mapping");
+    }
     if !config.get("providers").is_some_and(YamlValue::is_mapping) {
         config["providers"] = YamlValue::Mapping(Mapping::new());
     }

@@ -32,6 +32,8 @@ const CONSOLE_HTML: &str = include_str!("console.html");
 
 /// Shared handler state.
 pub struct AppState {
+    /// Optional shared agent lifecycle manager and actual listening port.
+    pub agents: Option<crate::agents::AgentService>,
     /// The loaded configuration.
     pub config: ConfigStore,
     /// The pooled upstream client.
@@ -51,6 +53,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1beta/models", get(gemini_models))
         .route("/v1beta/models/{*model}", post(gemini_generate))
         .route("/v1/models", get(list_models))
+        .route("/agents", get(crate::agents::list))
+        .route("/agents/{id}/preview", post(crate::agents::preview))
+        .route("/agents/{id}/apply", post(crate::agents::apply))
+        .route("/agents/{id}/recover", post(crate::agents::recover))
         .route("/stats", get(stats))
         .route("/config", get(config))
         .route("/config/providers", post(crate::providers::create))
@@ -154,7 +160,11 @@ pub async fn serve_with_config_path(
     config_path: Option<std::path::PathBuf>,
     history_path: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    let port = port.unwrap_or(config.port);
+    let requested_port = port.unwrap_or(config.port);
+    let listener =
+        tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], requested_port))).await?;
+    let addr = listener.local_addr()?;
+    let port = addr.port();
     let http = upstream::http_client()?;
     let requests = match history_path.as_ref().or(config.history_path.as_ref()) {
         Some(path) => {
@@ -163,7 +173,18 @@ pub async fn serve_with_config_path(
         }
         None => Arc::new(Mutex::new(RequestLog::default())),
     };
+    let agent_config = match &config_path {
+        Some(path) => path.clone(),
+        None => crate::config::config_path()?,
+    };
+    let manager = magpie_agents::lifecycle::Manager::native(
+        magpie_agents::lifecycle::state_directory(&agent_config)?,
+    )?;
     let state = Arc::new(AppState {
+        agents: Some(crate::agents::AgentService {
+            manager: Arc::new(manager),
+            port,
+        }),
         config: ConfigStore::new(config, config_path),
         http,
         requests,
@@ -171,8 +192,6 @@ pub async fn serve_with_config_path(
     });
     let app = build_router(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("magpie-lite gateway listening on http://{addr}");
     println!("magpie-lite gateway listening on http://{addr}");
     axum::serve(listener, app).await?;

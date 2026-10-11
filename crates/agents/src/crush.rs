@@ -13,7 +13,7 @@ const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 16_384;
 
 /// Crush keeps providers and picker data in different files on Unix, but in
 /// one `%LOCALAPPDATA%\crush\crush.json` on Windows.
-fn paths() -> Result<(PathBuf, PathBuf)> {
+pub fn paths() -> Result<(PathBuf, PathBuf)> {
     if let Some(home) = std::env::var_os("MAGPIE_LITE_HOME").filter(|value| !value.is_empty()) {
         let home = PathBuf::from(home);
         return Ok((
@@ -102,7 +102,12 @@ fn read_object(path: &Path) -> Result<Value> {
     if text.trim().is_empty() {
         return Ok(json!({}));
     }
-    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    let config: Value =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    if !config.is_object() {
+        anyhow::bail!("Crush configuration must contain a JSON object");
+    }
+    Ok(config)
 }
 
 fn set_provider(config: &mut Value, model: &str, port: u16, token: &str) {

@@ -9,12 +9,12 @@ name = "magpie-lite"
 path = "src/main.rs"
 
 [dependencies]
+magpie-agents = { path = "../agents" }
 magpie-gateway = { path = "../gateway" }
 anyhow.workspace = true
 clap.workspace = true
-dirs.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
-toml.workspace = true
-toml_edit.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

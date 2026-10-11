@@ -1,5 +1,6 @@
 //! magpie-gateway: the local server agents talk to.
 
+pub mod agents;
 pub mod config;
 pub mod config_store;
 pub mod cooldown;

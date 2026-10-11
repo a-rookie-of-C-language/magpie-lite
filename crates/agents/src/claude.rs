@@ -35,6 +35,12 @@ pub fn wire_at(path: &Path, model: &str, port: u16, token: &str) -> Result<()> {
     } else {
         json!({})
     };
+    if !settings.is_object() {
+        anyhow::bail!("Claude settings must contain a JSON object");
+    }
+    if settings.get("env").is_some_and(|env| !env.is_object()) {
+        anyhow::bail!("Claude env must contain a JSON object");
+    }
     if !settings.get("env").map(Value::is_object).unwrap_or(false) {
         settings["env"] = json!({});
     }

@@ -7,15 +7,19 @@ use std::path::{Path, PathBuf};
 /// Where OpenCode reads its user configuration from.
 pub fn config_path() -> Result<PathBuf> {
     let dir = config_dir()?;
+    Ok(preferred_path(&dir))
+}
+
+pub(crate) fn preferred_path(dir: &Path) -> PathBuf {
     // OpenCode itself prefers the JSONC file, so do the same. Wiring rejects
     // JSONC rather than writing an ignored opencode.json beside it.
     for name in ["opencode.jsonc", "opencode.json", "config.json"] {
         let path = dir.join(name);
         if path.exists() {
-            return Ok(path);
+            return path;
         }
     }
-    Ok(dir.join("opencode.json"))
+    dir.join("opencode.json")
 }
 
 /// The OpenCode config directory, with `MAGPIE_LITE_HOME` taking precedence

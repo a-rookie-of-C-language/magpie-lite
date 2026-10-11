@@ -432,3 +432,8 @@ mod tests {
         dir
     }
 }
+
+pub mod lifecycle;
+
+#[cfg(windows)]
+mod windows;

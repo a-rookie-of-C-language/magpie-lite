@@ -73,6 +73,7 @@ async fn gateway(referenced: bool) -> Gateway {
     };
     config.save(&path).unwrap();
     let state = Arc::new(AppState {
+        agents: None,
         config: ConfigStore::new(config, Some(path.clone())),
         http: magpie_gateway::upstream::http_client().unwrap(),
         requests: Arc::new(Mutex::new(magpie_gateway::usage::RequestLog::default())),
