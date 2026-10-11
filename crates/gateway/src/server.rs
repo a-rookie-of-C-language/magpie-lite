@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Request, State};
@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
-use magpie_core::ir::CompletionRequest;
+use magpie_core::ir::{CompletionRequest, Usage};
 use magpie_core::stream::{SseParser, StreamEvent};
 use magpie_core::{anthropic, chat, gemini, responses};
 use serde_json::{Value, json};
@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 use crate::config::ProviderConfig;
 use crate::config::{Config, Protocol};
 use crate::upstream;
+use crate::usage::{RequestLog, RequestTracker, StatsSnapshot};
 
 /// Shared handler state.
 pub struct AppState {
@@ -30,6 +31,8 @@ pub struct AppState {
     pub config: Config,
     /// The pooled upstream client.
     pub http: reqwest::Client,
+    /// In-memory request totals and recent history for `/stats`.
+    pub requests: Arc<Mutex<RequestLog>>,
 }
 
 /// Build the router around a state; what `serve` runs and tests drive.
@@ -41,9 +44,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1beta/models", get(gemini_models))
         .route("/v1beta/models/{*model}", post(gemini_generate))
         .route("/v1/models", get(list_models))
-        // Every model route above proves it knows the configured local
-        // token before a request can reach a provider. The health probe
-        // below is added after the layer and stays public.
+        .route("/stats", get(stats))
+        // Every route above proves it knows the configured local token
+        // before a request can reach a provider or read statistics. The
+        // health probe below is added after the layer and stays public.
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
         .route("/health", get(health))
         .with_state(state)
@@ -112,7 +116,11 @@ fn auth_error_body(uri: &Uri, status: StatusCode) -> Value {
 pub async fn serve(config: Config, port: Option<u16>) -> anyhow::Result<()> {
     let port = port.unwrap_or(config.port);
     let http = upstream::http_client()?;
-    let state = Arc::new(AppState { config, http });
+    let state = Arc::new(AppState {
+        config,
+        http,
+        requests: Arc::new(Mutex::new(RequestLog::default())),
+    });
     let app = build_router(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -125,6 +133,16 @@ pub async fn serve(config: Config, port: Option<u16>) -> anyhow::Result<()> {
 
 async fn health() -> Json<Value> {
     Json(json!({"status": "ok"}))
+}
+
+/// GET /stats — totals and recent request metadata, token-protected.
+async fn stats(State(state): State<Arc<AppState>>) -> Json<StatsSnapshot> {
+    let snapshot = state
+        .requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .snapshot();
+    Json(snapshot)
 }
 
 async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -180,6 +198,16 @@ impl ClientWire {
             Self::Anthropic => upstream::anthropic_error(status, message),
             Self::Responses => upstream::responses_error(status, message),
             Self::Gemini => upstream::gemini_error(status, message),
+        }
+    }
+
+    /// The name used in request statistics.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Chat { .. } => "chat",
+            Self::Anthropic => "anthropic",
+            Self::Responses => "responses",
+            Self::Gemini => "gemini",
         }
     }
 
@@ -317,9 +345,10 @@ async fn send_with_fallback(
     creq: &CompletionRequest,
     initial: UpstreamCandidate,
     wire: ClientWire,
-) -> Result<(reqwest::Response, Protocol), Box<Response>> {
+) -> Result<(reqwest::Response, UpstreamCandidate), (Box<Response>, UpstreamCandidate)> {
     let candidates = upstream_candidates(&state.config, initial);
     let last = candidates.len().saturating_sub(1);
+    let no_route = candidates.first().cloned().expect("initial candidate");
 
     for (attempt, candidate) in candidates.into_iter().enumerate() {
         let body = upstream::build_request(&candidate.provider, creq, &candidate.model);
@@ -344,10 +373,13 @@ async fn send_with_fallback(
                 let message = format!("cannot reach {}: {e}", candidate.provider.id);
                 tracing::warn!("{message}");
                 if attempt == last {
-                    return Err(Box::new(err_response(
-                        StatusCode::BAD_GATEWAY,
-                        wire.error_body(StatusCode::BAD_GATEWAY, &message),
-                    )));
+                    return Err((
+                        Box::new(err_response(
+                            StatusCode::BAD_GATEWAY,
+                            wire.error_body(StatusCode::BAD_GATEWAY, &message),
+                        )),
+                        candidate,
+                    ));
                 }
                 continue;
             }
@@ -355,7 +387,7 @@ async fn send_with_fallback(
 
         let status = resp.status();
         if status.is_success() {
-            return Ok((resp, candidate.provider.protocol));
+            return Ok((resp, candidate));
         }
         let detail = upstream::error_detail(resp).await;
         tracing::warn!("upstream {}: {detail}", candidate.provider.id);
@@ -363,16 +395,19 @@ async fn send_with_fallback(
             continue;
         }
         let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        return Err(Box::new(err_response(
-            status,
-            wire.error_body(status, &detail),
-        )));
+        return Err((
+            Box::new(err_response(status, wire.error_body(status, &detail))),
+            candidate,
+        ));
     }
 
-    Err(Box::new(err_response(
-        StatusCode::BAD_GATEWAY,
-        wire.error_body(StatusCode::BAD_GATEWAY, "no upstream route"),
-    )))
+    Err((
+        Box::new(err_response(
+            StatusCode::BAD_GATEWAY,
+            wire.error_body(StatusCode::BAD_GATEWAY, "no upstream route"),
+        )),
+        no_route,
+    ))
 }
 
 fn err_response(status: StatusCode, body: Value) -> Response {
@@ -433,26 +468,45 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
         Err((status, body)) => return err_response(status, body),
     };
 
-    let (resp, protocol) = match send_with_fallback(&state, &creq, initial, wire).await {
-        Ok(x) => x,
-        Err(response) => return *response,
+    let mut tracker = RequestTracker::new(
+        state.requests.clone(),
+        wire.name(),
+        &creq,
+        &initial.provider.id,
+        &initial.model,
+    );
+    let (resp, candidate) = match send_with_fallback(&state, &creq, initial, wire).await {
+        Ok((resp, candidate)) => {
+            tracker.set_route(&candidate.provider.id, &candidate.model);
+            (resp, candidate)
+        }
+        Err((response, candidate)) => {
+            tracker.set_route(&candidate.provider.id, &candidate.model);
+            tracker.finish("upstream_error", &Usage::default());
+            return *response;
+        }
     };
+    let protocol = candidate.provider.protocol;
 
     if !creq.stream {
         let upstream_body: Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
                 let message = format!("bad upstream body: {e}");
+                tracker.finish("bad_upstream_body", &Usage::default());
                 return err_response(
                     StatusCode::BAD_GATEWAY,
                     wire.error_body(StatusCode::BAD_GATEWAY, &message),
                 );
             }
         };
+        let mut status = "ok";
         let ir = decode_upstream_response(protocol, &upstream_body).unwrap_or_else(|e| {
             tracing::warn!("decoding upstream reply: {e}");
+            status = "upstream_decode_error";
             magpie_core::ir::CompletionResponse::default()
         });
+        tracker.finish(status, &ir.usage);
         return ok_json(wire.encode_response(&ir));
     }
 
@@ -463,6 +517,7 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
         let mut decoders = UpstreamDecoders::new();
         let mut encoder = ClientStreamEncoder::new(wire, &client_model);
         let mut byte_stream = byte_stream;
+        let mut usage = Usage::default();
 
         while let Some(chunk) = byte_stream.next().await {
             let chunk = match chunk {
@@ -474,6 +529,7 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
                     if let Some(frame) = encoder.encode(&event) {
                         yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                     }
+                    tracker.finish("upstream_stream_error", &usage);
                     break;
                 }
             };
@@ -488,6 +544,12 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
                     Err(_) => continue,
                 };
                 for event in decode_upstream_chunk(protocol, &value, &mut decoders) {
+                    if let StreamEvent::Usage(reported) = &event {
+                        usage.merge(reported);
+                    }
+                    if matches!(event, StreamEvent::Error { .. }) {
+                        tracker.finish("upstream_stream_error", &usage);
+                    }
                     if let Some(frame) = encoder.encode(&event) {
                         yield Ok(Bytes::from(frame));
                     }
@@ -499,6 +561,12 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
             && let Ok(value) = serde_json::from_str::<Value>(&data)
         {
             for event in decode_upstream_chunk(protocol, &value, &mut decoders) {
+                if let StreamEvent::Usage(reported) = &event {
+                    usage.merge(reported);
+                }
+                if matches!(event, StreamEvent::Error { .. }) {
+                    tracker.finish("upstream_stream_error", &usage);
+                }
                 if let Some(frame) = encoder.encode(&event) {
                     yield Ok(Bytes::from(frame));
                 }
@@ -507,6 +575,7 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
         if let Some(frame) = encoder.encode(&StreamEvent::Done) {
             yield Ok(Bytes::from(frame));
         }
+        tracker.finish("ok", &usage);
     };
     sse_response(Body::from_stream(out))
 }

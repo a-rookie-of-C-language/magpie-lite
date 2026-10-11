@@ -187,6 +187,9 @@ async fn spawn_gateway_with_protocol(upstream_base: String, protocol: Protocol) 
     let state = Arc::new(AppState {
         config,
         http: magpie_gateway::upstream::http_client().unwrap(),
+        requests: Arc::new(std::sync::Mutex::new(
+            magpie_gateway::usage::RequestLog::default(),
+        )),
     });
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -397,6 +400,9 @@ async fn spawn_gateway_with_fallback(primary: String, backup: String) -> String 
     let state = Arc::new(AppState {
         config,
         http: magpie_gateway::upstream::http_client().unwrap(),
+        requests: Arc::new(std::sync::Mutex::new(
+            magpie_gateway::usage::RequestLog::default(),
+        )),
     });
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -555,6 +561,50 @@ async fn retryable_primary_falls_back_before_streaming() {
     let upstream_req = last.lock().unwrap().clone().expect("backup was called");
     assert_eq!(upstream_req["model"], "mock-model");
     assert!(upstream_req["stream"].as_bool().unwrap());
+
+    let stats = client
+        .get(format!("{gw}/stats"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap();
+    let stats: Value = stats.json().await.unwrap();
+    assert_eq!(stats["total_requests"], 1);
+    assert!(stats["providers"].get("primary").is_none());
+    assert_eq!(stats["providers"]["backup"]["requests"], 1);
+    assert_eq!(stats["recent_requests"][0]["provider"], "backup");
+}
+
+#[tokio::test]
+async fn stats_record_upstream_failures() {
+    let upstream = spawn_rate_limited().await;
+    let gw = spawn_gateway(upstream).await;
+    let client = reqwest::Client::new();
+
+    let failed = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "mock/mock-model",
+            "messages": [{"role": "user", "content": "Weather?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), StatusCode::TOO_MANY_REQUESTS);
+    drop(failed.json::<Value>().await.unwrap());
+
+    let stats = client
+        .get(format!("{gw}/stats"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap();
+    let stats: Value = stats.json().await.unwrap();
+    assert_eq!(stats["total_requests"], 1);
+    assert_eq!(stats["errors"], 1);
+    assert_eq!(stats["providers"]["mock"]["errors"], 1);
+    assert_eq!(stats["recent_requests"][0]["status"], "upstream_error");
 }
 
 #[tokio::test]
@@ -756,6 +806,68 @@ async fn chat_client_stream_over_gemini_upstream() {
     assert_eq!(upstream_req["path"], "mock-model:streamGenerateContent");
     assert_eq!(upstream_req["api_key"], "test-key");
     assert!(upstream_req["body"].get("model").is_none());
+}
+
+#[tokio::test]
+async fn stats_track_nonstream_and_stream_usage() {
+    let (upstream, _) = spawn_mock().await;
+    let gw = spawn_gateway(upstream).await;
+    let client = reqwest::Client::new();
+
+    let nonstream = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "mock/mock-model",
+            "messages": [{"role": "user", "content": "Weather?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(nonstream.status(), StatusCode::OK);
+    drop(nonstream.json::<Value>().await.unwrap());
+
+    let stream = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "mock/mock-model",
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "messages": [{"role": "user", "content": "Weather?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+    drop(stream.text().await.unwrap());
+
+    let stats = client
+        .get(format!("{gw}/stats"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stats.status(), StatusCode::OK);
+    let stats: Value = stats.json().await.unwrap();
+    assert_eq!(stats["total_requests"], 2);
+    assert_eq!(stats["errors"], 0);
+    assert_eq!(stats["providers"]["mock"]["requests"], 2);
+    assert_eq!(stats["providers"]["mock"]["errors"], 0);
+    assert_eq!(stats["providers"]["mock"]["input_tokens"], 39);
+    assert_eq!(stats["providers"]["mock"]["output_tokens"], 16);
+
+    let recent = stats["recent_requests"].as_array().unwrap();
+    assert_eq!(recent.len(), 2);
+    assert_eq!(recent[0]["client_protocol"], "chat");
+    assert_eq!(recent[0]["stream"], false);
+    assert_eq!(recent[0]["status"], "ok");
+    assert_eq!(recent[0]["usage"]["input"], 31);
+    assert_eq!(recent[1]["stream"], true);
+    assert_eq!(recent[1]["status"], "ok");
+    assert_eq!(recent[1]["usage"]["input"], 8);
+    assert_eq!(recent[1]["usage"]["output"], 4);
+    assert!(recent[1]["latency_ms"].is_u64());
 }
 
 #[tokio::test]

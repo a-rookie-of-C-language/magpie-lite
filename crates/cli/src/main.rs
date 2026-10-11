@@ -57,6 +57,8 @@ enum Command {
     },
     /// List the agents this build can wire, and whether they are installed.
     Ls,
+    /// Show request and usage statistics from the running gateway.
+    Stats,
     /// List the models the configured providers serve.
     Models,
 }
@@ -234,6 +236,24 @@ async fn main() -> Result<()> {
                 };
                 println!("{:<8} {:<12} {}", a.id, a.name, state);
             }
+        }
+        Command::Stats => {
+            let cfg = load_config(&cli.config)?;
+            let url = format!("http://127.0.0.1:{}/stats", cfg.port);
+            let response = magpie_gateway::upstream::http_client()?
+                .get(&url)
+                .bearer_auth(&cfg.token)
+                .send()
+                .await
+                .with_context(|| format!("requesting {url}; is the gateway running?"))?;
+            if !response.status().is_success() {
+                anyhow::bail!("gateway returned {}", response.status());
+            }
+            let stats: serde_json::Value = response
+                .json()
+                .await
+                .with_context(|| format!("reading response from {url}"))?;
+            println!("{}", serde_json::to_string_pretty(&stats)?);
         }
         Command::Models => {
             let cfg = load_config(&cli.config)?;
