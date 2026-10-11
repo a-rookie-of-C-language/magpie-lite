@@ -52,6 +52,11 @@ enum Command {
         /// Model as the gateway names it: `deepseek/deepseek-chat`.
         model: String,
     },
+    /// Point Crush at the gateway, on a model.
+    Crush {
+        /// Model as the gateway names it: deepseek/deepseek-chat.
+        model: String,
+    },
     /// Point Gemini CLI at the gateway, on a model.
     Gemini {
         /// Model as the gateway names it: `deepseek/deepseek-chat`.
@@ -330,6 +335,12 @@ async fn main() -> Result<()> {
             let path = agents::codex::wire(&model, cfg.port, &cfg.token)?;
             println!("Codex wired onto {model} ({})", path.display());
             println!("restart Codex for the change to take effect");
+        }
+        Command::Crush { model } => {
+            let cfg = load_config(&cli.config)?;
+            let path = agents::crush::wire(&model, cfg.port, &cfg.token)?;
+            println!("Crush wired onto {model} ({})", path.display());
+            println!("restart Crush for the provider and model changes to take effect");
         }
         Command::Gemini { model } => {
             let cfg = load_config(&cli.config)?;

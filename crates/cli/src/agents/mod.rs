@@ -3,6 +3,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod crush;
 pub mod gemini;
 pub mod goose;
 pub mod opencode;
@@ -30,6 +31,11 @@ pub fn list() -> Vec<AgentInfo> {
             id: "codex",
             name: "Codex",
             installed: codex::installed(),
+        },
+        AgentInfo {
+            id: "crush",
+            name: "Crush",
+            installed: crush::installed(),
         },
         AgentInfo {
             id: "gemini",
@@ -197,6 +203,112 @@ mod tests {
         );
     }
 
+    #[test]
+    fn crush_wire_preserves_unrelated_config_and_replaces_the_large_pick() {
+        let dir = tempdir();
+        let config = dir.join("crush-config.json");
+        let data = dir.join("crush-data.json");
+        std::fs::write(
+            &config,
+            r#"{
+  "theme": "dark",
+  "providers": {
+    "mine": {"type": "openai", "api_key": "keep-me"},
+    "magpie-lite": {
+      "custom": true,
+      "models": [{"id": "old-route", "name": "Old"}]
+    }
+  }
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &data,
+            r#"{
+  "models": {
+    "large": {
+      "provider": "openai",
+      "model": "gpt-5",
+      "reasoning_effort": "medium",
+      "max_tokens": 128000,
+      "temperature": 0.2,
+      "provider_options": {"x": 1}
+    },
+    "small": {"provider": "openai", "model": "gpt-5-mini"}
+  },
+  "providers": {"openai": {"api_key": "sk-keep"}},
+  "recent_models": {
+    "large": [{"provider": "openai", "model": "gpt-5"}]
+  }
+}"#,
+        )
+        .unwrap();
+
+        crush::wire_at(&config, &data, "deepseek/deepseek-chat", 3426, "tok").expect("wire");
+
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(config["theme"], "dark");
+        assert_eq!(config["providers"]["mine"]["api_key"], "keep-me");
+        let provider = &config["providers"]["magpie-lite"];
+        assert_eq!(provider["type"], "openai");
+        assert_eq!(provider["base_url"], "http://127.0.0.1:3426/v1");
+        assert_eq!(provider["api_key"], "tok");
+        assert_eq!(provider["custom"], true);
+        assert_eq!(
+            provider["models"],
+            serde_json::json!([{
+                "id": "deepseek/deepseek-chat",
+                "name": "deepseek/deepseek-chat",
+                "context_window": 200000,
+                "default_max_tokens": 16384,
+                "can_reason": false
+            }])
+        );
+
+        let data: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&data).unwrap()).unwrap();
+        assert_eq!(
+            data["models"]["large"],
+            serde_json::json!({
+                "provider": "magpie-lite",
+                "model": "deepseek/deepseek-chat"
+            })
+        );
+        assert_eq!(data["models"]["small"]["model"], "gpt-5-mini");
+        assert_eq!(data["providers"]["openai"]["api_key"], "sk-keep");
+        assert_eq!(data["recent_models"]["large"][0]["model"], "gpt-5");
+    }
+
+    #[test]
+    fn crush_windows_layout_writes_provider_and_pick_in_one_file() {
+        let dir = tempdir();
+        let path = dir.join("crush.json");
+        std::fs::write(
+            &path,
+            r#"{"theme":"dark","models":{"large":{"provider":"openai","model":"gpt-5"},"small":{"provider":"openai","model":"gpt-5-mini"}},"providers":{"openai":{"api_key":"sk-keep"},"magpie-lite":{"custom":true,"models":[{"id":"old-route"}]}}}"#,
+        )
+        .unwrap();
+
+        crush::wire_at(&path, &path, "group/daily-coding", 3426, "tok").expect("wire");
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["theme"], "dark");
+        assert_eq!(
+            v["models"]["large"],
+            serde_json::json!({
+                "provider": "magpie-lite",
+                "model": "group/daily-coding"
+            })
+        );
+        assert_eq!(v["models"]["small"]["model"], "gpt-5-mini");
+        assert_eq!(v["providers"]["openai"]["api_key"], "sk-keep");
+        assert_eq!(
+            v["providers"]["magpie-lite"]["base_url"],
+            "http://127.0.0.1:3426/v1"
+        );
+    }
     #[test]
     fn opencode_wire_replaces_only_the_gateway_provider_fields() {
         let dir = tempdir();

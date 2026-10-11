@@ -22,7 +22,7 @@ Zed ─────────┘   Chat + Responses +
 - **Failover**: ordered provider fallbacks and routing-group routes, tried before any reply bytes are streamed when the active provider is rate limited, out of quota, overloaded, or unreachable
 - **Local authentication**: every non-health route requires the configured token as Bearer, Anthropic `x-api-key`, or Gemini `x-goog-api-key`; `/health` stays public
 - **Request statistics**: token-protected `/stats` and `magpie-lite stats` show provider and per-key totals, token usage, statuses, latency, and recent request metadata (including which key slot served it, never the key); `recent_usage` adds provider/model aggregates over the recent window, and optional sanitized JSONL history keeps that window across restarts while process totals stay process-local
-- **Agent wiring**: `magpie-lite claude <model>` (settings.json env block), `magpie-lite codex <model>` (config.toml provider table, native `wire_api = "responses"`), `magpie-lite gemini <model>` (`~/.gemini/settings.json` plus `.env`), `magpie-lite goose <model>` (custom OpenAI-compatible provider plus the active model), `magpie-lite opencode <model>` (`~/.config/opencode/opencode.json` provider block), `magpie-lite zed <model>` (OpenAI-compatible provider in Zed settings; the token goes in Zed provider settings or `MAGPIE_LITE_API_KEY`, not `settings.json`)
+- **Agent wiring**: `magpie-lite claude <model>` (settings.json env block), `magpie-lite codex <model>` (config.toml provider table, native `wire_api = "responses"`), `magpie-lite crush <model>` (custom OpenAI-compatible provider and large-model pick), `magpie-lite gemini <model>` (`~/.gemini/settings.json` plus `.env`), `magpie-lite goose <model>` (custom OpenAI-compatible provider plus the active model), `magpie-lite opencode <model>` (`~/.config/opencode/opencode.json` provider block), `magpie-lite zed <model>` (OpenAI-compatible provider in Zed settings; the token goes in Zed provider settings or `MAGPIE_LITE_API_KEY`, not `settings.json`)
 - **Conformance tests** for every translation direction, and end-to-end tests over real HTTP with mock Chat and Gemini upstreams
 
 ## Quick start
@@ -49,6 +49,7 @@ magpie-lite serve
 # point agents at it
 magpie-lite claude group/daily-coding
 magpie-lite codex group/daily-coding
+magpie-lite crush group/daily-coding
 magpie-lite gemini group/daily-coding
 magpie-lite goose group/daily-coding
 magpie-lite opencode group/daily-coding
@@ -80,7 +81,7 @@ Tests are the contract: `crates/core/tests/translation.rs` checks real wire shap
 
 ## Not yet (the roadmap)
 
-- More agents (Cursor CLI, Crush, ...)
+- More agents (Cursor CLI, ...)
 - A TUI/Web UI
 
 ## Safety
