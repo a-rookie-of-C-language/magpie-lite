@@ -4,7 +4,7 @@ mod agents;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use magpie_gateway::{Config, Protocol, ProviderConfig, config_path};
+use magpie_gateway::{Config, GroupConfig, Protocol, ProviderConfig, config_path};
 
 #[derive(Parser)]
 #[command(
@@ -34,6 +34,11 @@ enum Command {
         #[command(subcommand)]
         command: ProviderCommand,
     },
+    /// Manage named route chains.
+    Group {
+        #[command(subcommand)]
+        command: GroupCommand,
+    },
     /// Point Claude Code at the gateway, on a model.
     Claude {
         /// Model as the gateway names it: `deepseek/deepseek-chat`.
@@ -61,6 +66,28 @@ enum Command {
     Stats,
     /// List the models the configured providers serve.
     Models,
+}
+
+#[derive(Subcommand)]
+enum GroupCommand {
+    /// Add or update a named route chain.
+    Add {
+        /// Group id; agents pick the chain as `group/<id>`.
+        id: String,
+        /// Display name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Ordered routes: the first available model serves the request.
+        #[arg(long = "route")]
+        routes: Vec<String>,
+    },
+    /// List configured groups.
+    List,
+    /// Remove a group.
+    Rm {
+        /// Group id.
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -134,6 +161,9 @@ async fn main() -> Result<()> {
                 fallback,
                 default,
             } => {
+                if id == "group" {
+                    anyhow::bail!("provider id `group` is reserved for `group/<id>` routes");
+                }
                 let path = provider_path(&cli.config)?;
                 let mut cfg = Config::load(&path)?;
                 let provider = ProviderConfig {
@@ -201,6 +231,65 @@ async fn main() -> Result<()> {
                 }
                 cfg.save(&path)?;
                 println!("removed provider `{id}`");
+            }
+        },
+        Command::Group { command } => match command {
+            GroupCommand::Add { id, name, routes } => {
+                if id.is_empty() || id.contains('/') {
+                    anyhow::bail!("group id must be non-empty and contain no `/`");
+                }
+                if routes.is_empty() {
+                    anyhow::bail!("a group needs at least one --route provider/model");
+                }
+                if routes.iter().any(|route| route.starts_with("group/")) {
+                    anyhow::bail!("group routes must name providers directly, not other groups");
+                }
+
+                let path = provider_path(&cli.config)?;
+                let mut cfg = Config::load(&path)?;
+                let group = GroupConfig {
+                    id: id.clone(),
+                    name: name.unwrap_or_default(),
+                    routes,
+                };
+                match cfg.group.iter().position(|g| g.id == id) {
+                    Some(i) => cfg.group[i] = group,
+                    None => cfg.group.push(group),
+                }
+                cfg.save(&path)?;
+                println!("saved group `group/{id}` to {}", path.display());
+            }
+            GroupCommand::List => {
+                let cfg = load_config(&cli.config)?;
+                if cfg.group.is_empty() {
+                    println!(
+                        "no groups; add one: magpie-lite group add <id> --route provider/model"
+                    );
+                    return Ok(());
+                }
+                for g in &cfg.group {
+                    let label = if g.name.is_empty() {
+                        g.id.as_str()
+                    } else {
+                        g.name.as_str()
+                    };
+                    println!("group/{:<18} {}", g.id, label);
+                    for (i, route) in g.routes.iter().enumerate() {
+                        let marker = if i == 0 { "route" } else { "fallback" };
+                        println!("{:<26} {marker} {route}", "");
+                    }
+                }
+            }
+            GroupCommand::Rm { id } => {
+                let path = provider_path(&cli.config)?;
+                let mut cfg = Config::load(&path)?;
+                let before = cfg.group.len();
+                cfg.group.retain(|g| g.id != id);
+                if cfg.group.len() == before {
+                    anyhow::bail!("no group `{id}`");
+                }
+                cfg.save(&path)?;
+                println!("removed group `{id}`");
             }
         },
         Command::Claude { model } => {

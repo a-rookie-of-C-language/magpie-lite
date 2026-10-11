@@ -83,6 +83,30 @@ impl ProviderConfig {
     }
 }
 
+/// A named route chain agents can pick as one model id: `group/daily-coding`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupConfig {
+    /// Short id used after the reserved `group/` prefix.
+    pub id: String,
+    /// Display name.
+    #[serde(default)]
+    pub name: String,
+    /// Ordered model routes. The first available one serves the request;
+    /// the rest are fallbacks tried before any reply bytes are streamed.
+    pub routes: Vec<String>,
+}
+
+impl GroupConfig {
+    /// Display name: the given one, or the id.
+    pub fn label(&self) -> &str {
+        if self.name.is_empty() {
+            &self.id
+        } else {
+            &self.name
+        }
+    }
+}
+
 /// Everything the gateway needs to run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -98,6 +122,9 @@ pub struct Config {
     /// The upstreams.
     #[serde(default)]
     pub provider: Vec<ProviderConfig>,
+    /// Named route chains.
+    #[serde(default)]
+    pub group: Vec<GroupConfig>,
 }
 
 fn default_port() -> u16 {
@@ -115,6 +142,7 @@ impl Default for Config {
             token: default_token(),
             default_provider: String::new(),
             provider: Vec::new(),
+            group: Vec::new(),
         }
     }
 }
@@ -144,16 +172,32 @@ impl Config {
         self.provider.iter().find(|p| p.id == id)
     }
 
+    /// Find a routing group by id.
+    pub fn group(&self, id: &str) -> Option<&GroupConfig> {
+        self.group.iter().find(|g| g.id == id)
+    }
+
     /// Resolve a model name to (upstream, upstream model name).
     ///
+    /// `group/<id>` resolves the first usable route in that group.
     /// `deepseek/deepseek-chat` routes by provider id; a bare name matches
     /// a provider's `models` list, else the default provider, else the
     /// first provider there is.
     pub fn resolve(&self, model: &str) -> Option<(&ProviderConfig, String)> {
-        if let Some((pid, rest)) = model.split_once('/')
-            && let Some(p) = self.provider(pid)
-        {
-            return Some((p, rest.to_owned()));
+        if let Some(id) = model.strip_prefix("group/") {
+            let group = self.group(id)?;
+            return group
+                .routes
+                .iter()
+                .find_map(|route| self.resolve_provider(route));
+        }
+        self.resolve_provider(model)
+    }
+
+    /// Resolve an ordinary provider/model or bare model reference.
+    fn resolve_provider(&self, model: &str) -> Option<(&ProviderConfig, String)> {
+        if let Some((pid, rest)) = model.split_once('/') {
+            return self.provider(pid).map(|p| (p, rest.to_owned()));
         }
         for p in &self.provider {
             if p.models.iter().any(|m| m == model) {
@@ -166,9 +210,25 @@ impl Config {
         self.provider.first().map(|p| (p, model.to_owned()))
     }
 
-    /// Every model the catalog lists, as agents pick them (`provider/model`).
+    /// The fallback references that follow the provider that first resolved
+    /// `model`. A group owns its whole ordered chain; the provider fallbacks
+    /// inside that chain are deliberately not combined with it.
+    pub fn fallback_references(&self, model: &str, resolved: &ProviderConfig) -> Vec<String> {
+        if let Some(id) = model.strip_prefix("group/")
+            && let Some(group) = self.group(id)
+        {
+            return group.routes.clone();
+        }
+        resolved.fallback.clone()
+    }
+
+    /// Every model the catalog lists, as agents pick them (`provider/model`
+    /// or `group/<id>`).
     pub fn catalog(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
+        for g in &self.group {
+            out.push((format!("group/{}", g.id), g.label().to_owned()));
+        }
         for p in &self.provider {
             for m in &p.models {
                 out.push((format!("{}/{}", p.id, m), p.label().to_owned()));

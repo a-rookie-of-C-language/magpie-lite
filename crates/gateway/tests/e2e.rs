@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use axum::extract::{Path, State};
 use axum::routing::post;
 use axum::{Json, Router};
-use magpie_gateway::{AppState, Config, Protocol, ProviderConfig, build_router};
+use magpie_gateway::{AppState, Config, GroupConfig, Protocol, ProviderConfig, build_router};
 use serde_json::{Value, json};
 
 #[derive(Clone)]
@@ -183,6 +183,7 @@ async fn spawn_gateway_with_protocol(upstream_base: String, protocol: Protocol) 
             models: vec!["mock-model".into()],
             fallback: Vec::new(),
         }],
+        group: Vec::new(),
     };
     let state = Arc::new(AppState {
         config,
@@ -396,6 +397,54 @@ async fn spawn_gateway_with_fallback(primary: String, backup: String) -> String 
                 fallback: Vec::new(),
             },
         ],
+        group: Vec::new(),
+    };
+    let state = Arc::new(AppState {
+        config,
+        http: magpie_gateway::upstream::http_client().unwrap(),
+        requests: Arc::new(std::sync::Mutex::new(
+            magpie_gateway::usage::RequestLog::default(),
+        )),
+    });
+    let app = build_router(state);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+async fn spawn_gateway_with_group(primary: String, backup: String) -> String {
+    let config = Config {
+        port: 0,
+        token: "magpie-lite".into(),
+        default_provider: "primary".into(),
+        provider: vec![
+            ProviderConfig {
+                id: "primary".into(),
+                name: "Primary".into(),
+                protocol: Protocol::Chat,
+                base_url: format!("{primary}/v1"),
+                api_key: "primary-key".into(),
+                models: vec!["mock-model".into()],
+                fallback: Vec::new(),
+            },
+            ProviderConfig {
+                id: "backup".into(),
+                name: "Backup".into(),
+                protocol: Protocol::Chat,
+                base_url: format!("{backup}/v1"),
+                api_key: "backup-key".into(),
+                models: vec!["mock-model".into()],
+                fallback: Vec::new(),
+            },
+        ],
+        group: vec![GroupConfig {
+            id: "daily-coding".into(),
+            name: "Daily coding".into(),
+            routes: vec!["primary/mock-model".into(), "backup/mock-model".into()],
+        }],
     };
     let state = Arc::new(AppState {
         config,
@@ -573,6 +622,62 @@ async fn retryable_primary_falls_back_before_streaming() {
     assert!(stats["providers"].get("primary").is_none());
     assert_eq!(stats["providers"]["backup"]["requests"], 1);
     assert_eq!(stats["recent_requests"][0]["provider"], "backup");
+}
+
+#[tokio::test]
+async fn routing_groups_fall_back_in_configured_order() {
+    let primary = spawn_rate_limited().await;
+    let (backup, last) = spawn_mock().await;
+    let gw = spawn_gateway_with_group(primary, backup).await;
+    let client = reqwest::Client::new();
+
+    let models = client
+        .get(format!("{gw}/v1/models"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap();
+    let models: Value = models.json().await.unwrap();
+    assert!(
+        models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "group/daily-coding")
+    );
+
+    let resp = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "group/daily-coding",
+            "messages": [{"role": "user", "content": "Weather?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "Beijing is sunny."
+    );
+
+    let upstream_req = last.lock().unwrap().clone().expect("backup was called");
+    assert_eq!(upstream_req["model"], "mock-model");
+
+    let stats = client
+        .get(format!("{gw}/stats"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap();
+    let stats: Value = stats.json().await.unwrap();
+    assert_eq!(stats["providers"]["backup"]["requests"], 1);
+    assert_eq!(
+        stats["recent_requests"][0]["requested_model"],
+        "group/daily-coding"
+    );
 }
 
 #[tokio::test]

@@ -309,11 +309,16 @@ fn prepare(
 /// The initial provider followed by its fallback references, each resolved
 /// with the ordinary model rules. Chains are deliberately one level deep:
 /// `fallback` says where this model goes next, not how to build a graph.
-fn upstream_candidates(config: &Config, initial: UpstreamCandidate) -> Vec<UpstreamCandidate> {
+fn upstream_candidates(
+    config: &Config,
+    initial: UpstreamCandidate,
+    requested_model: &str,
+) -> Vec<UpstreamCandidate> {
     let mut out = vec![initial.clone()];
     let mut seen = HashSet::from([initial.provider.id.clone()]);
 
-    for reference in &initial.provider.fallback {
+    let references = config.fallback_references(requested_model, &initial.provider);
+    for reference in &references {
         let Some((provider, model)) = config.resolve(reference) else {
             tracing::warn!("fallback `{reference}` does not resolve; skipping");
             continue;
@@ -346,7 +351,7 @@ async fn send_with_fallback(
     initial: UpstreamCandidate,
     wire: ClientWire,
 ) -> Result<(reqwest::Response, UpstreamCandidate), (Box<Response>, UpstreamCandidate)> {
-    let candidates = upstream_candidates(&state.config, initial);
+    let candidates = upstream_candidates(&state.config, initial, &creq.model);
     let last = candidates.len().saturating_sub(1);
     let no_route = candidates.first().cloned().expect("initial candidate");
 
