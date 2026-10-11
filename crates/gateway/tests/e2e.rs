@@ -211,6 +211,7 @@ async fn spawn_gateway_with_protocol_and_history(
             models: vec!["mock-model".into()],
             fallback: Vec::new(),
             key_cooldown_ms: None,
+            key_generation: 0,
         }],
         group: Vec::new(),
     };
@@ -542,6 +543,7 @@ async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) ->
         models: vec!["mock-model".into()],
         fallback: Vec::new(),
         key_cooldown_ms: None,
+        key_generation: 0,
     }];
     if let Some(backup) = backup {
         fallback.push("backup/mock-model".into());
@@ -555,6 +557,7 @@ async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) ->
             models: vec!["mock-model".into()],
             fallback: Vec::new(),
             key_cooldown_ms: None,
+            key_generation: 0,
         });
     }
     providers[0].fallback = fallback;
@@ -601,6 +604,7 @@ async fn spawn_gateway_with_fallback(primary: String, backup: String) -> String 
                 models: vec!["mock-model".into()],
                 fallback: vec!["backup/mock-model".into()],
                 key_cooldown_ms: None,
+                key_generation: 0,
             },
             ProviderConfig {
                 id: "backup".into(),
@@ -612,6 +616,7 @@ async fn spawn_gateway_with_fallback(primary: String, backup: String) -> String 
                 models: vec!["mock-model".into()],
                 fallback: Vec::new(),
                 key_cooldown_ms: None,
+                key_generation: 0,
             },
         ],
         group: Vec::new(),
@@ -650,6 +655,7 @@ async fn spawn_gateway_with_group(primary: String, backup: String) -> String {
                 models: vec!["mock-model".into()],
                 fallback: Vec::new(),
                 key_cooldown_ms: None,
+                key_generation: 0,
             },
             ProviderConfig {
                 id: "backup".into(),
@@ -661,6 +667,7 @@ async fn spawn_gateway_with_group(primary: String, backup: String) -> String {
                 models: vec!["mock-model".into()],
                 fallback: Vec::new(),
                 key_cooldown_ms: None,
+                key_generation: 0,
             },
         ],
         group: vec![GroupConfig {

@@ -58,15 +58,20 @@ pub async fn send(
     };
     match p.protocol {
         Protocol::Chat | Protocol::Responses => {
-            req = req.bearer_auth(api_key);
+            if !api_key.is_empty() {
+                req = req.bearer_auth(api_key);
+            }
         }
         Protocol::Anthropic => {
-            req = req
-                .bearer_auth(api_key)
-                .header("anthropic-version", "2023-06-01");
+            req = req.header("anthropic-version", "2023-06-01");
+            if !api_key.is_empty() {
+                req = req.bearer_auth(api_key);
+            }
         }
         Protocol::Gemini => {
-            req = req.header("x-goog-api-key", api_key);
+            if !api_key.is_empty() {
+                req = req.header("x-goog-api-key", api_key);
+            }
         }
     }
 

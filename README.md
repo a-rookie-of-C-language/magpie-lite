@@ -16,7 +16,7 @@ Zed ─────────┘   Chat + Responses +
 
 - **Gateway** at `127.0.0.1:3426` speaking **OpenAI Chat Completions** (`/v1/chat/completions`), **OpenAI Responses** (`/v1/responses`), **Anthropic Messages** (`/v1/messages`), and **Gemini generateContent** (`/v1beta/models/...`)
 - **Cross-protocol translation** through a neutral IR: requests, replies, and **SSE streams** — text, tool calls, reasoning deltas, usage
-- **Providers** from one TOML file: Chat-compatible, Responses-compatible, Anthropic, or Gemini upstreams
+- **Providers** from one TOML file: Chat-compatible, Responses-compatible, Anthropic, or Gemini upstreams; console CRUD, credential rotation and cooldown editing with immediate runtime updates
 - **Model routing**: `deepseek/deepseek-chat` by provider id, `group/daily-coding` route chains, bare names by provider model lists, default provider fallback
 - **Multi-key pools**: repeat `--api-key`; requests rotate across keys, rejected/rate-limited keys are retried before route fallback, and `402`/`429` starts a cooldown from `Retry-After`, common duration/reset headers, absolute reset timestamps, or JSON error-body retry delays (60s fallback, per-provider `key_cooldown_ms` / `--key-cooldown-ms` override; `0` disables it)
 - **Failover**: ordered provider fallbacks and routing-group routes, tried before any reply bytes are streamed when the active provider is rate limited, out of quota, overloaded, or unreachable
@@ -30,6 +30,11 @@ Zed ─────────┘   Chat + Responses +
 
 ```sh
 cargo build --release
+
+# add a fallback provider before referencing it
+magpie-lite provider add kimi \
+  --base-url https://api.moonshot.cn/v1 \
+  --api-key sk-kimi... --models moonshot-v1-128k
 
 # add a provider
 magpie-lite provider add deepseek \
@@ -69,6 +74,26 @@ magpie-lite serve --history-file 'D:\magpie\history.jsonl'
 
 Restart the agent after wiring it. For Zed, also set MAGPIE_LITE_API_KEY to the gateway token in Zed's environment, or enter that token in Zed's AI provider settings. Unwire by restoring the agent's own provider (or use your agent switcher).
 
+## Editing providers
+
+The protected web console can create, edit, and delete providers without restarting the gateway. Provider metadata and route lists are editable directly; API keys are never returned. When editing an existing provider, choose **Keep existing keys**, **Replace key pool**, or **No upstream authentication** explicitly. New requests use a saved provider immediately, while in-flight requests keep their original endpoint and credential snapshot.
+
+The same API is available to other interfaces:
+
+| Method | Endpoint | Body / response |
+|---|---|---|
+| POST | `/config/providers` | Provider JSON with id, protocol, base_url, optional api_keys and models; 201 |
+| PUT | `/config/providers/{id}` | Same body; omit `api_keys` to preserve saved credentials, use `[]` to clear them; 200 |
+| DELETE | `/config/providers/{id}` | 200; deletion is rejected while a group or fallback still references the provider |
+
+Optional fields include `name`, `models`, `fallback`, `key_cooldown_ms`, and `make_default`. PUT replaces metadata: omitted lists become empty and an omitted/null cooldown inherits the gateway default. Only `api_keys` has preserve-on-omission semantics (null also preserves). `make_default: true` selects the provider; false keeps the current default. Creating the first provider selects it automatically. Deleting the default selects the first remaining provider, or clears the default when none remain.
+
+IDs permit ASCII letters, digits, hyphens and underscores; `group` is reserved. Base URLs require HTTP/HTTPS without embedded credentials, query strings, fragments or whitespace. Fallbacks name existing `provider/model`, `group/id`, or listed bare model IDs. CLI writes use the same validation and reference checks; adding a local provider may omit `--api-key`. As with the existing add command, CLI updates replace the supplied provider including its key pool.
+
+`/config` returns `credential_count` (zero for no upstream auth), effective `key_cooldown_ms`, and nullable `key_cooldown_override_ms`. Endpoint/protocol/key-pool changes start a new process-local rotation schedule; metadata changes keep active cooldowns. A delayed quota rejection from an old request cannot cool a replacement key. Credentials remain in the local TOML file; a separate secret store is still planned.
+
+Successful edits return the secret-free `/config` snapshot. Invalid provider IDs, protocols, URLs, models, keys, and fallback routes return 400. Duplicate providers return 409; missing providers return 404. Changes are persisted through the same atomic config update used by routing groups.
+
 ## Editing routing groups
 
 The web console can create, edit, and delete routing groups. Enter an ID such as
@@ -99,7 +124,7 @@ per config file: the external-change check does not lock out simultaneous writes
 from other processes. Comments and formatting are rewritten when saving TOML.
 
 `serve --port` and `serve --history-file` remain runtime overrides and are not
-persisted by group edits. Embedded callers using `serve(config, port)` without a
+persisted by provider or group edits. Embedded callers using `serve(config, port)` without a
 file path receive 503 for editing; use `serve_with_config_path` to enable it.
 
 ## Layout
@@ -119,8 +144,12 @@ Tests are the contract: `crates/core/tests/translation.rs` checks real wire shap
 ## Not yet (the roadmap)
 
 - More agents (Cursor CLI, ...)
-- Editing providers and key cooldowns from the console
 - A TUI
+- Model discovery and provider connection tests
+- Agent connect/disconnect with backup, restoration and drift detection
+- More routing policies, versioned admin API and separate management authentication
+
+See [core parity tracker](docs/core-parity.md) for implementation evidence and remaining reference gaps.
 
 ## Safety
 

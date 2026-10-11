@@ -121,7 +121,7 @@ enum ProviderCommand {
         #[arg(long)]
         base_url: String,
         /// API keys; repeat --api-key to build a rotating pool.
-        #[arg(long = "api-key", required = true, num_args = 1)]
+        #[arg(long = "api-key", num_args = 1)]
         api_keys: Vec<String>,
         /// Display name.
         #[arg(long)]
@@ -199,14 +199,9 @@ async fn main() -> Result<()> {
                     models,
                     fallback,
                     key_cooldown_ms,
+                    key_generation: 0,
                 };
-                match cfg.provider.iter().position(|p| p.id == id) {
-                    Some(i) => cfg.provider[i] = provider,
-                    None => cfg.provider.push(provider),
-                }
-                if default || cfg.default_provider.is_empty() {
-                    cfg.default_provider = id.clone();
-                }
+                cfg.set_provider(provider, default)?;
                 cfg.save(&path)?;
                 println!("saved provider `{}` to {}", id, path.display());
             }
@@ -247,18 +242,7 @@ async fn main() -> Result<()> {
             ProviderCommand::Rm { id } => {
                 let path = provider_path(&cli.config)?;
                 let mut cfg = Config::load(&path)?;
-                let before = cfg.provider.len();
-                cfg.provider.retain(|p| p.id != id);
-                if cfg.provider.len() == before {
-                    anyhow::bail!("no provider `{id}`");
-                }
-                if cfg.default_provider == id {
-                    cfg.default_provider = cfg
-                        .provider
-                        .first()
-                        .map(|p| p.id.clone())
-                        .unwrap_or_default();
-                }
+                cfg.remove_provider(&id)?;
                 cfg.save(&path)?;
                 println!("removed provider `{id}`");
             }

@@ -82,9 +82,61 @@ pub struct ProviderConfig {
     /// a key out of quota or rate limited.
     #[serde(default)]
     pub key_cooldown_ms: Option<u64>,
+    /// Process-local credential/endpoint version; never saved or disclosed.
+    #[serde(skip)]
+    pub key_generation: u64,
 }
 
 impl ProviderConfig {
+    /// Shared validation for console and CLI writes. Errors never quote secrets.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.id.is_empty()
+            || self.id == "group"
+            || self
+                .id
+                .chars()
+                .any(|c| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        {
+            anyhow::bail!(
+                "provider id must contain only ASCII letters, digits, '-', or '_'; 'group' is reserved"
+            );
+        }
+        if self.base_url.chars().any(char::is_whitespace) {
+            anyhow::bail!("base URL cannot contain whitespace");
+        }
+        let url = reqwest::Url::parse(&self.base_url)
+            .map_err(|_| anyhow::anyhow!("base URL must be an absolute HTTP or HTTPS URL"))?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            anyhow::bail!(
+                "base URL must use HTTP or HTTPS without credentials, query, or fragment"
+            );
+        }
+        let keys = if self.api_keys.is_empty() {
+            vec![&self.api_key]
+        } else {
+            self.api_keys.iter().collect()
+        };
+        if keys
+            .iter()
+            .any(|key| key.bytes().any(|c| c.is_ascii_control() || c == b' '))
+        {
+            anyhow::bail!("API keys cannot contain whitespace or control characters");
+        }
+        if self
+            .models
+            .iter()
+            .any(|m| m.is_empty() || m.chars().any(char::is_whitespace))
+        {
+            anyhow::bail!("model ids must be non-empty and contain no whitespace");
+        }
+        Ok(())
+    }
     /// Display name: the given one, or the id.
     pub fn label(&self) -> &str {
         if self.name.is_empty() {
@@ -122,6 +174,7 @@ impl ProviderConfig {
 /// that request and cools the rejected key for later requests.
 #[derive(Debug, Default)]
 struct KeyRotationState {
+    generation: u64,
     cursor: usize,
     cooldowns: BTreeMap<usize, Instant>,
 }
@@ -149,8 +202,13 @@ impl KeyRotator {
     /// Return `(configured slot, key)` pairs, starting at the next key that is
     /// not cooling. If every key is cooling, all are returned as a best effort
     /// rather than leaving the provider with no route.
-    pub fn rotate(&self, provider_id: &str, keys: &[String]) -> Vec<(usize, String)> {
-        if keys.len() < 2 {
+    pub fn rotate(
+        &self,
+        provider_id: &str,
+        generation: u64,
+        keys: &[String],
+    ) -> Vec<(usize, String)> {
+        if keys.is_empty() {
             return keys.iter().cloned().map(|key| (0, key)).collect();
         }
         let now = Instant::now();
@@ -159,9 +217,19 @@ impl KeyRotator {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let state = states.entry(provider_id.to_owned()).or_default();
+        // A request pinned before an edit must never reset a newer schedule.
+        if generation < state.generation {
+            return keys.iter().cloned().enumerate().collect();
+        }
+        if generation > state.generation {
+            *state = KeyRotationState {
+                generation,
+                ..Default::default()
+            };
+        }
         state.cooldowns.retain(|_, until| *until > now);
 
-        let start = state.cursor;
+        let start = state.cursor % keys.len();
         let rotated = keys[start..]
             .iter()
             .chain(keys[..start].iter())
@@ -183,7 +251,7 @@ impl KeyRotator {
     }
 
     /// Copy the currently active cooldowns, dropping expired entries.
-    pub fn cooldown_snapshot(&self) -> KeyCooldownSnapshotMap {
+    pub fn cooldown_snapshot(&self, config: &Config) -> KeyCooldownSnapshotMap {
         let now = Instant::now();
         let wall_now = SystemTime::now();
         let mut states = self
@@ -192,7 +260,14 @@ impl KeyRotator {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let mut out = KeyCooldownSnapshotMap::new();
+        states.retain(|provider_id, _| config.provider(provider_id).is_some());
         for (provider_id, state) in states.iter_mut() {
+            if config
+                .provider(provider_id)
+                .is_none_or(|p| p.key_generation != state.generation)
+            {
+                continue;
+            }
             state.cooldowns.retain(|_, until| *until > now);
             for (slot, until) in &state.cooldowns {
                 let remaining = until.duration_since(now);
@@ -216,7 +291,13 @@ impl KeyRotator {
     }
 
     /// Avoid a quota-limited or rate-limited key when another key is healthy.
-    pub fn cool_down(&self, provider_id: &str, key_slot: usize, cooldown: Duration) {
+    pub fn cool_down(
+        &self,
+        provider_id: &str,
+        generation: u64,
+        key_slot: usize,
+        cooldown: Duration,
+    ) {
         if cooldown.is_zero() {
             return;
         }
@@ -224,11 +305,19 @@ impl KeyRotator {
             .states
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        states
-            .entry(provider_id.to_owned())
-            .or_default()
-            .cooldowns
-            .insert(key_slot, Instant::now() + cooldown);
+        let state = states.entry(provider_id.to_owned()).or_default();
+        if generation < state.generation {
+            return;
+        }
+        if generation > state.generation {
+            *state = KeyRotationState {
+                generation,
+                ..Default::default()
+            };
+        }
+        if let Some(until) = Instant::now().checked_add(cooldown) {
+            state.cooldowns.insert(key_slot, until);
+        }
     }
 }
 
@@ -299,6 +388,10 @@ pub struct ProviderConfigSnapshot {
     pub models: Vec<String>,
     /// Number of effective key slots, not the keys themselves.
     pub key_count: usize,
+    /// Number of configured credentials (zero means no upstream authentication).
+    pub credential_count: usize,
+    /// Explicit override; null means inherit the gateway default.
+    pub key_cooldown_override_ms: Option<u64>,
     /// Ordered fallback references.
     pub fallback: Vec<String>,
     /// Effective cooldown after quota or rate-limit rejection.
@@ -382,6 +475,75 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Add or replace a provider after checking routes against the next config.
+    pub fn set_provider(
+        &mut self,
+        provider: ProviderConfig,
+        make_default: bool,
+    ) -> anyhow::Result<()> {
+        provider.validate()?;
+        let mut next = self.clone();
+        let id = provider.id.clone();
+        match next.provider.iter().position(|p| p.id == id) {
+            Some(index) => next.provider[index] = provider,
+            None => next.provider.push(provider),
+        }
+        for route in &next.provider(&id).expect("just inserted").fallback {
+            if route.is_empty()
+                || route.chars().any(char::is_whitespace)
+                || next.resolve(route).is_none()
+                || (!route.contains('/') && !next.provider.iter().any(|p| p.models.contains(route)))
+            {
+                anyhow::bail!(
+                    "fallback must name an existing provider/model, group/id, or known bare model"
+                );
+            }
+            if let Some((_, model)) = route.split_once('/')
+                && model.is_empty()
+            {
+                anyhow::bail!("fallback must include a model or group id");
+            }
+        }
+        if make_default || next.default_provider.is_empty() {
+            next.default_provider = id;
+        }
+        *self = next;
+        Ok(())
+    }
+
+    /// Remove a provider only if no other provider or group still uses it.
+    pub fn remove_provider(&mut self, id: &str) -> anyhow::Result<()> {
+        let index = self
+            .provider
+            .iter()
+            .position(|p| p.id == id)
+            .ok_or_else(|| anyhow::anyhow!("provider not found"))?;
+        if self.group.iter().any(|g| {
+            g.routes
+                .iter()
+                .any(|r| r.split_once('/').is_some_and(|(p, _)| p == id))
+        }) {
+            anyhow::bail!("provider is referenced by a routing group");
+        }
+        if self.provider.iter().filter(|p| p.id != id).any(|p| {
+            p.fallback.iter().any(|r| {
+                !r.starts_with("group/")
+                    && self.resolve(r).is_some_and(|(target, _)| target.id == id)
+            })
+        }) {
+            anyhow::bail!("provider is referenced by a provider fallback");
+        }
+        self.provider.remove(index);
+        if self.default_provider == id {
+            self.default_provider = self
+                .provider
+                .first()
+                .map(|p| p.id.clone())
+                .unwrap_or_default();
+        }
+        Ok(())
+    }
+
     /// Load from a path; a missing file is a fresh config, not an error.
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         if !path.exists() {
@@ -423,6 +585,12 @@ impl Config {
                     base_url: p.base_url.clone(),
                     models: p.models.clone(),
                     key_count: p.api_key_pool().len(),
+                    credential_count: p
+                        .api_key_pool()
+                        .iter()
+                        .filter(|key| !key.is_empty())
+                        .count(),
+                    key_cooldown_override_ms: p.key_cooldown_ms,
                     fallback: p.fallback.clone(),
                     key_cooldown_ms: self.key_cooldown_for(p).as_millis().min(u64::MAX as u128)
                         as u64,
@@ -542,6 +710,7 @@ mod tests {
             models: Vec::new(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
+            key_generation: 0,
         };
 
         assert_eq!(provider.api_key_pool(), vec!["legacy-key".to_owned()]);
@@ -553,28 +722,60 @@ mod tests {
         let keys = vec!["one".to_owned(), "two".to_owned()];
 
         assert_eq!(
-            rotator.rotate("mock", &keys),
+            rotator.rotate("mock", 0, &keys),
             vec![(0, "one".to_owned()), (1, "two".to_owned())]
         );
         assert_eq!(
-            rotator.rotate("mock", &keys),
+            rotator.rotate("mock", 0, &keys),
             vec![(1, "two".to_owned()), (0, "one".to_owned())]
         );
+    }
+
+    #[test]
+    fn newer_key_generation_is_not_reset_by_a_stale_request() {
+        let rotator = KeyRotator::default();
+        let old = vec![
+            "old-one".to_owned(),
+            "old-two".to_owned(),
+            "old-three".to_owned(),
+        ];
+        let new = vec!["new-one".to_owned(), "new-two".to_owned()];
+        rotator.rotate("mock", 1, &old);
+        rotator.rotate("mock", 1, &old);
+        rotator.cool_down("mock", 1, 0, Duration::from_secs(60));
+        assert_eq!(
+            rotator.rotate("mock", 2, &new)[0],
+            (0, "new-one".to_owned())
+        );
+        rotator.cool_down("mock", 2, 0, Duration::from_secs(60));
+        rotator.rotate("mock", 1, &old);
+        rotator.cool_down("mock", 1, 1, Duration::from_secs(60));
+        assert_eq!(
+            rotator.rotate("mock", 2, &new),
+            vec![(1, "new-two".to_owned())]
+        );
+        let mut config = cooldown_config();
+        config.provider[0].key_generation = 2;
+        assert_eq!(rotator.cooldown_snapshot(&config)["mock"].len(), 1);
+        assert!(rotator.cooldown_snapshot(&Config::default()).is_empty());
     }
 
     #[test]
     fn key_cooldown_hides_a_slot_until_it_expires() {
         let rotator = KeyRotator::default();
         let keys = vec!["one".to_owned(), "two".to_owned()];
-        rotator.rotate("mock", &keys);
-        rotator.rotate("mock", &keys);
-        rotator.cool_down("mock", 0, Duration::from_millis(20));
+        rotator.rotate("mock", 0, &keys);
+        rotator.rotate("mock", 0, &keys);
+        rotator.cool_down("mock", 0, 0, Duration::from_millis(20));
 
-        assert_eq!(rotator.rotate("mock", &keys), vec![(1, "two".to_owned())]);
+        assert_eq!(
+            rotator.rotate("mock", 0, &keys),
+            vec![(1, "two".to_owned())]
+        );
 
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(
-            rotator.rotate("mock", &keys),
+            rotator.rotate("mock", 0, &keys),
             vec![(1, "two".to_owned()), (0, "one".to_owned())]
         );
     }
@@ -582,15 +783,33 @@ mod tests {
     #[test]
     fn cooldown_snapshot_reports_slots_and_expires_them() {
         let rotator = KeyRotator::default();
-        rotator.cool_down("mock", 0, Duration::from_millis(80));
+        rotator.cool_down("mock", 0, 0, Duration::from_millis(80));
 
-        let snapshot = rotator.cooldown_snapshot();
+        let snapshot = rotator.cooldown_snapshot(&cooldown_config());
         let slot = &snapshot["mock"]["0"];
         assert!(slot.remaining_ms > 0 && slot.remaining_ms <= 80);
         assert!(slot.until_unix_ms >= unix_now_ms());
 
         std::thread::sleep(Duration::from_millis(100));
-        assert!(rotator.cooldown_snapshot().is_empty());
+        assert!(rotator.cooldown_snapshot(&cooldown_config()).is_empty());
+    }
+
+    fn cooldown_config() -> Config {
+        Config {
+            provider: vec![ProviderConfig {
+                id: "mock".into(),
+                name: String::new(),
+                protocol: Protocol::Chat,
+                base_url: "http://localhost/v1".into(),
+                api_key: String::new(),
+                api_keys: vec![],
+                models: vec![],
+                fallback: vec![],
+                key_cooldown_ms: None,
+                key_generation: 0,
+            }],
+            ..Default::default()
+        }
     }
 
     fn unix_now_ms() -> u64 {
@@ -617,6 +836,7 @@ mod tests {
             models: vec!["mock-model".into()],
             fallback: vec!["backup/other".into()],
             key_cooldown_ms: Some(1_200),
+            key_generation: 0,
         });
         config.group.push(GroupConfig {
             id: "daily".into(),
@@ -654,6 +874,7 @@ mod tests {
             models: Vec::new(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
+            key_generation: 0,
         };
 
         assert_eq!(config.key_cooldown_for(&provider), Duration::from_secs(60));

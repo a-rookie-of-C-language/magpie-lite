@@ -53,6 +53,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/models", get(list_models))
         .route("/stats", get(stats))
         .route("/config", get(config))
+        .route("/config/providers", post(crate::providers::create))
+        .route(
+            "/config/providers/{id}",
+            put(crate::providers::update).delete(crate::providers::delete),
+        )
         .route("/config/groups", post(create_group))
         .route(
             "/config/groups/{id}",
@@ -183,7 +188,9 @@ async fn stats(State(state): State<Arc<AppState>>) -> Json<StatsSnapshot> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .snapshot();
-    snapshot.key_cooldowns = state.key_rotation.cooldown_snapshot();
+    snapshot.key_cooldowns = state
+        .key_rotation
+        .cooldown_snapshot(&state.config.current());
     Json(snapshot)
 }
 
@@ -505,7 +512,11 @@ fn upstream_routes(
         .map(|(_, key)| key.clone())
         .collect::<Vec<_>>();
     let initial = UpstreamRoute {
-        api_keys: key_rotation.rotate(&initial.provider.id, &initial_keys),
+        api_keys: key_rotation.rotate(
+            &initial.provider.id,
+            initial.provider.key_generation,
+            &initial_keys,
+        ),
         ..initial
     };
     let mut out = vec![initial.clone()];
@@ -520,7 +531,11 @@ fn upstream_routes(
         if !seen.insert(provider.id.clone()) {
             continue;
         }
-        let api_keys = key_rotation.rotate(&provider.id, &provider.api_key_pool());
+        let api_keys = key_rotation.rotate(
+            &provider.id,
+            provider.key_generation,
+            &provider.api_key_pool(),
+        );
         out.push(UpstreamRoute {
             provider: Arc::new(provider.clone()),
             model,
@@ -629,9 +644,12 @@ async fn send_with_fallback(
                     Some(&error.body),
                     config.key_cooldown_for(&route.provider),
                 );
-                state
-                    .key_rotation
-                    .cool_down(&route.provider.id, *key_slot, cooldown);
+                state.key_rotation.cool_down(
+                    &route.provider.id,
+                    route.provider.key_generation,
+                    *key_slot,
+                    cooldown,
+                );
             }
             let detail = error.message;
             tracing::warn!(

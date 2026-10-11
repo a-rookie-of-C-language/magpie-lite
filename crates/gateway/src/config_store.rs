@@ -1,5 +1,6 @@
 //! Serialized, persistent configuration updates shared by request handlers.
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use axum::http::StatusCode;
@@ -13,16 +14,22 @@ struct Inner {
     current: RwLock<Config>,
     updates: Mutex<()>,
     path: Option<PathBuf>,
+    next_key_generation: AtomicU64,
 }
 
 pub type ConfigError = (StatusCode, String);
 
 impl ConfigStore {
-    pub fn new(config: Config, path: Option<PathBuf>) -> Self {
+    pub fn new(mut config: Config, path: Option<PathBuf>) -> Self {
+        for (index, provider) in config.provider.iter_mut().enumerate() {
+            provider.key_generation = index as u64 + 1;
+        }
+        let next_key_generation = AtomicU64::new(config.provider.len() as u64 + 1);
         Self(Arc::new(Inner {
             current: RwLock::new(config),
             updates: Mutex::new(()),
             path,
+            next_key_generation,
         }))
     }
 
@@ -67,12 +74,26 @@ impl ConfigStore {
                 ));
             }
             next.save(path).map_err(|error| {
-                tracing::error!(%error, "could not persist routing configuration");
+                tracing::error!(%error, "could not persist configuration");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "could not save configuration; no changes applied".to_owned(),
                 )
             })?;
+            // Only changes to the endpoint or effective credential pool start
+            // a new schedule. Metadata/group edits preserve active cooldowns.
+            for provider in &mut next.provider {
+                provider.key_generation = match current.provider(&provider.id) {
+                    Some(old)
+                        if old.protocol == provider.protocol
+                            && old.base_url == provider.base_url
+                            && old.api_key_pool() == provider.api_key_pool() =>
+                    {
+                        old.key_generation
+                    }
+                    _ => store.0.next_key_generation.fetch_add(1, Ordering::Relaxed),
+                };
+            }
             let snapshot = next.snapshot();
             *store.0.current.write().unwrap_or_else(|p| p.into_inner()) = next;
             Ok(snapshot)
@@ -116,6 +137,35 @@ mod tests {
             std::fs::read_to_string(blocked).unwrap(),
             "this is a file, not a directory"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_save_failure_does_not_publish_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocked = directory.path().join("blocked");
+        std::fs::write(&blocked, "file").unwrap();
+        let store = ConfigStore::new(Config::default(), Some(blocked.join("config.toml")));
+        let result = store
+            .update(|config| {
+                let provider = crate::config::ProviderConfig {
+                    id: "local".into(),
+                    name: "After".into(),
+                    protocol: crate::config::Protocol::Chat,
+                    base_url: "http://localhost/v1".into(),
+                    api_key: "new-secret".into(),
+                    api_keys: vec![],
+                    models: vec![],
+                    fallback: vec![],
+                    key_cooldown_ms: None,
+                    key_generation: 0,
+                };
+                config.set_provider(provider, true).unwrap();
+                Ok(())
+            })
+            .await;
+        assert_eq!(result.unwrap_err().0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(store.current().provider.is_empty());
+        assert!(store.current().default_provider.is_empty());
     }
 
     #[tokio::test]

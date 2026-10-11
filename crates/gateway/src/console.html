@@ -41,7 +41,7 @@
       color: inherit;
     }
 
-    button, input, textarea {
+    button, input, textarea, select {
       font: inherit;
     }
 
@@ -49,7 +49,7 @@
       cursor: pointer;
     }
 
-    button:focus-visible, input:focus-visible, textarea:focus-visible, a:focus-visible {
+    button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, a:focus-visible {
       outline: 2px solid var(--accent);
       outline-offset: 2px;
     }
@@ -402,6 +402,14 @@
     #group-new { min-height: 44px; flex-shrink: 0; }
     #group-message { padding: 0 16px; text-align: left; }
     .button.danger { color: var(--bad); }
+    #provider-new { min-height: 44px; flex-shrink: 0; }
+    #provider-message { padding: 0 16px; text-align: left; }
+    .editor-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .editor-grid .field { min-width: 0; }
+    .provider-name { white-space: normal; min-width: 120px; }
+    .provider-name code { display: block; color: var(--muted); font-size: .8rem; }
+    .panel-header { flex-wrap: wrap; }
+    @media (max-width: 540px) { .editor-grid { grid-template-columns: minmax(0, 1fr); } }
   </style>
 </head>
 <body>
@@ -518,7 +526,25 @@
 
           <div class="stack">
             <section class="panel" aria-labelledby="routing-title">
-              <div class="panel-header"><h2 id="routing-title">Routing configuration</h2></div>
+              <div class="panel-header"><h2 id="routing-title">Routing configuration</h2><button id="provider-new" type="button" class="button secondary">New provider</button></div>
+              <form id="provider-editor" class="group-editor" hidden autocomplete="off">
+                <h3 id="provider-editor-title">New provider</h3>
+                <div class="editor-grid">
+                  <div class="field"><label for="provider-id">Provider ID</label><input id="provider-id" class="token-input" required pattern="[A-Za-z0-9_-]+" placeholder="deepseek" aria-describedby="provider-id-help"><p id="provider-id-help" class="group-help">Letters, digits, hyphens and underscores. Agents use provider/model. The ID group is reserved.</p></div>
+                  <div class="field"><label for="provider-name">Display name (optional)</label><input id="provider-name" class="token-input" placeholder="DeepSeek"></div>
+                  <div class="field"><label for="provider-protocol">Protocol</label><select id="provider-protocol" class="token-input"><option value="chat">OpenAI Chat Completions</option><option value="responses">OpenAI Responses</option><option value="anthropic">Anthropic Messages</option><option value="gemini">Google Gemini</option></select></div>
+                  <div class="field"><label for="provider-url">Base URL</label><input id="provider-url" class="token-input" type="url" required placeholder="https://api.example.com/v1" aria-describedby="provider-url-help"><p id="provider-url-help" class="group-help">Chat and Responses: include /v1. Anthropic: host root. Gemini: include /v1beta.</p></div>
+                </div>
+                <div class="field"><label for="provider-models">Model IDs</label><textarea id="provider-models" class="token-input" placeholder="deepseek-chat&#10;deepseek-reasoner" aria-describedby="provider-models-help"></textarea><p id="provider-models-help" class="group-help">One upstream model ID per line. Listed models appear in the agent catalog; explicit provider/model routes also work for unlisted models.</p></div>
+                <div class="field"><label for="provider-key-mode">API keys</label><select id="provider-key-mode" class="token-input" aria-describedby="provider-key-help"><option value="keep">Keep existing keys</option><option value="replace">Replace key pool</option><option value="clear">No upstream authentication</option></select><p id="provider-key-help" class="group-help">Saved keys are never displayed. Choose Replace to rotate credentials, or No upstream authentication for a local service.</p></div>
+                <div id="provider-keys-field" class="field" hidden><label for="provider-keys">New key pool</label><textarea id="provider-keys" class="token-input" autocomplete="off" spellcheck="false" aria-describedby="provider-keys-help"></textarea><p id="provider-keys-help" class="group-help">One API key per line, in rotation order. These values are sent only when you save.</p></div>
+                <div class="editor-grid">
+                  <div class="field"><label for="provider-fallback">Fallback routes (optional)</label><textarea id="provider-fallback" class="token-input" placeholder="backup/model&#10;group/daily" aria-describedby="provider-fallback-help"></textarea><p id="provider-fallback-help" class="group-help">One route per line, tried in order. Providers and groups must already exist.</p></div>
+                  <div class="field"><label for="provider-cooldown">Key cooldown in milliseconds (optional)</label><input id="provider-cooldown" class="token-input" type="number" min="0" step="1" placeholder="Gateway default" aria-describedby="provider-cooldown-help"><p id="provider-cooldown-help" class="group-help">Leave blank to inherit the gateway default. Use 0 to disable cooldown.</p><label class="switch"><input id="provider-default" type="checkbox">Make default provider</label><p class="group-help">To switch defaults, select this option on the provider you want to use.</p></div>
+                </div>
+                <div class="group-actions"><button id="provider-save" type="submit" class="button">Save provider</button><button id="provider-cancel" type="button" class="button secondary">Cancel</button></div>
+              </form>
+              <p id="provider-message" class="console-message" role="status" aria-live="polite"></p>
               <div class="table-wrap">
                 <table>
                   <thead>
@@ -530,6 +556,7 @@
                       <th scope="col">Keys</th>
                       <th scope="col">Fallback</th>
                       <th scope="col">Cooldown</th>
+                      <th scope="col">Actions</th>
                     </tr>
                   </thead>
                   <tbody id="routing-rows"></tbody>
@@ -605,6 +632,23 @@
       requestRows: document.getElementById("request-rows"),
       requestEmpty: document.getElementById("request-empty"),
       requestCount: document.getElementById("request-count"),
+      providerEditor: document.getElementById("provider-editor"),
+      providerEditorTitle: document.getElementById("provider-editor-title"),
+      providerId: document.getElementById("provider-id"),
+      providerName: document.getElementById("provider-name"),
+      providerProtocol: document.getElementById("provider-protocol"),
+      providerUrl: document.getElementById("provider-url"),
+      providerModels: document.getElementById("provider-models"),
+      providerKeyMode: document.getElementById("provider-key-mode"),
+      providerKeysField: document.getElementById("provider-keys-field"),
+      providerKeys: document.getElementById("provider-keys"),
+      providerFallback: document.getElementById("provider-fallback"),
+      providerCooldown: document.getElementById("provider-cooldown"),
+      providerDefault: document.getElementById("provider-default"),
+      providerNew: document.getElementById("provider-new"),
+      providerSave: document.getElementById("provider-save"),
+      providerCancel: document.getElementById("provider-cancel"),
+      providerMessage: document.getElementById("provider-message"),
       routingRows: document.getElementById("routing-rows"),
       routingEmpty: document.getElementById("routing-empty"),
       groupEditor: document.getElementById("group-editor"),
@@ -633,6 +677,8 @@
     let refreshTimer = 0;
     let lastUpdate = "";
     let editingGroup = null;
+    let editingProvider = null;
+    let routingSnapshot = null;
     let groupBusy = false;
     let dataRevision = 0;
     let sessionRevision = 0;
@@ -731,6 +777,7 @@
     }
 
     function formatDuration(milliseconds) {
+      if (Number(milliseconds) === 0) return "Disabled";
       const totalSeconds = Math.max(1, Math.ceil(Number(milliseconds) / 1000));
       if (totalSeconds >= 3600) return `${(totalSeconds / 3600).toFixed(1)} h`;
       if (totalSeconds >= 60) return `${Math.floor(totalSeconds / 60)}m ${totalSeconds % 60}s`;
@@ -790,6 +837,7 @@
     }
 
     function renderRouting(configuration) {
+      routingSnapshot = configuration;
       elements.groupProviders.textContent = `Configured providers: ${(configuration.providers || []).map(p => p.id).join(", ") || "none"}`;
       renderRoutingProviders(configuration.providers || []);
       renderRoutingGroups(configuration.groups || []);
@@ -799,14 +847,29 @@
       clear(elements.routingRows);
       elements.routingEmpty.hidden = providers.length !== 0;
       for (const provider of providers) {
+        const name = text("td", provider.name || provider.id, "provider-name");
+        name.append(text("code", provider.id + (routingSnapshot.default_provider === provider.id ? " · default" : "")));
+        const actions = document.createElement("td");
+        const buttons = document.createElement("div");
+        buttons.className = "group-actions";
+        for (const [label, action] of [["Edit", () => openProviderEditor(provider)], ["Delete", () => deleteProvider(provider)]]) {
+          const button = text("button", label, "button secondary" + (label === "Delete" ? " danger" : ""));
+          button.type = "button";
+          button.disabled = groupBusy;
+          button.setAttribute("aria-label", label + " provider " + provider.id);
+          button.addEventListener("click", action);
+          buttons.append(button);
+        }
+        actions.append(buttons);
         elements.routingRows.append(row([
-          text("td", provider.name || provider.id),
+          name,
           text("td", provider.protocol),
           text("td", provider.base_url),
           text("td", listSummary(provider.models || [])),
-          text("td", `${fmt(provider.key_count)} slot${Number(provider.key_count) === 1 ? "" : "s"}`),
+          text("td", provider.credential_count === 0 ? "No auth" : `${fmt(provider.key_count)} slots`),
           text("td", listSummary(provider.fallback || [])),
-          text("td", formatDuration(provider.key_cooldown_ms))
+          text("td", formatDuration(provider.key_cooldown_ms)),
+          actions
         ]));
       }
     }
@@ -875,8 +938,121 @@
       return date.toLocaleTimeString([], { hour12: false });
     }
 
+    function keyModeChanged() {
+      const replace = elements.providerKeyMode.value === "replace";
+      elements.providerKeysField.hidden = !replace;
+      elements.providerKeys.required = replace;
+      if (!replace) elements.providerKeys.value = "";
+    }
+
+    function openProviderEditor(provider = null) {
+      if (groupBusy) return;
+      if (!elements.groupEditor.hidden) closeGroupEditor();
+      editingProvider = provider?.id ?? null;
+      elements.providerEditorTitle.textContent = provider ? "Edit provider" : "New provider";
+      elements.providerId.value = provider?.id || "";
+      elements.providerId.readOnly = Boolean(provider);
+      elements.providerName.value = provider?.name || "";
+      elements.providerProtocol.value = provider?.protocol || "chat";
+      elements.providerUrl.value = provider?.base_url || "";
+      elements.providerModels.value = (provider?.models || []).join("\n");
+      elements.providerFallback.value = (provider?.fallback || []).join("\n");
+      elements.providerCooldown.value = provider?.key_cooldown_override_ms ?? "";
+      elements.providerDefault.checked = provider ? routingSnapshot.default_provider === provider.id : !(routingSnapshot?.providers || []).length;
+      elements.providerDefault.disabled = groupBusy;
+      elements.providerKeyMode.value = provider ? "keep" : "replace";
+      elements.providerKeyMode.querySelector('[value="keep"]').disabled = !provider;
+      elements.providerKeys.value = "";
+      keyModeChanged();
+      elements.providerMessage.textContent = "";
+      elements.providerEditor.hidden = false;
+      (provider ? elements.providerName : elements.providerId).focus();
+    }
+
+    function closeProviderEditor() {
+      editingProvider = null;
+      elements.providerEditor.hidden = true;
+      elements.providerEditor.reset();
+      elements.providerKeys.value = "";
+      keyModeChanged();
+      elements.providerNew.focus();
+    }
+
+    const lines = value => value.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+
+    async function mutateProvider(path, method, body, success) {
+      if (groupBusy) return;
+      const session = sessionRevision;
+      ++dataRevision;
+      setGroupBusy(true);
+      elements.providerMessage.textContent = method === "DELETE" ? "Deleting…" : "Saving…";
+      let saved = false;
+      try {
+        const snapshot = await authorized(path, { method, ...(body ? { body: JSON.stringify(body) } : {}) });
+        if (session !== sessionRevision) return;
+        renderRouting(snapshot);
+        saved = true;
+        closeProviderEditor();
+        elements.providerMessage.textContent = success;
+      } catch (error) {
+        if (session !== sessionRevision) return;
+        if (error.unauthorized) disconnect(true);
+        elements.providerMessage.textContent = error.message;
+        if (error.unauthorized) setMessage(error.message);
+      } finally {
+        setGroupBusy(false);
+      }
+      if (saved && session === sessionRevision) {
+        elements.providerNew.focus();
+        await update(true);
+      }
+    }
+
+    async function deleteProvider(provider) {
+      if (groupBusy || !window.confirm("Delete provider " + provider.id + "? Remove its group and fallback references first. Agents using it will need another route.")) return;
+      await mutateProvider("/config/providers/" + encodeURIComponent(provider.id), "DELETE", null, "Provider deleted and saved.");
+    }
+
+    elements.providerNew.addEventListener("click", () => openProviderEditor());
+    elements.providerCancel.addEventListener("click", closeProviderEditor);
+    elements.providerKeyMode.addEventListener("change", keyModeChanged);
+    elements.providerEditor.addEventListener("keydown", event => {
+      if (event.key === "Escape" && !groupBusy) { event.preventDefault(); closeProviderEditor(); }
+    });
+    elements.providerEditor.addEventListener("submit", async event => {
+      event.preventDefault();
+      if (groupBusy) return;
+      const cooldown = elements.providerCooldown.value;
+      if (cooldown !== "" && (!Number.isSafeInteger(Number(cooldown)) || Number(cooldown) < 0)) {
+        elements.providerMessage.textContent = "Cooldown must be a non-negative whole number.";
+        elements.providerCooldown.focus();
+        return;
+      }
+      const body = {
+        id: elements.providerId.value.trim(),
+        name: elements.providerName.value.trim(),
+        protocol: elements.providerProtocol.value,
+        base_url: elements.providerUrl.value.trim(),
+        models: lines(elements.providerModels.value),
+        fallback: lines(elements.providerFallback.value),
+        key_cooldown_ms: cooldown === "" ? null : Number(cooldown),
+        make_default: elements.providerDefault.checked
+      };
+      if (elements.providerKeyMode.value === "replace") {
+        body.api_keys = lines(elements.providerKeys.value);
+        if (!body.api_keys.length) {
+          elements.providerMessage.textContent = "Enter a key or choose No upstream authentication.";
+          elements.providerKeys.focus();
+          return;
+        }
+      } else if (elements.providerKeyMode.value === "clear") body.api_keys = [];
+      const path = editingProvider === null ? "/config/providers" : "/config/providers/" + encodeURIComponent(editingProvider);
+      await mutateProvider(path, editingProvider === null ? "POST" : "PUT", body, "Provider saved. New requests use it immediately.");
+    });
+
     function openGroupEditor(group = null) {
       if (groupBusy) return;
+      if (!elements.providerEditor.hidden) closeProviderEditor();
       editingGroup = group?.id ?? null;
       elements.groupEditorTitle.textContent = group ? "Edit routing group" : "New routing group";
       elements.groupId.value = group?.id || "";
@@ -897,6 +1073,11 @@
 
     function setGroupBusy(busy) {
       groupBusy = busy;
+      elements.providerEditor.setAttribute("aria-busy", String(busy));
+      for (const control of elements.providerEditor.elements) control.disabled = busy;
+      elements.providerNew.disabled = busy;
+      for (const button of elements.routingRows.querySelectorAll("button")) button.disabled = busy;
+      elements.providerSave.textContent = busy ? "Saving…" : "Save provider";
       elements.groupEditor.setAttribute("aria-busy", String(busy));
       for (const control of elements.groupEditor.elements) control.disabled = busy;
       elements.groupNew.disabled = busy;
@@ -1014,6 +1195,12 @@
     function disconnect(expired) {
       ++sessionRevision;
       ++dataRevision;
+      elements.providerEditor.hidden = true;
+      elements.providerEditor.reset();
+      elements.providerKeys.value = "";
+      elements.providerMessage.textContent = "";
+      editingProvider = null;
+      routingSnapshot = null;
       elements.groupEditor.hidden = true;
       elements.groupEditor.reset();
       elements.groupMessage.textContent = "";
