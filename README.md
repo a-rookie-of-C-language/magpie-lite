@@ -17,7 +17,7 @@ OpenCode ────┘   Chat + Responses +
 - **Cross-protocol translation** through a neutral IR: requests, replies, and **SSE streams** — text, tool calls, reasoning deltas, usage
 - **Providers** from one TOML file: Chat-compatible, Responses-compatible, Anthropic, or Gemini upstreams
 - **Model routing**: `deepseek/deepseek-chat` by provider id, `group/daily-coding` route chains, bare names by provider model lists, default provider fallback
-- **Multi-key pools**: repeat `--api-key`; requests rotate across keys, rejected/rate-limited keys are retried before route fallback, and `402`/`429` starts a fixed cooldown (60s default, per-provider `key_cooldown_ms` / `--key-cooldown-ms` override)
+- **Multi-key pools**: repeat `--api-key`; requests rotate across keys, rejected/rate-limited keys are retried before route fallback, and `402`/`429` starts a cooldown from `Retry-After` or common `x-ratelimit-reset-*` headers (60s fallback, per-provider `key_cooldown_ms` / `--key-cooldown-ms` override; `0` disables it)
 - **Failover**: ordered provider fallbacks and routing-group routes, tried before any reply bytes are streamed when the active provider is rate limited, out of quota, overloaded, or unreachable
 - **Local authentication**: every non-health route requires the configured token as Bearer, Anthropic `x-api-key`, or Gemini `x-goog-api-key`; `/health` stays public
 - **Request statistics**: token-protected `/stats` and `magpie-lite stats` show provider and per-key totals, token usage, statuses, latency, and recent request metadata (including which key slot served it, never the key) — in memory only, with no prompt/reply text or credentials
@@ -73,7 +73,7 @@ Tests are the contract: `crates/core/tests/translation.rs` checks real wire shap
 
 ## Not yet (the roadmap)
 
-- `Retry-After` and provider quota-header-aware cooldown durations (fixed cooldowns and per-provider overrides work)
+- Provider reset timestamps and body-reported retry delays (`Retry-After` and common `x-ratelimit-reset-*` durations work)
 - Persistent request history and richer usage views (in-memory `/stats` already works)
 - More agents (Cursor CLI, Zed, Crush, Goose, ...)
 - A TUI/Web UI

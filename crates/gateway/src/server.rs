@@ -21,6 +21,7 @@ use magpie_core::{anthropic, chat, gemini, responses};
 use serde_json::{Value, json};
 
 use crate::config::{Config, Protocol, ProviderConfig};
+use crate::cooldown::quota_cooldown;
 use crate::upstream;
 use crate::usage::{RequestLog, RequestTracker, StatsSnapshot};
 
@@ -457,11 +458,13 @@ async fn send_with_fallback(
             };
             tracker.record_attempt(&route.provider.id, *key_slot, &attempt_status);
             if quota_limited_status(status) {
-                state.key_rotation.cool_down(
-                    &route.provider.id,
-                    *key_slot,
+                let cooldown = quota_cooldown(
+                    resp.headers(),
                     state.config.key_cooldown_for(&route.provider),
                 );
+                state
+                    .key_rotation
+                    .cool_down(&route.provider.id, *key_slot, cooldown);
             }
             if status.is_success() {
                 return Ok((resp, candidate));

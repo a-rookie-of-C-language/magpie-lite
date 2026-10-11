@@ -10,6 +10,7 @@ anyhow.workspace = true
 async-stream.workspace = true
 axum.workspace = true
 futures.workspace = true
+httpdate.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

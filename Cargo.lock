@@ -754,6 +754,7 @@ dependencies = [
  "axum",
  "dirs",
  "futures",
+ "httpdate",
  "magpie-core",
  "reqwest",
  "serde",
