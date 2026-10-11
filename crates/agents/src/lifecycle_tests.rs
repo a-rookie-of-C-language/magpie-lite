@@ -1067,3 +1067,109 @@ fn comments_only_and_bom_text_configs_connect_and_selectively_restore() {
         assert!(!restored.contains("magpie-lite"));
     }
 }
+
+#[test]
+fn duplicate_json_in_any_adapter_file_is_refused_before_real_writes() {
+    for id in [
+        AgentId::Claude,
+        AgentId::Crush,
+        AgentId::Gemini,
+        AgentId::Goose,
+        AgentId::Opencode,
+        AgentId::Zed,
+    ] {
+        let (_root, m) = setup();
+        let paths = m.paths(id).unwrap();
+        for index in 0..paths.len() {
+            if (id == AgentId::Goose && index == 0) || (id == AgentId::Gemini && index == 1) {
+                continue;
+            }
+            for duplicate in [
+                r#"{"foreign":1,"foreign":2}"#,
+                r#"{"foreign":{"secret-name":1,"secret-name":2}}"#,
+                r#"{"foreign":[{"key":1,"\u006bey":2}]}"#,
+            ] {
+                for (i, path) in paths.iter().enumerate() {
+                    write(path, original(id, i));
+                }
+                write(&paths[index], duplicate);
+                let before = images(&m, id);
+                let error = m
+                    .preview(id, Action::Connect, Some(MODEL), gateway())
+                    .unwrap_err();
+                assert_eq!(error.kind, ErrorKind::Invalid, "{id:?} file {index}");
+                assert!(!error.to_string().contains("secret-name"));
+                assert!(
+                    m.apply(id, Action::Connect, Some(MODEL), &"0".repeat(64), gateway())
+                        .is_err()
+                );
+                assert_eq!(images(&m, id), before, "{id:?} changed a real file");
+                assert!(m.read_journal(id).unwrap().is_none());
+            }
+        }
+    }
+}
+#[test]
+fn connected_duplicate_json_blocks_rewire_and_restore_without_losing_edits() {
+    for id in [
+        AgentId::Claude,
+        AgentId::Crush,
+        AgentId::Gemini,
+        AgentId::Goose,
+        AgentId::Opencode,
+        AgentId::Zed,
+    ] {
+        let (_root, m) = setup();
+        connect(&m, id, MODEL);
+        let paths = m.paths(id).unwrap();
+        for (index, path) in paths.iter().enumerate() {
+            if (id == AgentId::Goose && index == 0) || (id == AgentId::Gemini && index == 1) {
+                continue;
+            }
+            let original = fs::read(path).unwrap();
+            let mut text = String::from_utf8(original.clone()).unwrap();
+            let end = text.rfind('}').unwrap();
+            text.insert_str(end, ",\"foreign\":1,\"foreign\":2");
+            write(path, text);
+            let before = images(&m, id);
+            assert!(m.status(id).unwrap().drifted, "{id:?} file {index}");
+            for (action, model) in [
+                (Action::Connect, Some("mock/new")),
+                (Action::Disconnect, None),
+            ] {
+                let error = m.preview(id, action, model, gateway()).unwrap_err();
+                assert_eq!(error.kind, ErrorKind::Conflict);
+                assert_safe(m.status(id).unwrap());
+                assert_eq!(images(&m, id), before);
+            }
+            write(path, original);
+            assert!(!m.status(id).unwrap().drifted);
+        }
+        disconnect(&m, id);
+    }
+}
+
+#[test]
+fn ambiguous_legacy_json_backup_refuses_migration_without_changing_files_or_journal() {
+    let (_root, m) = setup();
+    let id = AgentId::Claude;
+    connect(&m, id, MODEL);
+    let mut j = m.load(id).unwrap().unwrap();
+    j.schema = 1;
+    for entry in &mut j.files {
+        entry.owned = None;
+        entry.restore_base = None;
+    }
+    j.files[0].baseline = Image {
+        data: Some(STANDARD.encode(r#"{"private-original-key":1,"private-original-key":2}"#)),
+        mode: j.files[0].applied.mode,
+    };
+    m.save(&j).unwrap();
+    let files_before = images(&m, id);
+    let journal_before = fs::read(m.journal_path(id)).unwrap();
+    let error = m.recover(id).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert!(!error.to_string().contains("private-original-key"));
+    assert_eq!(images(&m, id), files_before);
+    assert_eq!(fs::read(m.journal_path(id)).unwrap(), journal_before);
+}

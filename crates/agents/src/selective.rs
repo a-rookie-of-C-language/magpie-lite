@@ -106,7 +106,7 @@ fn parse(id: AgentId, index: usize, text: &str) -> Result<Value> {
     } else if id == AgentId::Goose && index == 0 {
         serde_yaml::from_str(text).ok()
     } else {
-        serde_json::from_str::<serde_json::Value>(text)
+        super::json_config::from_str(text)
             .ok()
             .and_then(|v| serde_yaml::to_value(v).ok())
     }

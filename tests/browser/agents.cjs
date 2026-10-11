@@ -163,6 +163,86 @@ test("Agent console against a real isolated Rust gateway", { timeout: 120000 }, 
       }
     });
 
+    await t.test("seven Agents preserve unrelated edits through stale preview, rewire and disconnect", async () => {
+      for (const id of Object.keys(names)) {
+        const files = statuses.find(agent => agent.id === id).files;
+        await manage(id); await page.locator("#agent-model").fill("mock/alpha");
+        await preview(); await apply("Connected to mock/alpha.");
+        for (const [index, file] of files.entries()) {
+          const current = await fs.readFile(file, "utf8");
+          let edited;
+          if (id === "codex") edited = "user_note = 'BROWSER_USER_BEFORE'\r\n" + current;
+          else if (id === "goose" && index === 0) edited = "user_note: BROWSER_USER_BEFORE\r\n" + current;
+          else if (id === "gemini" && index === 1) edited = current + "# later user comment\r\nUSER_NOTE=BROWSER_USER_BEFORE\r\n";
+          else {
+            const value = JSON.parse(current);
+            value.user_note = "BROWSER_USER_BEFORE";
+            value.custom = "user-updated";
+            delete value["original-secret"];
+            edited = JSON.stringify(value, null, 2);
+          }
+          await write(file, edited);
+        }
+        await page.locator("#agent-refresh").click();
+        await page.waitForFunction(() => !document.getElementById("agent-refresh").disabled);
+        assert.equal((await api("/agents")).agents.find(agent => agent.id === id).drifted, false);
+        assert.equal((await card(id).innerText()).includes("Configuration drift"), false);
+        await page.locator("#agent-model").fill("mock/beta"); await preview();
+        for (const file of files) await write(file, (await fs.readFile(file, "utf8")).replaceAll("BROWSER_USER_BEFORE", "BROWSER_USER_AFTER"));
+        const snapshots = await Promise.all(files.map(file => fs.readFile(file)));
+        await page.locator("#agent-apply").click();
+        await page.waitForFunction(() => document.getElementById("agent-message").textContent.includes("Preview again before retrying"));
+        for (const [index, file] of files.entries()) assert.deepEqual(await fs.readFile(file), snapshots[index]);
+        assert.equal(await page.locator("#agent-preview").isVisible(), false);
+        await preview(); await apply("Connected to mock/beta.");
+        await page.locator("#agent-action").selectOption("disconnect");
+        await preview(); await apply("Managed settings restored; unrelated edits preserved.");
+        for (const [index, file] of files.entries()) {
+          const restored = await fs.readFile(file, "utf8");
+          assert.ok(restored.includes("BROWSER_USER_AFTER"), id + " lost file " + index);
+          assert.equal(restored.includes(TOKEN), false);
+          if (!(id === "codex" || (id === "goose" && index === 0) || (id === "gemini" && index === 1))) {
+            const value = JSON.parse(restored);
+            assert.equal(value.custom, "user-updated");
+            assert.equal(Object.hasOwn(value, "original-secret"), false);
+          }
+          await write(file, originals.get(file));
+        }
+        await safeDom();
+      }
+      assert.deepEqual(await fs.readFile(gateway.config), configBytes);
+      assert.equal((await api("/stats")).total_requests, 0);
+    });
+
+    await t.test("ambiguous JSON is rejected without writes or rendering private keys", async () => {
+      const file = statuses.find(agent => agent.id === "claude").files[0];
+      const duplicate = Buffer.from('{"' + KEY + '":1,"' + KEY + '":2}');
+      await write(file, duplicate);
+      await manage("claude"); await page.locator("#agent-model").fill("mock/alpha");
+      await page.locator("#agent-preview-button").click();
+      await page.waitForFunction(() => document.getElementById("agent-message").textContent.includes("could not parse"));
+      assert.deepEqual(await fs.readFile(file), duplicate);
+      assert.equal(await page.locator("#agent-preview").isVisible(), false);
+      await safeDom();
+      await write(file, originals.get(file));
+      await preview(); await apply("Connected to mock/alpha.");
+      const applied = await fs.readFile(file);
+      const text = applied.toString("utf8");
+      const end = text.lastIndexOf("}");
+      const ambiguous = text.slice(0, end) + ',"foreign":{"x":1,"x":2}' + text.slice(end);
+      await write(file, ambiguous);
+      await page.locator("#agent-refresh").click();
+      await page.waitForFunction(() => document.querySelector(".agent-card").textContent.includes("Configuration drift"));
+      await page.locator("#agent-action").selectOption("disconnect");
+      await page.locator("#agent-preview-button").click();
+      await page.waitForFunction(() => document.getElementById("agent-message").textContent.includes("cannot be parsed"));
+      assert.equal(await fs.readFile(file, "utf8"), ambiguous);
+      await safeDom();
+      await write(file, applied);
+      await preview(); await apply("Managed settings restored; unrelated edits preserved.");
+      assert.deepEqual(await fs.readFile(file), originals.get(file));
+    });
+
     await t.test("input/action changes invalidate previews, Escape clears and returns focus", async () => {
       await manage("claude"); await preview();
       await page.evaluate(() => update(false));
@@ -224,11 +304,17 @@ test("Agent console against a real isolated Rust gateway", { timeout: 120000 }, 
     await t.test("recovery requires explicit confirmation and restores a synthetic pending disconnect", async () => {
       await manage("claude"); await page.locator("#agent-model").fill("mock/alpha");
       await preview(); await apply("Connected to mock/alpha.");
+      const files = statuses.find(agent => agent.id === "claude").files;
+      const edited = JSON.parse(await fs.readFile(files[0], "utf8"));
+      edited.recovery_note = "BROWSER_RECOVERY_USER";
+      await write(files[0], JSON.stringify(edited));
+      await page.locator("#agent-model").fill("mock/beta");
+      await preview(); await apply("Connected to mock/beta.");
       const journalPath = path.join(root, "agent-state", "claude.json");
       const journal = JSON.parse(await fs.readFile(journalPath, "utf8"));
       journal.phase = "disconnecting";
       journal.rollback = journal.files.map(file => file.applied);
-      journal.restore = journal.files.map(file => file.baseline);
+      journal.restore = journal.files.map(file => file.restore_base);
       await write(journalPath, JSON.stringify(journal));
       await page.locator("#agent-refresh").click();
       await page.locator("#agent-recover").waitFor({ state: "visible" });
@@ -240,8 +326,12 @@ test("Agent console against a real isolated Rust gateway", { timeout: 120000 }, 
       page.once("dialog", dialog => dialog.accept());
       await page.locator("#agent-recover").click();
       await page.waitForFunction(() => document.getElementById("agent-message").textContent.includes("Recovery complete."));
-      for (const file of statuses.find(agent => agent.id === "claude").files) assert.deepEqual(await fs.readFile(file), originals.get(file));
+      const expected = JSON.parse(originals.get(files[0]).toString("utf8"));
+      expected.recovery_note = "BROWSER_RECOVERY_USER";
+      assert.deepEqual(JSON.parse(await fs.readFile(files[0], "utf8")), expected);
       assert.equal(await page.locator("#agent-recover").isVisible(), false);
+      await safeDom();
+      await write(files[0], originals.get(files[0]));
     });
 
     await t.test("busy operations lock all conflicting workflows and route edits clear previews", async () => {

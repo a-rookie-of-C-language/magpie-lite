@@ -202,3 +202,196 @@ fn windows_junction_cannot_redirect_agent_writes() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("reparse-point"));
     assert!(!elsewhere.join("settings.json").exists());
 }
+
+fn managed_paths(sandbox: &Sandbox, preview: &Value) -> Vec<PathBuf> {
+    preview["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            let path = PathBuf::from(f["path"].as_str().unwrap());
+            assert!(
+                path.starts_with(sandbox.root.path()),
+                "Agent path escaped sandbox"
+            );
+            path
+        })
+        .collect()
+}
+fn add_cli_user_note(agent: &str, index: usize, path: &std::path::Path) {
+    let text = std::fs::read_to_string(path).unwrap();
+    let text = match (agent, index) {
+        ("codex", _) => format!("user_note = 'CLI_USER_BEFORE'\r\n{text}"),
+        ("goose", 0) => format!("user_note: CLI_USER_BEFORE\r\n{text}"),
+        ("gemini", 1) => format!("{text}# user note\r\nUSER_NOTE=CLI_USER_BEFORE\r\n"),
+        _ => {
+            let mut v: Value = serde_json::from_str(&text).unwrap();
+            v["user_note"] = json!("CLI_USER_BEFORE");
+            v["custom"] = json!("user-updated");
+            v.as_object_mut().unwrap().remove("remove_me");
+            serde_json::to_string_pretty(&v).unwrap()
+        }
+    };
+    std::fs::write(path, text).unwrap();
+}
+#[test]
+fn all_cli_agents_preserve_unrelated_edits_across_rewire_and_configless_disconnect() {
+    let s = Sandbox::new();
+    let config = std::fs::read(&s.config).unwrap();
+    for agent in [
+        "claude", "codex", "crush", "gemini", "goose", "opencode", "zed",
+    ] {
+        let p = s.success(&["agent", "preview", agent, "mock/model"]);
+        let paths = managed_paths(&s, &p);
+        for (i, path) in paths.iter().enumerate() {
+            let original = match (agent, i) {
+                ("codex", _) => "# prior\r\nmodel = 'original'\r\n",
+                ("goose", 0) => "# prior\r\nGOOSE_PROVIDER: original\r\nGOOSE_MODEL: original\r\n",
+                ("gemini", 1) => "# prior\r\nGEMINI_API_KEY=original-secret\r\n",
+                _ => r#"{"custom":"original","remove_me":true}"#,
+            };
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, original).unwrap();
+        }
+        s.success(&["agent", "connect", agent, "mock/model"]);
+        for (i, path) in paths.iter().enumerate() {
+            add_cli_user_note(agent, i, path);
+        }
+        let list = s.success(&["agent", "list"]);
+        let status = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["id"] == agent)
+            .unwrap();
+        assert_eq!(status["drifted"], false);
+        let stale = s.success(&["agent", "preview", agent, "mock/rewired"]);
+        for path in &paths {
+            let text = std::fs::read_to_string(path)
+                .unwrap()
+                .replace("CLI_USER_BEFORE", "CLI_USER_AFTER");
+            std::fs::write(path, text).unwrap();
+        }
+        let before: Vec<_> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+        let failed = s.run(&[
+            "agent",
+            "connect",
+            agent,
+            "mock/rewired",
+            "--revision",
+            stale["revision"].as_str().unwrap(),
+        ]);
+        assert!(!failed.status.success());
+        assert!(!String::from_utf8_lossy(&failed.stderr).contains(TOKEN));
+        assert_eq!(
+            paths
+                .iter()
+                .map(|p| std::fs::read(p).unwrap())
+                .collect::<Vec<_>>(),
+            before
+        );
+        s.success(&["agent", "connect", agent, "mock/rewired"]);
+        std::fs::remove_file(&s.config).unwrap();
+        let p = s.success(&["agent", "preview", agent, "--disconnect"]);
+        assert_eq!(
+            s.success(&[
+                "agent",
+                "disconnect",
+                agent,
+                "--revision",
+                p["revision"].as_str().unwrap()
+            ])["connected"],
+            false
+        );
+        for (i, path) in paths.iter().enumerate() {
+            let text = std::fs::read_to_string(path).unwrap();
+            assert!(text.contains("CLI_USER_AFTER"), "lost {agent} file {i}");
+            assert!(!text.contains(TOKEN));
+            if !(agent == "codex" || (agent == "goose" && i == 0) || (agent == "gemini" && i == 1))
+            {
+                let v: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(v["custom"], "user-updated");
+                assert!(v.get("remove_me").is_none());
+            }
+        }
+        std::fs::write(&s.config, &config).unwrap();
+    }
+}
+#[test]
+fn cli_duplicate_json_is_rejected_without_writes_or_private_error_content() {
+    let s = Sandbox::new();
+    let p = s.success(&["agent", "preview", "claude", "mock/model"]);
+    let path = managed_paths(&s, &p).remove(0);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let duplicate = r#"{"private-key-name":1,"private-key-name":2}"#;
+    std::fs::write(&path, duplicate).unwrap();
+    let failed = s.run(&["agent", "connect", "claude", "mock/model"]);
+    assert!(!failed.status.success());
+    assert!(!String::from_utf8_lossy(&failed.stderr).contains("private-key-name"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), duplicate);
+    assert!(!s.root.path().join("agent-state/claude.json").exists());
+    std::fs::write(&path, "{}").unwrap();
+    s.success(&["agent", "connect", "claude", "mock/model"]);
+    let mut duplicate = std::fs::read_to_string(&path).unwrap();
+    duplicate.insert_str(
+        duplicate.rfind('}').unwrap(),
+        ",\"foreign\":1,\"foreign\":2",
+    );
+    std::fs::write(&path, &duplicate).unwrap();
+    let failed = s.run(&["agent", "disconnect", "claude"]);
+    assert!(!failed.status.success());
+    assert!(!String::from_utf8_lossy(&failed.stderr).contains(TOKEN));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), duplicate);
+}
+#[test]
+fn cli_recovers_selective_multifile_disconnect_after_restart_without_config() {
+    let s = Sandbox::new();
+    let p = s.success(&["agent", "preview", "gemini", "mock/model"]);
+    let paths = managed_paths(&s, &p);
+    s.success(&["agent", "connect", "gemini", "mock/model"]);
+    for (i, path) in paths.iter().enumerate() {
+        add_cli_user_note("gemini", i, path);
+    }
+    s.success(&["agent", "connect", "gemini", "mock/rewired"]);
+    let before: Vec<_> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    let journal_path = s.root.path().join("agent-state/gemini.json");
+    let mut journal: Value =
+        serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+    s.success(&["agent", "disconnect", "gemini"]);
+    let targets: Vec<_> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    journal["phase"] = json!("disconnecting");
+    journal["rollback"] = json!(
+        journal["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["applied"].clone())
+            .collect::<Vec<_>>()
+    );
+    journal["restore"] = json!(
+        journal["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["restore_base"].clone())
+            .collect::<Vec<_>>()
+    );
+    std::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+    std::fs::write(&paths[1], &before[1]).unwrap();
+    std::fs::remove_file(&s.config).unwrap();
+    let result = s.success(&["agent", "recover", "gemini"]);
+    assert_eq!(result["connected"], false);
+    assert_eq!(result["recovery_needed"], false);
+    assert_eq!(
+        paths
+            .iter()
+            .map(|p| std::fs::read(p).unwrap())
+            .collect::<Vec<_>>(),
+        targets
+    );
+    for path in paths {
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains("CLI_USER_BEFORE"));
+        assert!(!text.contains(TOKEN));
+    }
+}

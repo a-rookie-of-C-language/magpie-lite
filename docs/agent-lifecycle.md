@@ -143,13 +143,18 @@ do not delete backups to dismiss an error.
   Pending recovery accepts only recorded whole-file input/target images, not
   edits made after journaling. External editors do not participate in our lock;
   immediate checks are not a filesystem-wide CAS.
-- JSON parsing currently follows serde_json's last-key-wins behavior for duplicate
-  keys; ambiguous duplicate-key configurations are not supported. Gemini dotenv
-  supports export prefixes, duplicate assignments and quoted multiline records,
-  but is not a full dotenv evaluator and does not expand variables. Managed
-  dotenv value-format changes can cause conservative conflicts. Unsupported
-  YAML editing shapes are refused when independent semantic validation fails,
-  rather than falling back to lossy serialization.
+- Agent JSON parsing rejects duplicate object keys recursively, including nested
+  objects inside arrays and keys that match after escape decoding. A first
+  connection with ambiguous JSON returns a sanitized 400; ambiguous edits to a
+  connected file cause drift/conflict (409). Files and backups are not rewritten
+  on refusal. Schema-1 backups containing ambiguous JSON cannot be selectively
+  migrated and are retained for manual recovery. JSON/JSONC lossless editing is
+  still a parity gap; JSONC is not silently converted to JSON.
+- Gemini dotenv supports export prefixes, duplicate assignments and quoted
+  multiline records, but is not a full dotenv evaluator and does not expand
+  variables. Managed dotenv value-format changes can cause conservative
+  conflicts. Unsupported YAML editing shapes are refused when independent
+  semantic validation fails, rather than falling back to lossy serialization.
 - OpenCode's JSONC/JSON/legacy precedence is checked live. A new overriding file
   marks an existing connection drifted; disconnect/recovery can still restore
   the originally managed path, including after restart. JSONC wiring is refused
@@ -177,6 +182,12 @@ cargo fmt --all -- --check
 Tests use `Manager::at_home` with explicit temporary directories, or child CLI
 processes with `MAGPIE_LITE_HOME` pointing to a temporary home. They never mutate
 process-wide home variables or target the user's actual agent configuration.
+The HTTP and child-CLI suites exercise seven-Agent unrelated edits, stale
+revisions, rewires and immediate selective disconnects. Child CLI tests also
+remove the gateway TOML before disconnect/recovery. Multi-file recovery fixtures
+simulate a partly completed Gemini disconnect using images from a real rewire;
+HTTP additionally refuses edits made after the pending journal without partial
+writes. These fixtures validate journal recovery, not actual crash injection.
 
 ### Reproducible browser checks
 
@@ -196,14 +207,17 @@ Rust distribution; Playwright is only needed to run this browser suite.
 
 The suite exercises actual HTTP preview/apply endpoints for every adapter:
 original-byte restoration, missing-file creation/removal, rewiring via a group,
-stale revisions, refused whole-file drift and OpenCode overriding paths. It also
+seven-Agent preservation of unrelated additions/changes/deletions, stale
+revisions even after unrelated edits, refused managed-field drift, ambiguous
+JSON refusal and OpenCode overriding paths. It also
 checks model suggestions, form/preview invalidation, provider/group CRUD and
 delete-reference protection, busy coordination in both directions, errors,
 session expiry, late old-session responses, Escape/focus,
 secret-free rendered text/forms, 44px controls and 390px page overflow.
 
 Recovery uses a **synthetic pending-disconnect journal** in the temporary state
-directory, not a real process crash. Agent-status failure, authentication expiry
+directory with a merged restoration image retaining unrelated edits, not a real
+process crash. Agent-status failure, authentication expiry
 and provider-tool busy coordination use explicit browser response fixtures;
 the timeout check accelerates one browser timer. These are UI coordination
 checks, not live vendor or real Agent execution evidence. Screenshots were

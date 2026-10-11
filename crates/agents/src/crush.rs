@@ -102,8 +102,8 @@ fn read_object(path: &Path) -> Result<Value> {
     if text.trim().is_empty() {
         return Ok(json!({}));
     }
-    let config: Value =
-        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let config: Value = super::json_config::from_str(&text)
+        .with_context(|| format!("parsing {}", path.display()))?;
     if !config.is_object() {
         anyhow::bail!("Crush configuration must contain a JSON object");
     }

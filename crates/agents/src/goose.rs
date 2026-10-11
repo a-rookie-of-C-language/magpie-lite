@@ -155,7 +155,7 @@ fn write_custom_provider(config_dir: &Path, model: &str, port: u16, token: &str)
     let path = dir.join(format!("{PROVIDER_ID}.json"));
 
     let mut provider = if path.exists() {
-        let current: JsonValue = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let current: JsonValue = super::json_config::from_slice(&std::fs::read(&path)?)?;
         current
             .as_object()
             .context("Goose custom provider must be a JSON object")?

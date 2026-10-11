@@ -66,7 +66,8 @@ pub fn wire_at(path: &Path, model: &str, port: u16, _token: &str) -> Result<()> 
     let mut settings: Value = if path.exists() {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?
+        super::json_config::from_str(&text)
+            .with_context(|| format!("parsing {}", path.display()))?
     } else {
         json!({})
     };

@@ -48,7 +48,7 @@ pub fn wire_at(
     let mut settings: Value = if settings_path.exists() {
         let text = std::fs::read_to_string(settings_path)
             .with_context(|| format!("reading {}", settings_path.display()))?;
-        serde_json::from_str(&text)
+        super::json_config::from_str(&text)
             .with_context(|| format!("parsing {}", settings_path.display()))?
     } else {
         json!({})
