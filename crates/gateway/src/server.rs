@@ -624,45 +624,68 @@ fn upstream_routes(
         ..initial
     };
     let mut out = vec![initial.clone()];
-    let mut seen = HashSet::from([initial.provider.id.clone()]);
+    // Ordinary provider fallbacks are provider-level: once a provider has
+    // been attempted, its other fallback models must not create a loop. A
+    // routing group is different: each configured provider/model pair is an
+    // independent route, so one provider can intentionally contribute more
+    // than one model to the same group.
+    let mut seen_providers = HashSet::from([initial.provider.id.clone()]);
+    let mut seen_group_routes =
+        HashSet::from([(initial.provider.id.clone(), initial.model.clone())]);
 
     let mut fallback_references = group_plan
         .map(|plan| {
             plan.routes
                 .iter()
                 .skip(1)
-                .map(|(_, route)| route.clone())
+                .map(|(index, route)| (Some(*index), route.clone()))
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_else(|| config.fallback_references(requested_model, &initial.provider));
-    for reference in fallback_references.drain(..) {
+        .unwrap_or_else(|| {
+            config
+                .fallback_references(requested_model, &initial.provider)
+                .into_iter()
+                .map(|route| (None, route))
+                .collect()
+        });
+    for (group_route_index, reference) in fallback_references.drain(..) {
         let Some((provider, model)) = config.resolve(&reference) else {
             tracing::warn!("fallback `{reference}` does not resolve; skipping");
             continue;
         };
-        if !seen.insert(provider.id.clone()) {
-            continue;
+        if let Some(route_index) = group_route_index {
+            if !seen_group_routes.insert((provider.id.clone(), model.clone())) {
+                continue;
+            }
+            let api_keys = key_rotation.rotate(
+                &provider.id,
+                provider.key_generation,
+                &provider.api_key_pool(),
+            );
+            out.push(UpstreamRoute {
+                provider: Arc::new(provider.clone()),
+                model,
+                api_keys,
+                group_id: group_plan.map(|plan| plan.id.clone()),
+                group_route_index: Some(route_index),
+            });
+        } else {
+            if !seen_providers.insert(provider.id.clone()) {
+                continue;
+            }
+            let api_keys = key_rotation.rotate(
+                &provider.id,
+                provider.key_generation,
+                &provider.api_key_pool(),
+            );
+            out.push(UpstreamRoute {
+                provider: Arc::new(provider.clone()),
+                model,
+                api_keys,
+                group_id: None,
+                group_route_index: None,
+            });
         }
-        let (group_id, group_route_index) = group_plan
-            .and_then(|plan| {
-                plan.routes
-                    .iter()
-                    .find(|(_, route)| route == &reference)
-                    .map(|(index, _)| (Some(plan.id.clone()), Some(*index)))
-            })
-            .unwrap_or((None, None));
-        let api_keys = key_rotation.rotate(
-            &provider.id,
-            provider.key_generation,
-            &provider.api_key_pool(),
-        );
-        out.push(UpstreamRoute {
-            provider: Arc::new(provider.clone()),
-            model,
-            api_keys,
-            group_id,
-            group_route_index,
-        });
     }
     out
 }

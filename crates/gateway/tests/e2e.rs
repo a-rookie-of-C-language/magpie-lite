@@ -406,6 +406,60 @@ async fn spawn_rate_limited() -> String {
 }
 
 #[derive(Clone)]
+struct SameProviderModelMock {
+    seen_models: Arc<Mutex<Vec<String>>>,
+}
+
+async fn same_provider_model_chat(
+    State(mock): State<SameProviderModelMock>,
+    body: axum::body::Bytes,
+) -> Response {
+    let request: Value = serde_json::from_slice(&body).expect("upstream body is JSON");
+    let model = request["model"]
+        .as_str()
+        .expect("upstream model is a string")
+        .to_owned();
+    mock.seen_models.lock().unwrap().push(model.clone());
+
+    if model == "model-a" {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": {"message": "model-a is temporarily unavailable"}
+            })),
+        )
+            .into_response();
+    }
+
+    Json(json!({
+        "id": "chatcmpl-same-provider",
+        "object": "chat.completion",
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "model-b worked."},
+            "finish_reason": "stop"
+        }]
+    }))
+    .into_response()
+}
+
+async fn spawn_same_provider_model_mock() -> (String, Arc<Mutex<Vec<String>>>) {
+    let seen_models = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(same_provider_model_chat))
+        .with_state(SameProviderModelMock {
+            seen_models: seen_models.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), seen_models)
+}
+
+#[derive(Clone)]
 struct KeyPoolMock {
     seen_keys: Arc<Mutex<Vec<String>>>,
     retry_after: Option<&'static str>,
@@ -642,6 +696,48 @@ async fn spawn_gateway_with_fallback(primary: String, backup: String) -> String 
     format!("http://{addr}")
 }
 
+async fn spawn_gateway_with_same_provider_group(upstream: String) -> String {
+    let config = Config {
+        port: 0,
+        token: "magpie-lite".into(),
+        key_cooldown_ms: 60_000,
+        history_path: None,
+        default_provider: "mock".into(),
+        provider: vec![ProviderConfig {
+            id: "mock".into(),
+            name: "Mock".into(),
+            protocol: Protocol::Chat,
+            base_url: format!("{upstream}/v1"),
+            api_key: "mock-key".into(),
+            api_keys: Vec::new(),
+            models: vec!["model-a".into(), "model-b".into()],
+            fallback: Vec::new(),
+            key_cooldown_ms: None,
+            key_generation: 0,
+        }],
+        group: vec![GroupConfig {
+            id: "same-provider".into(),
+            name: "Same provider models".into(),
+            routes: vec!["mock/model-a".into(), "mock/model-b".into()],
+            routing: RoutingPolicy::Order,
+        }],
+    };
+    let requests = request_log(&config);
+    let state = Arc::new(AppState {
+        agents: None,
+        config: magpie_gateway::ConfigStore::new(config, None),
+        http: magpie_gateway::upstream::http_client().unwrap(),
+        requests,
+        key_rotation: magpie_gateway::KeyRotator::default(),
+    });
+    let app = build_router(state);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
 async fn spawn_gateway_with_group(
     primary: String,
     backup: String,
@@ -867,6 +963,30 @@ async fn retryable_primary_falls_back_before_streaming() {
     assert_eq!(stats["recent_requests"][0]["provider"], "backup");
 }
 
+#[tokio::test]
+async fn routing_group_retries_same_provider_with_a_different_model() {
+    let (upstream, seen_models) = spawn_same_provider_model_mock().await;
+    let gw = spawn_gateway_with_same_provider_group(upstream).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "group/same-provider",
+            "messages": [{"role": "user", "content": "Try both models."}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "model-b worked.");
+    assert_eq!(
+        *seen_models.lock().unwrap(),
+        vec!["model-a".to_owned(), "model-b".to_owned()]
+    );
+}
 #[tokio::test]
 async fn routing_groups_fall_back_in_configured_order() {
     let primary = spawn_rate_limited().await;

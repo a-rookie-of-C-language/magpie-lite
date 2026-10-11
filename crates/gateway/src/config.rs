@@ -1007,6 +1007,18 @@ mod tests {
         assert!(!json.contains("magpie-lite"));
     }
     #[test]
+    fn group_validation_allows_distinct_models_from_one_provider() {
+        let group = GroupConfig {
+            id: "same-provider".into(),
+            name: String::new(),
+            routes: vec!["mock/model-a".into(), "mock/model-b".into()],
+            routing: RoutingPolicy::Order,
+        };
+
+        assert!(group.validate().is_ok());
+    }
+
+    #[test]
     fn group_routing_policy_parses_aliases_and_defaults_to_order() {
         assert_eq!(RoutingPolicy::default(), RoutingPolicy::Order);
         assert_eq!("round_robin".parse(), Ok(RoutingPolicy::Rotate));
