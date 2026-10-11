@@ -457,19 +457,22 @@ async fn send_with_fallback(
                 status.as_u16().to_string()
             };
             tracker.record_attempt(&route.provider.id, *key_slot, &attempt_status);
+            if status.is_success() {
+                return Ok((resp, candidate));
+            }
+            let headers = resp.headers().clone();
+            let error = upstream::error_detail(resp).await;
             if quota_limited_status(status) {
                 let cooldown = quota_cooldown(
-                    resp.headers(),
+                    &headers,
+                    Some(&error.body),
                     state.config.key_cooldown_for(&route.provider),
                 );
                 state
                     .key_rotation
                     .cool_down(&route.provider.id, *key_slot, cooldown);
             }
-            if status.is_success() {
-                return Ok((resp, candidate));
-            }
-            let detail = upstream::error_detail(resp).await;
+            let detail = error.message;
             tracing::warn!(
                 "upstream {} key {}: {detail}",
                 route.provider.id,

@@ -74,27 +74,39 @@ pub async fn send(
     Ok(resp)
 }
 
+/// An upstream error response after its body has been consumed.
+#[derive(Debug)]
+pub struct UpstreamError {
+    /// A readable message for agents and logs.
+    pub message: String,
+    /// The parsed JSON body, when there was one. It is used only to extract
+    /// cooldown metadata and is never persisted.
+    pub body: Value,
+}
+
 /// Pull a readable message out of an upstream error body. Takes the
 /// response: reading its body consumes it, and callers only want the
 /// status after this.
-pub async fn error_detail(resp: reqwest::Response) -> String {
+pub async fn error_detail(resp: reqwest::Response) -> UpstreamError {
     let status = resp.status();
     let bytes = resp.bytes().await.unwrap_or_default();
     if bytes.is_empty() {
-        return format!("upstream {status}");
+        return UpstreamError {
+            message: format!("upstream {status}"),
+            body: Value::Null,
+        };
     }
     let text = String::from_utf8_lossy(&bytes).into_owned();
-    match serde_json::from_str::<Value>(&text) {
-        Ok(v) => {
-            let inner = v
-                .pointer("/error/message")
-                .or_else(|| v.pointer("/message"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or(text);
-            format!("upstream {status}: {inner}")
-        }
-        Err(_) => format!("upstream {status}: {text}"),
+    let body = serde_json::from_str(&text).unwrap_or(Value::Null);
+    let message = body
+        .pointer("/error/message")
+        .or_else(|| body.pointer("/message"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or(text);
+    UpstreamError {
+        message: format!("upstream {status}: {message}"),
+        body,
     }
 }
 

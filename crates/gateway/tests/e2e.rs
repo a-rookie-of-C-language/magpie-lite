@@ -381,6 +381,7 @@ async fn spawn_rate_limited() -> String {
 struct KeyPoolMock {
     seen_keys: Arc<Mutex<Vec<String>>>,
     retry_after: Option<&'static str>,
+    retry_after_body: Option<&'static str>,
 }
 
 async fn key_pool_chat_completions(
@@ -398,11 +399,11 @@ async fn key_pool_chat_completions(
     mock.seen_keys.lock().unwrap().push(key.clone());
 
     if key == "first-key" {
-        let mut response = (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({"error": {"message": "first key is rate limited"}})),
-        )
-            .into_response();
+        let mut error = json!({"error": {"message": "first key is rate limited"}});
+        if let Some(retry_after) = mock.retry_after_body {
+            error["error"]["retryAfter"] = json!(retry_after);
+        }
+        let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response();
         if let Some(retry_after) = mock.retry_after {
             response.headers_mut().insert(
                 header::RETRY_AFTER,
@@ -424,13 +425,15 @@ async fn key_pool_chat_completions(
     .into_response()
 }
 
-async fn spawn_key_pool_mock_with_retry_after(
+async fn spawn_key_pool_mock_with_hints(
     retry_after: Option<&'static str>,
+    retry_after_body: Option<&'static str>,
 ) -> (String, Arc<Mutex<Vec<String>>>) {
     let seen_keys = Arc::new(Mutex::new(Vec::new()));
     let mock = KeyPoolMock {
         seen_keys: seen_keys.clone(),
         retry_after,
+        retry_after_body,
     };
     let app = Router::new()
         .route("/v1/chat/completions", post(key_pool_chat_completions))
@@ -441,6 +444,18 @@ async fn spawn_key_pool_mock_with_retry_after(
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (format!("http://{addr}"), seen_keys)
+}
+
+async fn spawn_key_pool_mock_with_retry_after(
+    retry_after: Option<&'static str>,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    spawn_key_pool_mock_with_hints(retry_after, None).await
+}
+
+async fn spawn_key_pool_mock_with_retry_body(
+    retry_after_body: Option<&'static str>,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    spawn_key_pool_mock_with_hints(None, retry_after_body).await
 }
 
 async fn spawn_key_pool_mock() -> (String, Arc<Mutex<Vec<String>>>) {
@@ -984,6 +999,55 @@ async fn retry_after_headers_shorten_key_cooldowns() {
         ]
     );
 }
+#[tokio::test]
+async fn body_retry_delays_shorten_key_cooldowns() {
+    let (upstream, seen_keys) = spawn_key_pool_mock_with_retry_body(Some("25ms")).await;
+    let gw = spawn_gateway_with_key_pool(upstream, None).await;
+    let client = reqwest::Client::new();
+
+    for expected_content in ["Weather?", "Again?"] {
+        let resp = client
+            .post(format!("{gw}/v1/chat/completions"))
+            .bearer_auth("magpie-lite")
+            .json(&json!({
+                "model": "primary/mock-model",
+                "messages": [{"role": "user", "content": expected_content}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        drop(resp.json::<Value>().await.unwrap());
+    }
+
+    // Gemini-style providers often put RetryInfo in the JSON error body.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let recovered = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "primary/mock-model",
+            "messages": [{"role": "user", "content": "Once more?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(recovered.status(), StatusCode::OK);
+    drop(recovered.json::<Value>().await.unwrap());
+
+    assert_eq!(
+        *seen_keys.lock().unwrap(),
+        vec![
+            "first-key".to_owned(),
+            "second-key".to_owned(),
+            "second-key".to_owned(),
+            "first-key".to_owned(),
+            "second-key".to_owned()
+        ]
+    );
+}
+
 #[tokio::test]
 async fn provider_level_failure_skips_the_rest_of_the_key_pool() {
     let (primary, primary_keys) = spawn_internal_error_mock().await;
