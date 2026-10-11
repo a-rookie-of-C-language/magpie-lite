@@ -66,7 +66,7 @@ pub fn wire_at(path: &Path, model: &str, port: u16, _token: &str) -> Result<()> 
     let mut settings: Value = if path.exists() {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        super::json_config::from_str(&text)
+        super::json_config::parse(&text, super::json_config::Syntax::Jsonc)
             .with_context(|| format!("parsing {}", path.display()))?
     } else {
         json!({})
@@ -113,7 +113,7 @@ pub fn wire_at(path: &Path, model: &str, port: u16, _token: &str) -> Result<()> 
     );
     settings["language_models"]["openai_compatible"][PROVIDER_ID] = Value::Object(provider);
 
-    std::fs::write(path, serde_json::to_vec_pretty(&settings)?)
+    super::json_config::write(path, &settings, super::json_config::Syntax::Jsonc)
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }

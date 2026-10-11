@@ -427,12 +427,16 @@ fn opencode_live_precedence_changes_allow_restore_after_restart() {
     assert!(!json.exists());
     assert!(jsonc.exists());
     assert_eq!(m.paths(id).unwrap(), vec![jsonc.clone()]);
-    assert_eq!(
-        m.preview(id, Action::Connect, Some(MODEL), gateway())
-            .unwrap_err()
-            .kind,
-        ErrorKind::Invalid
+    let baseline = fs::read(&jsonc).unwrap();
+    connect(&m, id, MODEL);
+    assert!(
+        fs::read_to_string(&jsonc)
+            .unwrap()
+            .contains("// keep comments")
     );
+    assert!(!json.exists(), "do not write an ignored JSON sibling");
+    disconnect(&m, id);
+    assert_eq!(fs::read(&jsonc).unwrap(), baseline);
     fs::remove_file(jsonc).unwrap();
     assert!(
         m.preview(id, Action::Connect, Some(MODEL), gateway())
@@ -1172,4 +1176,200 @@ fn ambiguous_legacy_json_backup_refuses_migration_without_changing_files_or_jour
     assert!(!error.to_string().contains("private-original-key"));
     assert_eq!(images(&m, id), files_before);
     assert_eq!(fs::read(m.journal_path(id)).unwrap(), journal_before);
+}
+
+#[test]
+fn jsonc_agents_keep_bom_crlf_foreign_values_and_comments_across_rewire_restore() {
+    let (_root, m) = setup();
+    for id in [AgentId::Opencode, AgentId::Zed] {
+        let path = m.paths(id).unwrap().remove(0);
+        let original = "\u{feff}// header { 中文\r\n{\r\n\t\"theme\": \"dark\",\r\n\t\"custom\": {\"url\":\"https://x//y\",\"n\":1e2},\r\n\t\"model\": \"native/old\",\r\n}\r\n";
+        write(&path, original);
+        connect(&m, id, MODEL);
+        let applied = fs::read_to_string(&path).unwrap();
+        assert!(applied.contains("\t\"custom\": {\"url\":\"https://x//y\",\"n\":1e2},\r\n"));
+        let note = if id == AgentId::Opencode {
+            "\"models\": {"
+        } else {
+            "\"available_models\": ["
+        };
+        let edited = applied
+            .replace("\"theme\": \"dark\"", "\"theme\": \"light\"")
+            .replace(note, &format!("{note} /* generated container note */"));
+        write(&path, format!("{edited}// user footer\r\n"));
+        assert!(!m.status(id).unwrap().drifted);
+        connect(&m, id, "mock/other-model");
+        let rewired = fs::read_to_string(&path).unwrap();
+        assert!(rewired.contains("generated container note"));
+        assert!(rewired.contains("\"theme\": \"light\""));
+        disconnect(&m, id);
+        let restored = fs::read_to_string(&path).unwrap();
+        assert!(restored.starts_with("\u{feff}// header { 中文\r\n"));
+        assert!(!restored.replace("\r\n", "").contains('\n'));
+        for comment in ["// user footer", "/* generated container note */"] {
+            assert_eq!(restored.matches(comment).count(), 1, "{id:?}: {restored}");
+        }
+        let value =
+            crate::json_config::parse(&restored, crate::json_config::Syntax::Jsonc).unwrap();
+        assert_eq!(value["theme"], "light");
+        assert_eq!(value["model"], "native/old");
+        assert_eq!(value["custom"]["n"], 100.0);
+        assert!(!restored.contains(TOKEN));
+        assert!(!restored.contains("magpie-lite"));
+    }
+}
+
+#[test]
+fn jsonc_comment_only_edits_are_not_erased_by_semantic_baseline_equality() {
+    for had_baseline in [false, true] {
+        let (_root, m) = setup();
+        let id = AgentId::Opencode;
+        let path = m.paths(id).unwrap().remove(0);
+        if had_baseline {
+            write(&path, b"{}\r\n");
+        }
+        connect(&m, id, MODEL);
+        let applied = fs::read_to_string(&path).unwrap();
+        write(&path, format!("{applied}// my note\r\n"));
+        disconnect(&m, id);
+        let restored = fs::read_to_string(&path).unwrap();
+        assert!(restored.contains("// my note"));
+        assert_eq!(
+            crate::json_config::parse(&restored, crate::json_config::Syntax::Jsonc).unwrap(),
+            serde_json::json!({})
+        );
+    }
+}
+
+#[test]
+fn selected_jsonc_rejects_invalid_and_duplicate_inputs_without_real_writes() {
+    let (_root, m) = setup();
+    let id = AgentId::Opencode;
+    let json = m.paths(id).unwrap().remove(0);
+    let path = json.with_extension("jsonc");
+    for original in [
+        "{,}",
+        "{ /* secret-comment */ \"x\":1,\"x\":2,}",
+        "{\"x\":[{\"a\":1,/* comment */\"\\u0061\":2}]}",
+        "{ // unfinished\n",
+        "/* unfinished",
+    ] {
+        write(&path, original);
+        assert_eq!(m.paths(id).unwrap(), vec![path.clone()]);
+        let before = fs::read(&path).unwrap();
+        assert_eq!(
+            m.preview(id, Action::Connect, Some(MODEL), gateway())
+                .unwrap_err()
+                .kind,
+            ErrorKind::Invalid
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!json.exists());
+        assert!(m.load(id).unwrap().is_none());
+    }
+    write(&path, b"{ // own\n\"x\":1,}\n");
+    connect(&m, id, MODEL);
+    let applied = fs::read_to_string(&path).unwrap();
+    write(
+        &path,
+        applied.replacen("{", "{\"foreign-private\":1,\"foreign-private\":2,", 1),
+    );
+    let bad = fs::read(&path).unwrap();
+    assert!(m.status(id).unwrap().drifted);
+    for action in [Action::Connect, Action::Disconnect] {
+        let e = m.preview(id, action, Some(MODEL), gateway()).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Conflict);
+        assert!(!e.message.contains("foreign-private"));
+    }
+    assert_eq!(fs::read(&path).unwrap(), bad);
+}
+
+#[test]
+fn jsonc_pending_selective_restore_recovers_exact_durable_target_after_restart() {
+    let (root, m) = setup();
+    let id = AgentId::Opencode;
+    let json = m.paths(id).unwrap().remove(0);
+    let path = json.with_extension("jsonc");
+    write(&path, "// original\r\n{\r\n  \"theme\": \"dark\",\r\n}\r\n");
+    connect(&m, id, MODEL);
+    let before = fs::read_to_string(&path)
+        .unwrap()
+        .replace("\"dark\"", "\"light\"");
+    write(&path, format!("{before}// recovery user note\r\n"));
+    let plan = m.plan(id, Action::Disconnect, None, gateway()).unwrap();
+    let expected = plan.after.clone();
+    let mut journal = plan.journal.unwrap();
+    journal.phase = Phase::Disconnecting;
+    journal.rollback = Some(plan.before);
+    journal.restore = Some(plan.after);
+    m.save(&journal).unwrap();
+    drop(m);
+    let m = Manager::at_home(&root.path().join("home"), root.path().join("agent-state")).unwrap();
+    assert!(m.status(id).unwrap().recovery_needed);
+    assert!(!m.recover(id).unwrap().connected);
+    assert_eq!(images(&m, id), expected);
+    let restored = fs::read_to_string(&path).unwrap();
+    assert!(restored.contains("// recovery user note\r\n"));
+    assert!(restored.contains("\"theme\": \"light\""));
+    assert!(!restored.contains(TOKEN));
+    assert!(!json.exists());
+}
+
+#[test]
+fn all_json_adapter_files_keep_foreign_spelling_bom_crlf_during_wiring_and_restore() {
+    let (_root, m) = setup();
+    for id in [
+        AgentId::Claude,
+        AgentId::Crush,
+        AgentId::Gemini,
+        AgentId::Goose,
+        AgentId::Opencode,
+        AgentId::Zed,
+    ] {
+        let paths = m.paths(id).unwrap();
+        let is_json = |i: usize| !matches!((id, i), (AgentId::Goose, 0) | (AgentId::Gemini, 1));
+        for (i, path) in paths.iter().enumerate() {
+            if is_json(i) {
+                write(
+                    path,
+                    "\u{feff}{\r\n  \"custom\": {\"url\":\"https://x//y\",\"v\":1e+02},\r\n  \"sentinel\": \"original\"\r\n}\r\n",
+                );
+            } else {
+                write(path, original(id, i));
+            }
+        }
+        connect(&m, id, MODEL);
+        for (i, path) in paths.iter().enumerate().filter(|(i, _)| is_json(*i)) {
+            let applied = fs::read_to_string(path).unwrap();
+            assert!(applied.starts_with("\u{feff}{\r\n"), "{id:?} {i}");
+            assert!(
+                applied.contains("  \"custom\": {\"url\":\"https://x//y\",\"v\":1e+02},\r\n"),
+                "{id:?} {i}: {applied}"
+            );
+            assert!(!applied.replace("\r\n", "").contains('\n'), "{id:?} {i}");
+            write(
+                path,
+                applied.replace(
+                    "\"sentinel\": \"original\"",
+                    "\"sentinel\": \"user-edited\"",
+                ),
+            );
+        }
+        connect(&m, id, "mock/other-model");
+        disconnect(&m, id);
+        for (i, path) in paths.iter().enumerate().filter(|(i, _)| is_json(*i)) {
+            let restored = fs::read_to_string(path).unwrap();
+            assert!(restored.starts_with("\u{feff}{\r\n"), "{id:?} {i}");
+            assert!(
+                restored.contains("  \"custom\": {\"url\":\"https://x//y\",\"v\":1e+02},\r\n"),
+                "{id:?} {i}: {restored}"
+            );
+            assert!(restored.contains("\"sentinel\": \"user-edited\""));
+            assert_eq!(
+                crate::json_config::from_str(&restored).unwrap()["sentinel"],
+                "user-edited"
+            );
+            assert!(!restored.contains(TOKEN));
+        }
+    }
 }

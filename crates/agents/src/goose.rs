@@ -194,9 +194,10 @@ fn write_custom_provider(config_dir: &Path, model: &str, port: u16, token: &str)
     );
     provider.insert("dynamic_models".into(), json!(false));
 
-    std::fs::write(
+    super::json_config::write(
         &path,
-        serde_json::to_vec_pretty(&JsonValue::Object(provider))?,
+        &JsonValue::Object(provider),
+        super::json_config::Syntax::Json,
     )
     .with_context(|| format!("writing {}", path.display()))?;
     Ok(())

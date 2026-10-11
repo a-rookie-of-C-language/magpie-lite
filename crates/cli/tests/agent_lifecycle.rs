@@ -395,3 +395,68 @@ fn cli_recovers_selective_multifile_disconnect_after_restart_without_config() {
         assert!(!text.contains(TOKEN));
     }
 }
+
+#[test]
+fn cli_selected_opencode_jsonc_preserves_format_and_configless_restore() {
+    let s = Sandbox::new();
+    let config = std::fs::read_to_string(&s.config)
+        .unwrap()
+        .replace("models=['model']", "models=['model','other']");
+    std::fs::write(&s.config, config).unwrap();
+    let p = s.success(&["agent", "preview", "opencode", "mock/model"]);
+    let json = managed_paths(&s, &p).remove(0);
+    let path = json.with_extension("jsonc");
+    let original = "\u{feff}// CLI header {\r\n{\r\n\t\"theme\": \"dark\",\r\n\t\"model\": \"native/old\",\r\n}\r\n";
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let ambiguous = r#"{ /* private-comment */ "private-key":1, "\u0070rivate-key":2,}"#;
+    std::fs::write(&path, ambiguous).unwrap();
+    let refusal = s.run(&["agent", "preview", "opencode", "mock/model"]);
+    assert!(!refusal.status.success());
+    assert!(!String::from_utf8_lossy(&refusal.stderr).contains("private-key"));
+    assert!(!String::from_utf8_lossy(&refusal.stderr).contains("private-comment"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), ambiguous);
+    assert!(!json.exists());
+    std::fs::write(&path, original).unwrap();
+    let p = s.success(&["agent", "preview", "opencode", "mock/model"]);
+    assert_eq!(managed_paths(&s, &p), vec![path.clone()]);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    s.success(&[
+        "agent",
+        "connect",
+        "opencode",
+        "mock/model",
+        "--revision",
+        p["revision"].as_str().unwrap(),
+    ]);
+    let applied = std::fs::read_to_string(&path).unwrap();
+    assert!(applied.starts_with("\u{feff}// CLI header {\r\n"));
+    let edited = format!(
+        "{}// CLI user note\r\n",
+        applied.replace("\"dark\"", "\"light\"")
+    );
+    std::fs::write(&path, &edited).unwrap();
+    s.success(&["agent", "connect", "opencode", "mock/other"]);
+    let rewired = std::fs::read_to_string(&path).unwrap();
+    assert!(rewired.contains("// CLI user note"));
+    assert!(rewired.contains("magpie-lite/mock/other"));
+    let duplicate = rewired.replacen("\r\n{", "\r\n{\"private-key\":1,\"private-key\":2,", 1);
+    std::fs::write(&path, &duplicate).unwrap();
+    let refusal = s.run(&["agent", "disconnect", "opencode"]);
+    assert!(!refusal.status.success());
+    assert!(!String::from_utf8_lossy(&refusal.stderr).contains("private-key"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), duplicate);
+    std::fs::write(&path, rewired).unwrap();
+    std::fs::remove_file(&s.config).unwrap();
+    s.success(&["agent", "disconnect", "opencode"]);
+    let restored = std::fs::read_to_string(&path).unwrap();
+    for exact in [
+        "\u{feff}// CLI header {\r\n",
+        "\t\"theme\": \"light\",\r\n",
+        "\"model\": \"native/old\"",
+        "// CLI user note\r\n",
+    ] {
+        assert!(restored.contains(exact), "{restored}");
+    }
+    assert!(!restored.contains(TOKEN));
+    assert!(!json.exists());
+}

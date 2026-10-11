@@ -96,10 +96,14 @@ a scalar/array with a container, that replaced ancestor is owned as a whole.
 Changes to owned fields or an unsafe configuration shape cause a conflict.
 
 With no intervening edits, disconnect restores the original bytes exactly or
-removes a file that did not originally exist. With unrelated edits, JSON may be
-reformatted; TOML/YAML use format-preserving editors, and Gemini dotenv preserves
-unrelated records. Comments from removed TOML/YAML containers are retained but
-may move to the end. Generated files containing unrelated user data are kept.
+removes a file that did not originally exist. With unrelated edits, JSON/JSONC,
+TOML and YAML use format-preserving editors; Gemini dotenv preserves unrelated
+records. Existing JSON key order, string/number spelling, BOM and line endings
+are retained outside changed values. Inserting a property into a compact JSON
+object can expand that touched object to multiple lines. Comments from removed
+or replaced JSONC/TOML/YAML containers are retained but may move to the end.
+Generated files containing unrelated user data or JSONC comments are kept.
+Semantic equality with the baseline does not discard later comments/formatting.
 
 Schema-2 journals record explicit ownership and the latest restoration image as
 well as the first baseline. Schema-1 journals are upgraded in memory and saved
@@ -148,8 +152,12 @@ do not delete backups to dismiss an error.
   connection with ambiguous JSON returns a sanitized 400; ambiguous edits to a
   connected file cause drift/conflict (409). Files and backups are not rewritten
   on refusal. Schema-1 backups containing ambiguous JSON cannot be selectively
-  migrated and are retained for manual recovery. JSON/JSONC lossless editing is
-  still a parity gap; JSONC is not silently converted to JSON.
+  migrated and are retained for manual recovery. OpenCode and Zed use native
+  JSONC, accepting line/block comments and trailing commas (not JSON5). Other
+  Agent JSON files still require strict JSON. Shared CST edits are independently
+  checked for exact target semantics, syntax, duplicate keys, finite numbers,
+  depth and the 4 MiB byte bound before staged output can be published. Invalid
+  or unsupported edits are refused, never replaced with lossy serialization.
 - Gemini dotenv supports export prefixes, duplicate assignments and quoted
   multiline records, but is not a full dotenv evaluator and does not expand
   variables. Managed dotenv value-format changes can cause conservative
@@ -157,8 +165,9 @@ do not delete backups to dismiss an error.
   semantic validation fails, rather than falling back to lossy serialization.
 - OpenCode's JSONC/JSON/legacy precedence is checked live. A new overriding file
   marks an existing connection drifted; disconnect/recovery can still restore
-  the originally managed path, including after restart. JSONC wiring is refused
-  rather than dropping comments or writing an ignored JSON file beside it.
+  the originally managed path, including after restart. Wiring edits the selected
+  JSONC file without creating an ignored JSON sibling. After restoring the old
+  managed file, a new connection can target the live preferred JSONC file.
 - Detection checks configuration files/folders and binary names on this process's
   PATH. It does not inspect login-shell/off-PATH installations, running processes,
   project overrides or reachability. Restart the agent after changing settings.
@@ -209,11 +218,17 @@ The suite exercises actual HTTP preview/apply endpoints for every adapter:
 original-byte restoration, missing-file creation/removal, rewiring via a group,
 seven-Agent preservation of unrelated additions/changes/deletions, stale
 revisions even after unrelated edits, refused managed-field drift, ambiguous
-JSON refusal and OpenCode overriding paths. It also
-checks model suggestions, form/preview invalidation, provider/group CRUD and
-delete-reference protection, busy coordination in both directions, errors,
-session expiry, late old-session responses, Escape/focus,
-secret-free rendered text/forms, 44px controls and 390px page overflow.
+JSON/JSONC refusal and OpenCode overriding paths. It also checks model
+suggestions, form/preview invalidation, provider/group CRUD and delete-reference
+protection, busy coordination in both directions, errors, session expiry, late
+old-session responses, Escape/focus, secret-free rendered text/forms, 44px
+controls and 390px page overflow.
+
+JSON/JSONC editor unit tests cover nested edits, removals, shape changes, escaped
+keys/strings, repeated comments, strict-vs-JSONC syntax, numbers, depth, BOM and
+CRLF. All JSON adapter files are checked for foreign-byte preservation through
+wiring and restoration. HTTP, child CLI and console browser tests exercise
+selected OpenCode JSONC preview/connect/rewire/selective restoration and refusal.
 
 Recovery uses a **synthetic pending-disconnect journal** in the temporary state
 directory with a merged restoration image retaining unrelated edits, not a real

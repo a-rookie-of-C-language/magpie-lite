@@ -94,6 +94,12 @@ fn text(image: &Image) -> Result<String> {
         conflict("agent configuration is not valid UTF-8; managed fields cannot be checked")
     })
 }
+fn json_syntax(id: AgentId) -> super::json_config::Syntax {
+    match id {
+        AgentId::Opencode | AgentId::Zed => super::json_config::Syntax::Jsonc,
+        _ => super::json_config::Syntax::Json,
+    }
+}
 fn parse(id: AgentId, index: usize, text: &str) -> Result<Value> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     if text.trim().is_empty() {
@@ -106,7 +112,7 @@ fn parse(id: AgentId, index: usize, text: &str) -> Result<Value> {
     } else if id == AgentId::Goose && index == 0 {
         serde_yaml::from_str(text).ok()
     } else {
-        super::json_config::from_str(text)
+        super::json_config::parse(text, json_syntax(id))
             .ok()
             .and_then(|v| serde_yaml::to_value(v).ok())
     }
@@ -257,18 +263,21 @@ pub(super) fn restore(
         } else if id == AgentId::Goose && index == 0 {
             edit_yaml(&before, &merged)?
         } else {
-            if merged == base {
-                return Ok(Image {
-                    data: baseline.data.clone(),
-                    mode: if baseline.data.is_none() {
-                        None
-                    } else {
-                        restore_mode(baseline, applied, current)
-                    },
-                });
+            let target = serde_json::to_value(&merged)
+                .map_err(|_| conflict("cannot encode restored agent configuration"))?;
+            let edited = super::json_config::edit(&before, &target, json_syntax(id))
+                .map_err(|_| conflict("cannot edit restored agent configuration"))?;
+            // A generated file without user comments/values can be removed.
+            // Semantic equality alone must not erase user-added JSONC comments.
+            if baseline.data.is_none()
+                && target.as_object().is_some_and(|o| o.is_empty())
+                && !edited.contains("//")
+                && !edited.contains("/*")
+            {
+                String::new()
+            } else {
+                edited
             }
-            serde_json::to_string_pretty(&merged)
-                .map_err(|_| conflict("cannot encode restored agent configuration"))?
         }
     };
     // Text formats can hold user-added comments even when all values are gone.

@@ -413,9 +413,11 @@ mod tests {
         let dir = tempdir();
         let path = dir.join("opencode.jsonc");
         std::fs::write(&path, "{\n  // mine\n}\n").unwrap();
-        let err = opencode::wire_at(&path, "deepseek/deepseek-chat", 3426, "tok")
-            .expect_err("JSONC is not rewritten");
-        assert!(err.to_string().contains("JSONC"));
+        opencode::wire_at(&path, "deepseek/deepseek-chat", 3426, "tok").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("// mine"));
+        let value = super::json_config::parse(&text, super::json_config::Syntax::Jsonc).unwrap();
+        assert_eq!(value["model"], "magpie-lite/deepseek/deepseek-chat");
         assert!(!dir.join("opencode.json").exists());
     }
 

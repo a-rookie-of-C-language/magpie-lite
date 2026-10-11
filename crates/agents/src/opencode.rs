@@ -11,8 +11,7 @@ pub fn config_path() -> Result<PathBuf> {
 }
 
 pub(crate) fn preferred_path(dir: &Path) -> PathBuf {
-    // OpenCode itself prefers the JSONC file, so do the same. Wiring rejects
-    // JSONC rather than writing an ignored opencode.json beside it.
+    // Edit the file OpenCode actually selects, preserving its JSONC trivia.
     for name in ["opencode.jsonc", "opencode.json", "config.json"] {
         let path = dir.join(name);
         if path.exists() {
@@ -61,15 +60,6 @@ pub fn wire(model: &str, port: u16, token: &str) -> Result<PathBuf> {
 
 /// The wiring itself, against an explicit config path.
 pub fn wire_at(path: &Path, model: &str, port: u16, token: &str) -> Result<()> {
-    if path
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonc"))
-    {
-        anyhow::bail!(
-            "{} uses JSONC; preserve its comments and copy the gateway provider into it manually",
-            path.display()
-        );
-    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -77,7 +67,7 @@ pub fn wire_at(path: &Path, model: &str, port: u16, token: &str) -> Result<()> {
     let mut config: Value = if path.exists() {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        super::json_config::from_str(&text)
+        super::json_config::parse(&text, super::json_config::Syntax::Jsonc)
             .with_context(|| format!("parsing {}", path.display()))?
     } else {
         json!({})
@@ -117,7 +107,7 @@ pub fn wire_at(path: &Path, model: &str, port: u16, token: &str) -> Result<()> {
     config["provider"]["magpie-lite"] = provider;
     config["model"] = json!(format!("magpie-lite/{model}"));
 
-    std::fs::write(path, serde_json::to_vec_pretty(&config)?)
+    super::json_config::write(path, &config, super::json_config::Syntax::Jsonc)
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }

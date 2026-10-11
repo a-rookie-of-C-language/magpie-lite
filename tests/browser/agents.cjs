@@ -287,6 +287,47 @@ test("Agent console against a real isolated Rust gateway", { timeout: 120000 }, 
       await write(file, originals.get(file));
     });
 
+
+    await t.test("OpenCode selected JSONC connects, rewires and selectively restores comments and formatting", async () => {
+      const json = statuses.find(agent => agent.id === "opencode").files[0];
+      const file = path.join(path.dirname(json), "opencode.jsonc");
+      const original = '\uFEFF// BROWSER header {\r\n{\r\n\t"theme": "dark",\r\n\t"model": "native/old",\r\n}\r\n';
+      await write(file, original);
+      await page.evaluate(() => update(false));
+      await manage("opencode"); await page.locator("#agent-model").fill("mock/alpha");
+      await preview();
+      assert.ok((await page.locator("#agent-preview-files").innerText()).includes("opencode.jsonc"));
+      assert.equal(await fs.readFile(file, "utf8"), original, "Preview wrote JSONC");
+      await apply("Connected to mock/alpha.");
+      const applied = await fs.readFile(file, "utf8");
+      assert.ok(applied.startsWith("\uFEFF// BROWSER header {\r\n"));
+      assert.ok(applied.includes('\t"theme": "dark",\r\n'));
+      const edited = applied.replace('"theme": "dark"', '"theme": "light"')
+        .replace('"models": {', '"models": { /* model comment */') + "// BROWSER user note\r\n";
+      await write(file, edited);
+      await page.locator("#agent-model").fill("mock/beta");
+      await preview(); await apply("Connected to mock/beta.");
+      const rewired = await fs.readFile(file, "utf8");
+      assert.ok(rewired.includes("magpie-lite/mock/beta"));
+      assert.ok(rewired.includes("/* model comment */"));
+      await disconnectAgent("opencode");
+      const restored = await fs.readFile(file, "utf8");
+      for (const exact of ["\uFEFF// BROWSER header {\r\n", '\t"theme": "light",\r\n', '"model": "native/old"', "// BROWSER user note\r\n", "/* model comment */"]) {
+        assert.ok(restored.includes(exact), "Lost JSONC content: " + exact);
+      }
+      assert.equal(restored.includes(TOKEN), false);
+      assert.deepEqual(await fs.readFile(json), originals.get(json), "Wrote ignored JSON sibling");
+      const ambiguous = '{ /* private-note */ "private-key":1, "\\u0070rivate-key":2,}';
+      await write(file, ambiguous);
+      await manage("opencode"); await page.locator("#agent-model").fill("mock/alpha");
+      await page.locator("#agent-preview-button").click();
+      await page.waitForFunction(() => document.getElementById("agent-message").textContent.includes("could not parse or edit"));
+      assert.equal(await fs.readFile(file, "utf8"), ambiguous);
+      assert.equal((await page.locator("body").innerText()).includes("private-key"), false);
+      await fs.unlink(file);
+      await safeDom();
+    });
+
     await t.test("OpenCode overriding JSONC warns but original-path restoration remains available", async () => {
       const file = statuses.find(agent => agent.id === "opencode").files[0];
       await manage("opencode"); await page.locator("#agent-model").fill("mock/alpha");

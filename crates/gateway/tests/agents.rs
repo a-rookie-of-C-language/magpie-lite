@@ -560,3 +560,65 @@ async fn selective_http_pending_disconnect_recovers_merged_multifile_targets() {
         assert!(!text.contains(TOKEN));
     }
 }
+
+#[tokio::test]
+async fn selected_opencode_jsonc_is_lossless_through_http_lifecycle_and_refusal() {
+    let s = server(true).await;
+    let first = s.preview("opencode", "connect", "mock/model").await;
+    let json = agent_paths(&s, &first).remove(0);
+    let path = json.with_extension("jsonc");
+    let original = "\u{feff}// HTTP header {\r\n{\r\n\t\"theme\": \"dark\",\r\n\t\"model\": \"native/old\",\r\n}\r\n";
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, original).unwrap();
+    let p = s.preview("opencode", "connect", "mock/model").await;
+    assert_eq!(agent_paths(&s, &p), vec![path.clone()]);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    assert_eq!(s.apply("opencode", &p).await["connected"], true);
+    let applied = std::fs::read_to_string(&path).unwrap();
+    assert!(applied.starts_with("\u{feff}// HTTP header {\r\n"));
+    assert!(applied.contains("\t\"theme\": \"dark\",\r\n"));
+    let stale = s.preview("opencode", "connect", "group/daily").await;
+    let edited = format!(
+        "{}// HTTP user note\r\n",
+        applied.replace("\"dark\"", "\"light\"")
+    );
+    std::fs::write(&path, &edited).unwrap();
+    let response = s
+        .request(
+            Method::POST,
+            "/agents/opencode/apply",
+            json!({"action":"connect","model":stale["model"],"revision":stale["revision"]}),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+    let p = s.preview("opencode", "connect", "group/daily").await;
+    s.apply("opencode", &p).await;
+    let rewired = std::fs::read_to_string(&path).unwrap();
+    assert!(rewired.contains("// HTTP user note"));
+    assert!(rewired.contains("magpie-lite/group/daily"));
+    let p = s.preview("opencode", "disconnect", "").await;
+    s.apply("opencode", &p).await;
+    let restored = std::fs::read_to_string(&path).unwrap();
+    assert!(restored.starts_with("\u{feff}// HTTP header {\r\n"));
+    assert!(restored.contains("\t\"theme\": \"light\",\r\n"));
+    assert!(restored.contains("\"model\": \"native/old\""));
+    assert!(restored.contains("// HTTP user note\r\n"));
+    assert!(!restored.contains(TOKEN));
+    assert!(!json.exists());
+    let invalid = "{ /* private-note */ \"secret-private\":1,\"\\u0073ecret-private\":2,}";
+    std::fs::write(&path, invalid).unwrap();
+    let response = s
+        .request(
+            Method::POST,
+            "/agents/opencode/preview",
+            json!({"action":"connect","model":"mock/model"}),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error = response.text().await.unwrap();
+    assert!(!error.contains("secret-private"));
+    assert!(!error.contains("private-note"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
+    assert!(!json.exists());
+}

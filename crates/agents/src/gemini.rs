@@ -73,7 +73,7 @@ pub fn wire_at(
     }
     settings["model"]["name"] = json!(model);
 
-    std::fs::write(settings_path, serde_json::to_vec_pretty(&settings)?)
+    super::json_config::write(settings_path, &settings, super::json_config::Syntax::Json)
         .with_context(|| format!("writing {}", settings_path.display()))?;
 
     set_env_values(

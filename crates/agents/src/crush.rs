@@ -154,7 +154,7 @@ fn write_json(path: &Path, value: &Value) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    std::fs::write(path, serde_json::to_vec_pretty(value)?)
+    super::json_config::write(path, value, super::json_config::Syntax::Json)
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }

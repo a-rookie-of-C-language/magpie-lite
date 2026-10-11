@@ -48,7 +48,7 @@ pub fn wire_at(path: &Path, model: &str, port: u16, token: &str) -> Result<()> {
     settings["env"]["ANTHROPIC_BASE_URL"] = json!(format!("http://127.0.0.1:{port}"));
     settings["env"]["ANTHROPIC_AUTH_TOKEN"] = json!(token);
     settings["model"] = json!(model);
-    std::fs::write(path, serde_json::to_vec_pretty(&settings)?)
+    super::json_config::write(path, &settings, super::json_config::Syntax::Json)
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }

@@ -761,7 +761,9 @@ impl Manager {
             }
             AgentId::Zed => super::zed::wire_at(&paths[0], model, gateway.port, gateway.token),
         };
-        result.map_err(|_| invalid("agent adapter could not parse or edit the existing configuration; JSONC is not supported"))?;
+        result.map_err(|_| {
+            invalid("agent adapter could not parse or edit the existing configuration")
+        })?;
         paths
             .iter()
             .zip(before)
