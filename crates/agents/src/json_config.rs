@@ -9,7 +9,11 @@ use jsonc_parser::{
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Number, Value};
-use std::{collections::HashMap, fmt, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    path::Path,
+};
 
 /// JSONC is supported only for agents whose native configuration supports it.
 #[derive(Clone, Copy)]
@@ -221,6 +225,8 @@ fn edit_object(
     object: &CstObject,
     before: &Map<String, Value>,
     after: &Map<String, Value>,
+    path: &mut Vec<PathSegment>,
+    compact_inserted: &HashSet<Vec<PathSegment>>,
 ) -> Result<()> {
     for (key, old) in before {
         if after.get(key) == Some(old) {
@@ -232,7 +238,9 @@ fn edit_object(
             Some(new) => {
                 if let (Some(a), Some(b)) = (old.as_object(), new.as_object()) {
                     let child = prop.object_value().context("JSON editor object missing")?;
-                    edit_object(&child, a, b)?;
+                    path.push(PathSegment::Key(key.clone()));
+                    edit_object(&child, a, b, path, compact_inserted)?;
+                    path.pop();
                 } else {
                     prop.set_value(input(new));
                 }
@@ -241,7 +249,11 @@ fn edit_object(
     }
     for (key, new) in after {
         if !before.contains_key(key) {
-            object.append(key, input(new));
+            let mut property_path = path.clone();
+            property_path.push(PathSegment::Key(key.clone()));
+            if !compact_inserted.contains(&property_path) {
+                object.append(key, input(new));
+            }
         }
     }
     Ok(())
@@ -249,7 +261,8 @@ fn edit_object(
 
 /// Apply a semantic target to the original syntax tree. Existing foreign values,
 /// spelling/key order and trivia are never serialized through a Value. Only
-/// changed leaves/subtrees are replaced. A touched compact object may expand.
+/// changed leaves/subtrees are replaced. Additions to compact, comment-free
+/// objects stay on their original line when the syntax permits it.
 /// Comments inside a removed/replaced subtree are retained at the document end.
 pub(super) fn edit(text: &str, target: &Value, syntax: Syntax) -> Result<String> {
     if text.len() > MAX_BYTES {
@@ -286,12 +299,17 @@ pub(super) fn edit(text: &str, target: &Value, syntax: Syntax) -> Result<String>
     } else {
         source
     };
-    let root = CstRootNode::parse(source, &options(syntax))
+    let (edited_source, compact_inserted) = if blank {
+        (source.to_owned(), HashSet::new())
+    } else {
+        compact_additions(source, &before, target)?
+    };
+    let root = CstRootNode::parse(&edited_source, &options(syntax))
         .map_err(|_| anyhow::anyhow!("agent JSON syntax tree could not be parsed"))?;
     let object = root
         .object_value()
         .context("agent JSON root must be an object")?;
-    edit_object(&object, old, new)?;
+    edit_object(&object, old, new, &mut Vec::new(), &compact_inserted)?;
     let mut out = root.to_string();
     if matches!(syntax, Syntax::Jsonc) {
         let (_, original_comments) = normalize(source)?;
@@ -531,4 +549,381 @@ mod tests {
             assert_eq!(out.starts_with('\u{feff}'), source.starts_with('\u{feff}'));
         }
     }
+}
+#[test]
+fn compact_object_additions_keep_single_line_containers() {
+    let cases = [
+        (
+            r#"{"a":{"x":1,"y":2},"b":[1,2]}"#,
+            serde_json::json!({"a":{"x":1,"y":2,"z":3},"b":[1,2]}),
+            r#"{"a":{"x":1,"y":2,"z":3},"b":[1,2]}"#,
+            Syntax::Json,
+        ),
+        (
+            r#"{"a":{"x":1}}"#,
+            serde_json::json!({"a":{"x":1,"nested":{"enabled":true}}}),
+            r#"{"a":{"x":1,"nested":{"enabled":true}}}"#,
+            Syntax::Json,
+        ),
+        (
+            r#"{}"#,
+            serde_json::json!({"a":{"x":1},"foreign":true}),
+            r#"{"a":{"x":1},"foreign":true}"#,
+            Syntax::Json,
+        ),
+        (
+            r#"{"a":1,}"#,
+            serde_json::json!({"a":1,"b":2}),
+            r#"{"a":1,"b":2,}"#,
+            Syntax::Jsonc,
+        ),
+        (
+            r#"{"a":1 }"#,
+            serde_json::json!({"a":1,"b":2}),
+            r#"{"a":1,"b":2 }"#,
+            Syntax::Json,
+        ),
+    ];
+    for (source, target, expected, syntax) in cases {
+        let out = edit(source, &target, syntax).unwrap();
+        assert_eq!(out, expected);
+        assert_eq!(parse(&out, syntax).unwrap(), target);
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum PathSegment {
+    Key(String),
+    Index(usize),
+}
+
+#[derive(Clone, Debug)]
+struct ObjectSpan {
+    insert_at: usize,
+    properties: usize,
+    trailing_comma: bool,
+    direct_comment: bool,
+    single_line: bool,
+}
+
+struct JsonScanner<'a> {
+    source: &'a str,
+    bytes: &'a [u8],
+    position: usize,
+    objects: HashMap<Vec<PathSegment>, ObjectSpan>,
+}
+
+impl<'a> JsonScanner<'a> {
+    fn new(source: &'a str) -> Self {
+        Self {
+            source,
+            bytes: source.as_bytes(),
+            position: 0,
+            objects: HashMap::new(),
+        }
+    }
+
+    fn scan(mut self) -> Result<HashMap<Vec<PathSegment>, ObjectSpan>> {
+        self.skip_trivia()?;
+        self.value(&[])?;
+        self.skip_trivia()?;
+        if self.position != self.bytes.len() {
+            bail!("JSON scanner did not consume the document");
+        }
+        Ok(self.objects)
+    }
+
+    fn value(&mut self, path: &[PathSegment]) -> Result<()> {
+        self.skip_trivia()?;
+        match self.bytes.get(self.position).copied() {
+            Some(b'{') => self.object(path),
+            Some(b'[') => self.array(path),
+            Some(b'"') => {
+                self.string()?;
+                Ok(())
+            }
+            Some(_) => self.scalar(),
+            None => bail!("JSON scanner reached the end of a value"),
+        }
+    }
+
+    fn object(&mut self, path: &[PathSegment]) -> Result<()> {
+        let open = self.position;
+        self.position += 1;
+        let mut direct_comment = self.skip_trivia()?;
+        let mut properties = 0;
+
+        if self.consume(b'}') {
+            self.record_object(
+                path,
+                ObjectSpan {
+                    insert_at: open + 1,
+                    properties,
+                    trailing_comma: false,
+                    direct_comment,
+                    single_line: !self.bytes[open..self.position - 1]
+                        .iter()
+                        .any(|byte| matches!(byte, b'\r' | b'\n')),
+                },
+            );
+            return Ok(());
+        }
+
+        loop {
+            if self.bytes.get(self.position) != Some(&b'"') {
+                bail!("JSON scanner expected an object key");
+            }
+            let key = self.string_value()?;
+            direct_comment |= self.skip_trivia()?;
+            if !self.consume(b':') {
+                bail!("JSON scanner expected an object colon");
+            }
+            direct_comment |= self.skip_trivia()?;
+            let mut child_path = path.to_vec();
+            child_path.push(PathSegment::Key(key));
+            self.value(&child_path)?;
+            let insert_at = self.position;
+            direct_comment |= self.skip_trivia()?;
+            properties += 1;
+
+            if self.consume(b',') {
+                let after_comma = self.position;
+                direct_comment |= self.skip_trivia()?;
+                if self.consume(b'}') {
+                    self.record_object(
+                        path,
+                        ObjectSpan {
+                            insert_at: after_comma,
+                            properties,
+                            trailing_comma: true,
+                            direct_comment,
+                            single_line: !self.bytes[open..self.position - 1]
+                                .iter()
+                                .any(|byte| matches!(byte, b'\r' | b'\n')),
+                        },
+                    );
+                    return Ok(());
+                }
+                continue;
+            }
+            if self.consume(b'}') {
+                self.record_object(
+                    path,
+                    ObjectSpan {
+                        insert_at,
+                        properties,
+                        trailing_comma: false,
+                        direct_comment,
+                        single_line: !self.bytes[open..self.position - 1]
+                            .iter()
+                            .any(|byte| matches!(byte, b'\r' | b'\n')),
+                    },
+                );
+                return Ok(());
+            }
+            bail!("JSON scanner expected an object separator");
+        }
+    }
+
+    fn array(&mut self, path: &[PathSegment]) -> Result<()> {
+        self.position += 1;
+        self.skip_trivia()?;
+        if self.consume(b']') {
+            return Ok(());
+        }
+
+        let mut index = 0;
+        loop {
+            let mut child_path = path.to_vec();
+            child_path.push(PathSegment::Index(index));
+            self.value(&child_path)?;
+            self.skip_trivia()?;
+            if self.consume(b',') {
+                self.skip_trivia()?;
+                if self.consume(b']') {
+                    return Ok(());
+                }
+                index += 1;
+                continue;
+            }
+            if self.consume(b']') {
+                return Ok(());
+            }
+            bail!("JSON scanner expected an array separator");
+        }
+    }
+
+    fn scalar(&mut self) -> Result<()> {
+        let start = self.position;
+        while let Some(byte) = self.bytes.get(self.position).copied() {
+            if byte.is_ascii_whitespace() || matches!(byte, b',' | b']' | b'}') {
+                break;
+            }
+            if byte == b'/'
+                && self
+                    .bytes
+                    .get(self.position + 1)
+                    .is_some_and(|next| matches!(next, b'/' | b'*'))
+            {
+                break;
+            }
+            self.position += 1;
+        }
+        if start == self.position {
+            bail!("JSON scanner found an empty scalar");
+        }
+        Ok(())
+    }
+
+    fn string_value(&mut self) -> Result<String> {
+        let start = self.position;
+        self.string()?;
+        serde_json::from_str(&self.source[start..self.position])
+            .context("JSON scanner could not decode an object key")
+    }
+
+    fn string(&mut self) -> Result<()> {
+        if !self.consume(b'"') {
+            bail!("JSON scanner expected a string");
+        }
+        while let Some(byte) = self.bytes.get(self.position).copied() {
+            self.position += 1;
+            match byte {
+                b'\\' => {
+                    if self.position >= self.bytes.len() {
+                        bail!("JSON scanner found an unterminated escape");
+                    }
+                    self.position += 1;
+                }
+                b'"' => return Ok(()),
+                _ => {}
+            }
+        }
+        bail!("JSON scanner found an unterminated string")
+    }
+
+    fn skip_trivia(&mut self) -> Result<bool> {
+        let mut comment = false;
+        loop {
+            while self
+                .bytes
+                .get(self.position)
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+            {
+                self.position += 1;
+            }
+            if self.bytes[self.position..].starts_with(b"//") {
+                comment = true;
+                self.position += 2;
+                while self
+                    .bytes
+                    .get(self.position)
+                    .is_some_and(|byte| !matches!(byte, b'\r' | b'\n'))
+                {
+                    self.position += 1;
+                }
+                continue;
+            }
+            if self.bytes[self.position..].starts_with(b"/*") {
+                comment = true;
+                self.position += 2;
+                while self.position + 1 < self.bytes.len()
+                    && !self.bytes[self.position..].starts_with(b"*/")
+                {
+                    self.position += 1;
+                }
+                if self.position + 1 >= self.bytes.len() {
+                    bail!("JSON scanner found an unterminated comment");
+                }
+                self.position += 2;
+                continue;
+            }
+            return Ok(comment);
+        }
+    }
+
+    fn consume(&mut self, byte: u8) -> bool {
+        if self.bytes.get(self.position) == Some(&byte) {
+            self.position += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn record_object(&mut self, path: &[PathSegment], span: ObjectSpan) {
+        self.objects.insert(path.to_vec(), span);
+    }
+}
+
+fn compact_additions(
+    source: &str,
+    old: &Value,
+    new: &Value,
+) -> Result<(String, HashSet<Vec<PathSegment>>)> {
+    let spans = JsonScanner::new(source).scan()?;
+    let mut edits = Vec::new();
+    let mut inserted = HashSet::new();
+    let mut path = Vec::new();
+    collect_compact_additions(old, new, &mut path, &spans, &mut edits, &mut inserted)?;
+    edits.sort_by_key(|edit| std::cmp::Reverse(edit.0));
+    let mut out = source.to_owned();
+    for (position, text) in edits {
+        out.insert_str(position, &text);
+    }
+    Ok((out, inserted))
+}
+
+fn collect_compact_additions(
+    old: &Value,
+    new: &Value,
+    path: &mut Vec<PathSegment>,
+    spans: &HashMap<Vec<PathSegment>, ObjectSpan>,
+    edits: &mut Vec<(usize, String)>,
+    inserted: &mut HashSet<Vec<PathSegment>>,
+) -> Result<()> {
+    let (Some(old), Some(new)) = (old.as_object(), new.as_object()) else {
+        return Ok(());
+    };
+    if let Some(span) = spans.get(path)
+        && span.single_line
+        && !span.direct_comment
+    {
+        let mut pairs = Vec::new();
+        for (key, value) in new {
+            if old.contains_key(key) {
+                continue;
+            }
+            let mut property_path = path.clone();
+            property_path.push(PathSegment::Key(key.clone()));
+            pairs.push(format!(
+                "{}:{}",
+                serde_json::to_string(key)?,
+                serde_json::to_string(value)?
+            ));
+            inserted.insert(property_path);
+        }
+        if !pairs.is_empty() {
+            let joined = pairs.join(",");
+            let text = if span.properties == 0 {
+                joined
+            } else if span.trailing_comma {
+                format!("{joined},")
+            } else {
+                format!(",{joined}")
+            };
+            edits.push((span.insert_at, text));
+        }
+    }
+    for (key, old_value) in old {
+        let Some(new_value) = new.get(key) else {
+            continue;
+        };
+        if old_value.is_object() && new_value.is_object() {
+            path.push(PathSegment::Key(key.clone()));
+            collect_compact_additions(old_value, new_value, path, spans, edits, inserted)?;
+            path.pop();
+        }
+    }
+    Ok(())
 }
