@@ -32,6 +32,52 @@ The CLI uses the configured port. If the running server uses `serve --port` to
 override it, use HTTP management on that server to connect: HTTP operations use
 the actual listening port (including an OS-assigned port requested with `0`).
 
+## Passive Agent detection
+
+All seven adapters share `crates/agents/src/discovery.rs`. `agent list`, `ls`,
+HTTP statuses and the console distinguish three independent observations:
+
+- `detection.config_file`: a managed configuration file exists;
+- `detection.config_directory`: a managed file's parent directory exists;
+- `detection.cli`: a launcher was found, with its absolute `path` and nullable
+  `on_path`. `true` means found in the launching process's captured PATH;
+  `false` means found only in a known user/install directory, after searching
+  that PATH. `null` means the PATH search was truncated or could not resolve an
+  entry, so membership cannot be asserted. The top-level `detected` remains the
+  OR of these observations for older clients.
+
+PATH order wins over fallback locations. Native discovery also checks common
+user bin/npm/bun/Volta/asdf/mise/pnpm directories, Windows npm/local-app directories,
+and shallow nvm/fnm/mise/asdf Node-version installation directories. Absolute
+`BUN_INSTALL`, `VOLTA_HOME`, `PNPM_HOME`, `npm_config_prefix`/`NPM_CONFIG_PREFIX`,
+`NVM_DIR`, `NVM_HOME` (Windows), `FNM_DIR`, `MISE_DATA_DIR`, `ASDF_DATA_DIR`,
+`XDG_DATA_HOME`, `APPDATA` and `LOCALAPPDATA` can contribute installation locations;
+relative prefix variables are ignored. Relative/empty entries explicitly present
+in PATH are resolved against the launcher's working directory. Fallback Node
+versions are tried in numeric descending order; this is **not** a shell's nvm
+alias/default resolution.
+
+The process environment is captured when the manager is created. Refresh rechecks
+launcher files and Node-version directories; it does not reload a login shell's
+PATH or mutate environment variables. `MAGPIE_LITE_HOME` and `Manager::at_home`
+ignore the real machine's PATH, external prefix variables and global directories,
+and search only under the sandbox home. Unix launchers require a regular file
+with an executable permission bit. Windows checks `.exe`, `.com`, `.cmd` and
+`.bat` files; no script or binary is opened for its contents or run. Zed can be
+found as `zed` or `zeditor`.
+
+Search bounds are 128 captured PATH entries, 256 distinct candidate directories
+and 64 immediate entries per version-manager root; no recursive walk is performed.
+`detection.search_limited` warns when entries were omitted or a launcher path
+could not be represented in JSON (non-UTF-8 on Unix). Missing results are
+not proof that an Agent is uninstalled. Discovery does not verify a launcher
+format, version, current process, health, permissions to launch as the current
+user, a new terminal's PATH, project overrides or which model that Agent will
+actually select. No login shell, registry or credential store is queried.
+Launcher-only changes do not alter managed-field ownership, drift or backend
+preview revisions. The console may still clear a preview when refreshed metadata
+changes, so the displayed information is reviewed again.
+
 ## HTTP
 
 All endpoints require the gateway token, exactly like `/config` and inference.
@@ -168,9 +214,10 @@ do not delete backups to dismiss an error.
   the originally managed path, including after restart. Wiring edits the selected
   JSONC file without creating an ignored JSON sibling. After restoring the old
   managed file, a new connection can target the live preferred JSONC file.
-- Detection checks configuration files/folders and binary names on this process's
-  PATH. It does not inspect login-shell/off-PATH installations, running processes,
-  project overrides or reachability. Restart the agent after changing settings.
+- Detection is passive file/directory/launcher evidence, including known off-PATH
+  installation locations, not installed-version, login-shell, running-process,
+  project-override or reachability evidence. See Passive Agent detection above.
+  Restart the Agent after changing settings.
 - Zed still needs its token in its environment/provider settings; no credential is
   written to its JSON. Real-agent-version compatibility is not yet verified.
 - Agent-specific model catalogs, broader protocol fixtures
@@ -238,3 +285,15 @@ the timeout check accelerates one browser timer. These are UI coordination
 checks, not live vendor or real Agent execution evidence. Screenshots were
 captured on Windows/Edge; layout/focus were measured automatically. Manual visual
 inspection was unavailable on this development host, and is not claimed.
+
+Passive discovery tests use temporary launchers for all seven Agents. Unit tests
+exercise PATH priority, prefix/environment snapshots without global env mutation,
+sandbox isolation, numeric Node-version ordering, bounded/unknown results and
+refresh/removal. A lifecycle regression confirms that adding a launcher between
+preview and apply does not change revisions or ownership. HTTP and child CLI
+fixtures verify authenticated/secret-free metadata, unchanged configs/statistics
+and marker scripts that are never executed. The real-gateway browser suite checks
+all seven CLI paths; an explicitly injected metadata response additionally checks
+text-only rendering, unknown-membership warnings and long-path wrapping at 390px.
+Unix permission/symlink branches are platform-gated and have not been executed
+on this Windows host.

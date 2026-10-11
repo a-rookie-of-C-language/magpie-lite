@@ -622,3 +622,84 @@ async fn selected_opencode_jsonc_is_lossless_through_http_lifecycle_and_refusal(
     assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
     assert!(!json.exists());
 }
+
+#[tokio::test]
+async fn passive_cli_discovery_is_protected_refreshable_and_never_runs_launchers() {
+    let s = server(true).await;
+    let initial = s.ok(Method::GET, "/agents", json!(null)).await;
+    assert!(
+        initial["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["detected"] == false && a["detection"]["cli"].is_null())
+    );
+    let config_before = std::fs::read(&s.path).unwrap();
+    let stats_before = s.ok(Method::GET, "/stats", json!(null)).await;
+    let bin = s.root.path().join("home/.local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let mut files = Vec::new();
+    for id in [
+        "claude", "codex", "crush", "gemini", "goose", "opencode", "zed",
+    ] {
+        let marker = s.root.path().join(format!("must-not-run-{id}"));
+        let path = bin.join(if cfg!(windows) {
+            format!("{id}.cmd")
+        } else {
+            id.into()
+        });
+        let script = if cfg!(windows) {
+            format!(
+                "@echo off\r\necho executed>\"{}\"\r\nREM {TOKEN} {UPSTREAM_KEY}\r\n",
+                marker.display()
+            )
+        } else {
+            format!(
+                "#!/bin/sh\nprintf executed > '{}'\n# {TOKEN} {UPSTREAM_KEY}\n",
+                marker.display()
+            )
+        };
+        std::fs::write(&path, script.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        files.push((path, script, marker));
+    }
+    let unauthorized = s
+        .client
+        .get(format!("{}/agents", s.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    assert!(!unauthorized.text().await.unwrap().contains(".local"));
+    let list = s.ok(Method::GET, "/agents", json!(null)).await;
+    for (agent, (path, script, marker)) in list["agents"].as_array().unwrap().iter().zip(&files) {
+        assert_eq!(agent["detected"], true);
+        assert_eq!(agent["connected"], false);
+        assert_eq!(agent["detection"]["config_file"], false);
+        assert_eq!(agent["detection"]["config_directory"], false);
+        assert_eq!(
+            PathBuf::from(agent["detection"]["cli"]["path"].as_str().unwrap()),
+            *path
+        );
+        assert_eq!(agent["detection"]["cli"]["on_path"], false);
+        assert_eq!(agent["detection"]["search_limited"], false);
+        assert!(!marker.exists());
+        assert_eq!(std::fs::read(path).unwrap(), script.as_bytes());
+        std::fs::remove_file(path).unwrap();
+    }
+    let text = list.to_string();
+    assert!(!text.contains(TOKEN) && !text.contains(UPSTREAM_KEY));
+    assert_eq!(std::fs::read(&s.path).unwrap(), config_before);
+    assert_eq!(s.ok(Method::GET, "/stats", json!(null)).await, stats_before);
+    assert!(
+        s.ok(Method::GET, "/agents", json!(null)).await["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["detected"] == false)
+    );
+}

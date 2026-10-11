@@ -69,6 +69,7 @@ test("Agent console against a real isolated Rust gateway", { timeout: 120000 }, 
       return response.json();
     };
     const statuses = (await api("/agents")).agents;
+    assert.ok(statuses.every(agent => !agent.detected && agent.detection.cli === null), "Sandbox must not detect real-machine Agents");
     const originals = new Map();
     for (const agent of statuses) {
       for (const [index, file] of agent.files.entries()) {
@@ -120,6 +121,63 @@ test("Agent console against a real isolated Rust gateway", { timeout: 120000 }, 
     };
     await page.goto(gateway.url);
     await login();
+
+    await t.test("passive CLI paths refresh for seven Agents without running scripts or changing configs", async () => {
+      const commands = [];
+      const marker = path.join(root, "detection-must-not-run");
+      for (const id of Object.keys(names)) {
+        const cli = path.join(root, "home", ".local", "bin", id + (process.platform === "win32" ? ".cmd" : ""));
+        const script = process.platform === "win32" ? `@echo off\r\necho executed>"${marker}"\r\nREM ${TOKEN} ${KEY}\r\n` : `#!/bin/sh\nprintf executed > '${marker}'\n# ${TOKEN} ${KEY}\n`;
+        await write(cli, script);
+        if (process.platform !== "win32") await fs.chmod(cli, 0o700);
+        commands.push({ cli, script });
+      }
+      await page.locator("#agent-refresh").click();
+      await page.waitForFunction(() => document.querySelectorAll(".agent-cli-path").length === 7);
+      const current = (await api("/agents")).agents;
+      for (const [index, agent] of current.entries()) {
+        assert.equal(agent.detection.config_file, true);
+        assert.equal(agent.detection.config_directory, true);
+        assert.equal(agent.detection.cli.on_path, false);
+        assert.equal(path.normalize(agent.detection.cli.path), commands[index].cli);
+        assert.ok((await card(agent.id).innerText()).includes("not on gateway's PATH"));
+        assert.equal(path.normalize(await card(agent.id).locator(".agent-cli-path").innerText()), commands[index].cli);
+        assert.equal(await fs.readFile(commands[index].cli, "utf8"), commands[index].script);
+      }
+      await assert.rejects(fs.access(marker));
+      for (const [file, bytes] of originals) assert.deepEqual(await fs.readFile(file), bytes);
+      assert.deepEqual(await fs.readFile(gateway.config), configBytes);
+      await safeDom();
+    });
+
+    await t.test("discovery metadata is text-only and long paths wrap at 390px", async () => {
+      // Inject only response metadata to test rendering; this is not a discovered CLI.
+      const longPath = "<img src=x onerror='window.discoveryInjected=true'>/" + "long-path-component/".repeat(30);
+      await page.route("**/agents", async route => {
+        const response = await route.fetch();
+        const body = await response.json();
+        body.agents.find(agent => agent.id === "claude").detection.cli = { path: longPath, on_path: true };
+        const codex = body.agents.find(agent => agent.id === "codex");
+        codex.detection.cli.on_path = null;
+        codex.detection.search_limited = true;
+        await route.fulfill({ response, json: body });
+      });
+      await page.setViewportSize({ width: 390, height: 844 });
+      await page.locator("#agent-refresh").click();
+      await page.waitForFunction(() => document.querySelector(".agent-cli-path").textContent.startsWith("<img"));
+      assert.equal(await card("claude").locator(".agent-cli-path").innerText(), longPath);
+      assert.ok((await card("claude").innerText()).includes("CLI found on gateway's PATH"));
+      assert.ok((await card("codex").innerText()).includes("PATH membership unknown"));
+      assert.ok((await card("codex").innerText()).includes("search reached its entry limit"));
+      assert.equal(await page.locator(".agent-card img").count(), 0);
+      assert.equal(await page.evaluate(() => Boolean(window.discoveryInjected)), false);
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
+      if (process.env.MAGPIE_LITE_SCREENSHOTS) await page.locator("#agent-list").screenshot({ path: path.join(process.env.MAGPIE_LITE_SCREENSHOTS, "detection-mobile.png") });
+      await page.unroute("**/agents");
+      await page.setViewportSize({ width: 1280, height: 900 });
+      await page.locator("#agent-refresh").click();
+      await page.waitForFunction(() => !document.querySelector(".agent-cli-path").textContent.startsWith("<img"));
+    });
 
     await t.test("seven Agents preview, connect, rewire and restore exact original bytes", async () => {
       assert.equal(await page.locator(".agent-card").count(), 7);

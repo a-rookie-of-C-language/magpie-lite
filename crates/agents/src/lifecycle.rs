@@ -132,6 +132,7 @@ pub struct Status {
     pub id: AgentId,
     pub name: &'static str,
     pub detected: bool,
+    pub detection: super::discovery::Detection,
     pub connected: bool,
     pub model: Option<String>,
     pub drifted: bool,
@@ -227,58 +228,21 @@ pub struct Manager {
     state_dir: PathBuf,
     targets: BTreeMap<AgentId, Vec<PathBuf>>,
     local: Mutex<()>,
+    discovery: super::discovery::Discovery,
 }
 impl Manager {
     pub fn native(state_dir: PathBuf) -> Result<Self> {
-        let crush =
-            super::crush::paths().map_err(|_| unavailable("cannot locate Crush configuration"))?;
-        let mut targets = BTreeMap::new();
-        targets.insert(
-            AgentId::Claude,
-            vec![
-                super::claude::settings_path()
-                    .map_err(|_| unavailable("cannot locate Claude configuration"))?,
-            ],
-        );
-        targets.insert(
-            AgentId::Codex,
-            vec![
-                super::codex::config_path()
-                    .map_err(|_| unavailable("cannot locate Codex configuration"))?,
-            ],
-        );
-        targets.insert(AgentId::Crush, vec![crush.0, crush.1]);
-        targets.insert(
-            AgentId::Gemini,
-            vec![
-                super::gemini::settings_path()
-                    .map_err(|_| unavailable("cannot locate Gemini configuration"))?,
-                super::gemini::env_path()
-                    .map_err(|_| unavailable("cannot locate Gemini credentials"))?,
-            ],
-        );
-        let goose = super::goose::config_path()
-            .map_err(|_| unavailable("cannot locate Goose configuration"))?;
-        let custom = goose
-            .parent()
-            .ok_or_else(|| unavailable("cannot locate Goose provider directory"))?
-            .join("custom_providers/magpie-lite.json");
-        targets.insert(AgentId::Goose, vec![goose, custom]);
-        targets.insert(
-            AgentId::Opencode,
-            vec![
-                super::opencode::config_path()
-                    .map_err(|_| unavailable("cannot locate OpenCode configuration"))?,
-            ],
-        );
-        targets.insert(
-            AgentId::Zed,
-            vec![
-                super::zed::settings_path()
-                    .map_err(|_| unavailable("cannot locate Zed configuration"))?,
-            ],
-        );
-        Self::new(state_dir, targets)
+        let targets = AgentId::ALL
+            .into_iter()
+            .map(|id| {
+                super::native_files(id)
+                    .map(|files| (id, files))
+                    .map_err(|_| unavailable("cannot locate agent configuration"))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let mut manager = Self::new(state_dir, targets)?;
+        manager.discovery = super::discovery::Discovery::native();
+        Ok(manager)
     }
     /// Isolated layout, without changing process-wide HOME variables.
     pub fn at_home(home: &Path, state_dir: PathBuf) -> Result<Self> {
@@ -313,7 +277,9 @@ impl Manager {
             .unwrap_or_else(|| home.join(".config/opencode/opencode.json"));
         targets.insert(AgentId::Opencode, vec![opencode]);
         targets.insert(AgentId::Zed, vec![home.join(".config/zed/settings.json")]);
-        Self::new(state_dir, targets)
+        let mut manager = Self::new(state_dir, targets)?;
+        manager.discovery = super::discovery::Discovery::at_home(home);
+        Ok(manager)
     }
     fn new(state_dir: PathBuf, mut targets: BTreeMap<AgentId, Vec<PathBuf>>) -> Result<Self> {
         for paths in targets.values_mut() {
@@ -332,6 +298,7 @@ impl Manager {
             state_dir,
             targets,
             local: Mutex::new(()),
+            discovery: super::discovery::Discovery::empty(),
         })
     }
     fn lock(&self) -> Result<(std::sync::MutexGuard<'_, ()>, File)> {
@@ -532,9 +499,16 @@ impl Manager {
     }
     pub fn statuses(&self) -> Result<Vec<Status>> {
         let _lock = self.lock()?;
-        AgentId::ALL.into_iter().map(|id| self.status(id)).collect()
+        let search = self.discovery.search();
+        AgentId::ALL
+            .into_iter()
+            .map(|id| self.status_with(id, &search))
+            .collect()
     }
     fn status(&self, id: AgentId) -> Result<Status> {
+        self.status_with(id, &self.discovery.search())
+    }
+    fn status_with(&self, id: AgentId, search: &super::discovery::Search) -> Result<Status> {
         let journal = self.load(id)?;
         let connected = journal
             .as_ref()
@@ -561,21 +535,19 @@ impl Manager {
                             .is_err()
                     })
                 }));
+        let detection = search.detect(id, &paths);
         Ok(Status {
             id,
             name: id.name(),
-            detected: self
-                .paths(id)?
-                .iter()
-                .any(|p| p.exists() || p.parent().is_some_and(Path::is_dir))
-                || binary_detected(id),
+            detected: detection.detected(),
+            detection,
             connected,
             model: journal
                 .filter(|j| j.phase != Phase::Disconnected)
                 .map(|j| j.model),
             drifted,
             recovery_needed,
-            files: self.paths(id)?,
+            files: paths,
             notice: notice(id),
         })
     }
@@ -1071,24 +1043,6 @@ fn private_directory(path: &Path) -> Result<()> {
         .map_err(|_| unavailable("cannot restrict agent backup directory"))?;
     Ok(())
 }
-fn binary_detected(id: AgentId) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-    let binary = if id == AgentId::Zed { "zed" } else { id.id() };
-    std::env::split_paths(&paths).any(|dir| {
-        #[cfg(windows)]
-        let names = [
-            format!("{binary}.exe"),
-            format!("{binary}.cmd"),
-            format!("{binary}.bat"),
-        ];
-        #[cfg(not(windows))]
-        let names = [binary.to_owned()];
-        names.into_iter().any(|name| dir.join(name).is_file())
-    })
-}
-
 /// Keep journals shared between local CLI and gateway processes for this config location.
 pub fn state_directory(config_path: &Path) -> Result<PathBuf> {
     let absolute = if config_path.is_absolute() {

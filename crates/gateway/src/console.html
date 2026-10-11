@@ -497,7 +497,7 @@
 
         <section class="panel agents-panel" aria-labelledby="agents-title">
           <div class="panel-header"><h2 id="agents-title">Coding agents</h2><button id="agent-refresh" class="button secondary" type="button">Refresh agents</button></div>
-          <p class="panel-copy">Seven agents, one gateway. Review file paths and byte counts before applying any change. Detection is a local hint, not a running-agent health check.</p>
+          <p class="panel-copy">Seven agents, one gateway. Review file paths and byte counts before applying any change. Detection never runs an agent. CLI paths describe this gateway's environment, not a new terminal; they are not version or health checks.</p>
           <p id="agent-load-message" class="console-message" role="status" aria-live="polite" aria-atomic="true"></p>
           <form id="agent-editor" class="agent-editor" hidden aria-labelledby="agent-editor-title">
             <h3 id="agent-editor-title">Manage agent</h3>
@@ -999,7 +999,14 @@
         card.append(text("h3", status.name));
         const label = status.recovery_needed ? "Recovery needed" : status.drifted ? "Configuration drift" : status.connected ? "Connected" : "Not connected";
         card.append(text("p", label, "status " + (status.recovery_needed || status.drifted ? "warn" : status.connected ? "good" : "agent-meta")));
-        card.append(text("p", status.detected ? "Detected locally" : "Not detected · can create configuration", "agent-meta"));
+        const detection = status.detection;
+        card.append(text("p", detection ? detection.config_file ? "Configuration file found" : detection.config_directory ? "Configuration directory found" : "No user configuration yet" : status.detected ? "Detected locally" : "Not detected · can create configuration", "agent-meta"));
+        if (detection) {
+          const cli = detection.cli;
+          card.append(text("p", cli ? cli.on_path === true ? "CLI found on gateway's PATH" : cli.on_path === false ? "CLI found · not on gateway's PATH" : "CLI found · PATH membership unknown (search limited)" : "CLI not found in searched directories", cli && cli.on_path !== true ? "agent-warning" : "agent-meta"));
+          if (cli) card.append(text("p", cli.path, "agent-meta agent-cli-path"));
+          if (detection.search_limited) card.append(text("p", "CLI search reached its entry limit; an installation may be omitted.", "agent-warning"));
+        }
         card.append(text("p", status.model || "No managed model", "agent-meta"));
         const manage = text("button", "Manage", "button secondary");
         manage.type = "button"; manage.dataset.agent = status.id;

@@ -460,3 +460,89 @@ fn cli_selected_opencode_jsonc_preserves_format_and_configless_restore() {
     assert!(!restored.contains(TOKEN));
     assert!(!json.exists());
 }
+
+#[test]
+fn sandbox_discovery_ignores_machine_paths_and_reports_passive_user_launchers() {
+    let s = Sandbox::new();
+    let external = s.root.path().join("external-machine-bin");
+    std::fs::create_dir_all(&external).unwrap();
+    let name = if cfg!(windows) { "codex.cmd" } else { "codex" };
+    let outside = external.join(name);
+    std::fs::write(&outside, "must not count as a sandbox installation").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let isolated = s
+        .command()
+        .env("PATH", &external)
+        .env("BUN_INSTALL", &external)
+        .env("APPDATA", &external)
+        .env("NVM_HOME", &external)
+        .args(["agent", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        isolated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&isolated.stderr)
+    );
+    let list: Value = serde_json::from_slice(&isolated.stdout).unwrap();
+    assert!(
+        list.as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["detected"] == false && a["detection"]["cli"].is_null())
+    );
+    let bin = s.root.path().join("home/.local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let path = bin.join(name);
+    let marker = s.root.path().join("must-not-run-codex");
+    let script = if cfg!(windows) {
+        format!(
+            "@echo off\r\necho executed>\"{}\"\r\nREM {TOKEN}\r\n",
+            marker.display()
+        )
+    } else {
+        format!(
+            "#!/bin/sh\nprintf executed > '{}'\n# {TOKEN}\n",
+            marker.display()
+        )
+    };
+    std::fs::write(&path, &script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let list = s.success(&["agent", "list"]);
+    let codex = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == "codex")
+        .unwrap();
+    assert_eq!(codex["detected"], true);
+    assert_eq!(codex["detection"]["config_file"], false);
+    assert_eq!(
+        PathBuf::from(codex["detection"]["cli"]["path"].as_str().unwrap()),
+        path
+    );
+    assert_eq!(codex["detection"]["cli"]["on_path"], false);
+    let output = s.run(&["ls"]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.replace('\\', "/")
+            .contains(&path.to_str().unwrap().replace('\\', "/"))
+    );
+    assert!(text.contains("not on launcher's PATH"));
+    assert!(!text.contains(TOKEN));
+    assert!(!marker.exists());
+    assert_eq!(std::fs::read(path).unwrap(), script.as_bytes());
+    assert_eq!(
+        std::fs::read_to_string(outside).unwrap(),
+        "must not count as a sandbox installation"
+    );
+}

@@ -100,11 +100,16 @@ The CLI and protected HTTP API now share seven adapters through the
 `magpie-agents` crate. Use `agent preview <id> <model>`,
 `agent connect <id> <model>`, `agent preview <id> --disconnect`,
 `agent disconnect <id>` and `agent recover <id>`. `agent list` reports managed
-connection, drift and pending recovery. Existing per-agent shorthand commands
-also save a durable backup before writing.
+connection, drift, pending recovery and passive detection details. `ls` includes
+configuration markers, the discovered CLI path and whether it is on the launcher's
+captured PATH (or unknown when the search is limited). Existing per-agent shorthand
+commands also save a durable backup before writing.
 
 The **Coding agents** panel shows detection, connection, selected model, drift
-and recovery status for all seven agents. Click **Manage**, choose a configured
+and recovery status for all seven agents. It also separates configuration markers
+from CLI discovery and warns about launchers outside the gateway's PATH. Detection
+never runs a launcher and is not a terminal-PATH, version or health check.
+Click **Manage**, choose a configured
 route (or type `provider/model` / `group/id`), and **Preview changes**. Review the
 paths, operations and byte counts, then **Confirm connection**. To disconnect,
 choose **Disconnect / restore backup**, preview and **Confirm restoration**.
@@ -116,11 +121,11 @@ HTTP management exposes `GET /agents` and
 `POST /agents/{id}/preview|apply|recover`. Apply requires the reviewed preview
 revision. Previews show paths, operations and byte counts, not secrets.
 
-Unchanged managed files can be restored byte-for-byte; later user edits are
-refused rather than overwritten. Multi-file operations have explicit journaled
+Unchanged managed files can be restored byte-for-byte; unrelated later edits are
+preserved by selective field restoration. Managed-field conflicts and unsafe
+configuration shapes are refused rather than overwritten. Multi-file operations have explicit journaled
 recovery, not an atomic all-file transaction. Journals retain sensitive baseline
-credentials and are **not encrypted**. Selective field-level restore preserving
-later unrelated edits is still pending. See `docs/agent-lifecycle.md` for commands,
+credentials and are **not encrypted**. See `docs/agent-lifecycle.md` for commands,
 API bodies, port overrides, backup retention, platform permissions and precise limitations.
 
 ## Discovering models and testing providers

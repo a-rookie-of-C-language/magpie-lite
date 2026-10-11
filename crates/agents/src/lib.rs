@@ -15,49 +15,47 @@ pub struct AgentInfo {
     pub id: &'static str,
     /// Display name.
     pub name: &'static str,
-    /// Whether its config directory exists.
+    /// Configuration file/directory or a CLI launcher was found (not a health check).
     pub installed: bool,
 }
 
-/// Every agent this build can wire.
+/// Every agent this build can wire, using the same passive detection as HTTP/CLI.
 pub fn list() -> Vec<AgentInfo> {
-    vec![
-        AgentInfo {
-            id: "claude",
-            name: "Claude Code",
-            installed: claude::installed(),
-        },
-        AgentInfo {
-            id: "codex",
-            name: "Codex",
-            installed: codex::installed(),
-        },
-        AgentInfo {
-            id: "crush",
-            name: "Crush",
-            installed: crush::installed(),
-        },
-        AgentInfo {
-            id: "gemini",
-            name: "Gemini CLI",
-            installed: gemini::installed(),
-        },
-        AgentInfo {
-            id: "goose",
-            name: "Goose",
-            installed: goose::installed(),
-        },
-        AgentInfo {
-            id: "opencode",
-            name: "OpenCode",
-            installed: opencode::installed(),
-        },
-        AgentInfo {
-            id: "zed",
-            name: "Zed",
-            installed: zed::installed(),
-        },
-    ]
+    let search = discovery::Discovery::native().search();
+    lifecycle::AgentId::ALL
+        .into_iter()
+        .map(|id| {
+            let files = native_files(id).unwrap_or_default();
+            AgentInfo {
+                id: id.id(),
+                name: id.name(),
+                installed: search.detect(id, &files).detected(),
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn native_files(id: lifecycle::AgentId) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    use lifecycle::AgentId;
+    Ok(match id {
+        AgentId::Claude => vec![claude::settings_path()?],
+        AgentId::Codex => vec![codex::config_path()?],
+        AgentId::Crush => {
+            let (config, data) = crush::paths()?;
+            vec![config, data]
+        }
+        AgentId::Gemini => vec![gemini::settings_path()?, gemini::env_path()?],
+        AgentId::Goose => {
+            let config = goose::config_path()?;
+            let provider = config
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("cannot locate Goose providers"))?
+                .join("custom_providers/magpie-lite.json");
+            vec![config, provider]
+        }
+        AgentId::Opencode => vec![opencode::config_path()?],
+        AgentId::Zed => vec![zed::settings_path()?],
+    })
 }
 
 /// The home directory agent configs live under. `MAGPIE_LITE_HOME`
@@ -436,6 +434,8 @@ mod tests {
 }
 
 pub mod lifecycle;
+
+pub mod discovery;
 
 #[cfg(windows)]
 mod windows;

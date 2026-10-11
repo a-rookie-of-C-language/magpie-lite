@@ -493,6 +493,28 @@ async fn main() -> Result<()> {
                     agent.drifted,
                     agent.recovery_needed
                 );
+                println!(
+                    "         config_file={} config_directory={}",
+                    agent.detection.config_file, agent.detection.config_directory
+                );
+                if let Some(cli) = agent.detection.cli {
+                    println!(
+                        "         CLI: {} ({})",
+                        cli.path.display(),
+                        match cli.on_path {
+                            Some(true) => "on launcher's PATH",
+                            Some(false) => "not on launcher's PATH",
+                            None => "PATH membership unknown; search limited",
+                        }
+                    );
+                } else {
+                    println!("         CLI: not found (not a running-agent check)");
+                }
+                if agent.detection.search_limited {
+                    println!(
+                        "         CLI search reached its entry limit; an installation may be omitted"
+                    );
+                }
             }
         }
         Command::Stats => {

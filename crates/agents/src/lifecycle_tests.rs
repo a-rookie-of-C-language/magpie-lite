@@ -1373,3 +1373,64 @@ fn all_json_adapter_files_keep_foreign_spelling_bom_crlf_during_wiring_and_resto
         }
     }
 }
+
+#[test]
+fn passive_cli_changes_do_not_change_owned_fields_or_invalidate_lifecycle_revisions() {
+    let (root, manager) = setup();
+    let initial = manager.statuses().unwrap();
+    assert!(
+        initial
+            .iter()
+            .all(|s| !s.detected && s.detection.cli.is_none())
+    );
+    let preview = manager
+        .preview(
+            AgentId::Claude,
+            Action::Connect,
+            Some("mock/model"),
+            gateway(),
+        )
+        .unwrap();
+    let dir = root.path().join("home/.local/bin");
+    fs::create_dir_all(&dir).unwrap();
+    let cli = dir.join(if cfg!(windows) {
+        "claude.cmd"
+    } else {
+        "claude"
+    });
+    fs::write(&cli, "a launcher must never be run by detection").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let before = fs::read(&cli).unwrap();
+    let status = manager
+        .apply(
+            AgentId::Claude,
+            Action::Connect,
+            Some("mock/model"),
+            &preview.revision,
+            gateway(),
+        )
+        .unwrap();
+    assert!(status.connected && status.detected && !status.drifted);
+    assert!(status.detection.config_file && status.detection.config_directory);
+    assert_eq!(status.detection.cli.as_ref().unwrap().path, cli);
+    assert_eq!(status.detection.cli.as_ref().unwrap().on_path, Some(false));
+    let status = disconnect(&manager, AgentId::Claude);
+    assert!(!status.connected && !status.detection.config_file);
+    assert!(
+        status.detected,
+        "existing launcher still detects the disconnected agent"
+    );
+    assert_eq!(fs::read(&cli).unwrap(), before);
+    fs::remove_file(cli).unwrap();
+    assert!(
+        manager
+            .statuses()
+            .unwrap()
+            .iter()
+            .all(|s| s.detection.cli.is_none())
+    );
+}
