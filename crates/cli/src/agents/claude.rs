@@ -1,0 +1,47 @@
+//! Claude Code: point its `settings.json` env block at the gateway.
+
+use anyhow::{Context, Result};
+use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
+
+/// Where Claude Code's settings live.
+pub fn settings_path() -> Result<PathBuf> {
+    let home = super::agent_home().context("cannot find the home directory")?;
+    Ok(home.join(".claude").join("settings.json"))
+}
+
+/// Whether Claude Code looks installed.
+pub fn installed() -> bool {
+    settings_path().map(|p| p.exists()).unwrap_or(false)
+}
+
+/// Wire Claude Code onto the gateway: `ANTHROPIC_BASE_URL`,
+/// `ANTHROPIC_AUTH_TOKEN`, and the model. Returns the settings path.
+pub fn wire(model: &str, port: u16, token: &str) -> Result<PathBuf> {
+    let path = settings_path()?;
+    wire_at(&path, model, port, token)?;
+    Ok(path)
+}
+
+/// The wiring itself, against an explicit settings path.
+pub fn wire_at(path: &Path, model: &str, port: u16, token: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).context("creating the settings directory")?;
+    }
+    let mut settings: Value = if path.exists() {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?
+    } else {
+        json!({})
+    };
+    if !settings.get("env").map(Value::is_object).unwrap_or(false) {
+        settings["env"] = json!({});
+    }
+    settings["env"]["ANTHROPIC_BASE_URL"] = json!(format!("http://127.0.0.1:{port}"));
+    settings["env"]["ANTHROPIC_AUTH_TOKEN"] = json!(token);
+    settings["model"] = json!(model);
+    std::fs::write(path, serde_json::to_vec_pretty(&settings)?)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}

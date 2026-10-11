@@ -1,0 +1,15 @@
+//! magpie-core: the protocol-neutral message IR and the wire codecs for
+//! OpenAI Chat Completions and Anthropic Messages, streaming included.
+//!
+//! Every request is decoded into [`ir::CompletionRequest`]; every reply is
+//! built from [`ir::CompletionResponse`]. A stream is decoded into
+//! [`stream::StreamEvent`]s and encoded back out. New protocols plug in as
+//! one decoder plus one encoder.
+
+pub mod anthropic;
+pub mod chat;
+pub mod error;
+pub mod ir;
+pub mod stream;
+
+pub use error::{CoreError, Result};
