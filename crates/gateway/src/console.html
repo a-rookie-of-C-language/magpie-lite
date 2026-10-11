@@ -506,6 +506,32 @@
           </div>
 
           <div class="stack">
+            <section class="panel" aria-labelledby="routing-title">
+              <div class="panel-header"><h2 id="routing-title">Routing configuration</h2></div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th scope="col">Provider</th>
+                      <th scope="col">Protocol</th>
+                      <th scope="col">Base URL</th>
+                      <th scope="col">Models</th>
+                      <th scope="col">Keys</th>
+                      <th scope="col">Fallback</th>
+                      <th scope="col">Cooldown</th>
+                    </tr>
+                  </thead>
+                  <tbody id="routing-rows"></tbody>
+                </table>
+              </div>
+              <p id="routing-empty" class="empty" hidden>No providers are configured.</p>
+            </section>
+
+            <section class="panel" aria-labelledby="groups-title">
+              <div class="panel-header"><h2 id="groups-title">Routing groups</h2></div>
+              <ul id="group-list" class="model-list"></ul>
+              <p id="group-empty" class="empty" hidden>No routing groups are configured.</p>
+            </section>
             <section class="panel" aria-labelledby="models-title">
               <div class="panel-header"><h2 id="models-title">Available models</h2></div>
               <ul id="model-list" class="model-list"></ul>
@@ -560,6 +586,10 @@
       requestRows: document.getElementById("request-rows"),
       requestEmpty: document.getElementById("request-empty"),
       requestCount: document.getElementById("request-count"),
+      routingRows: document.getElementById("routing-rows"),
+      routingEmpty: document.getElementById("routing-empty"),
+      groupList: document.getElementById("group-list"),
+      groupEmpty: document.getElementById("group-empty"),
       modelList: document.getElementById("model-list"),
       modelEmpty: document.getElementById("model-empty"),
       usageRows: document.getElementById("usage-rows"),
@@ -724,6 +754,48 @@
       }
     }
 
+    function renderRouting(configuration) {
+      renderRoutingProviders(configuration.providers || []);
+      renderRoutingGroups(configuration.groups || []);
+    }
+
+    function renderRoutingProviders(providers) {
+      clear(elements.routingRows);
+      elements.routingEmpty.hidden = providers.length !== 0;
+      for (const provider of providers) {
+        elements.routingRows.append(row([
+          text("td", provider.name || provider.id),
+          text("td", provider.protocol),
+          text("td", provider.base_url),
+          text("td", listSummary(provider.models || [])),
+          text("td", `${fmt(provider.key_count)} slot${Number(provider.key_count) === 1 ? "" : "s"}`),
+          text("td", listSummary(provider.fallback || [])),
+          text("td", formatDuration(provider.key_cooldown_ms))
+        ]));
+      }
+    }
+
+    function renderRoutingGroups(groups) {
+      clear(elements.groupList);
+      elements.groupEmpty.hidden = groups.length !== 0;
+      for (const group of groups) {
+        const li = document.createElement("li");
+        li.className = "model-chip";
+        const id = document.createElement("span");
+        id.textContent = `group/${group.id}`;
+        const route = document.createElement("span");
+        route.className = "model-owner";
+        route.textContent = (group.routes || []).join(" → ") || "No routes";
+        li.append(id, route);
+        elements.groupList.append(li);
+      }
+    }
+
+    function listSummary(values) {
+      if (!Array.isArray(values) || values.length === 0) return "—";
+      return `${values.length}: ${values.join(", ")}`;
+    }
+
     function renderModels(models) {
       clear(elements.modelList);
       const values = Array.isArray(models) ? models : [];
@@ -756,9 +828,14 @@
     async function update(silent) {
       if (!token) return;
       try {
-        const [stats, models] = await Promise.all([authorized("/stats"), authorized("/v1/models")]);
+        const [stats, models, routing] = await Promise.all([
+          authorized("/stats"),
+          authorized("/v1/models"),
+          authorized("/config")
+        ]);
         renderStats(stats);
         renderModels(models.data || []);
+        renderRouting(routing);
         lastUpdate = new Date().toLocaleTimeString([], { hour12: false });
         setPill(elements.dataPill, `Live · ${lastUpdate}`, "good");
         setMessage("");

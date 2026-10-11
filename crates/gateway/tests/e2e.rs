@@ -1546,12 +1546,29 @@ async fn console_is_public_while_protected_data_requires_the_token() {
     assert!(body.contains("magpie-lite console"));
     assert!(body.contains("Authorization"));
     assert!(body.contains("Cooldowns"));
+    assert!(body.contains("Routing configuration"));
+    assert!(body.contains("Routing groups"));
     assert!(!body.contains("localStorage"), "the token is not persisted");
     assert!(!body.contains("test-key"), "upstream credentials stay out");
 
     let alias = client.get(format!("{gw}/ui")).send().await.unwrap();
     assert_eq!(alias.status(), StatusCode::OK);
 
+    let config = client.get(format!("{gw}/config")).send().await.unwrap();
+    assert_eq!(config.status(), StatusCode::UNAUTHORIZED);
+
+    let config = client
+        .get(format!("{gw}/config"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(config.status(), StatusCode::OK);
+    let config: Value = config.json().await.unwrap();
+    assert_eq!(config["default_provider"], "mock");
+    assert_eq!(config["providers"][0]["id"], "mock");
+    assert_eq!(config["providers"][0]["key_count"], 1);
+    assert!(!config.to_string().contains("test-key"));
     let stats = client.get(format!("{gw}/stats")).send().await.unwrap();
     assert_eq!(stats.status(), StatusCode::UNAUTHORIZED);
 }

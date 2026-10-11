@@ -51,6 +51,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1beta/models/{*model}", post(gemini_generate))
         .route("/v1/models", get(list_models))
         .route("/stats", get(stats))
+        .route("/config", get(config))
         // Every route above proves it knows the configured local token
         // before a request can reach a provider or read statistics. The
         // health probe and secret-free login page below are added after
@@ -168,6 +169,11 @@ async fn stats(State(state): State<Arc<AppState>>) -> Json<StatsSnapshot> {
         .snapshot();
     snapshot.key_cooldowns = state.key_rotation.cooldown_snapshot();
     Json(snapshot)
+}
+
+/// GET `/config` — secret-free routing metadata for the console.
+async fn config(State(state): State<Arc<AppState>>) -> Json<crate::config::ConfigSnapshot> {
+    Json(state.config.snapshot())
 }
 
 async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {

@@ -256,6 +256,51 @@ impl GroupConfig {
     }
 }
 
+/// One provider as the console may show it: routing metadata only, never an
+/// upstream API key or the gateway token.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderConfigSnapshot {
+    /// Short id models route by.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Upstream wire protocol.
+    pub protocol: Protocol,
+    /// Upstream base URL.
+    pub base_url: String,
+    /// Models explicitly listed for bare-name routing and `/v1/models`.
+    pub models: Vec<String>,
+    /// Number of effective key slots, not the keys themselves.
+    pub key_count: usize,
+    /// Ordered fallback references.
+    pub fallback: Vec<String>,
+    /// Effective cooldown after quota or rate-limit rejection.
+    pub key_cooldown_ms: u64,
+}
+
+/// One routing group as the console may show it.
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupConfigSnapshot {
+    /// `group/<id>` as agents spell it.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Ordered route chain.
+    pub routes: Vec<String>,
+}
+
+/// Secret-free routing configuration for the token-protected console.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigSnapshot {
+    /// Provider used when a model names none.
+    pub default_provider: String,
+    /// Gateway-wide cooldown default, in milliseconds.
+    pub key_cooldown_ms: u64,
+    /// Upstream routing metadata.
+    pub providers: Vec<ProviderConfigSnapshot>,
+    /// Named route chains.
+    pub groups: Vec<GroupConfigSnapshot>,
+}
 /// Everything the gateway needs to run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -327,6 +372,38 @@ impl Config {
         }
         fs::write(path, toml::to_string_pretty(self)?)?;
         Ok(())
+    }
+
+    /// A secret-free view for `/config` and the console.
+    pub fn snapshot(&self) -> ConfigSnapshot {
+        ConfigSnapshot {
+            default_provider: self.default_provider.clone(),
+            key_cooldown_ms: self.key_cooldown_ms,
+            providers: self
+                .provider
+                .iter()
+                .map(|p| ProviderConfigSnapshot {
+                    id: p.id.clone(),
+                    name: p.label().to_owned(),
+                    protocol: p.protocol,
+                    base_url: p.base_url.clone(),
+                    models: p.models.clone(),
+                    key_count: p.api_key_pool().len(),
+                    fallback: p.fallback.clone(),
+                    key_cooldown_ms: self.key_cooldown_for(p).as_millis().min(u64::MAX as u128)
+                        as u64,
+                })
+                .collect(),
+            groups: self
+                .group
+                .iter()
+                .map(|g| GroupConfigSnapshot {
+                    id: g.id.clone(),
+                    name: g.label().to_owned(),
+                    routes: g.routes.clone(),
+                })
+                .collect(),
+        }
     }
 
     /// Find a provider by id.
@@ -489,6 +566,47 @@ mod tests {
             .as_millis() as u64
     }
 
+    #[test]
+    fn config_snapshot_is_route_metadata_without_secrets() {
+        let mut config = Config {
+            default_provider: "mock".into(),
+            key_cooldown_ms: 60_000,
+            ..Config::default()
+        };
+        config.provider.push(ProviderConfig {
+            id: "mock".into(),
+            name: "Mock Provider".into(),
+            protocol: Protocol::Chat,
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: String::new(),
+            api_keys: vec!["secret-one".into(), "secret-two".into()],
+            models: vec!["mock-model".into()],
+            fallback: vec!["backup/other".into()],
+            key_cooldown_ms: Some(1_200),
+        });
+        config.group.push(GroupConfig {
+            id: "daily".into(),
+            name: "Daily coding".into(),
+            routes: vec!["mock/mock-model".into(), "backup/other".into()],
+        });
+
+        let snapshot = config.snapshot();
+        assert_eq!(snapshot.default_provider, "mock");
+        assert_eq!(snapshot.providers.len(), 1);
+        let provider = &snapshot.providers[0];
+        assert_eq!(provider.id, "mock");
+        assert_eq!(provider.name, "Mock Provider");
+        assert_eq!(provider.protocol, Protocol::Chat);
+        assert_eq!(provider.key_count, 2);
+        assert_eq!(provider.key_cooldown_ms, 1_200);
+        assert_eq!(snapshot.groups[0].id, "daily");
+        assert_eq!(snapshot.groups[0].routes.len(), 2);
+
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!json.contains("secret-one"));
+        assert!(!json.contains("secret-two"));
+        assert!(!json.contains("magpie-lite"));
+    }
     #[test]
     fn provider_cooldown_overrides_the_gateway_default() {
         let config = Config::default();
