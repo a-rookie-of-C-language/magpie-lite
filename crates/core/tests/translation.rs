@@ -234,10 +234,11 @@ fn chat_stream_chunks() -> Vec<Value> {
 fn chat_stream_translates_to_anthropic_events() {
     let mut enc = AnthropicStreamEncoder::new("deepseek-chat");
     let mut out = String::new();
-    enc.encode(&StreamEvent::Start {
+    if let Some(f) = enc.encode(&StreamEvent::Start {
         model: "deepseek-chat".into(),
-    })
-    .map(|f| out.push_str(&f));
+    }) {
+        out.push_str(&f);
+    }
     for chunk in chat_stream_chunks() {
         for ir in chat::decode_chunk(&chunk) {
             if let Some(frame) = enc.encode(&ir) {
@@ -245,7 +246,9 @@ fn chat_stream_translates_to_anthropic_events() {
             }
         }
     }
-    enc.encode(&StreamEvent::Done).map(|f| out.push_str(&f));
+    if let Some(f) = enc.encode(&StreamEvent::Done) {
+        out.push_str(&f);
+    }
 
     let mut parser = SseParser::new();
     parser.extend(out.as_bytes());

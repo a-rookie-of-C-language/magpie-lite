@@ -138,7 +138,7 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
         .and_then(Value::as_array)
         .map(|ts| {
             ts.iter()
-                .filter(|t| t.get("type").map_or(true, |x| x == "custom"))
+                .filter(|t| t.get("type").is_none_or(|x| x == "custom"))
                 .map(|t| Tool {
                     name: t
                         .get("name")
@@ -416,27 +416,27 @@ impl AnthropicStreamDecoder {
                     .unwrap_or_default()
                 {
                     "text_delta" => {
-                        if let Some(t) = delta.get("text").and_then(Value::as_str) {
-                            if !t.is_empty() {
-                                out.push(StreamEvent::TextDelta { text: t.to_owned() });
-                            }
+                        if let Some(t) = delta.get("text").and_then(Value::as_str)
+                            && !t.is_empty()
+                        {
+                            out.push(StreamEvent::TextDelta { text: t.to_owned() });
                         }
                     }
                     "thinking_delta" => {
-                        if let Some(t) = delta.get("thinking").and_then(Value::as_str) {
-                            if !t.is_empty() {
-                                out.push(StreamEvent::ThinkingDelta { text: t.to_owned() });
-                            }
+                        if let Some(t) = delta.get("thinking").and_then(Value::as_str)
+                            && !t.is_empty()
+                        {
+                            out.push(StreamEvent::ThinkingDelta { text: t.to_owned() });
                         }
                     }
                     "input_json_delta" => {
-                        if let Some(a) = delta.get("partial_json").and_then(Value::as_str) {
-                            if !a.is_empty() {
-                                out.push(StreamEvent::ToolCallDelta {
-                                    index,
-                                    args: a.to_owned(),
-                                });
-                            }
+                        if let Some(a) = delta.get("partial_json").and_then(Value::as_str)
+                            && !a.is_empty()
+                        {
+                            out.push(StreamEvent::ToolCallDelta {
+                                index,
+                                args: a.to_owned(),
+                            });
                         }
                     }
                     _ => {}

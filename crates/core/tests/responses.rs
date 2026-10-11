@@ -108,9 +108,9 @@ fn chat_stream_translates_to_responses_events() {
             }
         }
     }
-    encoder
-        .encode(&StreamEvent::Done)
-        .map(|frame| wire.push_str(&frame));
+    if let Some(frame) = encoder.encode(&StreamEvent::Done) {
+        wire.push_str(&frame);
+    }
 
     let mut parser = SseParser::new();
     parser.extend(wire.as_bytes());

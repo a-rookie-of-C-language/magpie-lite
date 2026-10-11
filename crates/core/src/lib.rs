@@ -14,3 +14,4 @@ pub mod responses;
 pub mod stream;
 
 pub use error::{CoreError, Result};
+pub mod gemini;

@@ -12,9 +12,10 @@ impl std::str::FromStr for Protocol {
         match s {
             "chat" => Ok(Protocol::Chat),
             "anthropic" => Ok(Protocol::Anthropic),
+            "gemini" => Ok(Protocol::Gemini),
             "responses" => Ok(Protocol::Responses),
             _ => Err(format!(
-                "unknown protocol `{s}`; expected chat, anthropic or responses"
+                "unknown protocol `{s}`; expected chat, anthropic, responses or gemini"
             )),
         }
     }
@@ -30,6 +31,8 @@ pub enum Protocol {
     Anthropic,
     /// OpenAI Responses (the newer endpoint Codex speaks).
     Responses,
+    /// Google Gemini generateContent.
+    Gemini,
 }
 
 impl Protocol {
@@ -39,6 +42,7 @@ impl Protocol {
             Protocol::Chat => "chat",
             Protocol::Anthropic => "anthropic",
             Protocol::Responses => "responses",
+            Protocol::Gemini => "gemini",
         }
     }
 }
@@ -53,7 +57,7 @@ pub struct ProviderConfig {
     pub name: String,
     /// Wire protocol.
     pub protocol: Protocol,
-    /// Base URL: chat bases end in `/v1`, Anthropic bases are the root.
+    /// Base URL: chat/responses bases end in `/v1`, Anthropic bases are the root, Gemini bases end in `/v1beta`.
     pub base_url: String,
     /// API key.
     #[serde(default)]
@@ -147,10 +151,10 @@ impl Config {
     /// a provider's `models` list, else the default provider, else the
     /// first provider there is.
     pub fn resolve(&self, model: &str) -> Option<(&ProviderConfig, String)> {
-        if let Some((pid, rest)) = model.split_once('/') {
-            if let Some(p) = self.provider(pid) {
-                return Some((p, rest.to_owned()));
-            }
+        if let Some((pid, rest)) = model.split_once('/')
+            && let Some(p) = self.provider(pid)
+        {
+            return Some((p, rest.to_owned()));
         }
         for p in &self.provider {
             if p.models.iter().any(|m| m == model) {

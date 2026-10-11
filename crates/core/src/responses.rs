@@ -38,10 +38,10 @@ fn now_secs() -> u64 {
 pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
     let model = str_field(v, "model")?;
     let mut system = Vec::new();
-    if let Some(instructions) = v.get("instructions").and_then(Value::as_str) {
-        if !instructions.is_empty() {
-            system.push(Part::text(instructions));
-        }
+    if let Some(instructions) = v.get("instructions").and_then(Value::as_str)
+        && !instructions.is_empty()
+    {
+        system.push(Part::text(instructions));
     }
 
     let mut messages: Vec<Message> = Vec::new();
@@ -64,7 +64,7 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
         .and_then(Value::as_array)
         .map(|ts| {
             ts.iter()
-                .filter(|t| t.get("type").map_or(true, |x| x == "function"))
+                .filter(|t| t.get("type").is_none_or(|x| x == "function"))
                 .map(|t| Tool {
                     name: t
                         .get("name")
@@ -125,13 +125,12 @@ fn decode_input_item(item: &Value, messages: &mut Vec<Message>) {
                                         b.get("url").and_then(Value::as_str).map(str::to_owned)
                                     })
                                 {
-                                    if let Some(rest) = u.strip_prefix("data:") {
-                                        if let Some((meta, data)) = rest.split_once(',') {
-                                            if let Some(media) = meta.strip_suffix(";base64") {
-                                                parts.push(Part::image(media, data));
-                                                continue;
-                                            }
-                                        }
+                                    if let Some(rest) = u.strip_prefix("data:")
+                                        && let Some((meta, data)) = rest.split_once(',')
+                                        && let Some(media) = meta.strip_suffix(";base64")
+                                    {
+                                        parts.push(Part::image(media, data));
+                                        continue;
                                     }
                                     parts.push(Part::image_url(u));
                                 }
@@ -367,10 +366,10 @@ pub fn decode_response(v: &Value) -> Result<CompletionResponse> {
                     .and_then(Value::as_array)
                     .unwrap_or(&Vec::new())
                 {
-                    if b.get("type").and_then(Value::as_str) == Some("output_text") {
-                        if let Some(t) = b.get("text").and_then(Value::as_str) {
-                            parts.push(Part::text(t));
-                        }
+                    if b.get("type").and_then(Value::as_str) == Some("output_text")
+                        && let Some(t) = b.get("text").and_then(Value::as_str)
+                    {
+                        parts.push(Part::text(t));
                     }
                 }
             }
@@ -516,28 +515,28 @@ pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
             }
         }
         "response.output_text.delta" => {
-            if let Some(t) = v.get("delta").and_then(Value::as_str) {
-                if !t.is_empty() {
-                    out.push(StreamEvent::TextDelta { text: t.to_owned() });
-                }
+            if let Some(t) = v.get("delta").and_then(Value::as_str)
+                && !t.is_empty()
+            {
+                out.push(StreamEvent::TextDelta { text: t.to_owned() });
             }
         }
         "response.reasoning_summary_text.delta" => {
-            if let Some(t) = v.get("delta").and_then(Value::as_str) {
-                if !t.is_empty() {
-                    out.push(StreamEvent::ThinkingDelta { text: t.to_owned() });
-                }
+            if let Some(t) = v.get("delta").and_then(Value::as_str)
+                && !t.is_empty()
+            {
+                out.push(StreamEvent::ThinkingDelta { text: t.to_owned() });
             }
         }
         "response.function_call_arguments.delta" => {
             let index = v.get("output_index").and_then(Value::as_u64).unwrap_or(0) as usize;
-            if let Some(a) = v.get("delta").and_then(Value::as_str) {
-                if !a.is_empty() {
-                    out.push(StreamEvent::ToolCallDelta {
-                        index,
-                        args: a.to_owned(),
-                    });
-                }
+            if let Some(a) = v.get("delta").and_then(Value::as_str)
+                && !a.is_empty()
+            {
+                out.push(StreamEvent::ToolCallDelta {
+                    index,
+                    args: a.to_owned(),
+                });
             }
         }
         "response.completed" | "response.incomplete" => {
@@ -858,9 +857,7 @@ impl ResponsesStreamEncoder {
                 ))
             }
             StreamEvent::ToolCallEnd { index } => {
-                let Some(tool) = self.tools.remove(index) else {
-                    return None;
-                };
+                let tool = self.tools.remove(index)?;
                 let done = json!({
                     "id": tool.id, "type": "function_call", "call_id": tool.call_id,
                     "name": tool.name, "arguments": tool.args, "status": "completed",

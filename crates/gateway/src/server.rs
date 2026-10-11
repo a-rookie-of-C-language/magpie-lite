@@ -1,14 +1,14 @@
 //! The gateway itself: a local HTTP server that speaks OpenAI Chat
-//! Completions, OpenAI Responses, and Anthropic Messages to agents,
-//! translates each request through the IR, and forwards it to whichever
-//! provider serves the model.
+//! Completions, OpenAI Responses, Anthropic Messages, and Google Gemini to
+//! agents, translates each request through the IR, and forwards it to
+//! whichever provider serves the model.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -16,7 +16,7 @@ use axum::{Json, Router};
 use futures::StreamExt;
 use magpie_core::ir::CompletionRequest;
 use magpie_core::stream::{SseParser, StreamEvent};
-use magpie_core::{anthropic, chat, responses};
+use magpie_core::{anthropic, chat, gemini, responses};
 use serde_json::{Value, json};
 
 use crate::config::ProviderConfig;
@@ -37,6 +37,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/responses", post(responses_api))
+        .route("/v1beta/models", get(gemini_models))
+        .route("/v1beta/models/{*model}", post(gemini_generate))
         .route("/v1/models", get(list_models))
         .route("/health", get(health))
         .with_state(state)
@@ -71,6 +73,24 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({"object": "list", "data": data}))
 }
 
+/// GET /v1beta/models — the same catalog in Google's shape.
+async fn gemini_models(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let models: Vec<Value> = state
+        .config
+        .catalog()
+        .into_iter()
+        .map(|(id, owner)| {
+            json!({
+                "name": format!("models/{id}"),
+                "displayName": owner,
+                "description": format!("{owner} via magpie-lite"),
+                "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
+            })
+        })
+        .collect();
+    Json(json!({"models": models}))
+}
+
 /// A resolved place to send one attempt: a provider and its spelling of
 /// the model. The same IR is re-encoded for every candidate.
 #[derive(Debug, Clone)]
@@ -86,6 +106,7 @@ enum ClientWire {
     Chat { include_usage: bool },
     Anthropic,
     Responses,
+    Gemini,
 }
 
 impl ClientWire {
@@ -94,6 +115,7 @@ impl ClientWire {
             Self::Chat { .. } => upstream::chat_error(status, message),
             Self::Anthropic => upstream::anthropic_error(status, message),
             Self::Responses => upstream::responses_error(status, message),
+            Self::Gemini => upstream::gemini_error(status, message),
         }
     }
 
@@ -102,6 +124,7 @@ impl ClientWire {
             Self::Chat { .. } => chat::decode_request(body),
             Self::Anthropic => anthropic::decode_request(body),
             Self::Responses => responses::decode_request(body),
+            Self::Gemini => gemini::decode_request(body),
         }
     }
 
@@ -110,16 +133,18 @@ impl ClientWire {
             Self::Chat { .. } => chat::encode_response(ir),
             Self::Anthropic => anthropic::encode_response(ir),
             Self::Responses => responses::encode_response(ir),
+            Self::Gemini => gemini::encode_response(ir),
         }
     }
 }
 
 /// The agent-facing stream encoders, behind one small interface so the
-/// upstream translation loop can be shared by all three endpoints.
+/// upstream translation loop can be shared by every endpoint.
 enum ClientStreamEncoder {
     Chat(chat::ChatChunkEncoder),
     Anthropic(anthropic::AnthropicStreamEncoder),
     Responses(responses::ResponsesStreamEncoder),
+    Gemini(gemini::GeminiStreamEncoder),
 }
 
 impl ClientStreamEncoder {
@@ -130,6 +155,7 @@ impl ClientStreamEncoder {
             }
             ClientWire::Anthropic => Self::Anthropic(anthropic::AnthropicStreamEncoder::new(model)),
             ClientWire::Responses => Self::Responses(responses::ResponsesStreamEncoder::new(model)),
+            ClientWire::Gemini => Self::Gemini(gemini::GeminiStreamEncoder::new(model)),
         }
     }
 
@@ -138,7 +164,22 @@ impl ClientStreamEncoder {
             Self::Chat(enc) => enc.encode(event),
             Self::Anthropic(enc) => enc.encode(event),
             Self::Responses(enc) => enc.encode(event),
+            Self::Gemini(enc) => enc.encode(event),
         }
+    }
+}
+
+/// Stateful decoders for upstream protocols whose chunks cannot be decoded
+/// independently.
+#[derive(Default)]
+struct UpstreamDecoders {
+    anthropic: anthropic::AnthropicStreamDecoder,
+    gemini: gemini::GeminiStreamDecoder,
+}
+
+impl UpstreamDecoders {
+    fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -197,8 +238,6 @@ fn upstream_candidates(config: &Config, initial: UpstreamCandidate) -> Vec<Upstr
 }
 
 /// Whether an upstream status is worth spending another provider on.
-/// Authentication against the first provider is retried only on quota-style
-/// 403; ordinary bad keys (also 401) should surface immediately.
 fn retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(
         status.as_u16(),
@@ -214,7 +253,7 @@ async fn send_with_fallback(
     creq: &CompletionRequest,
     initial: UpstreamCandidate,
     wire: ClientWire,
-) -> Result<(reqwest::Response, Protocol), Response> {
+) -> Result<(reqwest::Response, Protocol), Box<Response>> {
     let candidates = upstream_candidates(&state.config, initial);
     let last = candidates.len().saturating_sub(1);
 
@@ -227,16 +266,24 @@ async fn send_with_fallback(
             "routing upstream"
         );
 
-        let resp = match upstream::send(&state.http, &candidate.provider, &body).await {
+        let resp = match upstream::send(
+            &state.http,
+            &candidate.provider,
+            &body,
+            &candidate.model,
+            creq.stream,
+        )
+        .await
+        {
             Ok(resp) => resp,
             Err(e) => {
                 let message = format!("cannot reach {}: {e}", candidate.provider.id);
                 tracing::warn!("{message}");
                 if attempt == last {
-                    return Err(err_response(
+                    return Err(Box::new(err_response(
                         StatusCode::BAD_GATEWAY,
                         wire.error_body(StatusCode::BAD_GATEWAY, &message),
-                    ));
+                    )));
                 }
                 continue;
             }
@@ -252,14 +299,16 @@ async fn send_with_fallback(
             continue;
         }
         let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        return Err(err_response(status, wire.error_body(status, &detail)));
+        return Err(Box::new(err_response(
+            status,
+            wire.error_body(status, &detail),
+        )));
     }
 
-    // candidates always contains the initial route, so this is unreachable.
-    Err(err_response(
+    Err(Box::new(err_response(
         StatusCode::BAD_GATEWAY,
         wire.error_body(StatusCode::BAD_GATEWAY, "no upstream route"),
-    ))
+    )))
 }
 
 fn err_response(status: StatusCode, body: Value) -> Response {
@@ -286,18 +335,20 @@ fn decode_upstream_response(
         Protocol::Chat => chat::decode_response(body),
         Protocol::Anthropic => anthropic::decode_response(body),
         Protocol::Responses => responses::decode_response(body),
+        Protocol::Gemini => gemini::decode_response(body),
     }
 }
 
 fn decode_upstream_chunk(
     protocol: Protocol,
     data: &Value,
-    anthropic_decoder: &mut anthropic::AnthropicStreamDecoder,
+    decoders: &mut UpstreamDecoders,
 ) -> Vec<StreamEvent> {
     match protocol {
         Protocol::Chat => chat::decode_chunk(data),
-        Protocol::Anthropic => anthropic_decoder.decode(data),
+        Protocol::Anthropic => decoders.anthropic.decode(data),
         Protocol::Responses => responses::decode_chunk(data),
+        Protocol::Gemini => decoders.gemini.decode(data),
     }
 }
 
@@ -320,7 +371,7 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
 
     let (resp, protocol) = match send_with_fallback(&state, &creq, initial, wire).await {
         Ok(x) => x,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     if !creq.stream {
@@ -341,13 +392,11 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
         return ok_json(wire.encode_response(&ir));
     }
 
-    // Translate the upstream dialect into whichever dialect the agent asked
-    // for, one SSE frame at a time.
     let client_model = creq.model.clone();
     let byte_stream = resp.bytes_stream();
     let out = async_stream::stream! {
         let mut parser = SseParser::new();
-        let mut anthropic_decoder = anthropic::AnthropicStreamDecoder::new();
+        let mut decoders = UpstreamDecoders::new();
         let mut encoder = ClientStreamEncoder::new(wire, &client_model);
         let mut byte_stream = byte_stream;
 
@@ -368,13 +417,13 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
 
             while let Some(data) = parser.next_data() {
                 if data == "[DONE]" {
-                    continue; // every encoder emits its own terminal frame
+                    continue;
                 }
                 let value: Value = match serde_json::from_str(&data) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                for event in decode_upstream_chunk(protocol, &value, &mut anthropic_decoder) {
+                for event in decode_upstream_chunk(protocol, &value, &mut decoders) {
                     if let Some(frame) = encoder.encode(&event) {
                         yield Ok(Bytes::from(frame));
                     }
@@ -382,12 +431,12 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
             }
         }
 
-        if let Some(data) = parser.flush() {
-            if let Ok(value) = serde_json::from_str::<Value>(&data) {
-                for event in decode_upstream_chunk(protocol, &value, &mut anthropic_decoder) {
-                    if let Some(frame) = encoder.encode(&event) {
-                        yield Ok(Bytes::from(frame));
-                    }
+        if let Some(data) = parser.flush()
+            && let Ok(value) = serde_json::from_str::<Value>(&data)
+        {
+            for event in decode_upstream_chunk(protocol, &value, &mut decoders) {
+                if let Some(frame) = encoder.encode(&event) {
+                    yield Ok(Bytes::from(frame));
                 }
             }
         }
@@ -418,4 +467,57 @@ async fn anthropic_messages(State(state): State<Arc<AppState>>, body: Bytes) -> 
 /// POST /v1/responses — the OpenAI Responses dialect Codex speaks.
 async fn responses_api(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     proxy(state, body, ClientWire::Responses).await
+}
+
+/// POST /v1beta/models/{model}:generateContent and its streaming sibling.
+/// The wildcard also accepts gateway model ids containing a slash.
+async fn gemini_generate(
+    State(state): State<Arc<AppState>>,
+    Path(raw): Path<String>,
+    body: Bytes,
+) -> Response {
+    let wire = ClientWire::Gemini;
+    let Some((model, method)) = raw.rsplit_once(':') else {
+        return err_response(
+            StatusCode::NOT_FOUND,
+            wire.error_body(StatusCode::NOT_FOUND, "expected :generateContent"),
+        );
+    };
+    let stream = match method {
+        "generateContent" => false,
+        "streamGenerateContent" => true,
+        _ => {
+            return err_response(
+                StatusCode::NOT_FOUND,
+                wire.error_body(
+                    StatusCode::NOT_FOUND,
+                    &format!("unsupported Gemini method `{method}`"),
+                ),
+            );
+        }
+    };
+
+    let mut value: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            let message = format!("invalid JSON: {e}");
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                wire.error_body(StatusCode::BAD_REQUEST, &message),
+            );
+        }
+    };
+    if !value.is_object() {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            wire.error_body(
+                StatusCode::BAD_REQUEST,
+                "request body must be a JSON object",
+            ),
+        );
+    }
+    value["model"] = json!(model);
+    value["stream"] = json!(stream);
+    let bytes = Bytes::from(value.to_string());
+    proxy(state, bytes, wire).await
 }

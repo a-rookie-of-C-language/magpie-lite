@@ -254,7 +254,7 @@ impl StopReason {
 }
 
 /// A completion request, decoded from any wire protocol.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompletionRequest {
     /// The model the agent asked for, `provider/model` or bare.
     pub model: String,
@@ -276,23 +276,6 @@ pub struct CompletionRequest {
     pub stop: Vec<String>,
     /// Whether the caller wants a stream.
     pub stream: bool,
-}
-
-impl Default for CompletionRequest {
-    fn default() -> Self {
-        Self {
-            model: String::new(),
-            system: Vec::new(),
-            messages: Vec::new(),
-            tools: Vec::new(),
-            tool_choice: None,
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
-            stop: Vec::new(),
-            stream: false,
-        }
-    }
 }
 
 /// A complete assistant reply.

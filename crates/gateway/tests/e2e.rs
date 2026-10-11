@@ -4,7 +4,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::routing::post;
 use axum::{Json, Router};
 use magpie_gateway::{AppState, Config, Protocol, ProviderConfig, build_router};
@@ -12,6 +12,11 @@ use serde_json::{Value, json};
 
 #[derive(Clone)]
 struct MockUpstream {
+    last_request: Arc<Mutex<Option<Value>>>,
+}
+
+#[derive(Clone)]
+struct MockGeminiUpstream {
     last_request: Arc<Mutex<Option<Value>>>,
 }
 
@@ -65,8 +70,77 @@ async fn mock_chat_completions(
 }
 
 use axum::body::{Body, Bytes};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+
+async fn mock_gemini_generate(
+    State(mock): State<MockGeminiUpstream>,
+    Path(model): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let v: Value = serde_json::from_slice(&body).expect("Gemini body is JSON");
+    *mock.last_request.lock().unwrap() = Some(json!({
+        "path": model,
+        "api_key": headers
+            .get("x-goog-api-key")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+        "body": v,
+    }));
+
+    if model.ends_with(":streamGenerateContent") {
+        let body = std::sync::Arc::new(
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello \"}]},\"index\":0}]}\n\n\
+             data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"id\":\"call_g\",\"name\":\"bash\",\"args\":{\"cmd\":\"pwd\"}}}]},\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":4,\"candidatesTokenCount\":2,\"totalTokenCount\":6}}\n\n\
+             data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[]},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":4,\"candidatesTokenCount\":2,\"totalTokenCount\":6}}\n\n"
+                .to_owned(),
+        );
+        return Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(async_stream::stream! {
+                let body = body.clone();
+                for line in body.split_inclusive("\n\n") {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(line.to_owned()));
+                }
+            }))
+            .unwrap();
+    }
+
+    Json(json!({
+        "candidates": [{
+            "content": {
+                "role": "model",
+                "parts": [
+                    {"text": "Gemini says hello."},
+                    {"functionCall": {"id": "call_g", "name": "bash", "args": {"cmd": "pwd"}}}
+                ]
+            },
+            "finishReason": "STOP",
+            "index": 0
+        }],
+        "usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 5, "totalTokenCount": 14},
+        "modelVersion": "mock-model",
+        "responseId": "gemini-mock"
+    }))
+    .into_response()
+}
+
+async fn spawn_gemini_mock() -> (String, Arc<Mutex<Option<Value>>>) {
+    let last_request = Arc::new(Mutex::new(None));
+    let mock = MockGeminiUpstream {
+        last_request: last_request.clone(),
+    };
+    let app = Router::new()
+        .route("/v1beta/models/{*model}", post(mock_gemini_generate))
+        .with_state(mock);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), last_request)
+}
 
 async fn spawn_mock() -> (String, Arc<Mutex<Option<Value>>>) {
     let last_request = Arc::new(Mutex::new(None));
@@ -85,6 +159,10 @@ async fn spawn_mock() -> (String, Arc<Mutex<Option<Value>>>) {
 }
 
 async fn spawn_gateway(upstream_base: String) -> String {
+    spawn_gateway_with_protocol(upstream_base, Protocol::Chat).await
+}
+
+async fn spawn_gateway_with_protocol(upstream_base: String, protocol: Protocol) -> String {
     let config = Config {
         port: 0,
         token: "magpie-lite".into(),
@@ -92,8 +170,15 @@ async fn spawn_gateway(upstream_base: String) -> String {
         provider: vec![ProviderConfig {
             id: "mock".into(),
             name: "Mock".into(),
-            protocol: Protocol::Chat,
-            base_url: format!("{upstream_base}/v1"),
+            protocol,
+            base_url: format!(
+                "{upstream_base}/{}",
+                if protocol == Protocol::Gemini {
+                    "v1beta"
+                } else {
+                    "v1"
+                }
+            ),
             api_key: "test-key".into(),
             models: vec!["mock-model".into()],
             fallback: Vec::new(),
@@ -470,4 +555,205 @@ async fn retryable_primary_falls_back_before_streaming() {
     let upstream_req = last.lock().unwrap().clone().expect("backup was called");
     assert_eq!(upstream_req["model"], "mock-model");
     assert!(upstream_req["stream"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn gemini_client_nonstream_over_chat_upstream() {
+    let (upstream, last) = spawn_mock().await;
+    let gw = spawn_gateway(upstream).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!(
+            "{gw}/v1beta/models/mock/mock-model:generateContent"
+        ))
+        .header("x-goog-api-key", "magpie-lite")
+        .json(&json!({
+            "systemInstruction": {"parts": [{"text": "You are terse."}]},
+            "contents": [{"role": "user", "parts": [{"text": "Weather in Beijing?"}]}],
+            "generationConfig": {"maxOutputTokens": 100}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(
+        v["candidates"][0]["content"]["parts"][0]["text"],
+        "Beijing is sunny."
+    );
+    assert_eq!(
+        v["candidates"][0]["content"]["parts"][1]["functionCall"]["name"],
+        "print"
+    );
+    assert_eq!(v["candidates"][0]["finishReason"], "STOP");
+    assert_eq!(v["usageMetadata"]["promptTokenCount"], 31);
+    assert_eq!(v["usageMetadata"]["candidatesTokenCount"], 12);
+
+    let upstream_req = last.lock().unwrap().clone().expect("upstream was called");
+    assert_eq!(upstream_req["model"], "mock-model");
+    assert_eq!(upstream_req["stream"], false);
+    let messages = upstream_req["messages"].as_array().unwrap();
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[0]["content"], "You are terse.");
+    assert_eq!(messages[1]["role"], "user");
+    assert_eq!(messages[1]["content"], "Weather in Beijing?");
+}
+
+#[tokio::test]
+async fn gemini_client_stream_over_chat_upstream() {
+    let (upstream, _) = spawn_mock().await;
+    let gw = spawn_gateway(upstream).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!(
+            "{gw}/v1beta/models/mock/mock-model:streamGenerateContent?alt=sse"
+        ))
+        .header("x-goog-api-key", "magpie-lite")
+        .json(&json!({
+            "contents": [{"role": "user", "parts": [{"text": "Weather?"}]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream")
+    );
+
+    let text = resp.text().await.unwrap();
+    let mut visible = String::new();
+    let mut args = String::new();
+    let mut prompt_tokens = None;
+    let mut finish_reason = String::new();
+    for frame in text.split("\n\n") {
+        let Some(data) = frame.lines().find_map(|l| l.strip_prefix("data: ")) else {
+            continue;
+        };
+        let v: Value = serde_json::from_str(data).expect("Gemini SSE data is JSON");
+        for part in v
+            .pointer("/candidates/0/content/parts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(t) = part.get("text").and_then(Value::as_str) {
+                visible.push_str(t);
+            }
+            if let Some(call) = part.get("functionCall") {
+                assert_eq!(call["name"], "bash");
+                args = call["args"]["cmd"].as_str().unwrap_or_default().to_owned();
+            }
+        }
+        if let Some(tokens) = v.pointer("/usageMetadata/promptTokenCount") {
+            prompt_tokens = tokens.as_u64();
+        }
+        if let Some(reason) = v
+            .pointer("/candidates/0/finishReason")
+            .and_then(Value::as_str)
+        {
+            finish_reason = reason.to_owned();
+        }
+    }
+    assert_eq!(visible, "Rainsoon");
+    assert_eq!(args, "ls");
+    assert_eq!(prompt_tokens, Some(8));
+    assert_eq!(finish_reason, "STOP");
+}
+
+#[tokio::test]
+async fn chat_client_nonstream_over_gemini_upstream() {
+    let (upstream, last) = spawn_gemini_mock().await;
+    let gw = spawn_gateway_with_protocol(upstream, Protocol::Gemini).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "mock/mock-model",
+            "messages": [{"role": "user", "content": "Hello?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(
+        v["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "bash"
+    );
+    assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(v["usage"]["prompt_tokens"], 9);
+    assert_eq!(v["usage"]["completion_tokens"], 5);
+
+    let upstream_req = last.lock().unwrap().clone().expect("Gemini was called");
+    assert_eq!(upstream_req["path"], "mock-model:generateContent");
+    assert_eq!(upstream_req["api_key"], "test-key");
+    assert!(upstream_req["body"].get("model").is_none());
+    assert_eq!(
+        upstream_req["body"]["contents"][0]["parts"][0]["text"],
+        "Hello?"
+    );
+}
+
+#[tokio::test]
+async fn chat_client_stream_over_gemini_upstream() {
+    let (upstream, last) = spawn_gemini_mock().await;
+    let gw = spawn_gateway_with_protocol(upstream, Protocol::Gemini).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "mock/mock-model",
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "messages": [{"role": "user", "content": "Hello?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = resp.text().await.unwrap();
+    let mut visible = String::new();
+    let mut args = String::new();
+    let mut usage = None;
+    for frame in text.split("\n\n") {
+        let Some(data) = frame.lines().find_map(|line| line.strip_prefix("data: ")) else {
+            continue;
+        };
+        if data == "[DONE]" {
+            continue;
+        }
+        let v: Value = serde_json::from_str(data).expect("chat chunk");
+        if let Some(chunk) = v
+            .pointer("/choices/0/delta/content")
+            .and_then(Value::as_str)
+        {
+            visible.push_str(chunk);
+        }
+        if let Some(arg) = v
+            .pointer("/choices/0/delta/tool_calls/0/function/arguments")
+            .and_then(Value::as_str)
+        {
+            args.push_str(arg);
+        }
+        if v.get("usage").is_some() {
+            usage = Some(v["usage"].clone());
+        }
+    }
+    assert_eq!(visible, "Hello ");
+    assert_eq!(args, r#"{"cmd":"pwd"}"#);
+    assert_eq!(usage.expect("usage")["prompt_tokens"], 4);
+
+    let upstream_req = last.lock().unwrap().clone().expect("Gemini was called");
+    assert_eq!(upstream_req["path"], "mock-model:streamGenerateContent");
+    assert_eq!(upstream_req["api_key"], "test-key");
+    assert!(upstream_req["body"].get("model").is_none());
 }

@@ -59,7 +59,7 @@ enum ProviderCommand {
         /// Wire protocol the upstream speaks.
         #[arg(long, default_value = "chat")]
         protocol: Protocol,
-        /// Base URL: chat/responses bases end in `/v1`, Anthropic bases are the root.
+        /// Base URL: chat/responses bases end in `/v1`; Anthropic bases are the root; Gemini bases end in `/v1beta`.
         #[arg(long)]
         base_url: String,
         /// API key.

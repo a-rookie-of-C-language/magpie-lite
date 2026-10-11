@@ -38,7 +38,7 @@ fn decode_content(content: &Value) -> Vec<Part> {
         Value::Array(blocks) => blocks
             .iter()
             .filter_map(|b| match b.get("type").and_then(Value::as_str) {
-                Some("text") => b.get("text").and_then(Value::as_str).map(|t| Part::text(t)),
+                Some("text") => b.get("text").and_then(Value::as_str).map(Part::text),
                 Some("image_url") => b
                     .pointer("/image_url/url")
                     .and_then(Value::as_str)
@@ -451,10 +451,10 @@ pub fn encode_response(resp: &CompletionResponse) -> Value {
 /// events. `[DONE]` is handled by the caller (it is not JSON).
 pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
     let mut out = Vec::new();
-    if let Some(u) = v.get("usage") {
-        if u.is_object() {
-            out.push(StreamEvent::Usage(decode_usage(u)));
-        }
+    if let Some(u) = v.get("usage")
+        && u.is_object()
+    {
+        out.push(StreamEvent::Usage(decode_usage(u)));
     }
     let Some(choice) = v
         .get("choices")
@@ -464,21 +464,21 @@ pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
         return out;
     };
     let delta = choice.get("delta").cloned().unwrap_or(Value::Null);
-    if let Some(text) = delta.get("content").and_then(Value::as_str) {
-        if !text.is_empty() {
-            out.push(StreamEvent::TextDelta {
-                text: text.to_owned(),
-            });
-        }
+    if let Some(text) = delta.get("content").and_then(Value::as_str)
+        && !text.is_empty()
+    {
+        out.push(StreamEvent::TextDelta {
+            text: text.to_owned(),
+        });
     }
     // DeepSeek-style reasoning deltas; harmless for clients that ignore it.
     for field in ["reasoning_content", "reasoning"] {
-        if let Some(text) = delta.get(field).and_then(Value::as_str) {
-            if !text.is_empty() {
-                out.push(StreamEvent::ThinkingDelta {
-                    text: text.to_owned(),
-                });
-            }
+        if let Some(text) = delta.get(field).and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            out.push(StreamEvent::ThinkingDelta {
+                text: text.to_owned(),
+            });
         }
     }
     if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
@@ -496,20 +496,21 @@ pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
                     name: name.to_owned(),
                 });
             }
-            if let Some(a) = c.pointer("/function/arguments").and_then(Value::as_str) {
-                if !a.is_empty() {
-                    out.push(StreamEvent::ToolCallDelta {
-                        index,
-                        args: a.to_owned(),
-                    });
-                }
+            if let Some(a) = c.pointer("/function/arguments").and_then(Value::as_str)
+                && !a.is_empty()
+            {
+                out.push(StreamEvent::ToolCallDelta {
+                    index,
+                    args: a.to_owned(),
+                });
             }
         }
     }
-    if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-        if !reason.is_empty() && reason != "null" {
-            out.push(StreamEvent::Stop(StopReason::from_chat(reason)));
-        }
+    if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str)
+        && !reason.is_empty()
+        && reason != "null"
+    {
+        out.push(StreamEvent::Stop(StopReason::from_chat(reason)));
     }
     out
 }
