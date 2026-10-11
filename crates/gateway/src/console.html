@@ -283,6 +283,45 @@
       font-weight: 650;
     }
 
+    .stats-range {
+      display: grid;
+      gap: 10px;
+      padding: 14px 19px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(149, 172, 216, .035);
+    }
+
+    .stats-range-fields {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: end;
+      gap: 10px;
+    }
+
+    .stats-range .field {
+      min-width: min(220px, 100%);
+      flex: 1 1 180px;
+    }
+
+    .stats-range .token-input {
+      min-height: 42px;
+    }
+
+    .stats-range-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .stats-range-message {
+      min-height: 1.2em;
+      margin: 0;
+      color: var(--muted);
+      font-size: .8rem;
+    }
+
+    .stats-range-message.error { color: var(--bad); }
+
     .mini-button {
       min-height: 44px;
       padding: 5px 11px;
@@ -555,6 +594,23 @@
                 <h2 id="recent-title">Recent requests</h2>
                 <label class="switch"><input id="auto-refresh" type="checkbox" checked> Auto refresh</label>
               </div>
+              <form id="stats-range" class="stats-range" autocomplete="off">
+                <div class="stats-range-fields">
+                  <div class="field">
+                    <label for="stats-from">From</label>
+                    <input id="stats-from" class="token-input" type="datetime-local" step="1" aria-describedby="stats-range-help">
+                  </div>
+                  <div class="field">
+                    <label for="stats-to">To</label>
+                    <input id="stats-to" class="token-input" type="datetime-local" step="1" aria-describedby="stats-range-help">
+                  </div>
+                  <div class="stats-range-actions">
+                    <button id="stats-apply" class="mini-button" type="submit">Apply</button>
+                    <button id="stats-clear" class="mini-button" type="button">Clear</button>
+                  </div>
+                </div>
+                <p id="stats-range-help" class="stats-range-message" role="status" aria-live="polite">Filter recent requests and usage only; process totals and provider totals stay unchanged.</p>
+              </form>
               <div class="table-wrap">
                 <table>
                   <thead>
@@ -687,6 +743,11 @@
       requestRows: document.getElementById("request-rows"),
       requestEmpty: document.getElementById("request-empty"),
       requestCount: document.getElementById("request-count"),
+      statsRange: document.getElementById("stats-range"),
+      statsFrom: document.getElementById("stats-from"),
+      statsTo: document.getElementById("stats-to"),
+      statsClear: document.getElementById("stats-clear"),
+      statsRangeHelp: document.getElementById("stats-range-help"),
       providerEditor: document.getElementById("provider-editor"),
       providerEditorTitle: document.getElementById("provider-editor-title"),
       providerId: document.getElementById("provider-id"),
@@ -762,6 +823,7 @@
     let editingProvider = null;
     let routingSnapshot = null;
     let managementBusy = false;
+    let statsQuery = null;
     let dataRevision = 0;
     let sessionRevision = 0;
 
@@ -797,6 +859,33 @@
     function setMessage(message) {
       elements.loginMessage.textContent = message;
       elements.message.textContent = message;
+    }
+
+    function statsPath() {
+      if (!statsQuery) return "/stats";
+      const params = new URLSearchParams();
+      if (statsQuery.from !== undefined) params.set("from", String(statsQuery.from));
+      if (statsQuery.to !== undefined) params.set("to", String(statsQuery.to));
+      const query = params.toString();
+      return query ? `/stats?${query}` : "/stats";
+    }
+
+    function parseDateTime(value) {
+      if (!value) return null;
+      const milliseconds = new Date(value).getTime();
+      return Number.isFinite(milliseconds) ? milliseconds : undefined;
+    }
+
+    function describeStatsRange() {
+      if (!statsQuery) return "Filter recent requests and usage only; process totals and provider totals stay unchanged.";
+      const from = statsQuery.from === undefined ? "the beginning" : new Date(statsQuery.from).toLocaleString();
+      const to = statsQuery.to === undefined ? "now" : new Date(statsQuery.to).toLocaleString();
+      return `Recent history: ${from} → ${to}. Process totals and provider totals stay unchanged.`;
+    }
+
+    function setStatsRangeMessage(message, error = false) {
+      elements.statsRangeHelp.textContent = message;
+      elements.statsRangeHelp.classList.toggle("error", error);
     }
 
     async function authorized(path, options = {}) {
@@ -890,13 +979,17 @@
       const count = requests.length;
       elements.requestEmpty.hidden = count !== 0;
       elements.requestCount.hidden = count === 0;
+      elements.requestEmpty.textContent = statsQuery
+        ? "No requests match the selected history range yet."
+        : "No requests are in the recent-history window yet.";
       if (count === 0) {
         elements.requestCount.textContent = "";
         return;
       }
 
       const shown = requests.slice(-100).reverse();
-      elements.requestCount.textContent = `Showing the latest ${shown.length} of ${count} records.`;
+      const rangeLabel = statsQuery ? " in the selected range" : "";
+      elements.requestCount.textContent = `Showing the latest ${shown.length} of ${count} records${rangeLabel}.`;
       for (const request of shown) {
         const usage = request.usage || {};
         const tokens = [usage.input, usage.output].filter(v => v !== undefined && v !== null).map(v => fmt(v)).join(" / ");
@@ -1487,7 +1580,7 @@
       const session = sessionRevision;
       try {
         const [stats, models, routing, agents] = await Promise.all([
-          authorized("/stats"),
+          authorized(statsPath()),
           authorized("/v1/models"),
           authorized("/config"),
           authorized("/agents").then(data => ({ data })).catch(error => {
@@ -1547,6 +1640,9 @@
     function disconnect(expired) {
       ++sessionRevision;
       ++dataRevision;
+      statsQuery = null;
+      elements.statsRange.reset();
+      setStatsRangeMessage(describeStatsRange());
       closeAgentEditor(false);
       agentSnapshot = [];
       clear(elements.agentList);
@@ -1595,6 +1691,32 @@
       }
     });
 
+    elements.statsRange.addEventListener("submit", async event => {
+      event.preventDefault();
+      const from = parseDateTime(elements.statsFrom.value);
+      const to = parseDateTime(elements.statsTo.value);
+      if (from === undefined || to === undefined) {
+        setStatsRangeMessage("Enter valid local date and time values.", true);
+        return;
+      }
+      if (from !== null && to !== null && from > to) {
+        setStatsRangeMessage("From must be earlier than or equal to To.", true);
+        elements.statsFrom.focus();
+        return;
+      }
+      statsQuery = from === null && to === null ? null : {
+        ...(from === null ? {} : { from }),
+        ...(to === null ? {} : { to })
+      };
+      setStatsRangeMessage(describeStatsRange());
+      await update(false);
+    });
+    elements.statsClear.addEventListener("click", async () => {
+      statsQuery = null;
+      elements.statsRange.reset();
+      setStatsRangeMessage(describeStatsRange());
+      await update(false);
+    });
     elements.refresh.addEventListener("click", () => update(false));
     elements.signOut.addEventListener("click", () => disconnect(false));
     elements.autoRefresh.addEventListener("change", startAutoRefresh);

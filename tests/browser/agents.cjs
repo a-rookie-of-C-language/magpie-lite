@@ -122,6 +122,45 @@ test("Agent console against a real isolated Rust gateway", { timeout: 120000 }, 
     await page.goto(gateway.url);
     await login();
 
+    await t.test("recent-history range controls preserve filters across refresh and clear", async () => {
+      await page.locator("#stats-from").fill("2026-10-01T10:00");
+      await page.locator("#stats-to").fill("2026-10-02T10:00");
+      const filteredResponse = page.waitForResponse(response => {
+        const url = new URL(response.url());
+        return url.pathname === "/stats" && url.searchParams.has("from") && url.searchParams.has("to");
+      });
+      await page.locator("#stats-apply").click();
+      const filtered = await filteredResponse;
+      assert.equal(filtered.status(), 200);
+      const filteredUrl = new URL(filtered.url());
+      assert.ok(Number(filteredUrl.searchParams.get("from")) < Number(filteredUrl.searchParams.get("to")));
+      assert.match(await page.locator("#stats-range-help").textContent(), /^Recent history:/);
+      assert.equal(await page.locator("#stats-from").inputValue(), "2026-10-01T10:00");
+      const refreshedResponse = page.waitForResponse(response => {
+        const url = new URL(response.url());
+        return url.pathname === "/stats" && url.searchParams.has("from") && url.searchParams.has("to");
+      });
+      await page.locator("#refresh").click();
+      const refreshed = await refreshedResponse;
+      assert.equal(refreshed.status(), 200);
+
+      await page.locator("#stats-from").fill("2026-10-03T10:00");
+      await page.locator("#stats-to").fill("2026-10-02T10:00");
+      await page.locator("#stats-apply").click();
+      await page.waitForFunction(() => document.getElementById("stats-range-help").textContent.includes("From must be earlier"));
+      assert.equal(await page.locator("#stats-range-help").evaluate(node => node.classList.contains("error")), true);
+
+      const clearedResponse = page.waitForResponse(response => {
+        const url = new URL(response.url());
+        return url.pathname === "/stats" && !url.search;
+      });
+      await page.locator("#stats-clear").click();
+      const cleared = await clearedResponse;
+      assert.equal(cleared.status(), 200);
+      assert.match(await page.locator("#stats-range-help").textContent(), /^Filter recent requests/);
+      assert.equal(await page.locator("#stats-from").inputValue(), "");
+      assert.equal(await page.locator("#stats-to").inputValue(), "");
+    });
     await t.test("passive CLI paths refresh for seven Agents without running scripts or changing configs", async () => {
       const commands = [];
       const marker = path.join(root, "detection-must-not-run");
