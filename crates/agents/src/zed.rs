@@ -17,7 +17,8 @@ pub const API_KEY_ENV_VAR: &str = "MAGPIE_LITE_API_KEY";
 /// common value and let users adjust it in Zed's settings.
 const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 128_000;
 
-/// Where Zed's user settings live.
+/// Where Zed's user settings live. `MAGPIE_ZED_CONFIG_DIR` is an explicit
+/// absolute override used by the reference Agent integration.
 pub fn settings_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("settings.json"))
 }
@@ -27,6 +28,12 @@ pub fn settings_path() -> Result<PathBuf> {
 fn config_dir() -> Result<PathBuf> {
     if let Some(home) = std::env::var_os("MAGPIE_LITE_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(home).join(".config").join("zed"));
+    }
+    if let Some(dir) = std::env::var_os("MAGPIE_ZED_CONFIG_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        return Ok(dir);
     }
 
     if cfg!(target_os = "windows") {

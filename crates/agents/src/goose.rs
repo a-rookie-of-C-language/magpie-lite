@@ -26,7 +26,11 @@ fn config_dir() -> Result<PathBuf> {
     }
 
     if cfg!(target_os = "windows") {
-        let dir = dirs::config_dir().context("cannot find the Windows config directory")?;
+        let dir = std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(dirs::config_dir)
+            .context("cannot find the Windows config directory")?;
         return Ok(dir.join("Block").join("goose").join("config"));
     }
 

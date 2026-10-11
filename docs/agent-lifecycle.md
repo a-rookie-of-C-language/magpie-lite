@@ -59,9 +59,12 @@ alias/default resolution.
 
 The process environment is captured when the manager is created. Refresh rechecks
 launcher files and Node-version directories; it does not reload a login shell's
-PATH or mutate environment variables. `MAGPIE_LITE_HOME` and `Manager::at_home`
+PATH or mutate environment variables. Native adapter paths also honor the
+reference-supported absolute overrides `CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
+`OPENCODE_CONFIG_DIR` and `MAGPIE_ZED_CONFIG_DIR`; relative values are ignored.
+`MAGPIE_LITE_HOME` and `Manager::at_home` take precedence over those overrides and
 ignore the real machine's PATH, external prefix variables and global directories,
-and search only under the sandbox home. Unix launchers require a regular file
+searching only under the sandbox home. Unix launchers require a regular file
 with an executable permission bit. Windows checks `.exe`, `.com`, `.cmd` and
 `.bat` files; no script or binary is opened for its contents or run. Zed can be
 found as `zed` or `zeditor`.

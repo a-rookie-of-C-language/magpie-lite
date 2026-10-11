@@ -7,7 +7,7 @@ Target: multiple coding agents sharing one Rust backend, provider adapters for d
 | Area | Current evidence | Remaining work |
 |---|---|---|
 | Shared Rust gateway | core wire codecs and gateway HTTP/SSE tests in crates/core/tests and crates/gateway/tests/e2e.rs | Recorded real-agent fixtures, broader multimodal/tool/stream conformance, cancellation and disconnect cases |
-| Agent adapters | Shared magpie-agents adapters for Claude Code, Codex, Crush, Gemini CLI, Goose, OpenCode and Zed; private staged preview, revision-checked apply, OS lock, schema-2 journaled selective field restore preserving unrelated edits, disconnect, managed-field drift and explicit recovery. Agent unit, HTTP, sandboxed child CLI and real-gateway console browser tests; Windows ACL/junction checks; recursive duplicate-key JSON/JSONC refusal, format-preserving JSON edits, native OpenCode/Zed JSONC, shared passive CLI/config discovery with bounded user-prefix/Node-version searches and PATH/unknown metadata, and seven-Agent selective restore through HTTP/CLI/browser | Smaller diffs in touched compact JSON containers, native Agent config-location/project overrides, shell/default-alias/npmrc detection, process/reachability and real-version compatibility evidence |
+| Agent adapters | Shared magpie-agents adapters for Claude Code, Codex, Crush, Gemini CLI, Goose, OpenCode and Zed; private staged preview, revision-checked apply, OS lock, schema-2 journaled selective field restore preserving unrelated edits, disconnect, managed-field drift and explicit recovery. Agent unit, HTTP, sandboxed child CLI and real-gateway console browser tests; Windows ACL/junction checks; recursive duplicate-key JSON/JSONC refusal, format-preserving JSON edits, native OpenCode/Zed JSONC, shared passive CLI/config discovery with bounded user-prefix/Node-version searches and PATH/unknown metadata, native absolute config-directory overrides for Claude/Codex/OpenCode/Zed, and seven-Agent selective restore through HTTP/CLI/browser | Smaller diffs in touched compact JSON containers, native project overrides, shell/default-alias/npmrc detection, process/reachability and real-version compatibility evidence |
 | Provider metadata and keys | Protected provider CRUD and console; providers.rs covers saved/live edits. provider_tools.rs covers four-protocol catalogs/probes, pagination, saved/draft/no-auth credentials and bounded read-only operations | Capability metadata, provider presets, specialized/stream-only probes and paid/live vendor evidence |
 | Hot edits and key rotation | ConfigStore saves before publishing; requests own snapshots. Versioned key schedules ignore stale requests. providers.rs checks an old in-flight request after a smaller pool is saved; config.rs checks stale scheduler calls | Cross-process locking, client revision conflicts and idempotency; encrypted secret storage with recovery |
 | Routing and catalog | Explicit provider/model, listed bare model, default provider, ordered fallback groups; groups.rs and e2e.rs | Rotation/load/usage policies, conversation affinity, richer model metadata and dynamic discovery |
@@ -31,6 +31,12 @@ Next implementation sequence:
 3. Usage/history management and stronger management API concurrency/authentication contracts.
 
 Subscriptions, plugin hosting, cloud sync and upstream platform integrations are outside this initial core scope. A green workspace suite supports only the behaviors it exercises; it does not prove those wider proposal gates.
+
+Native configuration directory overrides are compared with the reference's
+`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `OPENCODE_CONFIG_DIR` and
+`MAGPIE_ZED_CONFIG_DIR` handling. CLI coverage verifies that absolute overrides
+select the files used by preview without writing them; project-local overrides
+remain intentionally unsupported.
 
 Passive Agent discovery was compared with upstream `internal/agent/agent.go`
 (`Detected`) and `internal/proc/path_other.go`/`path_windows.go`. Lite reports

@@ -27,13 +27,10 @@ fn config_dir() -> Result<PathBuf> {
     if let Some(home) = std::env::var_os("MAGPIE_LITE_HOME").filter(|s| !s.is_empty()) {
         return Ok(PathBuf::from(home).join(".config").join("opencode"));
     }
-    if let Some(dir) = std::env::var_os("OPENCODE_CONFIG_DIR").filter(|s| !s.is_empty()) {
-        let dir = PathBuf::from(dir);
-        if !dir.is_absolute()
-            && let Ok(cwd) = std::env::current_dir()
-        {
-            return Ok(cwd.join(dir));
-        }
+    if let Some(dir) = std::env::var_os("OPENCODE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
         return Ok(dir);
     }
     if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {

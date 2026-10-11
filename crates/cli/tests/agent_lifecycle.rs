@@ -24,6 +24,23 @@ impl Sandbox {
     fn run(&self, args: &[&str]) -> Output {
         self.command().args(args).output().unwrap()
     }
+    fn native_command(&self) -> Command {
+        let home = self.root.path().join("native-home");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_magpie-lite"));
+        command
+            .arg("--config")
+            .arg(&self.config)
+            .env_remove("MAGPIE_LITE_HOME")
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("APPDATA", home.join("AppData/Roaming"))
+            .env("LOCALAPPDATA", home.join("AppData/Local"))
+            .env("CLAUDE_CONFIG_DIR", home.join("claude-config"))
+            .env("CODEX_HOME", home.join("codex-home"))
+            .env("MAGPIE_ZED_CONFIG_DIR", home.join("zed-config"))
+            .env("OPENCODE_CONFIG_DIR", home.join("opencode-config"));
+        command
+    }
     fn success(&self, args: &[&str]) -> Value {
         let o = self.run(args);
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -31,6 +48,35 @@ impl Sandbox {
         serde_json::from_slice(&o.stdout).unwrap()
     }
 }
+#[test]
+fn native_agent_config_directory_overrides_are_used() {
+    let s = Sandbox::new();
+    for (agent, component) in [
+        ("claude", "claude-config/settings.json"),
+        ("codex", "codex-home/config.toml"),
+        ("opencode", "opencode-config/opencode.json"),
+        ("zed", "zed-config/settings.json"),
+    ] {
+        let output = s
+            .native_command()
+            .args(["agent", "preview", agent, "mock/model"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{agent}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let preview: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let path = PathBuf::from(preview["files"][0]["path"].as_str().unwrap());
+        assert!(
+            path.ends_with(component),
+            "{agent} used unexpected native path: {}",
+            path.display()
+        );
+    }
+}
+
 #[test]
 fn all_shorthand_commands_share_backups_and_agent_disconnect() {
     let s = Sandbox::new();

@@ -4,10 +4,19 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item, Table, value};
 
-/// Where Codex's config lives.
+/// Where Codex's config lives. `CODEX_HOME` is honored only when absolute,
+/// matching Codex's native home resolution.
 pub fn config_path() -> Result<PathBuf> {
     let home = super::agent_home().context("cannot find the home directory")?;
-    Ok(home.join(".codex").join("config.toml"))
+    let dir = if std::env::var_os("MAGPIE_LITE_HOME").is_some_and(|value| !value.is_empty()) {
+        home.join(".codex")
+    } else {
+        std::env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| home.join(".codex"))
+    };
+    Ok(dir.join("config.toml"))
 }
 
 /// Whether Codex looks installed.

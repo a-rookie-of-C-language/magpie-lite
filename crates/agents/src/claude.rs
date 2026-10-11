@@ -4,10 +4,19 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
-/// Where Claude Code's settings live.
+/// Where Claude Code's settings live. `CLAUDE_CONFIG_DIR` is honored only
+/// when absolute, matching Claude's native desktop/config path behavior.
 pub fn settings_path() -> Result<PathBuf> {
     let home = super::agent_home().context("cannot find the home directory")?;
-    Ok(home.join(".claude").join("settings.json"))
+    let dir = if std::env::var_os("MAGPIE_LITE_HOME").is_some_and(|value| !value.is_empty()) {
+        home.join(".claude")
+    } else {
+        std::env::var_os("CLAUDE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| home.join(".claude"))
+    };
+    Ok(dir.join("settings.json"))
 }
 
 /// Whether Claude Code looks installed.

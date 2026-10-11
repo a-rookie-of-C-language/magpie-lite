@@ -26,7 +26,11 @@ pub fn paths() -> Result<(PathBuf, PathBuf)> {
     }
 
     if cfg!(target_os = "windows") {
-        let dir = dirs::data_local_dir().context("cannot find the Windows local data directory")?;
+        let dir = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(dirs::data_local_dir)
+            .context("cannot find the Windows local data directory")?;
         let path = dir.join("crush").join("crush.json");
         return Ok((path.clone(), path));
     }
