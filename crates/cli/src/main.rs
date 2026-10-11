@@ -44,6 +44,11 @@ enum Command {
         /// Model as the gateway names it: `deepseek/deepseek-chat`.
         model: String,
     },
+    /// Point Gemini CLI at the gateway, on a model.
+    Gemini {
+        /// Model as the gateway names it: `deepseek/deepseek-chat`.
+        model: String,
+    },
     /// List the agents this build can wire, and whether they are installed.
     Ls,
     /// List the models the configured providers serve.
@@ -201,6 +206,12 @@ async fn main() -> Result<()> {
             let path = agents::codex::wire(&model, cfg.port, &cfg.token)?;
             println!("Codex wired onto {model} ({})", path.display());
             println!("restart Codex for the change to take effect");
+        }
+        Command::Gemini { model } => {
+            let cfg = load_config(&cli.config)?;
+            let path = agents::gemini::wire(&model, cfg.port, &cfg.token)?;
+            println!("Gemini CLI wired onto {model} ({})", path.display());
+            println!("restart Gemini CLI for the change to take effect");
         }
         Command::Ls => {
             for a in agents::list() {

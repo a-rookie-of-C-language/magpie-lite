@@ -3,6 +3,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod gemini;
 
 /// One supported agent, as `magpie-lite ls` shows it.
 pub struct AgentInfo {
@@ -26,6 +27,11 @@ pub fn list() -> Vec<AgentInfo> {
             id: "codex",
             name: "Codex",
             installed: codex::installed(),
+        },
+        AgentInfo {
+            id: "gemini",
+            name: "Gemini CLI",
+            installed: gemini::installed(),
         },
     ]
 }
@@ -63,6 +69,37 @@ mod tests {
         assert_eq!(v["env"]["OTHER"], "kept", "other env survives");
     }
 
+    #[test]
+    fn gemini_wire_writes_only_the_gateway_fields() {
+        let dir = tempdir();
+        let settings = dir.join("settings.json");
+        let env = dir.join(".env");
+        std::fs::write(
+            &settings,
+            r#"{"theme":"dark","security":{"auth":{"selectedType":"oauth-personal"}},"model":{"name":"gemini-2.5-pro"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &env,
+            "# kept\nGEMINI_API_KEY=real-key\nOTHER=kept\n\nGOOGLE_GEMINI_BASE_URL=https://old\n",
+        )
+        .unwrap();
+
+        gemini::wire_at(&settings, &env, "deepseek/deepseek-chat", 3426, "tok").expect("wire");
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v["theme"], "dark");
+        assert_eq!(v["security"]["auth"]["selectedType"], "gemini-api-key");
+        assert_eq!(v["model"]["name"], "deepseek/deepseek-chat");
+
+        let text = std::fs::read_to_string(&env).unwrap();
+        assert!(text.contains("# kept"));
+        assert!(text.contains("GEMINI_API_KEY=tok"));
+        assert!(text.contains("OTHER=kept"));
+        assert!(text.contains("GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:3426"));
+        assert!(!text.contains("real-key"));
+    }
     #[test]
     fn codex_wire_writes_the_provider_table_and_keeps_the_rest() {
         let dir = tempdir();
