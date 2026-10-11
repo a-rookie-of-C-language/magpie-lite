@@ -66,7 +66,7 @@ is a local config/PATH hint, not proof that an Agent is running or reachable.
 3. Click **Preview changes**, review create/update/delete/unchanged operations
    and byte counts, and click **Confirm connection**. Preview contains no file
    contents. There is no automatic apply or retry.
-4. Choose **Disconnect / restore backup**, then preview and confirm restoration.
+4. Choose **Disconnect / restore managed settings**, then preview and confirm restoration.
    A drift warning does not blindly disable this action: an OpenCode overriding
    path can coexist with safe restoration of the originally managed file.
 5. An interrupted operation disables connect/disconnect and shows **Recover
@@ -88,10 +88,23 @@ if a write times out, refresh status rather than assuming it was rolled back.
 Each configuration directory contains an `agent-state` directory beside the
 TOML file. CLI and gateway processes use the same OS operation lock and journals
 there. A journal preserves the bytes before the **first** connect; rewiring does
-not replace that original baseline. A disconnect restores those bytes exactly
-or removes a file that did not originally exist, provided no later drift exists.
-Codex comments, Gemini dotenv comments/newlines and foreign provider files are
-therefore restored, not reconstructed from parsed fields.
+not replace that original baseline. Each adapter declares the fields it owns.
+Disconnect restores those fields while preserving later additions, modifications
+and deletions of unrelated fields, including edits adopted by a rewire. Model
+lists and designated model-pick objects are owned atomically. If wiring replaces
+a scalar/array with a container, that replaced ancestor is owned as a whole.
+Changes to owned fields or an unsafe configuration shape cause a conflict.
+
+With no intervening edits, disconnect restores the original bytes exactly or
+removes a file that did not originally exist. With unrelated edits, JSON may be
+reformatted; TOML/YAML use format-preserving editors, and Gemini dotenv preserves
+unrelated records. Comments from removed TOML/YAML containers are retained but
+may move to the end. Generated files containing unrelated user data are kept.
+
+Schema-2 journals record explicit ownership and the latest restoration image as
+well as the first baseline. Schema-1 journals are upgraded in memory and saved
+in the new format on the next journal write; pending schema-1 disconnects retain
+their original whole-file recovery targets.
 
 Gemini, Goose and split-layout Crush may change two files; Windows Crush can use
 one shared file. A durable pending journal is saved before publishing any of
@@ -101,7 +114,8 @@ An interruption leaves `recovery_needed=true`:
 - Pending first connect: restore the pre-connect files.
 - Pending rewire: restore the previous managed connection/model, retaining the
   original pre-connection baseline for a subsequent disconnect.
-- Pending disconnect: finish restoring the baseline.
+- Pending disconnect: finish the journaled merged restoration target, including
+  unrelated edits present when the operation began.
 
 Recovery checks all files first and rechecks each immediately before writing.
 If a file matches neither the recorded operation nor its recovery image, recovery
@@ -123,10 +137,19 @@ do not delete backups to dismiss an error.
 - Symlinks and Windows reparse points in managed paths are refused. Each agent
   file is limited to 4 MiB, journals to 64 MiB. Adapter and HTTP errors never echo
   file contents, upstream keys or the gateway token.
-- Whole-file changes after connect are reported as drift and block reconnect or
-  disconnect. **Field-level restoration that preserves subsequent unrelated
-  user edits is still pending**, unlike upstream Magpie. External editors do not
-  participate in our lock; immediate checks are not a filesystem-wide CAS.
+- Unrelated field edits alone do not mark a connection drifted. Managed-field
+  conflicts, unsafe/unparseable formats and overriding OpenCode paths do. Any
+  file change, even an unrelated one, invalidates an existing preview revision.
+  Pending recovery accepts only recorded whole-file input/target images, not
+  edits made after journaling. External editors do not participate in our lock;
+  immediate checks are not a filesystem-wide CAS.
+- JSON parsing currently follows serde_json's last-key-wins behavior for duplicate
+  keys; ambiguous duplicate-key configurations are not supported. Gemini dotenv
+  supports export prefixes, duplicate assignments and quoted multiline records,
+  but is not a full dotenv evaluator and does not expand variables. Managed
+  dotenv value-format changes can cause conservative conflicts. Unsupported
+  YAML editing shapes are refused when independent semantic validation fails,
+  rather than falling back to lossy serialization.
 - OpenCode's JSONC/JSON/legacy precedence is checked live. A new overriding file
   marks an existing connection drifted; disconnect/recovery can still restore
   the originally managed path, including after restart. JSONC wiring is refused
@@ -136,7 +159,7 @@ do not delete backups to dismiss an error.
   project overrides or reachability. Restart the agent after changing settings.
 - Zed still needs its token in its environment/provider settings; no credential is
   written to its JSON. Real-agent-version compatibility is not yet verified.
-- Agent-specific model catalogs, selective restore, broader protocol fixtures
+- Agent-specific model catalogs, broader protocol fixtures
   and real-agent execution evidence remain on the parity tracker. Console route
   suggestions come from gateway providers/groups, not a running Agent.
 

@@ -504,7 +504,7 @@
             <p id="agent-notice" class="agent-meta"></p>
             <ul id="agent-files" class="agent-files" aria-label="Managed configuration paths"></ul>
             <div class="agent-fields">
-              <div class="field"><label for="agent-action">Operation</label><select id="agent-action" class="token-input"><option value="connect">Connect / change model</option><option value="disconnect">Disconnect / restore backup</option></select></div>
+              <div class="field"><label for="agent-action">Operation</label><select id="agent-action" class="token-input"><option value="connect">Connect / change model</option><option value="disconnect">Disconnect / restore managed settings</option></select></div>
               <div id="agent-model-field" class="field"><label for="agent-model">Model route</label><input id="agent-model" class="token-input" list="agent-model-options" autocomplete="off" spellcheck="false" required aria-describedby="agent-model-help" placeholder="provider/model or group/id"><datalist id="agent-model-options"></datalist><p id="agent-model-help" class="agent-meta">Choose a configured route, or enter a provider/model or group/id. Providers and groups must already exist.</p></div>
             </div>
             <p class="agent-warning">Backups contain plaintext credentials, not encrypted secrets. Restore refuses conflicting file edits. Project settings and environment variables can override these user-level files.</p>
@@ -1035,7 +1035,7 @@
       elements.agentFiles.replaceChildren(...agent.files.map(path => text("li", path)));
       elements.agentAction.value = "connect";
       elements.agentModel.value = agent.model || elements.agentModelOptions.firstElementChild?.value || "";
-      elements.agentMessage.textContent = agent.recovery_needed ? "An operation was interrupted. Recovery rolls back a connect or completes a disconnect using its private journal." : agent.drifted ? "A managed file or overriding path changed. Preview will check whether this operation is safe; conflicting edits are never overwritten." : "";
+      elements.agentMessage.textContent = agent.recovery_needed ? "An operation was interrupted. Recovery rolls back a connect or completes a disconnect using its private journal." : agent.drifted ? "A managed field, file format or overriding path changed. Preview will check whether this operation is safe; conflicting edits are never overwritten." : "";
       elements.agentEditor.hidden = false;
       syncAgentControls();
       (agent.recovery_needed ? elements.agentRecover : elements.agentModel).focus();
@@ -1092,7 +1092,7 @@
         } else {
           // The returned status is authoritative even if the following refresh fails.
           renderAgents(agentSnapshot.map(agent => agent.id === id ? result : agent));
-          elements.agentMessage.textContent = operation === "recover" ? "Recovery complete. " + result.notice : edit.action === "connect" ? "Connected to " + result.model + ". " + result.notice : "Original configuration restored. " + result.notice;
+          elements.agentMessage.textContent = operation === "recover" ? "Recovery complete. " + result.notice : edit.action === "connect" ? "Connected to " + result.model + ". " + result.notice : "Managed settings restored; unrelated edits preserved. " + result.notice;
         }
       } catch (error) {
         if (session !== sessionRevision) return;

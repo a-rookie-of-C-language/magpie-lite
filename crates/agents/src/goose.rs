@@ -66,7 +66,12 @@ pub fn wire_at(path: &Path, model: &str, port: u16, token: &str) -> Result<()> {
         set_top(&mut config, "GOOSE_MODEL", model);
     }
 
-    std::fs::write(path, serde_yaml::to_string(&config)?)
+    let original = if path.exists() {
+        std::fs::read_to_string(path)?
+    } else {
+        String::new()
+    };
+    std::fs::write(path, super::selective::edit_yaml(&original, &config)?)
         .with_context(|| format!("writing {}", path.display()))?;
     write_custom_provider(parent, model, port, token)?;
     Ok(())
@@ -84,6 +89,9 @@ fn read_config(path: &Path) -> Result<YamlValue> {
     }
     let config: YamlValue =
         serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    if config.is_null() {
+        return Ok(YamlValue::Mapping(Mapping::new()));
+    }
     if !config.is_mapping() {
         anyhow::bail!("Goose configuration must contain a YAML mapping");
     }
@@ -146,7 +154,15 @@ fn write_custom_provider(config_dir: &Path, model: &str, port: u16, token: &str)
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(format!("{PROVIDER_ID}.json"));
 
-    let mut provider = Map::new();
+    let mut provider = if path.exists() {
+        let current: JsonValue = serde_json::from_slice(&std::fs::read(&path)?)?;
+        current
+            .as_object()
+            .context("Goose custom provider must be a JSON object")?
+            .clone()
+    } else {
+        Map::new()
+    };
     provider.insert("name".into(), json!(PROVIDER_ID));
     provider.insert("engine".into(), json!("openai"));
     provider.insert("display_name".into(), json!("magpie-lite"));
@@ -159,10 +175,13 @@ fn write_custom_provider(config_dir: &Path, model: &str, port: u16, token: &str)
         "base_url".into(),
         json!(format!("http://127.0.0.1:{port}/v1")),
     );
-    provider.insert(
-        "headers".into(),
-        json!({"Authorization": format!("Bearer {token}")}),
-    );
+    let mut headers = match provider.remove("headers") {
+        None => Map::new(),
+        Some(JsonValue::Object(map)) => map,
+        Some(_) => anyhow::bail!("Goose custom provider headers must be a JSON object"),
+    };
+    headers.insert("Authorization".into(), json!(format!("Bearer {token}")));
+    provider.insert("headers".into(), JsonValue::Object(headers));
     provider.insert("requires_auth".into(), json!(false));
     provider.insert("skip_canonical_filtering".into(), json!(true));
     provider.insert(

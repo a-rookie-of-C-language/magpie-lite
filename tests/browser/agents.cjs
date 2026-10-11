@@ -107,7 +107,7 @@ test("Agent console against a real isolated Rust gateway", { timeout: 120000 }, 
       await manage(id);
       await page.locator("#agent-action").selectOption("disconnect");
       assert.equal(await page.locator("#agent-model-field").isVisible(), false);
-      await preview(); await apply("Original configuration restored.");
+      await preview(); await apply("Managed settings restored; unrelated edits preserved.");
       for (const file of statuses.find(agent => agent.id === id).files) assert.deepEqual(await fs.readFile(file), originals.get(file));
     };
     const safeDom = async () => {
@@ -155,7 +155,7 @@ test("Agent console against a real isolated Rust gateway", { timeout: 120000 }, 
         for (const file of files) await assert.rejects(fs.readFile(file), { code: "ENOENT" });
         await apply("Connected to mock/alpha.");
         await page.locator("#agent-action").selectOption("disconnect");
-        await preview(); await apply("Original configuration restored.");
+        await preview(); await apply("Managed settings restored; unrelated edits preserved.");
         for (const file of files) {
           await assert.rejects(fs.readFile(file), { code: "ENOENT" });
           await write(file, originals.get(file));
@@ -202,7 +202,7 @@ test("Agent console against a real isolated Rust gateway", { timeout: 120000 }, 
       await page.waitForFunction(() => document.getElementById("agent-message").textContent.includes("configuration drifted"));
       assert.deepEqual(await fs.readFile(file), Buffer.from('{"user":"later drift"}\n'));
       await write(file, applied);
-      await preview(); await apply("Original configuration restored.");
+      await preview(); await apply("Managed settings restored; unrelated edits preserved.");
       assert.deepEqual(await fs.readFile(file), edited);
       await write(file, originals.get(file));
     });
@@ -227,6 +227,8 @@ test("Agent console against a real isolated Rust gateway", { timeout: 120000 }, 
       const journalPath = path.join(root, "agent-state", "claude.json");
       const journal = JSON.parse(await fs.readFile(journalPath, "utf8"));
       journal.phase = "disconnecting";
+      journal.rollback = journal.files.map(file => file.applied);
+      journal.restore = journal.files.map(file => file.baseline);
       await write(journalPath, JSON.stringify(journal));
       await page.locator("#agent-refresh").click();
       await page.locator("#agent-recover").waitFor({ state: "visible" });

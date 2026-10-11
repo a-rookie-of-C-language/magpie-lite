@@ -34,7 +34,8 @@ pub fn wire_at(path: &Path, model: &str, port: u16, token: &str) -> Result<()> {
     } else {
         String::new()
     };
-    let mut doc: DocumentMut = text
+    let (normalized, bom, crlf) = super::selective::normalized(&text);
+    let mut doc: DocumentMut = normalized
         .parse()
         .with_context(|| format!("parsing {}", path.display()))?;
 
@@ -60,6 +61,7 @@ pub fn wire_at(path: &Path, model: &str, port: u16, token: &str) -> Result<()> {
     table["wire_api"] = value("responses");
     table["experimental_bearer_token"] = value(token);
 
-    std::fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(path, super::selective::envelope(doc.to_string(), bom, crlf))
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }

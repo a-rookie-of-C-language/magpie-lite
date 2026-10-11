@@ -2,7 +2,6 @@
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Where Gemini CLI's settings live.
@@ -99,47 +98,7 @@ fn set_env_values(path: &Path, values: &[(&str, String)]) -> Result<()> {
     } else {
         String::new()
     };
-    let wanted: HashSet<&str> = values.iter().map(|(key, _)| *key).collect();
-    let mut seen = HashSet::new();
-    let mut lines: Vec<String> = text
-        .lines()
-        .map(|line| {
-            let Some((key, _)) = line.trim_start().split_once('=') else {
-                return line.to_owned();
-            };
-            let key = key.trim();
-            if !wanted.contains(key) {
-                return line.to_owned();
-            }
-            seen.insert(key.to_owned());
-            let (_, value) = values
-                .iter()
-                .find(|(wanted_key, _)| wanted_key == &key)
-                .expect("wanted key was checked above");
-            format!("{key}={}", quote_env_value(value))
-        })
-        .collect();
-
-    for (key, value) in values {
-        if !seen.contains(*key) {
-            lines.push(format!("{key}={}", quote_env_value(value)));
-        }
-    }
-
-    let mut out = lines.join("\n");
-    out.push('\n');
+    let out = super::dotenv::wire(&text, values)?;
     std::fs::write(path, out).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
-}
-
-fn quote_env_value(value: &str) -> String {
-    let needs_quotes = value.is_empty()
-        || value
-            .chars()
-            .any(|c| c.is_whitespace() || matches!(c, '#' | '$' | '"' | '\'' | '\\'));
-    if needs_quotes {
-        format!("{value:?}")
-    } else {
-        value.to_owned()
-    }
 }

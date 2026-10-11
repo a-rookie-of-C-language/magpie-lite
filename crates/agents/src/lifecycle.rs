@@ -86,14 +86,14 @@ impl std::fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
-type Result<T> = std::result::Result<T, Error>;
+pub(super) type Result<T> = std::result::Result<T, Error>;
 fn invalid(message: &'static str) -> Error {
     Error {
         kind: ErrorKind::Invalid,
         message,
     }
 }
-fn conflict(message: &'static str) -> Error {
+pub(super) fn conflict(message: &'static str) -> Error {
     Error {
         kind: ErrorKind::Conflict,
         message,
@@ -148,9 +148,9 @@ fn notice(id: AgentId) -> &'static str {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct Image {
-    data: Option<String>,
-    mode: Option<u32>,
+pub(super) struct Image {
+    pub(super) data: Option<String>,
+    pub(super) mode: Option<u32>,
 }
 impl Image {
     fn capture(path: &Path) -> Result<Self> {
@@ -168,7 +168,7 @@ impl Image {
             mode,
         })
     }
-    fn bytes(&self) -> Result<Option<Vec<u8>>> {
+    pub(super) fn bytes(&self) -> Result<Option<Vec<u8>>> {
         self.data
             .as_ref()
             .map(|data| {
@@ -195,6 +195,10 @@ struct Entry {
     path: PathBuf,
     baseline: Image,
     applied: Image,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owned: Option<Vec<Vec<String>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restore_base: Option<Image>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Journal {
@@ -205,6 +209,8 @@ struct Journal {
     files: Vec<Entry>,
     rollback: Option<Vec<Image>>,
     prior_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restore: Option<Vec<Image>>,
 }
 struct Plan {
     paths: Vec<PathBuf>,
@@ -212,6 +218,7 @@ struct Plan {
     before: Vec<Image>,
     after: Vec<Image>,
     journal: Option<Journal>,
+    restored: Option<Vec<Image>>,
 }
 
 /// A manager owns only enumerated agent paths; callers cannot supply arbitrary filenames.
@@ -388,10 +395,10 @@ impl Manager {
         Ok(Some(journal))
     }
     fn load(&self, id: AgentId) -> Result<Option<Journal>> {
-        let Some(journal) = self.read_journal(id)? else {
+        let Some(mut journal) = self.read_journal(id)? else {
             return Ok(None);
         };
-        if journal.schema != 1
+        if ![1, 2].contains(&journal.schema)
             || journal.agent != id
             || journal
                 .files
@@ -418,8 +425,19 @@ impl Manager {
             ));
         }
         let pending_connect = journal.phase == Phase::Connecting;
-        if pending_connect != journal.rollback.is_some()
+        let pending_disconnect = journal.phase == Phase::Disconnecting;
+        let old = journal.schema == 1;
+        if (if old {
+            pending_connect
+        } else {
+            pending_connect || pending_disconnect
+        }) != journal.rollback.is_some()
             || (!pending_connect && journal.prior_model.is_some())
+            || (if old { false } else { pending_disconnect }) != journal.restore.is_some()
+            || journal
+                .restore
+                .as_ref()
+                .is_some_and(|r| r.len() != journal.files.len())
         {
             return Err(conflict("agent recovery images are inconsistent"));
         }
@@ -427,7 +445,14 @@ impl Manager {
             .files
             .iter()
             .flat_map(|entry| [&entry.baseline, &entry.applied])
+            .chain(
+                journal
+                    .files
+                    .iter()
+                    .filter_map(|entry| entry.restore_base.as_ref()),
+            )
             .chain(journal.rollback.iter().flatten())
+            .chain(journal.restore.iter().flatten())
         {
             if image
                 .bytes()?
@@ -439,6 +464,47 @@ impl Manager {
                 ));
             }
         }
+        for (index, entry) in journal.files.iter_mut().enumerate() {
+            if old {
+                if entry.owned.is_some() || entry.restore_base.is_some() {
+                    return Err(conflict(
+                        "legacy agent journal contains unexpected ownership",
+                    ));
+                }
+                entry.restore_base = Some(entry.baseline.clone());
+                entry.owned = Some(super::selective::ownership(
+                    id,
+                    index,
+                    &entry.baseline,
+                    &entry.applied,
+                    true,
+                )?);
+            }
+            if entry.restore_base.is_none() {
+                return Err(conflict(
+                    "agent journal is missing its retained restoration image",
+                ));
+            }
+            let owned = entry
+                .owned
+                .as_ref()
+                .ok_or_else(|| conflict("agent journal is missing managed-field ownership"))?;
+            if owned.is_empty()
+                || owned.len() > 128
+                || owned.iter().any(|p| {
+                    p.is_empty() || p.len() > 16 || p.iter().any(|k| k.is_empty() || k.len() > 4096)
+                })
+            {
+                return Err(conflict(
+                    "agent journal has invalid managed-field ownership",
+                ));
+            }
+        }
+        if old && pending_disconnect {
+            journal.rollback = Some(journal.files.iter().map(|e| e.applied.clone()).collect());
+            journal.restore = Some(journal.files.iter().map(|e| e.baseline.clone()).collect());
+        }
+        journal.schema = 2;
         Ok(Some(journal))
     }
     fn save(&self, journal: &Journal) -> Result<()> {
@@ -480,8 +546,19 @@ impl Manager {
         let drifted = connected
             && (self.path_overridden(id, &paths)
                 || journal.as_ref().is_some_and(|j| {
-                    j.files.iter().any(|entry| {
-                        Image::capture(&entry.path).map_or(true, |current| current != entry.applied)
+                    j.files.iter().enumerate().any(|(index, entry)| {
+                        Image::capture(&entry.path)
+                            .and_then(|current| {
+                                super::selective::restore(
+                                    id,
+                                    index,
+                                    &entry.baseline,
+                                    &entry.applied,
+                                    &current,
+                                    entry.owned.as_ref().unwrap(),
+                                )
+                            })
+                            .is_err()
                     })
                 }));
         Ok(Status {
@@ -538,17 +615,18 @@ impl Manager {
             .iter()
             .map(|p| Image::capture(p))
             .collect::<Result<Vec<_>>>()?;
-        if journal.as_ref().is_some_and(|j| {
-            j.phase == Phase::Connected
-                && j.files
+        let restored = if let Some(j) = journal.as_ref().filter(|j| j.phase == Phase::Connected) {
+            Some(
+                j.files
                     .iter()
                     .zip(&before)
-                    .any(|(entry, current)| entry.applied != *current)
-        }) {
-            return Err(conflict(
-                "agent configuration drifted; restore the recorded applied files before disconnecting or reconnecting",
-            ));
-        }
+                    .enumerate()
+                    .map(|(index, (entry, current))| restore_entry(id, index, entry, current))
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        } else {
+            None
+        };
         let (after, model) = match action {
             Action::Connect => {
                 let model = model
@@ -583,12 +661,12 @@ impl Manager {
                     .as_ref()
                     .filter(|j| j.phase == Phase::Connected)
                     .ok_or_else(|| conflict("agent has no managed connection to restore"))?;
-                (
-                    j.files.iter().map(|entry| entry.baseline.clone()).collect(),
-                    Some(j.model.clone()),
-                )
+                (restored.clone().unwrap(), Some(j.model.clone()))
             }
         };
+        if after.iter().any(|image| image.len() as u64 > FILE_LIMIT) {
+            return Err(invalid("generated agent file exceeds its size limit"));
+        }
         let mut hash = Sha256::new();
         hash.update(b"magpie-lite-agent-preview-v1");
         hash.update(
@@ -627,6 +705,7 @@ impl Manager {
             before,
             after,
             journal,
+            restored,
         })
     }
     fn render(
@@ -714,7 +793,7 @@ impl Manager {
         }
         let mut journal = match action {
             Action::Connect => Journal {
-                schema: 1,
+                schema: 2,
                 agent: id,
                 model: plan.preview.model.clone().unwrap(),
                 phase: Phase::Connecting,
@@ -724,26 +803,43 @@ impl Manager {
                     .zip(&plan.before)
                     .zip(&plan.after)
                     .enumerate()
-                    .map(|(index, ((path, before), after))| Entry {
-                        path: path.clone(),
-                        baseline: plan
+                    .map(|(index, ((path, before), after))| {
+                        let prior = plan
                             .journal
                             .as_ref()
                             .filter(|j| j.phase == Phase::Connected)
-                            .map_or_else(|| before.clone(), |j| j.files[index].baseline.clone()),
-                        applied: after.clone(),
+                            .map(|j| &j.files[index]);
+                        Ok(Entry {
+                            path: path.clone(),
+                            baseline: prior.map_or_else(|| before.clone(), |e| e.baseline.clone()),
+                            applied: after.clone(),
+                            restore_base: Some(
+                                plan.restored
+                                    .as_ref()
+                                    .map_or_else(|| before.clone(), |images| images[index].clone()),
+                            ),
+                            owned: Some(match prior {
+                                Some(e) => e.owned.clone().unwrap(),
+                                None => {
+                                    super::selective::ownership(id, index, before, after, false)?
+                                }
+                            }),
+                        })
                     })
-                    .collect(),
+                    .collect::<Result<Vec<_>>>()?,
                 rollback: Some(plan.before.clone()),
                 prior_model: plan
                     .journal
                     .as_ref()
                     .filter(|j| j.phase == Phase::Connected)
                     .map(|j| j.model.clone()),
+                restore: None,
             },
             Action::Disconnect => {
                 let mut j = plan.journal.unwrap();
                 j.phase = Phase::Disconnecting;
+                j.rollback = Some(plan.before.clone());
+                j.restore = Some(plan.after.clone());
                 j
             }
         };
@@ -763,6 +859,7 @@ impl Manager {
             Action::Disconnect => Phase::Disconnected,
         };
         journal.rollback = None;
+        journal.restore = None;
         journal.prior_model = None;
         self.save(&journal)?;
         self.status(id)
@@ -780,21 +877,31 @@ impl Manager {
                 .clone()
                 .filter(|r| r.len() == j.files.len())
                 .ok_or_else(|| conflict("agent recovery images are missing"))?,
-            Phase::Disconnecting => j.files.iter().map(|entry| entry.baseline.clone()).collect(),
+            Phase::Disconnecting => j
+                .restore
+                .clone()
+                .ok_or_else(|| conflict("agent restoration targets are missing"))?,
             _ => return self.status(id),
         };
+        let before = if j.phase == Phase::Disconnecting {
+            j.rollback
+                .clone()
+                .ok_or_else(|| conflict("agent restoration inputs are missing"))?
+        } else {
+            j.files.iter().map(|e| e.applied.clone()).collect()
+        };
         // Validate every file before changing any: no partial recovery of third-party drift.
-        for (entry, target) in j.files.iter().zip(&targets) {
+        for ((entry, prior), target) in j.files.iter().zip(&before).zip(&targets) {
             let current = Image::capture(&entry.path)?;
-            if current != entry.applied && current != *target {
+            if current != *prior && current != *target {
                 return Err(conflict(
                     "agent files changed since the interrupted operation; recovery cannot overwrite them",
                 ));
             }
         }
-        for (entry, target) in j.files.iter().zip(&targets) {
+        for ((entry, prior), target) in j.files.iter().zip(&before).zip(&targets) {
             let current = Image::capture(&entry.path)?;
-            if current != entry.applied && current != *target {
+            if current != *prior && current != *target {
                 return Err(conflict(
                     "agent file changed during recovery; recovery cannot overwrite it",
                 ));
@@ -813,10 +920,31 @@ impl Manager {
             j.phase = Phase::Disconnected;
         }
         j.rollback = None;
+        j.restore = None;
         j.prior_model = None;
         self.save(&j)?;
         self.status(id)
     }
+}
+
+// A rewire adopts unrelated user edits without adopting their fields as owned.
+// Keep the first baseline for managed values and an exact restoration image for
+// the latest connection, otherwise current==applied would erase adopted edits.
+fn restore_entry(id: AgentId, index: usize, entry: &Entry, current: &Image) -> Result<Image> {
+    if *current == entry.applied {
+        return entry
+            .restore_base
+            .clone()
+            .ok_or_else(|| conflict("agent restoration image is missing"));
+    }
+    super::selective::restore(
+        id,
+        index,
+        &entry.baseline,
+        &entry.applied,
+        current,
+        entry.owned.as_ref().unwrap(),
+    )
 }
 
 fn read_optional(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> {

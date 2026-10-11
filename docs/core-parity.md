@@ -7,7 +7,7 @@ Target: multiple coding agents sharing one Rust backend, provider adapters for d
 | Area | Current evidence | Remaining work |
 |---|---|---|
 | Shared Rust gateway | core wire codecs and gateway HTTP/SSE tests in crates/core/tests and crates/gateway/tests/e2e.rs | Recorded real-agent fixtures, broader multimodal/tool/stream conformance, cancellation and disconnect cases |
-| Agent adapters | Shared magpie-agents adapters for Claude Code, Codex, Crush, Gemini CLI, Goose, OpenCode and Zed; private staged preview, revision-checked apply, OS lock, journaled backup/restore, disconnect, whole-file drift and explicit recovery. Agent unit, HTTP, sandboxed child CLI and real-gateway console browser tests; Windows ACL/junction checks | Field-level restore preserving later unrelated edits, richer detection/project overrides and real-version compatibility evidence |
+| Agent adapters | Shared magpie-agents adapters for Claude Code, Codex, Crush, Gemini CLI, Goose, OpenCode and Zed; private staged preview, revision-checked apply, OS lock, schema-2 journaled selective field restore preserving unrelated edits, disconnect, managed-field drift and explicit recovery. Agent unit, HTTP, sandboxed child CLI and real-gateway console browser tests; Windows ACL/junction checks | Strict duplicate-key JSON handling, richer detection/project overrides and real-version compatibility evidence |
 | Provider metadata and keys | Protected provider CRUD and console; providers.rs covers saved/live edits. provider_tools.rs covers four-protocol catalogs/probes, pagination, saved/draft/no-auth credentials and bounded read-only operations | Capability metadata, provider presets, specialized/stream-only probes and paid/live vendor evidence |
 | Hot edits and key rotation | ConfigStore saves before publishing; requests own snapshots. Versioned key schedules ignore stale requests. providers.rs checks an old in-flight request after a smaller pool is saved; config.rs checks stale scheduler calls | Cross-process locking, client revision conflicts and idempotency; encrypted secret storage with recovery |
 | Routing and catalog | Explicit provider/model, listed bare model, default provider, ordered fallback groups; groups.rs and e2e.rs | Rotation/load/usage policies, conversation affinity, richer model metadata and dynamic discovery |
@@ -26,7 +26,7 @@ inspection or real Agent-version compatibility.
 
 Next implementation sequence:
 
-1. Finish agent lifecycle parity: selective field-level restoration and richer drift/detection semantics. Shared backend/CLI/console preview, journal, apply and recovery are implemented; see docs/agent-lifecycle.md for exact limits.
+1. Continue agent lifecycle parity: stricter ambiguous-format handling and richer detection/project semantics. Selective field restoration and shared backend/CLI/console preview, journal, apply and recovery are implemented; see docs/agent-lifecycle.md for exact limits.
 2. Routing policies and protocol fixture coverage across the existing four adapters.
 3. Usage/history management and stronger management API concurrency/authentication contracts.
 
