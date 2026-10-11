@@ -2,7 +2,7 @@
 //! shape and auth headers.
 
 use magpie_core::ir::CompletionRequest;
-use magpie_core::{anthropic, chat};
+use magpie_core::{anthropic, chat, responses};
 use serde_json::{Value, json};
 
 use crate::config::{Protocol, ProviderConfig};
@@ -21,6 +21,7 @@ pub fn build_request(p: &ProviderConfig, req: &CompletionRequest, model: &str) -
     match p.protocol {
         Protocol::Chat => chat::encode_request(req, model),
         Protocol::Anthropic => anthropic::encode_request(req, model),
+        Protocol::Responses => responses::encode_request(req, model),
     }
 }
 
@@ -34,6 +35,7 @@ pub async fn send(
     let mut req = match p.protocol {
         Protocol::Chat => http.post(format!("{base}/chat/completions")),
         Protocol::Anthropic => http.post(format!("{base}/v1/messages")),
+        Protocol::Responses => http.post(format!("{base}/responses")),
     };
     match p.protocol {
         Protocol::Chat => {
@@ -43,6 +45,9 @@ pub async fn send(
             req = req
                 .bearer_auth(&p.api_key)
                 .header("anthropic-version", "2023-06-01");
+        }
+        Protocol::Responses => {
+            req = req.bearer_auth(&p.api_key);
         }
     }
     let resp = req.json(body).send().await?;
@@ -87,4 +92,8 @@ pub fn anthropic_error(status: reqwest::StatusCode, message: &str) -> Value {
         _ => "api_error",
     };
     json!({"type": "error", "error": {"type": kind, "message": message}})
+}
+/// An error body in the OpenAI Responses shape.
+pub fn responses_error(status: reqwest::StatusCode, message: &str) -> Value {
+    json!({"error": {"message": message, "type": "upstream_error", "code": status.as_u16()}})
 }

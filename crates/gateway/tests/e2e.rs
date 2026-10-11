@@ -96,6 +96,7 @@ async fn spawn_gateway(upstream_base: String) -> String {
             base_url: format!("{upstream_base}/v1"),
             api_key: "test-key".into(),
             models: vec!["mock-model".into()],
+            fallback: Vec::new(),
         }],
     };
     let state = Arc::new(AppState {
@@ -262,4 +263,211 @@ async fn chat_client_nonstream_passthrough_shape() {
     assert_eq!(v["object"], "chat.completion");
     assert_eq!(v["choices"][0]["message"]["content"], "Beijing is sunny.");
     assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+}
+
+async fn rate_limited_chat() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({"error": {"message": "primary is rate limited", "type": "rate_limit_error"}})),
+    )
+        .into_response()
+}
+
+async fn spawn_rate_limited() -> String {
+    let app = Router::new().route("/v1/chat/completions", post(rate_limited_chat));
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+async fn spawn_gateway_with_fallback(primary: String, backup: String) -> String {
+    let config = Config {
+        port: 0,
+        token: "magpie-lite".into(),
+        default_provider: "primary".into(),
+        provider: vec![
+            ProviderConfig {
+                id: "primary".into(),
+                name: "Primary".into(),
+                protocol: Protocol::Chat,
+                base_url: format!("{primary}/v1"),
+                api_key: "primary-key".into(),
+                models: vec!["mock-model".into()],
+                fallback: vec!["backup/mock-model".into()],
+            },
+            ProviderConfig {
+                id: "backup".into(),
+                name: "Backup".into(),
+                protocol: Protocol::Chat,
+                base_url: format!("{backup}/v1"),
+                api_key: "backup-key".into(),
+                models: vec!["mock-model".into()],
+                fallback: Vec::new(),
+            },
+        ],
+    };
+    let state = Arc::new(AppState {
+        config,
+        http: magpie_gateway::upstream::http_client().unwrap(),
+    });
+    let app = build_router(state);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn responses_client_nonstream_over_chat_upstream() {
+    let (upstream, last) = spawn_mock().await;
+    let gw = spawn_gateway(upstream).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{gw}/v1/responses"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "mock/mock-model",
+            "instructions": "Be terse.",
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "Weather?"}
+                ]},
+                {"type": "function_call", "call_id": "call_prev", "name": "forecast", "arguments": "{\"city\":\"Beijing\"}"},
+                {"type": "function_call_output", "call_id": "call_prev", "output": "5-day forecast"}
+            ],
+            "tools": [{
+                "type": "function", "name": "forecast", "description": "forecast",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }],
+            "max_output_tokens": 100
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: Value = resp.json().await.unwrap();
+
+    assert_eq!(v["object"], "response");
+    assert_eq!(v["status"], "completed");
+    let output = v["output"].as_array().unwrap();
+    assert_eq!(output[0]["type"], "message");
+    assert_eq!(output[0]["content"][0]["text"], "Beijing is sunny.");
+    assert_eq!(output[1]["type"], "function_call");
+    assert_eq!(output[1]["call_id"], "call_mock");
+    assert_eq!(output[1]["arguments"], r#"{"text":"sunny"}"#);
+    assert_eq!(v["usage"]["input_tokens"], 31);
+    assert_eq!(v["usage"]["output_tokens"], 12);
+
+    let upstream_req = last.lock().unwrap().clone().expect("upstream was called");
+    assert_eq!(upstream_req["model"], "mock-model");
+    let msgs = upstream_req["messages"].as_array().unwrap();
+    assert_eq!(msgs[0]["role"], "system");
+    assert_eq!(msgs[0]["content"], "Be terse.");
+    assert_eq!(msgs[1]["content"], "Weather?");
+    assert_eq!(msgs[2]["tool_calls"][0]["function"]["name"], "forecast");
+    assert_eq!(msgs[3]["role"], "tool");
+    assert_eq!(msgs[3]["tool_call_id"], "call_prev");
+}
+
+#[tokio::test]
+async fn responses_client_stream_over_chat_upstream() {
+    let (upstream, _) = spawn_mock().await;
+    let gw = spawn_gateway(upstream).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{gw}/v1/responses"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "mock/mock-model",
+            "stream": true,
+            "input": "Weather?"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = resp.text().await.unwrap();
+
+    let mut events = Vec::new();
+    for frame in text.split("\n\n") {
+        let Some(data) = frame.lines().find_map(|line| line.strip_prefix("data: ")) else {
+            continue;
+        };
+        events.push(serde_json::from_str::<Value>(data).expect("event JSON"));
+    }
+
+    assert_eq!(events[0]["type"], "response.created");
+    assert_eq!(events[0]["response"]["model"], "mock/mock-model");
+    assert!(
+        events.iter().any(|e| {
+            e["type"] == "response.output_item.added" && e["item"]["type"] == "message"
+        })
+    );
+    let visible: String = events
+        .iter()
+        .filter(|e| e["type"] == "response.output_text.delta")
+        .filter_map(|e| e["delta"].as_str())
+        .collect();
+    assert_eq!(visible, "Rainsoon");
+    let args: String = events
+        .iter()
+        .filter(|e| e["type"] == "response.function_call_arguments.delta")
+        .filter_map(|e| e["delta"].as_str())
+        .collect();
+    assert_eq!(args, r#"{"cmd":"ls"}"#);
+    let completed = events
+        .iter()
+        .rev()
+        .find(|e| e["type"] == "response.completed")
+        .expect("terminal event");
+    assert_eq!(completed["response"]["usage"]["input_tokens"], 8);
+    assert_eq!(completed["response"]["usage"]["output_tokens"], 4);
+    assert!(
+        completed["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "function_call")
+    );
+}
+
+#[tokio::test]
+async fn retryable_primary_falls_back_before_streaming() {
+    let primary = spawn_rate_limited().await;
+    let (backup, last) = spawn_mock().await;
+    let gw = spawn_gateway_with_fallback(primary, backup).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "primary/mock-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "Weather?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream")
+    );
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("\"Rain\"") && text.contains("\"soon\""));
+    assert!(text.contains("[DONE]"));
+
+    let upstream_req = last.lock().unwrap().clone().expect("backup was called");
+    assert_eq!(upstream_req["model"], "mock-model");
+    assert!(upstream_req["stream"].as_bool().unwrap());
 }

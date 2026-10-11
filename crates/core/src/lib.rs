@@ -10,6 +10,7 @@ pub mod anthropic;
 pub mod chat;
 pub mod error;
 pub mod ir;
+pub mod responses;
 pub mod stream;
 
 pub use error::{CoreError, Result};

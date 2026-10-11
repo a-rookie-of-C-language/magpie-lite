@@ -59,7 +59,7 @@ enum ProviderCommand {
         /// Wire protocol the upstream speaks.
         #[arg(long, default_value = "chat")]
         protocol: Protocol,
-        /// Base URL: chat bases end in `/v1`, Anthropic bases are the root.
+        /// Base URL: chat/responses bases end in `/v1`, Anthropic bases are the root.
         #[arg(long)]
         base_url: String,
         /// API key.
@@ -71,6 +71,9 @@ enum ProviderCommand {
         /// Known model ids, for bare-name routing and `models`.
         #[arg(long, num_args = 1..)]
         models: Vec<String>,
+        /// Fallback routes, tried in order when this provider is rate limited, out of quota, or down.
+        #[arg(long = "fallback")]
+        fallback: Vec<String>,
         /// Make this the provider for models that name none.
         #[arg(long)]
         default: bool,
@@ -115,6 +118,7 @@ async fn main() -> Result<()> {
                 api_key,
                 name,
                 models,
+                fallback,
                 default,
             } => {
                 let path = provider_path(&cli.config)?;
@@ -126,6 +130,7 @@ async fn main() -> Result<()> {
                     base_url,
                     api_key,
                     models,
+                    fallback,
                 };
                 match cfg.provider.iter().position(|p| p.id == id) {
                     Some(i) => cfg.provider[i] = provider,
@@ -160,6 +165,9 @@ async fn main() -> Result<()> {
                     );
                     for m in &p.models {
                         println!("               {}/{}", p.id, m);
+                    }
+                    for route in &p.fallback {
+                        println!("               ↳ fallback {route}");
                     }
                 }
             }

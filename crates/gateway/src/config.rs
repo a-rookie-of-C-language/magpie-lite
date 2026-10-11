@@ -12,8 +12,9 @@ impl std::str::FromStr for Protocol {
         match s {
             "chat" => Ok(Protocol::Chat),
             "anthropic" => Ok(Protocol::Anthropic),
+            "responses" => Ok(Protocol::Responses),
             _ => Err(format!(
-                "unknown protocol `{s}`; expected chat or anthropic"
+                "unknown protocol `{s}`; expected chat, anthropic or responses"
             )),
         }
     }
@@ -27,6 +28,8 @@ pub enum Protocol {
     Chat,
     /// Anthropic Messages.
     Anthropic,
+    /// OpenAI Responses (the newer endpoint Codex speaks).
+    Responses,
 }
 
 impl Protocol {
@@ -35,6 +38,7 @@ impl Protocol {
         match self {
             Protocol::Chat => "chat",
             Protocol::Anthropic => "anthropic",
+            Protocol::Responses => "responses",
         }
     }
 }
@@ -57,6 +61,11 @@ pub struct ProviderConfig {
     /// Known model ids, for bare-name routing and the catalog.
     #[serde(default)]
     pub models: Vec<String>,
+    /// Where a request goes when this provider cannot take it — out of
+    /// quota, rate limited, overloaded, or down — tried in order, before
+    /// any of the reply has been sent: models as agents pick them.
+    #[serde(default)]
+    pub fallback: Vec<String>,
 }
 
 impl ProviderConfig {
