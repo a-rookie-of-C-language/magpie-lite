@@ -1,18 +1,21 @@
-//! In-memory request accounting: enough history to see what the gateway has
-//! been doing, without persisting conversation content or credentials.
+//! Request accounting: enough history to see what the gateway has been doing,
+//! without persisting conversation content or credentials.
 
 use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use magpie_core::ir::{CompletionRequest, Usage};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// How many recent request records are kept for `/stats`.
 const RECENT_LIMIT: usize = 1_000;
 
 /// Token accounting as reported by the provider that served a request.
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct UsageSnapshot {
     /// Input (prompt) tokens, when reported.
     pub input: Option<u64>,
@@ -36,7 +39,7 @@ impl From<&Usage> for UsageSnapshot {
 }
 
 /// One completed (or failed) model request. No prompt or reply text is kept.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestRecord {
     /// Unix time in milliseconds when the gateway received the request.
     pub started_unix_ms: u64,
@@ -100,16 +103,56 @@ pub struct StatsSnapshot {
     pub recent_requests: Vec<RequestRecord>,
 }
 
-/// Shared, in-memory request history for one gateway process.
+/// Request totals and recent history for one gateway process.
+///
+/// When a history file is configured, completed records are appended as JSONL
+/// and the most recent bounded window is loaded on startup. Aggregate totals
+/// intentionally remain process-local: reloading only the recent window cannot
+/// reconstruct trustworthy lifetime totals or every historical key attempt.
 #[derive(Debug, Default)]
 pub struct RequestLog {
     total_requests: u64,
     errors: u64,
     providers: BTreeMap<String, ProviderStats>,
     recent_requests: Vec<RequestRecord>,
+    sink: Option<File>,
 }
 
 impl RequestLog {
+    /// Open (and create when needed) a JSONL history file.
+    ///
+    /// Invalid or truncated lines are ignored so a crash during an append or a
+    /// manually damaged file cannot make the gateway refuse to start.
+    pub fn open(path: &Path) -> anyhow::Result<Self> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let existing = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let file = OpenOptions::new().append(true).create(true).open(path)?;
+
+        let mut log = Self {
+            sink: Some(file),
+            ..Self::default()
+        };
+        for line in existing.lines() {
+            let Ok(record) = serde_json::from_str::<RequestRecord>(line) else {
+                continue;
+            };
+            log.recent_requests.push(record);
+            if log.recent_requests.len() > RECENT_LIMIT {
+                let overflow = log.recent_requests.len() - RECENT_LIMIT;
+                log.recent_requests.drain(0..overflow);
+            }
+        }
+        Ok(log)
+    }
+
     /// Record one concrete upstream key attempt. Finished request totals are
     /// counted separately by [`RequestLog::record`].
     pub fn record_attempt(&mut self, provider: &str, key_slot: usize, status: &str) {
@@ -125,6 +168,7 @@ impl RequestLog {
 
     /// Add one finished record and update every aggregate.
     pub fn record(&mut self, record: RequestRecord) {
+        self.persist(&record);
         self.total_requests = self.total_requests.saturating_add(1);
         let ok = record.status == "ok";
         if !ok {
@@ -157,6 +201,23 @@ impl RequestLog {
             errors: self.errors,
             providers: self.providers.clone(),
             recent_requests: self.recent_requests.clone(),
+        }
+    }
+
+    /// Append one sanitized record. Statistics still update if the disk write
+    /// fails; history is useful, but never more important than serving.
+    fn persist(&mut self, record: &RequestRecord) {
+        let Some(sink) = self.sink.as_mut() else {
+            return;
+        };
+        let result: anyhow::Result<()> = (|| {
+            let line = serde_json::to_string(record)?;
+            writeln!(sink, "{line}")?;
+            sink.flush()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            tracing::warn!("could not append request history: {error}");
         }
     }
 }
@@ -244,4 +305,120 @@ fn unix_ms() -> u64 {
 
 fn elapsed_ms(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn history_path(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "magpie-lite-{label}-{}-{unique}.jsonl",
+            std::process::id()
+        ))
+    }
+
+    fn record(index: u64, status: &str) -> RequestRecord {
+        RequestRecord {
+            started_unix_ms: index,
+            client_protocol: "chat".into(),
+            requested_model: format!("mock/model-{index}"),
+            provider: "mock".into(),
+            upstream_model: format!("model-{index}"),
+            key_slot: index as usize,
+            stream: index.is_multiple_of(2),
+            status: status.into(),
+            latency_ms: index,
+            usage: UsageSnapshot {
+                input: Some(index),
+                output: Some(index + 1),
+                cache_read: None,
+                cache_write: None,
+            },
+        }
+    }
+
+    #[test]
+    fn history_round_trips_recent_metadata_only() {
+        let path = history_path("round-trip");
+        let mut log = RequestLog::open(&path).unwrap();
+        log.record(record(7, "ok"));
+        drop(log);
+
+        let reloaded = RequestLog::open(&path).unwrap();
+        let snapshot = reloaded.snapshot();
+        assert_eq!(snapshot.total_requests, 0);
+        assert!(snapshot.providers.is_empty());
+        assert_eq!(snapshot.recent_requests.len(), 1);
+        assert_eq!(snapshot.recent_requests[0].requested_model, "mock/model-7");
+
+        let text = fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        let keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "started_unix_ms",
+                "client_protocol",
+                "requested_model",
+                "provider",
+                "upstream_model",
+                "key_slot",
+                "stream",
+                "status",
+                "latency_ms",
+                "usage"
+            ]
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn invalid_history_lines_are_ignored_and_appending_continues() {
+        let path = history_path("invalid");
+        fs::write(&path, "{not json\n").unwrap();
+
+        let mut log = RequestLog::open(&path).unwrap();
+        assert!(log.snapshot().recent_requests.is_empty());
+        log.record(record(1, "upstream_error"));
+        drop(log);
+
+        let text = fs::read_to_string(&path).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "{not json");
+        let reloaded = RequestLog::open(&path).unwrap();
+        assert_eq!(reloaded.snapshot().recent_requests.len(), 1);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn history_keeps_only_the_recent_window() {
+        let path = history_path("window");
+        let mut log = RequestLog::open(&path).unwrap();
+        for index in 0..(RECENT_LIMIT as u64 + 2) {
+            log.record(record(index, "ok"));
+        }
+        drop(log);
+
+        let reloaded = RequestLog::open(&path).unwrap();
+        let snapshot = reloaded.snapshot();
+        assert_eq!(snapshot.recent_requests.len(), RECENT_LIMIT);
+        assert_eq!(snapshot.recent_requests[0].requested_model, "mock/model-2");
+        assert_eq!(
+            snapshot.recent_requests.last().unwrap().requested_model,
+            format!("mock/model-{}", RECENT_LIMIT + 1)
+        );
+        fs::remove_file(&path).ok();
+    }
 }

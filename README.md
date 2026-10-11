@@ -21,7 +21,7 @@ Zed ─────────┘   Chat + Responses +
 - **Multi-key pools**: repeat `--api-key`; requests rotate across keys, rejected/rate-limited keys are retried before route fallback, and `402`/`429` starts a cooldown from `Retry-After`, common duration/reset headers, absolute reset timestamps, or JSON error-body retry delays (60s fallback, per-provider `key_cooldown_ms` / `--key-cooldown-ms` override; `0` disables it)
 - **Failover**: ordered provider fallbacks and routing-group routes, tried before any reply bytes are streamed when the active provider is rate limited, out of quota, overloaded, or unreachable
 - **Local authentication**: every non-health route requires the configured token as Bearer, Anthropic `x-api-key`, or Gemini `x-goog-api-key`; `/health` stays public
-- **Request statistics**: token-protected `/stats` and `magpie-lite stats` show provider and per-key totals, token usage, statuses, latency, and recent request metadata (including which key slot served it, never the key) — in memory only, with no prompt/reply text or credentials
+- **Request statistics**: token-protected `/stats` and `magpie-lite stats` show provider and per-key totals, token usage, statuses, latency, and recent request metadata (including which key slot served it, never the key); optional sanitized JSONL history keeps recent records across restarts, while aggregate totals and key-attempt counts stay process-local
 - **Agent wiring**: `magpie-lite claude <model>` (settings.json env block), `magpie-lite codex <model>` (config.toml provider table, native `wire_api = "responses"`), `magpie-lite gemini <model>` (`~/.gemini/settings.json` plus `.env`), `magpie-lite opencode <model>` (`~/.config/opencode/opencode.json` provider block), `magpie-lite zed <model>` (OpenAI-compatible provider in Zed settings; the token goes in Zed provider settings or `MAGPIE_LITE_API_KEY`, not `settings.json`)
 - **Conformance tests** for every translation direction, and end-to-end tests over real HTTP with mock Chat and Gemini upstreams
 
@@ -55,6 +55,10 @@ magpie-lite zed group/daily-coding
 
 # see provider/request/token totals
 magpie-lite stats
+
+# optionally keep sanitized recent history across restarts
+magpie-lite serve --history-file 'D:\magpie\history.jsonl'
+# or set history_path in config.toml
 ```
 
 Restart the agent after wiring it. For Zed, also set MAGPIE_LITE_API_KEY to the gateway token in Zed's environment, or enter that token in Zed's AI provider settings. Unwire by restoring the agent's own provider (or use your agent switcher).
@@ -75,7 +79,7 @@ Tests are the contract: `crates/core/tests/translation.rs` checks real wire shap
 
 ## Not yet (the roadmap)
 
-- Persistent request history and richer usage views (in-memory `/stats` already works)
+- Richer usage views over the persisted-history window
 - More agents (Cursor CLI, Crush, Goose, ...)
 - A TUI/Web UI
 

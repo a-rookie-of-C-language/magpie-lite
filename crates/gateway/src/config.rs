@@ -225,6 +225,10 @@ pub struct Config {
     /// Default time to avoid a provider key after quota or rate-limit rejection.
     #[serde(default = "default_key_cooldown_ms")]
     pub key_cooldown_ms: u64,
+    /// Optional JSONL file for sanitized request-history metadata. Setting this
+    /// makes recent `/stats` records survive gateway restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_path: Option<std::path::PathBuf>,
     /// The upstreams.
     #[serde(default)]
     pub provider: Vec<ProviderConfig>,
@@ -252,6 +256,7 @@ impl Default for Config {
             token: default_token(),
             default_provider: String::new(),
             key_cooldown_ms: default_key_cooldown_ms(),
+            history_path: None,
             provider: Vec::new(),
             group: Vec::new(),
         }

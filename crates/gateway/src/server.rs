@@ -118,10 +118,17 @@ fn auth_error_body(uri: &Uri, status: StatusCode) -> Value {
 pub async fn serve(config: Config, port: Option<u16>) -> anyhow::Result<()> {
     let port = port.unwrap_or(config.port);
     let http = upstream::http_client()?;
+    let requests = match &config.history_path {
+        Some(path) => {
+            let log = RequestLog::open(path)?;
+            Arc::new(Mutex::new(log))
+        }
+        None => Arc::new(Mutex::new(RequestLog::default())),
+    };
     let state = Arc::new(AppState {
         config,
         http,
-        requests: Arc::new(Mutex::new(RequestLog::default())),
+        requests,
         key_rotation: crate::config::KeyRotator::default(),
     });
     let app = build_router(state);

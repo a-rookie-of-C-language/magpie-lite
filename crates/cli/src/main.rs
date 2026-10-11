@@ -28,6 +28,9 @@ enum Command {
         /// Port to listen on (overrides the config).
         #[arg(long)]
         port: Option<u16>,
+        /// Optional JSONL file for sanitized request history (overrides the config).
+        #[arg(long)]
+        history_file: Option<std::path::PathBuf>,
     },
     /// Manage upstream providers.
     Provider {
@@ -154,8 +157,11 @@ fn provider_path(cli: &Option<std::path::PathBuf>) -> Result<std::path::PathBuf>
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { port } => {
-            let cfg = load_config(&cli.config)?;
+        Command::Serve { port, history_file } => {
+            let mut cfg = load_config(&cli.config)?;
+            if let Some(path) = history_file {
+                cfg.history_path = Some(path);
+            }
             magpie_gateway::serve(cfg, port).await?;
         }
         Command::Provider { command } => match command {

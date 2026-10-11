@@ -163,11 +163,36 @@ async fn spawn_gateway(upstream_base: String) -> String {
     spawn_gateway_with_protocol(upstream_base, Protocol::Chat).await
 }
 
+fn request_log(config: &Config) -> Arc<Mutex<magpie_gateway::usage::RequestLog>> {
+    match config.history_path.as_ref() {
+        Some(path) => Arc::new(Mutex::new(
+            magpie_gateway::usage::RequestLog::open(path).unwrap(),
+        )),
+        None => Arc::new(Mutex::new(magpie_gateway::usage::RequestLog::default())),
+    }
+}
+
 async fn spawn_gateway_with_protocol(upstream_base: String, protocol: Protocol) -> String {
+    spawn_gateway_with_protocol_and_history(upstream_base, protocol, None).await
+}
+
+async fn spawn_gateway_with_history(
+    upstream_base: String,
+    history_path: std::path::PathBuf,
+) -> String {
+    spawn_gateway_with_protocol_and_history(upstream_base, Protocol::Chat, Some(history_path)).await
+}
+
+async fn spawn_gateway_with_protocol_and_history(
+    upstream_base: String,
+    protocol: Protocol,
+    history_path: Option<std::path::PathBuf>,
+) -> String {
     let config = Config {
         port: 0,
         token: "magpie-lite".into(),
         key_cooldown_ms: 60_000,
+        history_path,
         default_provider: "mock".into(),
         provider: vec![ProviderConfig {
             id: "mock".into(),
@@ -189,12 +214,11 @@ async fn spawn_gateway_with_protocol(upstream_base: String, protocol: Protocol) 
         }],
         group: Vec::new(),
     };
+    let requests = request_log(&config);
     let state = Arc::new(AppState {
         config,
         http: magpie_gateway::upstream::http_client().unwrap(),
-        requests: Arc::new(std::sync::Mutex::new(
-            magpie_gateway::usage::RequestLog::default(),
-        )),
+        requests,
         key_rotation: magpie_gateway::KeyRotator::default(),
     });
     let app = build_router(state);
@@ -539,16 +563,16 @@ async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) ->
         port: 0,
         token: "magpie-lite".into(),
         key_cooldown_ms: 60_000,
+        history_path: None,
         default_provider: "primary".into(),
         provider: providers,
         group: Vec::new(),
     };
+    let requests = request_log(&config);
     let state = Arc::new(AppState {
         config,
         http: magpie_gateway::upstream::http_client().unwrap(),
-        requests: Arc::new(std::sync::Mutex::new(
-            magpie_gateway::usage::RequestLog::default(),
-        )),
+        requests,
         key_rotation: magpie_gateway::KeyRotator::default(),
     });
     let app = build_router(state);
@@ -564,6 +588,7 @@ async fn spawn_gateway_with_fallback(primary: String, backup: String) -> String 
         port: 0,
         token: "magpie-lite".into(),
         key_cooldown_ms: 60_000,
+        history_path: None,
         default_provider: "primary".into(),
         provider: vec![
             ProviderConfig {
@@ -591,12 +616,11 @@ async fn spawn_gateway_with_fallback(primary: String, backup: String) -> String 
         ],
         group: Vec::new(),
     };
+    let requests = request_log(&config);
     let state = Arc::new(AppState {
         config,
         http: magpie_gateway::upstream::http_client().unwrap(),
-        requests: Arc::new(std::sync::Mutex::new(
-            magpie_gateway::usage::RequestLog::default(),
-        )),
+        requests,
         key_rotation: magpie_gateway::KeyRotator::default(),
     });
     let app = build_router(state);
@@ -613,6 +637,7 @@ async fn spawn_gateway_with_group(primary: String, backup: String) -> String {
         port: 0,
         token: "magpie-lite".into(),
         key_cooldown_ms: 60_000,
+        history_path: None,
         default_provider: "primary".into(),
         provider: vec![
             ProviderConfig {
@@ -644,12 +669,11 @@ async fn spawn_gateway_with_group(primary: String, backup: String) -> String {
             routes: vec!["primary/mock-model".into(), "backup/mock-model".into()],
         }],
     };
+    let requests = request_log(&config);
     let state = Arc::new(AppState {
         config,
         http: magpie_gateway::upstream::http_client().unwrap(),
-        requests: Arc::new(std::sync::Mutex::new(
-            magpie_gateway::usage::RequestLog::default(),
-        )),
+        requests,
         key_rotation: magpie_gateway::KeyRotator::default(),
     });
     let app = build_router(state);
@@ -1385,6 +1409,95 @@ async fn stats_track_nonstream_and_stream_usage() {
     assert!(recent[1]["latency_ms"].is_u64());
 }
 
+#[tokio::test]
+async fn history_survives_restart_without_conversation_or_credentials() {
+    let (upstream, _) = spawn_mock().await;
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let history_path = std::env::temp_dir().join(format!(
+        "magpie-lite-history-e2e-{}-{unique}.jsonl",
+        std::process::id()
+    ));
+    let first_gateway = spawn_gateway_with_history(upstream.clone(), history_path.clone()).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{first_gateway}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "mock/mock-model",
+            "messages": [{"role": "user", "content": "Weather?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response.json::<Value>().await.unwrap());
+
+    let persisted = std::fs::read_to_string(&history_path).unwrap();
+    assert!(persisted.contains(r#""key_slot":0"#));
+    assert!(!persisted.contains("Weather?"));
+    assert!(!persisted.contains("Beijing is sunny."));
+    assert!(!persisted.contains("test-key"));
+    assert!(!persisted.contains("magpie-lite"));
+
+    let second_gateway = spawn_gateway_with_history(upstream, history_path.clone()).await;
+    let unauthorized = client
+        .get(format!("{second_gateway}/stats"))
+        .bearer_auth("not-the-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let stats = client
+        .get(format!("{second_gateway}/stats"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stats.status(), StatusCode::OK);
+    let stats: Value = stats.json().await.unwrap();
+    assert_eq!(stats["total_requests"], 0);
+    assert_eq!(stats["errors"], 0);
+    assert!(stats["providers"].as_object().unwrap().is_empty());
+    assert_eq!(stats["recent_requests"].as_array().unwrap().len(), 1);
+
+    let response = client
+        .post(format!("{second_gateway}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "mock/mock-model",
+            "messages": [{"role": "user", "content": "Again?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response.json::<Value>().await.unwrap());
+
+    let stats = client
+        .get(format!("{second_gateway}/stats"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(stats["total_requests"], 1);
+    assert_eq!(stats["providers"]["mock"]["requests"], 1);
+    let recent = stats["recent_requests"].as_array().unwrap();
+    assert_eq!(recent.len(), 2);
+    let first_started = recent[0]["started_unix_ms"].as_u64().unwrap();
+    assert!(recent[1]["started_unix_ms"].as_u64().unwrap() >= first_started);
+
+    let persisted = std::fs::read_to_string(&history_path).unwrap();
+    assert!(!persisted.contains("Again?"));
+    std::fs::remove_file(&history_path).ok();
+}
 #[tokio::test]
 async fn model_routes_require_the_exact_local_token() {
     let (upstream, last) = spawn_mock().await;
