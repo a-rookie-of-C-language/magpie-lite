@@ -267,13 +267,29 @@ impl RequestLog {
 
     /// A consistent copy for JSON rendering.
     pub fn snapshot(&self) -> StatsSnapshot {
+        self.snapshot_filtered(None, None)
+    }
+
+    /// Return a consistent copy with the recent-history portion bounded by a
+    /// Unix-millisecond range. `from` is inclusive and `to` is exclusive;
+    /// process lifetime totals and key state remain unfiltered.
+    pub fn snapshot_filtered(&self, from: Option<u64>, to: Option<u64>) -> StatsSnapshot {
+        let recent_requests = self
+            .recent_requests
+            .iter()
+            .filter(|record| {
+                from.is_none_or(|from| record.started_unix_ms >= from)
+                    && to.is_none_or(|to| record.started_unix_ms < to)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         StatsSnapshot {
             total_requests: self.total_requests,
             errors: self.errors,
             providers: self.providers.clone(),
             key_cooldowns: BTreeMap::new(),
-            recent_usage: summarize_recent(&self.recent_requests),
-            recent_requests: self.recent_requests.clone(),
+            recent_usage: summarize_recent(&recent_requests),
+            recent_requests,
         }
     }
 
@@ -551,5 +567,22 @@ mod tests {
             format!("mock/model-{}", RECENT_LIMIT + 1)
         );
         fs::remove_file(&path).ok();
+    }
+    #[test]
+    fn filtered_snapshot_uses_inclusive_from_and_exclusive_to() {
+        let mut log = RequestLog::default();
+        log.record(record(10, "ok"));
+        log.record(record(20, "upstream_error"));
+        log.record(record(30, "ok"));
+
+        let snapshot = log.snapshot_filtered(Some(10), Some(30));
+        assert_eq!(snapshot.total_requests, 3);
+        assert_eq!(snapshot.recent_requests.len(), 2);
+        assert_eq!(snapshot.recent_requests[0].started_unix_ms, 10);
+        assert_eq!(snapshot.recent_requests[1].started_unix_ms, 20);
+        assert_eq!(snapshot.recent_usage.totals.requests, 2);
+        assert_eq!(snapshot.recent_usage.totals.errors, 1);
+        assert_eq!(snapshot.recent_usage.totals.input_tokens, 30);
+        assert_eq!(snapshot.recent_usage.totals.output_tokens, 32);
     }
 }

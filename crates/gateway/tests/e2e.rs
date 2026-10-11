@@ -1537,6 +1537,26 @@ async fn history_survives_restart_without_conversation_or_credentials() {
     let first_started = recent[0]["started_unix_ms"].as_u64().unwrap();
     assert!(recent[1]["started_unix_ms"].as_u64().unwrap() >= first_started);
 
+    let filtered = client
+        .get(format!("{second_gateway}/stats?from=0&to=1"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(filtered.status(), StatusCode::OK);
+    let filtered: Value = filtered.json().await.unwrap();
+    assert_eq!(filtered["total_requests"], 1);
+    assert!(filtered["recent_requests"].as_array().unwrap().is_empty());
+    assert_eq!(filtered["recent_usage"]["totals"]["requests"], 0);
+
+    let invalid_range = client
+        .get(format!("{second_gateway}/stats?from=2&to=1"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid_range.status(), StatusCode::BAD_REQUEST);
+
     let persisted = std::fs::read_to_string(&history_path).unwrap();
     assert!(!persisted.contains("Again?"));
     std::fs::remove_file(&history_path).ok();

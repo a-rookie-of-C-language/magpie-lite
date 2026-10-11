@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
@@ -24,7 +24,7 @@ use crate::config::{Config, GroupConfig, Protocol, ProviderConfig};
 use crate::config_store::ConfigStore;
 use crate::cooldown::quota_cooldown;
 use crate::upstream;
-use crate::usage::{RequestLog, RequestTracker, StatsSnapshot};
+use crate::usage::{RequestLog, RequestTracker};
 
 /// The dependency-free local console. It contains no secrets and fetches
 /// protected data only after the user supplies the gateway token.
@@ -208,17 +208,35 @@ async fn health() -> Json<Value> {
     Json(json!({"status": "ok"}))
 }
 
+/// Optional Unix-millisecond bounds for the recent-history part of `/stats`.
+/// `from` is inclusive and `to` is exclusive. Lifetime process totals remain
+/// unfiltered because they are not reconstructed from the bounded history log.
+#[derive(Debug, Default, serde::Deserialize)]
+struct StatsQuery {
+    from: Option<u64>,
+    to: Option<u64>,
+}
+
 /// GET /stats — totals and recent request metadata, token-protected.
-async fn stats(State(state): State<Arc<AppState>>) -> Json<StatsSnapshot> {
+async fn stats(State(state): State<Arc<AppState>>, Query(query): Query<StatsQuery>) -> Response {
+    if let (Some(from), Some(to)) = (query.from, query.to)
+        && from > to
+    {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            upstream::chat_error(StatusCode::BAD_REQUEST, "stats `from` must be <= `to`"),
+        );
+    }
+
     let mut snapshot = state
         .requests
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .snapshot();
+        .snapshot_filtered(query.from, query.to);
     snapshot.key_cooldowns = state
         .key_rotation
         .cooldown_snapshot(&state.config.current());
-    Json(snapshot)
+    Json(snapshot).into_response()
 }
 
 /// GET `/config` — secret-free routing metadata for the console.
