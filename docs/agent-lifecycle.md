@@ -52,25 +52,49 @@ and shallow nvm/fnm/mise/asdf Node-version installation directories. Absolute
 `BUN_INSTALL`, `VOLTA_HOME`, `PNPM_HOME`, `npm_config_prefix`/`NPM_CONFIG_PREFIX`,
 `NVM_DIR`, `NVM_HOME` (Windows), `FNM_DIR`, `MISE_DATA_DIR`, `ASDF_DATA_DIR`,
 `XDG_DATA_HOME`, `APPDATA` and `LOCALAPPDATA` can contribute installation locations;
-relative prefix variables are ignored. Relative/empty entries explicitly present
-in PATH are resolved against the launcher's working directory. Fallback Node
-versions are tried in numeric descending order; this is **not** a shell's nvm
-alias/default resolution.
+relative prefix variables are ignored. An absolute `NVM_DIR` replaces `~/.nvm`.
+Relative/empty entries explicitly present in PATH are resolved against the launcher's
+working directory.
+
+The first usable `prefix` in the selected home's `.npmrc` contributes the global
+bin directory (the prefix itself on Windows, `prefix/bin` on Unix). Blank/comment
+lines, case-insensitive keys, paired single/double quotes and `~`/`~/` expansion
+are supported; relative values are ignored. Native absolute `npm_config_prefix`
+(or `NPM_CONFIG_PREFIX` if the lowercase spelling is absent/relative) replaces
+this file-derived prefix. This is passive discovery, not a full npm INI parser:
+environment interpolation, alternate userconfig files and project npmrc are not read.
+
+An nvm `alias/default` **text file** resolves chained aliases using the first
+non-empty line. Exact installed versions require an executable `bin/node`;
+major/minor versions, `node`/`stable`, named LTS aliases, `lts/*` (Unix) and
+`lts/-N` are supported. The resolved default is tried before the same root's
+remaining complete numeric versions, in descending order. Missing/uninstalled
+aliases, cycles and `system` do not select a preferred version, but all installed
+versions remain passive fallbacks, matching upstream `UserBinDirs` rather than
+its terminal-PATH injection policy.
 
 The process environment is captured when the manager is created. Refresh rechecks
-launcher files and Node-version directories; it does not reload a login shell's
+launcher files, `.npmrc`, alias files and Node-version directories; it does not reload a login shell's
 PATH or mutate environment variables. Native adapter paths also honor the
 reference-supported absolute overrides `CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
 `OPENCODE_CONFIG_DIR` and `MAGPIE_ZED_CONFIG_DIR`; relative values are ignored.
 `MAGPIE_LITE_HOME` and `Manager::at_home` take precedence over those overrides and
 ignore the real machine's PATH, external prefix variables and global directories,
-searching only under the sandbox home. Unix launchers require a regular file
-with an executable permission bit. Windows checks `.exe`, `.com`, `.cmd` and
+searching only under the sandbox home. Prefix traversal and symlink targets outside
+that home are ignored for discovery inputs, version roots and launchers. Alias
+names reject absolute/traversal syntax; alias-file symlinks must remain under the
+alias root even in native mode. These are canonical-path checks, not a filesystem
+sandbox against concurrent adversarial replacement between checking and opening.
+All discovery inputs are read-only; no npm/nvm command is executed. Unix launchers
+require a regular file with an executable permission bit. Windows checks `.exe`, `.com`, `.cmd` and
 `.bat` files; no script or binary is opened for its contents or run. Zed can be
 found as `zed` or `zeditor`.
 
 Search bounds are 128 captured PATH entries, 256 distinct candidate directories
 and 64 immediate entries per version-manager root; no recursive walk is performed.
+Npmrc reads are limited to 64 KiB. Alias reads are limited to 8 KiB each, 16 probes
+per chain, and 128 entries per LTS listing. Only regular files are read; oversized
+files, truncated listings and depth exhaustion are not used to choose a default.
 `detection.search_limited` warns when entries were omitted or a launcher path
 could not be represented in JSON (non-UTF-8 on Unix). Missing results are
 not proof that an Agent is uninstalled. Discovery does not verify a launcher

@@ -7,7 +7,7 @@ Target: multiple coding agents sharing one Rust backend, provider adapters for d
 | Area | Current evidence | Remaining work |
 |---|---|---|
 | Shared Rust gateway | core wire codecs and gateway HTTP/SSE tests in crates/core/tests and crates/gateway/tests/e2e.rs | Recorded real-agent fixtures, broader multimodal/tool/stream conformance, cancellation and disconnect cases |
-| Agent adapters | Shared magpie-agents adapters for Claude Code, Codex, Crush, Gemini CLI, Goose, OpenCode and Zed; private staged preview, revision-checked apply, OS lock, schema-2 journaled selective field restore preserving unrelated edits, disconnect, managed-field drift and explicit recovery. Agent unit, HTTP, sandboxed child CLI and real-gateway console browser tests; Windows ACL/junction checks; recursive duplicate-key JSON/JSONC refusal, format-preserving JSON edits, compact comment-free JSON object additions that preserve single-line layout, native OpenCode/Zed JSONC, shared passive CLI/config discovery with bounded user-prefix/Node-version searches and PATH/unknown metadata, native absolute config-directory overrides for Claude/Codex/OpenCode/Zed, and seven-Agent selective restore through HTTP/CLI/browser | Native project overrides, shell/default-alias/npmrc detection, process/reachability and real-version compatibility evidence; compact layout preservation is intentionally limited to single-line objects without direct comments |
+| Agent adapters | Shared magpie-agents adapters for Claude Code, Codex, Crush, Gemini CLI, Goose, OpenCode and Zed; private staged preview, revision-checked apply, OS lock, schema-2 journaled selective field restore preserving unrelated edits, disconnect, managed-field drift and explicit recovery. Agent unit, HTTP, sandboxed child CLI and real-gateway console browser tests; Windows ACL/junction checks; recursive duplicate-key JSON/JSONC refusal, format-preserving JSON edits, compact comment-free JSON object additions that preserve single-line layout, native OpenCode/Zed JSONC, shared passive CLI/config discovery with bounded user-prefix/Node-version searches, npmrc prefix and nvm default-alias handling, and PATH/unknown metadata, native absolute config-directory overrides for Claude/Codex/OpenCode/Zed, and seven-Agent selective restore through HTTP/CLI/browser | Native project overrides, login-shell/registry PATH refresh, process/reachability and real-version compatibility evidence; compact layout preservation is intentionally limited to single-line objects without direct comments |
 | Provider metadata and keys | Protected provider CRUD and console; providers.rs covers saved/live edits, secret-free capability metadata (`supported_protocols`, nullable streaming/tools/vision), protocol validation and preserve/clear semantics. provider_tools.rs covers four-protocol catalogs/probes, pagination, saved/draft/no-auth credentials and bounded read-only operations | Capability presets, specialized/stream-only probes and paid/live vendor evidence |
 | Hot edits and key rotation | ConfigStore saves before publishing; requests own snapshots. Versioned key schedules ignore stale requests. providers.rs checks an old in-flight request after a smaller pool is saved; config.rs checks stale scheduler calls. Durable config revisions/ETags and optional If-Match checks reject stale provider/group writes across restarts; the revision is committed in the atomically replaced TOML document, store and HTTP tests check unchanged disk/memory and a single winner for concurrent checked edits; gateway writers also serialize through a bounded file lock. Provider/group CRUD and agent apply now have durable idempotency with 256-entry retention, token-keyed HMAC digests, restart replay, pending fail-closed behavior, and secret-free ledgers | Encrypted secret storage with recovery; durable idempotency for any future agent rotate endpoint |
 | Routing and catalog | Explicit provider/model, listed bare model, default provider, and process-local group `order`/`rotate`/`usage` scheduling with ordered fallback; config unit tests, groups.rs and e2e.rs | Allowance/weight/pace policies, conversation affinity, richer model metadata and dynamic discovery |
@@ -41,8 +41,18 @@ remain intentionally unsupported.
 Passive Agent discovery was compared with upstream `internal/agent/agent.go`
 (`Detected`) and `internal/proc/path_other.go`/`path_windows.go`. Lite reports
 config/file/launcher evidence, a bounded captured-PATH membership result and
-fallback user installation locations, but deliberately does not claim the
-reference's login-shell/registry PATH refresh, npmrc prefixes, nvm default aliases,
+fallback user installation locations, npmrc prefixes and nvm default aliases, but
+deliberately does not claim the reference's login-shell/registry PATH refresh,
 Agent-version probes, process detection or project/native-config override parity.
 Unit/lifecycle/HTTP/child-CLI/real-gateway browser fixtures cover the implemented
 contract; no real installed Agent was executed to prove version compatibility.
+
+Npmrc/nvm discovery was additionally compared with upstream
+`internal/proc/nodever_other.go`: alias/default is a file, explicit NVM_DIR
+replaces the home root, and missing/system/cyclic defaults retain installed-version
+fallbacks. Bounded alias-chain/LTS parsing, refreshable npmrc prefixes and canonical
+sandbox confinement have Windows unit fixtures and Linux/WSL fixtures (including
+real lts/* filenames and escaping symlinks). An authenticated HTTP test refreshes
+both inputs in one live manager and verifies unchanged config, statistics and
+preview revision. These fixtures do not execute Node or any Agent launcher and
+do not prove real terminal PATH equivalence.

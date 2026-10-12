@@ -759,3 +759,87 @@ async fn passive_cli_discovery_is_protected_refreshable_and_never_runs_launchers
             .all(|a| a["detected"] == false)
     );
 }
+
+#[tokio::test]
+async fn npmrc_and_nvm_alias_files_refresh_in_the_same_backend_without_revision_or_config_writes() {
+    fn fixture(bin: &std::path::Path, command: &str, extension: bool) -> PathBuf {
+        std::fs::create_dir_all(bin).unwrap();
+        let path = bin.join(if cfg!(windows) && extension {
+            format!("{command}.cmd")
+        } else {
+            command.into()
+        });
+        std::fs::write(&path, "passive fixture; must never execute").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        path
+    }
+    fn cli_path(list: &Value, id: &str) -> PathBuf {
+        let agent = list["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == id)
+            .unwrap();
+        assert_eq!(agent["detection"]["search_limited"], false);
+        assert_eq!(agent["detection"]["cli"]["on_path"], false);
+        PathBuf::from(agent["detection"]["cli"]["path"].as_str().unwrap())
+    }
+    let s = server(true).await;
+    let home = s.root.path().join("home");
+    let config_before = std::fs::read(&s.path).unwrap();
+    let stats_before = s.ok(Method::GET, "/stats", json!(null)).await;
+    let preview_before = s.preview("claude", "connect", "mock/model").await;
+    let nvm = home.join(".nvm");
+    let old_bin = nvm.join("versions/node/v18.0.0/bin");
+    let new_bin = nvm.join("versions/node/v24.0.0/bin");
+    fixture(&old_bin, "node", false);
+    fixture(&new_bin, "node", false);
+    let old_cli = fixture(&old_bin, "claude", true);
+    let new_cli = fixture(&new_bin, "claude", true);
+    let npm_bin = |name| home.join(name).join(if cfg!(windows) { "" } else { "bin" });
+    let first_cli = fixture(&npm_bin("npm-first"), "opencode", true);
+    let second_cli = fixture(&npm_bin("npm-second"), "opencode", true);
+    std::fs::create_dir_all(nvm.join("alias/lts")).unwrap();
+    std::fs::write(nvm.join("alias/default"), "lts/local").unwrap();
+    std::fs::write(nvm.join("alias/lts/local"), "18").unwrap();
+    std::fs::write(home.join(".npmrc"), "prefix='~/npm-first'\n").unwrap();
+    let first = s.ok(Method::GET, "/agents", json!(null)).await;
+    assert_eq!(cli_path(&first, "claude"), old_cli);
+    assert_eq!(cli_path(&first, "opencode"), first_cli);
+    std::fs::write(nvm.join("alias/lts/local"), "stable").unwrap();
+    std::fs::write(home.join(".npmrc"), "prefix=\"~/npm-second\"\n").unwrap();
+    let refreshed = s.ok(Method::GET, "/agents", json!(null)).await;
+    assert_eq!(cli_path(&refreshed, "claude"), new_cli);
+    assert_eq!(cli_path(&refreshed, "opencode"), second_cli);
+    std::fs::write(nvm.join("alias/default"), "system").unwrap();
+    std::fs::write(home.join(".npmrc"), "prefix=~/../outside\n").unwrap();
+    let ignored = s.ok(Method::GET, "/agents", json!(null)).await;
+    assert_eq!(cli_path(&ignored, "claude"), new_cli);
+    assert!(
+        ignored["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == "opencode")
+            .unwrap()["detection"]["cli"]
+            .is_null()
+    );
+    assert_eq!(
+        s.preview("claude", "connect", "mock/model").await["revision"],
+        preview_before["revision"]
+    );
+    assert_eq!(std::fs::read(&s.path).unwrap(), config_before);
+    assert_eq!(s.ok(Method::GET, "/stats", json!(null)).await, stats_before);
+    assert!(!home.join(".claude").exists());
+    assert!(!s.root.path().join("agent-state/claude.json").exists());
+    for path in [old_cli, new_cli, first_cli, second_cli] {
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "passive fixture; must never execute"
+        );
+    }
+}
