@@ -72,7 +72,9 @@ and reads until one of:
 
 Discarded attempts' opening frames are never encoded into the selected answer.
 A new attempt gets a fresh upstream decoder; the client encoder is created only
-for the selected attempt. An answer is never assembled from two upstreams. In
+for the selected candidate. An answer is never assembled from different providers
+or models; the one allowed same-candidate reasoning re-ask preserves earlier
+reasoning while keeping one client response. In
 particular reasoning/tool activity counts as committed even if a particular
 client dialect buffers or hides that activity.
 
@@ -233,9 +235,10 @@ A Chat assistant role/model opening is decoded once per upstream attempt. Ready
 transport events take priority over the release timer, allowing a ready opening
 error to retry safely before any candidate metadata is published.
 
-Publishing opening metadata commits the selected attempt, even without answer
-content: a later error is delivered once, with selected-attempt accounting and
-no replay. Release does not satisfy or restart the absolute first-content
+Publishing opening metadata commits the selected candidate, even without answer
+content: a later error is delivered once, with selected-candidate accounting and
+no ordinary fallback/replay. The reasoning-only loop re-ask below is limited to
+the same candidate. Release does not satisfy or restart the absolute first-content
 limit. An interrupted upstream read retains its remaining idle budget across
 metadata replay without charging downstream backpressure or receiving a fresh
 full idle interval. Dropping the downstream still cancels the owned upstream.
@@ -311,15 +314,16 @@ The reference is `internal/gateway/loop_guard.go` and `loop_guard_test.go`:
   and safe UTF-8 truncation are not claimed bit-identical to Go's letter/digit
   categories and byte truncation. The thresholds and common-text behavior match.
 
-The triggering decoded delta is forwarded **whole**, then one terminal protocol
-error ends the selected stream and releases the upstream, including on a final
+The triggering decoded delta is forwarded **whole**, then (except for the one
+reasoning-only re-ask described below) one terminal protocol error ends the selected stream and releases the upstream, including on a final
 unterminated SSE frame at EOF. Text later inside that same delta may therefore
 be visible; later decoded events are not. No successful completion marker is
 fabricated. Content/reasoning has committed the candidate: the guard cannot spend
 another key, switch provider/group, or splice/replay an answer. Unlike the
 reference's diagnostic quote, Lite's fixed error message includes no generated
-text or credentials. The final record uses `upstream_stream_error`, retains only
-observed selected-attempt usage, and sanitized JSONL history survives reload.
+text or credentials. A terminal loop/failure record uses `upstream_stream_error`
+and retains observed selected-candidate usage (including its one allowed re-ask).
+A successful re-ask records `ok`. Sanitized JSONL history survives reload.
 
 This is a repetition heuristic, not a no-progress timeout, total-answer limit
 or guarantee against false positives. It does not end a heartbeats-only stall
@@ -327,9 +331,21 @@ after content. If the first trip is reasoning-only—no answer text and no tool
 call—the gateway waits about one second and re-asks the same provider/model/key
 slot once, without fallback or rotation. Previously emitted reasoning is kept,
 the re-ask's duplicate opening event is hidden from the client, and usage is
-combined across both attempts. If the re-ask loops again or fails, the client
-receives one protocol error; answer text or tool output emitted before the loop
-disables the re-ask path.
+combined across both attempts in the **client's usage and request history**.
+Each attempt's cumulative reports replace that attempt's known counters; the
+first attempt's counters are added once, preserving unknown fields and saturating
+on overflow. Prefetched reports are not counted again when replayed.
+If the re-ask loops again or fails, the client receives one protocol error;
+answer text or tool output emitted before the loop disables the re-ask path.
+
+The one-second pause does not consume the new attempt's first-content budget.
+A fresh clock then covers response headers and opening prefetch together;
+transport read-idle applies to its body. Keepalive activity resets for this
+attempt and comments are suppressed once non-2xx headers are known. Completed
+re-ask attempts update the same key's acceptance/error counters but never advance
+key/group scheduling, set cooldowns, or spend another fallback route. Dropping
+the downstream stream owns cancellation of the pause, send future and response,
+with one final `client_disconnected` record and all usage already observed.
 
 Seven unit tests cover chunk boundaries, text/reasoning independence, exact
 window/distinct thresholds, eviction, run-on cycles and short-break reset,
@@ -341,8 +357,16 @@ and nonstream exclusions, pinned edits and fresh request windows. Interaction
 fixtures exercise key/provider/group fallback followed by comments then a loop,
 selected-attempt usage and JSONL reload without secrets/reply quotes, and actual
 socket cancellation below the loop threshold without a late duplicate record.
-These are synthetic local HTTP/1.1 fixtures, not paid/live-vendor, real-Agent or
-HTTP/2 conformance evidence.
+The `reasoning_only_loop_reasks_*` fixture checks one logical completion,
+client/history usage totals, identical resent request bodies and key counters
+across all 16 protocol pairs.
+Additional `reasoning_reask_*` fixtures cover a second loop or early stream
+error across all pairs, second-request header/opening/error-body deadlines,
+grouped 401/429/500
+rejections without fallback/cooldown, and real socket disconnects during the
+retry pause and second-request header wait with JSONL reload and no late request
+or duplicate record. These are synthetic local HTTP/1.1 fixtures, not paid/live-
+vendor, real-Agent or HTTP/2 conformance evidence.
 
 ## Accounting and cancellation
 
@@ -354,8 +378,10 @@ frames does not overwrite a newer usage value already observed during prefetch.
 The tracker switches provider/model/key slot and clears prior attempt usage
 **before** awaiting the next concrete upstream request. The final record belongs
 to the selected or last attempted route, never to the abandoned primary. Only
-that attempt's reported usage is retained; this is not a billing ledger summing
-possibly charged discarded attempts. Unknown usage remains null, not estimated.
+that attempt's reported usage is retained across ordinary fallback; this is not
+a billing ledger summing possibly charged discarded candidates. The one allowed
+same-candidate reasoning re-ask is the exception: both attempts contribute to
+client/history totals. Unknown usage remains null, not estimated.
 
 The current Axum HTTP/1.1 serving path drops the pending handler when its client
 closes the socket. This releases the owned upstream response/send future before

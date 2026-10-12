@@ -1169,26 +1169,56 @@ async fn reask_reasoning_stream(
         config.stream_first_content_timeout_ms,
         config.stream_idle_timeout_ms,
     );
-    let response = upstream::send(
-        &state.http,
-        &candidate.provider,
-        &api_key,
-        &body,
-        &candidate.model,
-        true,
-    )
-    .await
-    .map_err(|error| format!("reasoning reask could not reach upstream: {error}"))?;
+    liveness.activity.attempt();
+    let response = match clock
+        .headers(upstream::send(
+            &state.http,
+            &candidate.provider,
+            &api_key,
+            &body,
+            &candidate.model,
+            true,
+        ))
+        .await
+    {
+        Ok(Ok(response)) => response,
+        Err(timeout) => {
+            tracker.record_attempt(
+                &candidate.provider.id,
+                candidate.key_slot,
+                timeout.attempt_status(),
+            );
+            return Err(timeout.message().to_owned());
+        }
+        Ok(Err(error)) => {
+            tracker.record_attempt(&candidate.provider.id, candidate.key_slot, "network_error");
+            return Err(format!("reasoning reask could not reach upstream: {error}"));
+        }
+    };
 
-    if !response.status().is_success() {
-        let detail = clock
-            .headers(upstream::error_detail(response))
-            .await
-            .map_err(|timeout| timeout.message().to_owned())?;
+    let status = response.status();
+    liveness.activity.headers(status.is_success());
+    if !status.is_success() {
+        let detail = match clock.headers(upstream::error_detail(response)).await {
+            Ok(detail) => detail,
+            Err(timeout) => {
+                tracker.record_attempt(
+                    &candidate.provider.id,
+                    candidate.key_slot,
+                    timeout.attempt_status(),
+                );
+                return Err(timeout.message().to_owned());
+            }
+        };
+        tracker.record_attempt(
+            &candidate.provider.id,
+            candidate.key_slot,
+            &status.as_u16().to_string(),
+        );
         return Err(detail.message);
     }
 
-    let (events, _failure) = prefetch_stream(
+    let (events, failure) = prefetch_stream(
         response,
         candidate.provider.protocol,
         tracker,
@@ -1197,6 +1227,15 @@ async fn reask_reasoning_stream(
         config.stream_loop_guard,
     )
     .await;
+    tracker.record_attempt(
+        &candidate.provider.id,
+        candidate.key_slot,
+        if failure.is_some() {
+            "upstream_stream_error"
+        } else {
+            "ok"
+        },
+    );
     Ok(events)
 }
 
@@ -1360,9 +1399,17 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
             let mut emitted_text_or_tool = false;
             'attempt: loop {
                 while let Some(item) = events.next().await {
-                    let event = item.event;
-                    if !item.usage_observed && let StreamEvent::Usage(usage) = &event {
-                        tracker.observe_usage(usage);
+                    let mut event = item.event;
+                    if let StreamEvent::Usage(usage) = &mut event {
+                        if !item.usage_observed {
+                            tracker.observe_usage(usage);
+                        }
+                        // Providers report cumulative counters for each attempt.
+                        // Account raw counters once, but expose the same logical
+                        // response total to clients and request history.
+                        if reasked {
+                            *usage = tracker.total_usage();
+                        }
                     }
 
                     // The second upstream sends its own Start frame, but the

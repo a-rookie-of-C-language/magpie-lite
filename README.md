@@ -166,8 +166,12 @@ selected stream normally ends with one client-protocol error, not a successful
 completion or a fallback/replay. When the first trip contains reasoning only
 (no answer text and no tool call), Lite waits about one second and re-asks the
 same provider/model/key slot at most once. Earlier reasoning is preserved, the
-second upstream opening event is suppressed, and usage is combined across both
-attempts. A second loop, a re-ask failure, or any already-emitted answer/tool
+second upstream opening event is suppressed, and client/history usage is combined
+across both attempts. After the pause, a fresh per-attempt first-content deadline
+covers response headers and opening prefetch; read-idle and keepalive policies
+also apply. Disconnecting the client cancels the pause or pending upstream work.
+The second request counts as another attempt on the same key, not another routing
+decision. A second loop, a re-ask failure, or any already-emitted answer/tool
 output ends with one client-protocol error. Errors do not quote the repeated
 reply; sanitized JSONL history stores neither prompt nor reply content. See
 `docs/stream-lifecycle.md` for exact limits and reproducible fixture evidence.

@@ -123,6 +123,9 @@ struct Transport {
     // Delay one selected slot; non-2xx status still applies only to slot zero.
     header_delay: Duration,
     header_delay_slot: usize,
+    // Optional request ordinal overrides the slot filter for reask fixtures.
+    header_delay_request: Option<usize>,
+    status_request: Option<usize>,
     status: axum::http::StatusCode,
 }
 impl Default for Transport {
@@ -131,6 +134,8 @@ impl Default for Transport {
             chunk_size: 19,
             header_delay: Duration::ZERO,
             header_delay_slot: 0,
+            header_delay_request: None,
+            status_request: None,
             status: axum::http::StatusCode::OK,
         }
     }
@@ -145,6 +150,7 @@ struct Fixture {
     attempts: Arc<Mutex<Vec<usize>>>,
     state: Arc<AppState>,
     sent_models: Arc<Mutex<Vec<String>>>,
+    sent_bodies: Arc<Mutex<Vec<Value>>>,
 }
 impl Fixture {
     async fn new(protocol: Protocol, script: String, ending: Ending) -> Self {
@@ -191,10 +197,14 @@ impl Fixture {
             chunk_size,
             header_delay,
             header_delay_slot,
+            header_delay_request,
+            status_request,
             status,
         } = transport;
         let sent_models = Arc::new(Mutex::new(Vec::new()));
         let captured_models = sent_models.clone();
+        let sent_bodies = Arc::new(Mutex::new(Vec::new()));
+        let captured_bodies = sent_bodies.clone();
         let extra_keys = (0..scripts.len())
             .map(|i| format!("secret-upstream-key-{i}"))
             .collect();
@@ -223,6 +233,7 @@ impl Fixture {
                     observed.lock().unwrap().push(slot);
                     let model = body.get("model").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| uri.path().split("/models/").nth(1).unwrap().split(':').next().unwrap().to_owned());
                     captured_models.lock().unwrap().push(model);
+                    captured_bodies.lock().unwrap().push(body);
                     let request_number = requests.fetch_add(1, Ordering::SeqCst);
                     let script = match &ending {
                         Ending::PerRequest(queue, _) => queue
@@ -239,8 +250,8 @@ impl Fixture {
                     };
                     let guard = Dropped(flag.clone());
                     async move {
-                        if slot == header_delay_slot { tokio::time::sleep(header_delay).await; }
-                        Response::builder().status(if slot == 0 { status } else { axum::http::StatusCode::OK }).header("content-type", "text/event-stream").header("retry-after", "2")
+                        if header_delay_request.map_or(slot == header_delay_slot, |request| request == request_number) { tokio::time::sleep(header_delay).await; }
+                        Response::builder().status(if status_request.map_or(slot == 0, |request| request == request_number) { status } else { axum::http::StatusCode::OK }).header("content-type", "text/event-stream").header("retry-after", "2")
                     .body(Body::from_stream(async_stream::stream! {
                         let _guard = guard;
                         // Deliberately cut inside JSON/SSE frame boundaries.
@@ -327,6 +338,7 @@ impl Fixture {
             attempts,
             state,
             sent_models,
+            sent_bodies,
         }
     }
     async fn request(&self, protocol: Protocol) -> reqwest::Response {
@@ -377,6 +389,15 @@ impl Fixture {
 }
 
 fn assert_completed(body: &str, protocol: Protocol) {
+    assert_completed_usage(body, protocol, 7, 3);
+}
+
+fn assert_completed_usage(
+    body: &str,
+    protocol: Protocol,
+    expected_input: u64,
+    expected_output: u64,
+) {
     let mut parser = magpie_core::stream::SseParser::new();
     let mut remaining = body.as_bytes();
     let mut frames = Vec::<Value>::new();
@@ -438,8 +459,8 @@ fn assert_completed(body: &str, protocol: Protocol) {
             )
         }
     };
-    assert_eq!(input, 7, "{body}");
-    assert_eq!(output, 3, "{body}");
+    assert_eq!(input, expected_input, "{body}");
+    assert_eq!(output, expected_output, "{body}");
 }
 
 fn assert_no_success(body: &str) {
@@ -3821,7 +3842,20 @@ async fn reasoning_only_loop_reasks_same_candidate_once_and_preserves_one_client
                 .expect("reasoning-only loop reask timed out")
                 .unwrap();
 
-            assert_completed(&body, client);
+            let expected_input = if upstream == Protocol::Responses {
+                7
+            } else {
+                14
+            };
+            assert_completed_usage(&body, client, expected_input, 3);
+            {
+                let requests = f.sent_bodies.lock().unwrap();
+                assert_eq!(requests.len(), 2);
+                assert_eq!(
+                    requests[0], requests[1],
+                    "reask must resend the original request"
+                );
+            }
             assert!(body.contains("mcp"), "first reasoning was lost: {body}");
             assert!(body.contains("partial"), "reask text was lost: {body}");
             assert_eq!(*f.attempts.lock().unwrap(), [0, 0]);
@@ -3846,6 +3880,9 @@ async fn reasoning_only_loop_reasks_same_candidate_once_and_preserves_one_client
             } else {
                 assert_eq!(record["usage"]["input"], 14);
             }
+            let stats = f.log.lock().unwrap().snapshot();
+            let key = &stats.providers["mock"].keys["0"];
+            assert_eq!((key.attempts, key.successes, key.errors), (2, 2, 0));
             f.assert_released().await;
         }
     }
@@ -4308,6 +4345,284 @@ async fn loop_guard_pending_window_is_dropped_on_client_disconnect_without_late_
             tokio::time::sleep(Duration::from_millis(50)).await;
             assert_eq!(f.log.lock().unwrap().snapshot().recent_requests.len(), 1);
             assert_loop_history(history.path(), &record);
+        }
+    }
+}
+
+#[tokio::test]
+async fn reasoning_reask_header_wait_obeys_first_content_deadline_without_fallback() {
+    for client in PROTOCOLS {
+        let upstream = client;
+        let mut first = opening(upstream).replace(":99", ":7");
+        first += &loop_delta(upstream, true, &"mcp ".repeat(4096));
+        let f = Fixture::with_transport(
+            upstream,
+            vec![String::new(), prefix(upstream) + completion(upstream)],
+            Ending::PerRequest(
+                vec![first, prefix(upstream) + completion(upstream)],
+                Box::new(Ending::Hold),
+            ),
+            Transport {
+                header_delay: Duration::from_secs(3),
+                header_delay_request: Some(1),
+                ..Transport::default()
+            },
+            |config| {
+                config.stream_first_content_timeout_ms = 200;
+                config.stream_idle_timeout_ms = 0;
+                config.stream_keepalive_interval_ms = 25;
+                config.stream_keepalive_max_silence_ms = 10000;
+            },
+        )
+        .await;
+        let body = tokio::time::timeout(Duration::from_secs(2), f.request(client).await.text())
+            .await
+            .expect("reask ignored first-content header deadline")
+            .unwrap();
+        assert_one_stream_error(&body, client, "upstream first-content timeout");
+        assert!(!body.contains("partial"));
+        assert_eq!(*f.attempts.lock().unwrap(), [0, 0]);
+        assert_eq!(f.record().await["status"], "upstream_stream_error");
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn reasoning_reask_second_loop_or_prefetch_error_never_retries_again() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            for second_loop in [true, false] {
+                let first = opening(upstream).replace(":99", ":7")
+                    + &loop_delta(upstream, true, &"mcp ".repeat(4096));
+                let second = opening(upstream).replace(":99", ":7")
+                    + &if second_loop {
+                        loop_delta(upstream, true, &"mcp ".repeat(4096))
+                    } else {
+                        error(upstream).to_owned()
+                    };
+                let f = Fixture::with_config(
+                    upstream,
+                    vec![String::new(), prefix(upstream) + completion(upstream)],
+                    Ending::PerRequest(vec![first, second], Box::new(Ending::Hold)),
+                    disable_stream_deadlines,
+                )
+                .await;
+                let history = f.persistent_history();
+                let body = tokio::time::timeout(LIMIT, f.request(client).await.text())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_one_stream_error(
+                    &body,
+                    client,
+                    if second_loop {
+                        "model's reasoning was stuck in a loop"
+                    } else {
+                        "fixture rate limit"
+                    },
+                );
+                assert!(!body.contains("partial"));
+                assert_eq!(*f.attempts.lock().unwrap(), [0, 0]);
+                let record = f.record().await;
+                assert_eq!(record["status"], "upstream_stream_error");
+                assert_eq!(record["key_slot"], 0);
+                assert_eq!(
+                    record["usage"]["input"],
+                    if upstream == Protocol::Responses {
+                        Value::Null
+                    } else {
+                        json!(14)
+                    }
+                );
+                assert_loop_history(history.path(), &record);
+                let stats = f.log.lock().unwrap().snapshot();
+                let key = &stats.providers["mock"].keys["0"];
+                assert_eq!(
+                    (key.attempts, key.successes, key.errors),
+                    if second_loop { (2, 2, 0) } else { (2, 1, 1) }
+                );
+                assert!(
+                    f.state
+                        .key_rotation
+                        .cooldown_snapshot(&f.state.config.current())
+                        .is_empty()
+                );
+                f.assert_released().await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn reasoning_reask_http_error_never_spends_another_key_or_route() {
+    for client in PROTOCOLS {
+        for status in [401, 429, 500] {
+            let first = opening(client).replace(":99", ":7")
+                + &loop_delta(client, true, &"mcp ".repeat(4096));
+            let f = Fixture::with_transport(
+                client,
+                vec![String::new(), prefix(client) + completion(client)],
+                Ending::PerRequest(
+                    vec![
+                        first,
+                        r#"{"error":{"message":"reask rejected"}}"#.to_owned(),
+                    ],
+                    Box::new(Ending::Eof),
+                ),
+                Transport {
+                    status: axum::http::StatusCode::from_u16(status).unwrap(),
+                    status_request: Some(1),
+                    ..Transport::default()
+                },
+                |config| {
+                    disable_stream_deadlines(config);
+                    configure_timeout_fallback(config, true);
+                },
+            )
+            .await;
+            let body =
+                tokio::time::timeout(LIMIT, f.request_model(client, "group/daily").await.text())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_one_stream_error(&body, client, "reask rejected");
+            assert!(!body.contains("partial"));
+            assert_eq!(*f.attempts.lock().unwrap(), [0, 0]);
+            let record = f.record().await;
+            assert_eq!(record["status"], "upstream_stream_error");
+            assert_eq!(record["provider"], "mock");
+            assert_partial_usage(&record, client);
+            let stats = f.log.lock().unwrap().snapshot();
+            let key = &stats.providers["mock"].keys["0"];
+            assert_eq!((key.attempts, key.successes, key.errors), (2, 1, 1));
+            assert!(
+                f.state
+                    .key_rotation
+                    .cooldown_snapshot(&f.state.config.current())
+                    .is_empty()
+            );
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn reasoning_reask_socket_disconnect_cancels_pause_and_header_wait() {
+    for client in PROTOCOLS {
+        for awaiting_headers in [false, true] {
+            let first = opening(client).replace(":99", ":7")
+                + &loop_delta(client, true, &"mcp ".repeat(4096));
+            let f = Fixture::with_transport(
+                client,
+                vec![String::new()],
+                Ending::PerRequest(vec![first, opening(client).into()], Box::new(Ending::Hold)),
+                Transport {
+                    header_delay: Duration::from_secs(3),
+                    header_delay_request: Some(1),
+                    ..Transport::default()
+                },
+                disable_stream_deadlines,
+            )
+            .await;
+            let history = f.persistent_history();
+            let socket = f.socket_request(client, "mock/up-model", true).await;
+            // A released first response proves the guard entered reask, not
+            // merely that the client saw some earlier reasoning frames.
+            tokio::time::timeout(LIMIT, async {
+                while f.dropped.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            if awaiting_headers {
+                f.wait_for_attempts(&[0, 0]).await;
+            } else {
+                assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            }
+            drop(socket);
+            let record = f.record().await;
+            assert_eq!(record["status"], "client_disconnected");
+            assert_eq!(record["provider"], "mock");
+            assert_partial_usage(&record, client);
+            f.assert_released().await;
+            // Wait past the retry pause to reject a detached retry or a late
+            // terminal record after the downstream socket has closed.
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            assert_eq!(
+                *f.attempts.lock().unwrap(),
+                if awaiting_headers {
+                    vec![0, 0]
+                } else {
+                    vec![0]
+                }
+            );
+            assert_eq!(f.log.lock().unwrap().snapshot().recent_requests.len(), 1);
+            assert_loop_history(history.path(), &record);
+        }
+    }
+}
+
+#[tokio::test]
+async fn reasoning_reask_opening_and_http_error_body_share_first_content_deadline() {
+    for client in PROTOCOLS {
+        for http_error in [false, true] {
+            let first = opening(client).replace(":99", ":7")
+                + &loop_delta(client, true, &"mcp ".repeat(4096));
+            let second = if http_error {
+                String::new()
+            } else {
+                opening(client).replace(":99", ":7")
+            };
+            let f = Fixture::with_transport(
+                client,
+                vec![String::new(), prefix(client) + completion(client)],
+                Ending::PerRequest(vec![first, second], Box::new(Ending::Hold)),
+                Transport {
+                    header_delay: Duration::from_millis(100),
+                    header_delay_request: Some(1),
+                    status: if http_error {
+                        axum::http::StatusCode::TOO_MANY_REQUESTS
+                    } else {
+                        axum::http::StatusCode::OK
+                    },
+                    status_request: Some(1),
+                    ..Transport::default()
+                },
+                |config| {
+                    config.stream_first_content_timeout_ms = 250;
+                    config.stream_idle_timeout_ms = 0;
+                    config.stream_keepalive_interval_ms = 25;
+                    config.stream_keepalive_max_silence_ms = 10000;
+                },
+            )
+            .await;
+            let body = tokio::time::timeout(LIMIT, f.request(client).await.text())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_one_stream_error(&body, client, "upstream first-content timeout");
+            assert_eq!(*f.attempts.lock().unwrap(), [0, 0]);
+            let record = f.record().await;
+            assert_eq!(record["status"], "upstream_stream_error");
+            assert_eq!(
+                record["usage"]["input"],
+                if client == Protocol::Responses {
+                    Value::Null
+                } else {
+                    json!(if http_error { 7 } else { 14 })
+                }
+            );
+            let stats = f.log.lock().unwrap().snapshot();
+            let key = &stats.providers["mock"].keys["0"];
+            assert_eq!((key.attempts, key.successes, key.errors), (2, 1, 1));
+            assert!(
+                f.state
+                    .key_rotation
+                    .cooldown_snapshot(&f.state.config.current())
+                    .is_empty()
+            );
+            f.assert_released().await;
         }
     }
 }
