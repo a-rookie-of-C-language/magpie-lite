@@ -18,11 +18,21 @@ than forwarding another API's raw `tool_choice` object.
   rejected even for native requests. An empty Responses allowlist does not mean
   all functions. Error messages do not include caller-provided names or values.
 - Ambiguous aliases, duplicate flat/nested selected names, malformed mode values,
-  namespaced allowed functions and unsupported allowlist restrictions are
-  rejected instead of silently dropping constraints.
+  and unsupported allowlist restrictions are rejected instead of silently
+  dropping constraints. Responses namespace selectors are normalized to the
+  same flattened names used by the shared IR.
 - Gemini `VALIDATED` and native additional selector options (such as Anthropic
   `disable_parallel_tool_use`) are retained for their native protocol and rejected
   on foreign routes. No cross-protocol parallel-call policy is implemented here.
+
+Responses namespace tools are supported in both non-streaming and streaming
+paths. A native namespace wrapper such as `collaboration.spawn_agent` is
+represented internally as `collaboration__spawn_agent`; the Responses encoder
+reconstructs the wire `namespace` plus local `name`, while Chat, Anthropic and
+Gemini have no equivalent namespace field and therefore receive the flattened
+name. Namespace and function names cannot contain `__`; nested namespaces and
+namespace-scoped custom tools are rejected. Invalid namespaced streaming items
+fail closed without emitting a tool call.
 
 Hosted-search requests other than Responses `allowed_tools` continue to use the
 existing search translator's native-option and global/function-choice contract.
@@ -36,8 +46,8 @@ sanitized HTTP 400 in its own protocol, including for a streaming request that
 has not committed headers. Native search keeps its original declaration/choice
 contract rather than applying function-only declaration filtering.
 
-This change is not a general translation of provider-specific search options,
-namespace tools, or other hosted built-ins. It enforces the policy carried in
+This change is not a general translation of provider-specific search options
+or other hosted built-ins. It enforces the policy carried in
 provider requests, not a sandbox that executes or independently authorizes
 model-generated function calls.
 
@@ -45,7 +55,10 @@ Evidence: `crates/core/tests/tool_choices.rs` checks all four basic modes in all
 16 protocol directions, allowlist filtering/search exclusion, invalid and
 nonportable selectors, request immutability, and search/native-policy bypass.
 The existing search-request suite checks native configured-search and
-allowed-tools preservation.
+allowed-tools preservation. The Responses namespace and stream suite in
+`crates/core/tests/namespaces.rs` and `crates/core/tests/responses.rs` covers
+flattening, native namespace reconstruction, foreign-dialect flattening and
+fail-closed malformed namespace input.
 
 `crates/gateway/tests/tool_choices.rs` adds seven real loopback HTTP tests with
 576 client requests (380 successful, 196 locally rejected), using independently

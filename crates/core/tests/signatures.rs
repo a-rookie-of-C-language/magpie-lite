@@ -280,6 +280,7 @@ fn gemini_fragmented_tool_signatures_only_attach_to_the_matching_call() {
             index: 2,
             id: "call_two".into(),
             name: "inspect".into(),
+            namespace: None,
         },
         StreamEvent::ToolCallDelta {
             index: 2,

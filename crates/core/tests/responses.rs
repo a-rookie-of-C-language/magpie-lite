@@ -1,10 +1,10 @@
 //! OpenAI Responses conformance tests: request and reply translation, plus
 //! the SSE event shapes Codex expects.
 
-use magpie_core::chat;
 use magpie_core::ir::StopReason;
 use magpie_core::responses::ResponsesStreamEncoder;
 use magpie_core::stream::{SseParser, StreamEvent};
+use magpie_core::{anthropic, chat, gemini, responses};
 use serde_json::{Value, json};
 
 fn responses_request() -> Value {
@@ -157,4 +157,149 @@ fn chat_stream_translates_to_responses_events() {
             .iter()
             .any(|item| item["type"] == "function_call" && item["call_id"] == "call_7")
     );
+}
+
+#[test]
+fn responses_stream_namespaces_round_trip_and_flatten_foreign_dialects() {
+    let added = json!({
+        "type": "response.output_item.added",
+        "output_index": 2,
+        "item": {
+            "type": "function_call",
+            "call_id": "call_ns",
+            "name": "spawn_agent",
+            "namespace": "collaboration",
+            "arguments": ""
+        }
+    });
+    assert_eq!(
+        responses::decode_chunk(&added),
+        [StreamEvent::ToolCallStart {
+            index: 2,
+            id: "call_ns".into(),
+            name: "collaboration__spawn_agent".into(),
+            namespace: Some("collaboration".into()),
+        }]
+    );
+
+    let done = json!({
+        "type": "response.output_item.done",
+        "output_index": 2,
+        "item": {
+            "type": "function_call",
+            "call_id": "call_ns",
+            "name": "spawn_agent",
+            "namespace": "collaboration",
+            "arguments": "{\"message\":\"hi\"}"
+        }
+    });
+    assert_eq!(
+        responses::decode_chunk(&done),
+        [StreamEvent::ToolCallEnd { index: 2 }]
+    );
+
+    let start = StreamEvent::ToolCallStart {
+        index: 0,
+        id: "call_ns".into(),
+        name: "collaboration__spawn_agent".into(),
+        namespace: Some("collaboration".into()),
+    };
+    let mut encoder = ResponsesStreamEncoder::new("mock-model");
+    let mut wire = String::new();
+    for event in [
+        start.clone(),
+        StreamEvent::ToolCallDelta {
+            index: 0,
+            args: "{\"message\":".into(),
+        },
+        StreamEvent::ToolCallDelta {
+            index: 0,
+            args: "\"hi\"}".into(),
+        },
+        StreamEvent::ToolCallEnd { index: 0 },
+        StreamEvent::Stop(StopReason::ToolUse),
+        StreamEvent::Done,
+    ] {
+        if let Some(frame) = encoder.encode(&event) {
+            wire.push_str(&frame);
+        }
+    }
+    let mut parser = SseParser::new();
+    let mut remaining = wire.as_bytes();
+    let mut events = Vec::new();
+    while let Some(data) = parser.feed(&mut remaining).unwrap() {
+        events.push(serde_json::from_str::<Value>(&data).unwrap());
+    }
+    let added_item = events
+        .iter()
+        .find(|event| event["type"] == "response.output_item.added")
+        .unwrap();
+    assert_eq!(added_item["item"]["name"], "spawn_agent");
+    assert_eq!(added_item["item"]["namespace"], "collaboration");
+    let done_item = events
+        .iter()
+        .find(|event| {
+            event["type"] == "response.output_item.done" && event["item"]["type"] == "function_call"
+        })
+        .unwrap();
+    assert_eq!(done_item["item"]["name"], "spawn_agent");
+    assert_eq!(done_item["item"]["namespace"], "collaboration");
+    assert_eq!(done_item["item"]["arguments"], r#"{"message":"hi"}"#);
+    let completed = events
+        .iter()
+        .find(|event| event["type"] == "response.completed")
+        .unwrap();
+    let output = completed["response"]["output"].as_array().unwrap();
+    assert_eq!(output[0]["name"], "spawn_agent");
+    assert_eq!(output[0]["namespace"], "collaboration");
+
+    let foreign = StreamEvent::ToolCallStart {
+        index: 0,
+        id: "call_ns".into(),
+        name: "collaboration__spawn_agent".into(),
+        namespace: Some("collaboration".into()),
+    };
+    let mut chat_encoder = chat::ChatChunkEncoder::new("mock-model", false);
+    let chat_wire = chat_encoder.encode(&foreign).unwrap();
+    assert!(chat_wire.contains("collaboration__spawn_agent"));
+    assert!(!chat_wire.contains("\"namespace\""));
+
+    let mut anthropic_encoder = anthropic::AnthropicStreamEncoder::new("mock-model");
+    let anthropic_wire = anthropic_encoder.encode(&foreign).unwrap();
+    assert!(anthropic_wire.contains("collaboration__spawn_agent"));
+    assert!(!anthropic_wire.contains("\"namespace\""));
+
+    let mut gemini_encoder = gemini::GeminiStreamEncoder::new("mock-model");
+    assert!(gemini_encoder.encode(&foreign).is_none());
+    let gemini_wire = gemini_encoder
+        .encode(&StreamEvent::ToolCallEnd { index: 0 })
+        .unwrap();
+    assert!(gemini_wire.contains("collaboration__spawn_agent"));
+    assert!(!gemini_wire.contains("\"namespace\""));
+}
+
+#[test]
+fn responses_stream_namespace_errors_are_fail_closed() {
+    for namespace in [json!(""), json!(42), json!(null), json!("bad__name")] {
+        let event = json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "call_id": "private",
+                "name": "spawn_agent",
+                "namespace": namespace
+            }
+        });
+        let decoded = responses::decode_chunk(&event);
+        assert!(
+            matches!(decoded.as_slice(), [StreamEvent::Error { .. }]),
+            "{event}"
+        );
+        assert!(
+            !decoded
+                .iter()
+                .any(|event| matches!(event, StreamEvent::ToolCallStart { .. }))
+        );
+    }
 }

@@ -685,6 +685,7 @@ impl AnthropicStreamDecoder {
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_owned(),
+                        namespace: None,
                     });
                 }
             }
@@ -1078,7 +1079,9 @@ impl AnthropicStreamEncoder {
                 ));
                 Some(out)
             }
-            StreamEvent::ToolCallStart { index, id, name } => {
+            StreamEvent::ToolCallStart {
+                index, id, name, ..
+            } => {
                 self.pending_thinking = false;
                 let mut out = self.start_message();
                 let block_index = self.next_index;

@@ -136,7 +136,8 @@ fn image_after_tool_flushes_complete_arguments_before_its_payload() {
             .encode(&StreamEvent::ToolCallStart {
                 index: 0,
                 id: "call_1".into(),
-                name: "draw".into()
+                name: "draw".into(),
+                namespace: None,
             })
             .is_none()
     );

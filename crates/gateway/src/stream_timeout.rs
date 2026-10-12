@@ -337,6 +337,7 @@ mod tests {
                 index: 0,
                 id: "call".into(),
                 name: "tool".into(),
+                namespace: None,
             },
             StreamEvent::ToolCallDelta {
                 index: 0,

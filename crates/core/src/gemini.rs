@@ -1034,7 +1034,12 @@ impl GeminiStreamDecoder {
                     .cloned()
                     .unwrap_or_else(|| json!({}))
                     .to_string();
-                out.push(StreamEvent::ToolCallStart { index, id, name });
+                out.push(StreamEvent::ToolCallStart {
+                    index,
+                    id,
+                    name,
+                    namespace: None,
+                });
                 out.push(StreamEvent::ToolCallDelta { index, args });
                 if let Some(signature) = get_either(part, "thoughtSignature", "thought_signature")
                     .and_then(Value::as_str)
@@ -1241,7 +1246,9 @@ impl GeminiStreamEncoder {
                 frame.push_str(&self.sse(json!([attachment_value(image)]), None, false));
                 Some(frame)
             }
-            StreamEvent::ToolCallStart { index, id, name } => {
+            StreamEvent::ToolCallStart {
+                index, id, name, ..
+            } => {
                 let frame = self.flush_tool();
                 self.tool = Some(PendingTool {
                     index: *index,

@@ -93,6 +93,25 @@ fn wire_name(name: &str, namespace: Option<&str>) -> String {
         .to_owned()
 }
 
+/// Decode a streamed Responses function-call identity into the shared IR.
+/// Responses carries the namespace separately; other dialects only see the
+/// flattened name, so the namespace is retained only as source metadata.
+fn stream_tool_identity(item: &Value) -> Result<(String, Option<String>)> {
+    if item.get("namespace").is_some() {
+        let namespace = component(item.get("namespace"), "namespace")?;
+        let name = component(item.get("name"), "name")?;
+        Ok((flat_name(&namespace, &name), Some(namespace)))
+    } else {
+        Ok((
+            item.get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            None,
+        ))
+    }
+}
+
 fn component(v: Option<&Value>, field: &'static str) -> Result<String> {
     let value = v.and_then(Value::as_str).ok_or(missing(field))?;
     if value.is_empty() || value.contains("__") {
@@ -761,19 +780,21 @@ pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
             }
             let index = v.get("output_index").and_then(Value::as_u64).unwrap_or(0) as usize;
             if v.pointer("/item/type").and_then(Value::as_str) == Some("function_call") {
-                out.push(StreamEvent::ToolCallStart {
-                    index,
-                    id: v
-                        .pointer("/item/call_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    name: v
-                        .pointer("/item/name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                });
+                match stream_tool_identity(v.get("item").unwrap_or(&Value::Null)) {
+                    Ok((name, namespace)) => out.push(StreamEvent::ToolCallStart {
+                        index,
+                        id: v
+                            .pointer("/item/call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        name,
+                        namespace,
+                    }),
+                    Err(_) => out.push(StreamEvent::Error {
+                        message: "invalid namespaced function call".into(),
+                    }),
+                }
             }
         }
         "response.output_item.done" => {
@@ -787,7 +808,13 @@ pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
             }
             let index = v.get("output_index").and_then(Value::as_u64).unwrap_or(0) as usize;
             if v.pointer("/item/type").and_then(Value::as_str) == Some("function_call") {
-                out.push(StreamEvent::ToolCallEnd { index });
+                if stream_tool_identity(v.get("item").unwrap_or(&Value::Null)).is_ok() {
+                    out.push(StreamEvent::ToolCallEnd { index });
+                } else {
+                    out.push(StreamEvent::Error {
+                        message: "invalid namespaced function call".into(),
+                    });
+                }
             }
             if let Some(search) = v.get("item").and_then(decode_search) {
                 out.push(StreamEvent::Search {
@@ -891,7 +918,9 @@ struct OpenItem {
 struct ToolItem {
     id: String,
     call_id: String,
+    /// Responses wire name (without the namespace prefix).
     name: String,
+    namespace: Option<String>,
     args: String,
     output_index: usize,
 }
@@ -1185,34 +1214,50 @@ impl ResponsesStreamEncoder {
                     .push_str(text);
                 Some(out)
             }
-            StreamEvent::ToolCallStart { index, id, name } => {
+            StreamEvent::ToolCallStart {
+                index,
+                id,
+                name,
+                namespace,
+            } => {
                 let mut out = self.ensure_created();
                 out.push_str(&self.close_message());
                 out.push_str(&self.close_reasoning());
                 let item_id = self.next_id("fc");
                 let output_index = self.next_index;
                 self.next_index += 1;
+                let valid_namespace = namespace.as_deref().filter(|ns| {
+                    name.strip_prefix(&format!("{ns}__"))
+                        .is_some_and(|wire| !wire.is_empty())
+                });
+                let wire = wire_name(name, valid_namespace);
                 self.tools.insert(
                     *index,
                     ToolItem {
                         id: item_id.clone(),
                         call_id: id.clone(),
-                        name: name.clone(),
+                        name: wire.clone(),
+                        namespace: valid_namespace.map(str::to_owned),
                         args: String::new(),
                         output_index,
                     },
                 );
+                let mut item = json!({
+                    "id": item_id, "type": "function_call", "call_id": id,
+                    "name": wire, "arguments": "", "status": "in_progress"
+                });
+                if let Some(namespace) = valid_namespace {
+                    item["namespace"] = json!(namespace);
+                }
                 out.push_str(&event(
                     "response.output_item.added",
-                    json!({"output_index": output_index, "item": {
-                        "id": item_id, "type": "function_call", "call_id": id,
-                        "name": name, "arguments": "", "status": "in_progress"
-                    }}),
+                    json!({"output_index": output_index, "item": item}),
                 ));
                 Some(out)
             }
             StreamEvent::ToolCallDelta { index, args } => {
-                let tool = self.tools.get(index)?;
+                let tool = self.tools.get_mut(index)?;
+                tool.args.push_str(args);
                 Some(event(
                     "response.function_call_arguments.delta",
                     json!({"item_id": tool.id, "output_index": tool.output_index, "delta": args}),
@@ -1220,10 +1265,13 @@ impl ResponsesStreamEncoder {
             }
             StreamEvent::ToolCallEnd { index } => {
                 let tool = self.tools.remove(index)?;
-                let done = json!({
+                let mut done = json!({
                     "id": tool.id, "type": "function_call", "call_id": tool.call_id,
                     "name": tool.name, "arguments": tool.args, "status": "completed",
                 });
+                if let Some(namespace) = tool.namespace {
+                    done["namespace"] = json!(namespace);
+                }
                 self.output.push(done.clone());
                 Some(event(
                     "response.output_item.done",

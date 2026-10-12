@@ -554,6 +554,7 @@ pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
                     index,
                     id: id.to_owned(),
                     name: name.to_owned(),
+                    namespace: None,
                 });
             }
             if let Some(a) = c.pointer("/function/arguments").and_then(Value::as_str)
@@ -659,7 +660,9 @@ impl ChatChunkEncoder {
                 json!({"reasoning_content": text}),
                 None,
             ))),
-            StreamEvent::ToolCallStart { index, id, name } => Some(sse(&chunk(
+            StreamEvent::ToolCallStart {
+                index, id, name, ..
+            } => Some(sse(&chunk(
                 &self.id,
                 &self.model,
                 self.created,

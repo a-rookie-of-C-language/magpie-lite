@@ -66,8 +66,11 @@ pub enum StreamEvent {
         index: usize,
         /// Call id.
         id: String,
-        /// Tool name.
+        /// Tool name in the protocol-neutral (possibly flattened) namespace.
         name: String,
+        /// Native tool namespace, when the source protocol carries one.
+        /// Foreign encoders intentionally ignore it.
+        namespace: Option<String>,
     },
     /// A fragment of a tool call's JSON arguments.
     ToolCallDelta {
