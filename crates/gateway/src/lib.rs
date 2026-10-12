@@ -8,6 +8,7 @@ mod provider_tools;
 mod providers;
 pub mod server;
 mod stream_keepalive;
+mod stream_loop;
 mod stream_status;
 mod stream_timeout;
 pub mod upstream;

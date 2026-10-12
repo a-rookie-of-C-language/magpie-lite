@@ -25,6 +25,7 @@ use crate::config::{Config, GroupConfig, Protocol, ProviderConfig};
 use crate::config_store::{ConfigStore, IdempotencyRequest};
 use crate::cooldown::quota_cooldown;
 use crate::stream_keepalive::{self, Keepalive, UpstreamActivity};
+use crate::stream_loop::LoopGuard;
 use crate::stream_timeout::{GroupFirstToken, ResponsesHold, StreamClock, StreamTimeout};
 use crate::upstream;
 use crate::usage::{RequestLog, RequestTracker};
@@ -1041,6 +1042,7 @@ async fn send_with_fallback(
                         tracker,
                         clock,
                         liveness,
+                        config.stream_loop_guard,
                     ))
                     .await
                 {
@@ -1428,6 +1430,7 @@ async fn prefetch_stream(
     tracker: &mut RequestTracker,
     clock: StreamClock,
     liveness: &StreamLiveness,
+    loop_guard_enabled: bool,
 ) -> (UpstreamEvents, Option<StreamFailure>) {
     const MAX_OPENING_EVENTS: usize = 64;
     const MAX_OPENING_METADATA_BYTES: usize = 64 * 1024;
@@ -1438,6 +1441,7 @@ async fn prefetch_stream(
         clock,
         liveness.activity.clone(),
         liveness.responses_hold,
+        loop_guard_enabled,
     ));
     let mut prefix = Vec::new();
     while let Some(read) = reads.next().await {
@@ -1505,12 +1509,14 @@ fn upstream_events(
     mut clock: StreamClock,
     activity: UpstreamActivity,
     responses_hold: ResponsesHold,
+    loop_guard_enabled: bool,
 ) -> impl futures::Stream<Item = UpstreamRead> {
     async_stream::stream! {
         let mut bytes = response.bytes_stream();
         let mut parser = SseParser::new();
         let mut decoders = UpstreamDecoders::new();
         let mut chat_stopped = false;
+        let mut loop_guard = loop_guard_enabled.then(LoopGuard::default);
         let mut hold = Some(responses_hold);
         let mut opening_held = false;
         loop {
@@ -1559,7 +1565,12 @@ fn upstream_events(
                         _ => hold = None,
                     }
                     chat_stopped |= protocol == Protocol::Chat && matches!(event.event, StreamEvent::Stop(_));
+                    let trip = loop_guard.as_mut().and_then(|guard| guard.observe(&event.event));
                     yield event.into();
+                    if let Some(trip) = trip {
+                        yield StreamEvent::Error { message: trip.message().into() }.into();
+                        return;
+                    }
                 }
             }
         }
@@ -1568,7 +1579,12 @@ fn upstream_events(
             Ok(Some(data)) => {
                 for event in decode_upstream_data(protocol, &data, &mut decoders) {
                     chat_stopped |= protocol == Protocol::Chat && matches!(event.event, StreamEvent::Stop(_));
+                    let trip = loop_guard.as_mut().and_then(|guard| guard.observe(&event.event));
                     yield event.into();
+                    if let Some(trip) = trip {
+                        yield StreamEvent::Error { message: trip.message().into() }.into();
+                        return;
+                    }
                 }
             }
             Ok(None) => {}

@@ -654,6 +654,9 @@ pub struct ConfigSnapshot {
     pub stream_keepalive_max_silence_ms: u64,
     /// Responses opening-event hold budget across all attempts; zero disables it.
     pub stream_responses_hold_timeout_ms: u64,
+    /// Whether long text/reasoning repetition loops are terminated.
+    #[serde(default = "default_stream_loop_guard")]
+    pub stream_loop_guard: bool,
     /// Upstream routing metadata.
     pub providers: Vec<ProviderConfigSnapshot>,
     /// Named route chains.
@@ -694,6 +697,10 @@ pub struct Config {
     /// Zero disables it. Releasing actual metadata commits the current attempt.
     #[serde(default = "default_stream_responses_hold_timeout_ms")]
     pub stream_responses_hold_timeout_ms: u64,
+    /// Stop streamed text/reasoning that is stuck in a long repetition loop.
+    /// Enabled by default; tool arguments and nonstreaming replies are excluded.
+    #[serde(default = "default_stream_loop_guard")]
+    pub stream_loop_guard: bool,
     /// Optional JSONL file for sanitized request-history metadata. Setting this
     /// makes recent `/stats` records survive gateway restarts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -734,6 +741,10 @@ fn default_stream_responses_hold_timeout_ms() -> u64 {
     240_000
 }
 
+fn default_stream_loop_guard() -> bool {
+    true
+}
+
 fn default_token() -> String {
     "magpie-lite".to_owned()
 }
@@ -750,6 +761,7 @@ impl Default for Config {
             stream_keepalive_interval_ms: default_stream_keepalive_interval_ms(),
             stream_keepalive_max_silence_ms: default_stream_keepalive_max_silence_ms(),
             stream_responses_hold_timeout_ms: default_stream_responses_hold_timeout_ms(),
+            stream_loop_guard: default_stream_loop_guard(),
             history_path: None,
             provider: Vec::new(),
             group: Vec::new(),
@@ -905,6 +917,7 @@ impl Config {
             stream_keepalive_interval_ms: self.stream_keepalive_interval_ms,
             stream_keepalive_max_silence_ms: self.stream_keepalive_max_silence_ms,
             stream_responses_hold_timeout_ms: self.stream_responses_hold_timeout_ms,
+            stream_loop_guard: self.stream_loop_guard,
             providers: self
                 .provider
                 .iter()
@@ -1416,5 +1429,30 @@ routes = ["mock/model"]
         assert_eq!(config.key_cooldown_for(&provider), Duration::from_secs(60));
         provider.key_cooldown_ms = Some(0);
         assert_eq!(config.key_cooldown_for(&provider), Duration::ZERO);
+    }
+}
+
+#[cfg(test)]
+mod loop_guard_config_tests {
+    use super::*;
+
+    #[test]
+    fn loop_guard_defaults_enabled_and_roundtrips_explicit_disable_and_snapshot() {
+        let legacy: Config = toml::from_str("").unwrap();
+        assert!(legacy.stream_loop_guard);
+        assert!(legacy.snapshot().stream_loop_guard);
+        assert!(Config::default().stream_loop_guard);
+        let disabled: Config = toml::from_str("stream_loop_guard = false").unwrap();
+        assert!(!disabled.stream_loop_guard);
+        assert!(!disabled.snapshot().stream_loop_guard);
+        let encoded = toml::to_string(&disabled).unwrap();
+        assert!(encoded.contains("stream_loop_guard = false"));
+        assert!(
+            !toml::from_str::<Config>(&encoded)
+                .unwrap()
+                .stream_loop_guard
+        );
+        assert!(toml::from_str::<Config>("stream_loop_guard = 0").is_err());
+        assert!(toml::from_str::<Config>("stream_loop_guard = \"false\"").is_err());
     }
 }

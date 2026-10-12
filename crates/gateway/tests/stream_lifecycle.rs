@@ -3691,3 +3691,297 @@ async fn group_first_token_socket_disconnect_after_failover_persists_only_last_a
         }
     }
 }
+
+fn loop_delta(protocol: Protocol, reasoning: bool, text: &str) -> String {
+    let value = match (protocol, reasoning) {
+        (Protocol::Chat, false) => json!({"choices":[{"delta":{"content":text}}]}),
+        (Protocol::Chat, true) => json!({"choices":[{"delta":{"reasoning_content":text}}]}),
+        (Protocol::Anthropic, false) => {
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}})
+        }
+        (Protocol::Anthropic, true) => {
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":text}})
+        }
+        (Protocol::Responses, false) => json!({"type":"response.output_text.delta","delta":text}),
+        (Protocol::Responses, true) => {
+            json!({"type":"response.reasoning_summary_text.delta","delta":text})
+        }
+        (Protocol::Gemini, _) => {
+            json!({"candidates":[{"content":{"parts":[{"text":text,"thought":reasoning}]}}]})
+        }
+    };
+    format!("data: {value}\n\n")
+}
+
+#[tokio::test]
+async fn loop_guard_ends_text_and_reasoning_without_retry_for_every_protocol_pair() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            for reasoning in [false, true] {
+                for grouped in [false, true] {
+                    let mut script = prefix(upstream);
+                    for _ in 0..300 {
+                        script += &loop_delta(
+                            upstream,
+                            reasoning,
+                            "Now. Writing. Go. Let me write. OK. Here. Produce.\n",
+                        );
+                    }
+                    script += &loop_delta(upstream, false, "SHOULD-NOT-LEAK");
+                    script += completion(upstream);
+                    let f = Fixture::with_chunk_size(
+                        upstream,
+                        vec![script, prefix(upstream) + completion(upstream)],
+                        Ending::Hold,
+                        4096,
+                        |config| {
+                            disable_stream_deadlines(config);
+                            configure_timeout_fallback(config, grouped);
+                        },
+                    )
+                    .await;
+                    let model = if grouped {
+                        "group/daily"
+                    } else {
+                        "mock/up-model"
+                    };
+                    let body =
+                        tokio::time::timeout(LIMIT, f.request_model(client, model).await.text())
+                            .await
+                            .expect(
+                                "loop guard must terminate even with upstream timeouts disabled",
+                            )
+                            .unwrap();
+                    let channel = if reasoning { "reasoning" } else { "text" };
+                    assert_one_stream_error(
+                        &body,
+                        client,
+                        &format!("model's {channel} was stuck in a loop"),
+                    );
+                    assert!(body.contains("partial"), "{body}");
+                    assert!(body.contains("Now."), "{body}");
+                    assert!(!body.contains("SHOULD-NOT-LEAK"), "{body}");
+                    assert_no_success(&body);
+                    assert_eq!(
+                        *f.attempts.lock().unwrap(),
+                        [0],
+                        "no key/provider/group replay"
+                    );
+                    let record = f.record().await;
+                    assert_eq!(record["status"], "upstream_stream_error");
+                    assert_eq!(record["provider"], "mock");
+                    assert_partial_usage(&record, upstream);
+                    assert!(!record.to_string().contains("Now."));
+                    assert!(
+                        f.state
+                            .key_rotation
+                            .cooldown_snapshot(&f.state.config.current())
+                            .is_empty()
+                    );
+                    f.assert_released().await;
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn loop_guard_pure_reasoning_aliases_and_run_on_loops_obey_disable_setting() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            for enabled in [false, true] {
+                let script = opening(upstream).replace(":99", ":7")
+                    + &loop_delta(upstream, true, &"mcp ".repeat(4096))
+                    + &loop_delta(upstream, false, "after-loop")
+                    + completion(upstream);
+                // Exercise Chat's alternate reasoning field and raw Responses
+                // reasoning, with neither an earlier nor a simultaneous text delta.
+                let script = script.replace("reasoning_content", "reasoning").replace(
+                    "response.reasoning_summary_text.delta",
+                    "response.reasoning_text.delta",
+                );
+                let f = Fixture::with_chunk_size(
+                    upstream,
+                    vec![script],
+                    Ending::Hold,
+                    4096,
+                    |config| {
+                        disable_stream_deadlines(config);
+                        config.stream_loop_guard = enabled;
+                    },
+                )
+                .await;
+                let body = tokio::time::timeout(LIMIT, f.request(client).await.text())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if enabled {
+                    assert_one_stream_error(&body, client, "model's reasoning was stuck in a loop");
+                    assert!(!body.contains("after-loop"), "{body}");
+                    assert_no_success(&body);
+                    assert_eq!(f.record().await["status"], "upstream_stream_error");
+                } else {
+                    assert_completed(&body, client);
+                    assert!(body.contains("after-loop"), "{body}");
+                    assert!(!body.contains("stuck in a loop"), "{body}");
+                    assert_eq!(f.record().await["status"], "ok");
+                }
+                assert!(body.contains("mcp"));
+                f.assert_released().await;
+            }
+        }
+    }
+}
+
+fn repetitive_tool_call(protocol: Protocol) -> String {
+    let args = json!({"contents":"Now.\n".repeat(400)}).to_string();
+    let events = match protocol {
+        Protocol::Chat => vec![
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_loop","function":{"name":"write","arguments":args}}]}}]}),
+        ],
+        Protocol::Anthropic => vec![
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_loop","name":"write","input":{}}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":args}}),
+            json!({"type":"content_block_stop","index":1}),
+        ],
+        Protocol::Responses => vec![
+            json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_loop","name":"write"}}),
+            json!({"type":"response.function_call_arguments.delta","output_index":1,"delta":args}),
+            json!({"type":"response.output_item.done","output_index":1,"item":{"type":"function_call"}}),
+        ],
+        Protocol::Gemini => vec![
+            json!({"candidates":[{"content":{"parts":[{"functionCall":{"id":"call_loop","name":"write","args":serde_json::from_str::<Value>(&args).unwrap()}}]}}]}),
+        ],
+    };
+    events
+        .iter()
+        .map(|value| format!("data: {value}\n\n"))
+        .collect()
+}
+
+#[tokio::test]
+async fn loop_guard_does_not_treat_tool_arguments_or_normal_code_as_prose_loops() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            let code = (0..300)
+                .map(|i| format!("fn item_{i}() {{ return {i}; }}\n| row {i} | cell {i} |\n"))
+                .collect::<String>();
+            let script = prefix(upstream)
+                + &repetitive_tool_call(upstream)
+                + &loop_delta(upstream, false, &code)
+                + completion(upstream);
+            let f = Fixture::with_chunk_size(
+                upstream,
+                vec![script],
+                Ending::Hold,
+                4096,
+                disable_stream_deadlines,
+            )
+            .await;
+            let body = tokio::time::timeout(LIMIT, f.request(client).await.text())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_completed(&body, client);
+            assert!(body.contains("item_299"));
+            assert!(body.contains("call_loop"));
+            assert!(body.contains("Now."));
+            assert!(!body.contains("stuck in a loop"));
+            assert_eq!(f.record().await["status"], "ok");
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn loop_guard_checks_unterminated_final_frame_without_success_or_replay() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            let script =
+                prefix(upstream) + loop_delta(upstream, false, &"Now.\n".repeat(300)).trim_end();
+            let f = Fixture::with_config(
+                upstream,
+                vec![script, prefix(upstream) + completion(upstream)],
+                Ending::Eof,
+                |config| {
+                    disable_stream_deadlines(config);
+                    configure_timeout_fallback(config, false);
+                },
+            )
+            .await;
+            let body = tokio::time::timeout(LIMIT, f.request(client).await.text())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_one_stream_error(&body, client, "model's text was stuck in a loop");
+            assert_no_success(&body);
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            assert_eq!(f.record().await["status"], "upstream_stream_error");
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn loop_guard_is_pinned_per_request_and_fresh_for_following_requests() {
+    let f = Fixture::with_config(
+        Protocol::Chat,
+        vec![prefix(Protocol::Chat)],
+        Ending::Paced(vec![(
+            Duration::from_millis(200),
+            loop_delta(Protocol::Chat, true, &"Now.\n".repeat(300)) + completion(Protocol::Chat),
+        )]),
+        disable_stream_deadlines,
+    )
+    .await;
+    let mut response = f.request(Protocol::Chat).await;
+    let mut body = read_through(&mut response, "partial").await;
+    f.state
+        .config
+        .update(|config| {
+            config.stream_loop_guard = false;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    body += &tokio::time::timeout(LIMIT, response.text())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_one_stream_error(
+        &body,
+        Protocol::Chat,
+        "model's reasoning was stuck in a loop",
+    );
+    assert_no_success(&body);
+    let body = tokio::time::timeout(LIMIT, f.request(Protocol::Chat).await.text())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_completed(&body, Protocol::Chat);
+    assert!(!body.contains("stuck in a loop"));
+    assert_eq!(*f.attempts.lock().unwrap(), [0, 0]);
+    f.assert_released().await;
+    assert_eq!(f.log.lock().unwrap().snapshot().recent_requests.len(), 2);
+
+    // Neither channel's window is carried into the next request.
+    let script = prefix(Protocol::Chat)
+        + &loop_delta(Protocol::Chat, true, &"Now.\n".repeat(200))
+        + completion(Protocol::Chat);
+    let f = Fixture::with_config(
+        Protocol::Chat,
+        vec![script],
+        Ending::Hold,
+        disable_stream_deadlines,
+    )
+    .await;
+    for _ in 0..2 {
+        let body = tokio::time::timeout(LIMIT, f.request(Protocol::Chat).await.text())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_completed(&body, Protocol::Chat);
+        assert!(!body.contains("stuck in a loop"));
+    }
+    f.assert_released().await;
+}

@@ -531,7 +531,7 @@ pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
                 out.push(StreamEvent::TextDelta { text: t.to_owned() });
             }
         }
-        "response.reasoning_summary_text.delta" => {
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
             if let Some(t) = v.get("delta").and_then(Value::as_str)
                 && !t.is_empty()
             {

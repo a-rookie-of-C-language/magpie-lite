@@ -199,6 +199,7 @@ async fn spawn_gateway_with_protocol_and_history(
         stream_keepalive_interval_ms: Config::default().stream_keepalive_interval_ms,
         stream_keepalive_max_silence_ms: Config::default().stream_keepalive_max_silence_ms,
         stream_responses_hold_timeout_ms: Config::default().stream_responses_hold_timeout_ms,
+        stream_loop_guard: Config::default().stream_loop_guard,
         history_path,
         default_provider: "mock".into(),
         provider: vec![ProviderConfig {
@@ -636,6 +637,7 @@ async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) ->
         stream_keepalive_interval_ms: Config::default().stream_keepalive_interval_ms,
         stream_keepalive_max_silence_ms: Config::default().stream_keepalive_max_silence_ms,
         stream_responses_hold_timeout_ms: Config::default().stream_responses_hold_timeout_ms,
+        stream_loop_guard: Config::default().stream_loop_guard,
         history_path: None,
         default_provider: "primary".into(),
         provider: providers,
@@ -667,6 +669,7 @@ async fn spawn_gateway_with_fallback(primary: String, backup: String) -> String 
         stream_keepalive_interval_ms: Config::default().stream_keepalive_interval_ms,
         stream_keepalive_max_silence_ms: Config::default().stream_keepalive_max_silence_ms,
         stream_responses_hold_timeout_ms: Config::default().stream_responses_hold_timeout_ms,
+        stream_loop_guard: Config::default().stream_loop_guard,
         history_path: None,
         default_provider: "primary".into(),
         provider: vec![
@@ -726,6 +729,7 @@ async fn spawn_gateway_with_same_provider_group(upstream: String) -> String {
         stream_keepalive_interval_ms: Config::default().stream_keepalive_interval_ms,
         stream_keepalive_max_silence_ms: Config::default().stream_keepalive_max_silence_ms,
         stream_responses_hold_timeout_ms: Config::default().stream_responses_hold_timeout_ms,
+        stream_loop_guard: Config::default().stream_loop_guard,
         history_path: None,
         default_provider: "mock".into(),
         provider: vec![ProviderConfig {
@@ -779,6 +783,7 @@ async fn spawn_gateway_with_group(
         stream_keepalive_interval_ms: Config::default().stream_keepalive_interval_ms,
         stream_keepalive_max_silence_ms: Config::default().stream_keepalive_max_silence_ms,
         stream_responses_hold_timeout_ms: Config::default().stream_responses_hold_timeout_ms,
+        stream_loop_guard: Config::default().stream_loop_guard,
         history_path: None,
         default_provider: "primary".into(),
         provider: vec![

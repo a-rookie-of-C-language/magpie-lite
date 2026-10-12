@@ -94,3 +94,25 @@ fn responses_stream_errors_decode_supported_envelopes_without_success() {
         }]
     );
 }
+
+#[test]
+fn responses_reasoning_delta_aliases_are_nonempty_thinking_not_visible_text() {
+    for kind in [
+        "response.reasoning_summary_text.delta",
+        "response.reasoning_text.delta",
+    ] {
+        assert_eq!(
+            responses::decode_chunk(&json!({"type": kind, "delta": "Now.\n"})),
+            vec![StreamEvent::ThinkingDelta {
+                text: "Now.\n".into()
+            }]
+        );
+        for delta in [
+            json!(""),
+            serde_json::Value::Null,
+            json!({"text": "not a string"}),
+        ] {
+            assert!(responses::decode_chunk(&json!({"type": kind, "delta": delta})).is_empty());
+        }
+    }
+}
