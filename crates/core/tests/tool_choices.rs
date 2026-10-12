@@ -249,3 +249,39 @@ fn allowlist_encoding_does_not_mutate_the_shared_request() {
         assert_eq!(format!("{request:?}"), before);
     }
 }
+
+#[test]
+fn hosted_search_cannot_bypass_gemini_native_only_or_malformed_constraints() {
+    for config in [
+        json!({"functionCallingConfig":{"mode":"VALIDATED"}}),
+        json!({"functionCallingConfig":{"mode":"VALIDATED","allowedFunctionNames":["safeB"]}}),
+        json!({"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["safeB"],"future_restriction":true}}),
+    ] {
+        let mut request = json!({"model":"m","contents":[],"tools":[{"googleSearch":{}},{"functionDeclarations":[{"name":"safeB","parameters":{"type":"object"}}]}]});
+        request["toolConfig"] = config.clone();
+        let r = gemini::decode_request(&request).unwrap();
+        assert_eq!(encode(3, &r).unwrap()["toolConfig"], config);
+        for target in 0..3 {
+            assert!(
+                encode(target, &r).is_err(),
+                "target={target} config={config}"
+            );
+        }
+    }
+    for config in [
+        json!({"functionCallingConfig":{"mode":42}}),
+        json!({"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["safeA"],"allowed_function_names":["safeB"]}}),
+        json!({"functionCallingConfig":{"mode":"ANY"},"function_calling_config":{"mode":"NONE"}}),
+    ] {
+        let r = gemini::decode_request(
+            &json!({"model":"m","contents":[],"tools":[{"googleSearch":{}}],"toolConfig":config}),
+        )
+        .unwrap();
+        for target in 0..4 {
+            assert!(
+                encode(target, &r).is_err(),
+                "target={target} config={config}"
+            );
+        }
+    }
+}

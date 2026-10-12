@@ -234,8 +234,11 @@ pub(crate) fn prepare(
         return Ok(Cow::Borrowed(req));
     };
     let allowed_tools = raw.get("type").is_some_and(|v| v == "allowed_tools");
-    if req.web_search.is_some() && !allowed_tools {
-        // Hosted search has its own native-only and function/global-choice contract.
+    let search_owns_choice = req.web_search.is_some() && !allowed_tools;
+    let gemini_function_config =
+        raw.get("functionCallingConfig").is_some() || raw.get("function_calling_config").is_some();
+    if search_owns_choice && !gemini_function_config {
+        // Hosted search owns its separate built-in and global/function choices.
         return Ok(Cow::Borrowed(req));
     }
     let selection = parse(raw)?;
@@ -243,6 +246,11 @@ pub(crate) fn prepare(
         return Err(invalid(
             "native tool selection restrictions cannot be translated to this provider protocol",
         ));
+    }
+    if search_owns_choice {
+        // Validate Gemini policies before delegating search-specific translation.
+        // VALIDATED permits text as well as calls; search must not turn it into ANY.
+        return Ok(Cow::Borrowed(req));
     }
     let mut prepared = req.clone();
     if let Some(allowed) = &selection.allowed {
