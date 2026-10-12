@@ -1571,7 +1571,7 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
             let mut continued = empty_retries > 0;
             let mut usage_since_retry = false;
             let empty_limit = if group_plan.is_some() { 1 } else { 2 };
-            let mut emitted_text_or_tool = false;
+            let mut emitted_answer = false;
             'attempt: loop {
                 while let Some(item) = events.next().await {
                     let mut event = item.event;
@@ -1592,17 +1592,12 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
                     // second response.created/message_start/chunk opening.
                     let suppress_start = reasked && matches!(event, StreamEvent::Start { .. });
 
-                    let text_or_tool = match &event {
-                        StreamEvent::TextDelta { text } => !text.is_empty(),
-                        StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallEnd { .. } => true,
-                        StreamEvent::ToolCallDelta { args, .. } => !args.is_empty(),
-                        _ => false,
-                    };
-                    emitted_text_or_tool |= text_or_tool || item.answer_observed;
+                    let answer = event.is_answer();
+                    emitted_answer |= answer || item.answer_observed;
 
-                    let retry_reasoning = item.loop_reasoning && !reasoning_reasked && !emitted_text_or_tool;
+                    let retry_reasoning = item.loop_reasoning && !reasoning_reasked && !emitted_answer;
                     let retry_empty = reask_allowed && item.failure.as_ref().is_some_and(|f| f.kind == FailureKind::EmptyReply)
-                        && empty_retries < empty_limit && !emitted_text_or_tool;
+                        && empty_retries < empty_limit && !emitted_answer;
                     if retry_reasoning || retry_empty {
                         // Preserve any reasoning already sent; replace only the
                         // internally classified terminal with a bounded

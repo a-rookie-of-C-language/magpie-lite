@@ -172,12 +172,7 @@ pub(crate) fn has_answer(protocol: Protocol, value: &Value, reasoning: bool) -> 
 }
 
 pub(crate) fn event_answers(event: &StreamEvent) -> bool {
-    match event {
-        StreamEvent::TextDelta { text } => !text.is_empty(),
-        StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallEnd { .. } => true,
-        StreamEvent::ToolCallDelta { args, .. } => !args.is_empty(),
-        _ => false,
-    }
+    event.is_answer()
 }
 
 #[cfg(test)]

@@ -795,6 +795,8 @@ impl ResponsesStreamEncoder {
                 }
                 Some(self.ensure_created())
             }
+            // Image output currently has a native mapping only in Gemini.
+            StreamEvent::Image { .. } => None,
             StreamEvent::TextDelta { text } => {
                 let mut out = self.ensure_created();
                 if self.open_message.is_none() {

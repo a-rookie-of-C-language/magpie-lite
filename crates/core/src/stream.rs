@@ -1,7 +1,7 @@
 //! Streaming: the protocol-neutral event set every SSE dialect is decoded
 //! into, and a small server-sent-events frame parser.
 
-use crate::ir::{StopReason, Usage};
+use crate::ir::{Part, StopReason, Usage};
 
 /// One thing that happened in a streamed completion.
 #[derive(Debug, Clone, PartialEq)]
@@ -15,6 +15,11 @@ pub enum StreamEvent {
     TextDelta {
         /// The fragment.
         text: String,
+    },
+    /// A complete visible image, inline or by URL; never a reasoning draft.
+    Image {
+        /// Image media, payload/reference and optional provider signature.
+        image: Box<Part>,
     },
     /// A fragment of reasoning text.
     ThinkingDelta {
@@ -53,6 +58,25 @@ pub enum StreamEvent {
         /// Human-readable detail.
         message: String,
     },
+}
+
+impl StreamEvent {
+    /// Whether this event carries an answer that must never be replayed.
+    /// Reasoning commits a stream but is not an answer for bounded reasks.
+    pub fn is_answer(&self) -> bool {
+        match self {
+            Self::TextDelta { text } => !text.is_empty(),
+            Self::Image { image } => !image.data.is_empty() || !image.url.is_empty(),
+            Self::ToolCallStart { .. } | Self::ToolCallEnd { .. } => true,
+            Self::ToolCallDelta { args, .. } => !args.is_empty(),
+            _ => false,
+        }
+    }
+
+    /// Visible answer or reasoning; metadata does not satisfy first content.
+    pub fn is_content(&self) -> bool {
+        self.is_answer() || matches!(self, Self::ThinkingDelta { text } if !text.is_empty())
+    }
 }
 
 /// Default byte budget for one raw SSE event, including nonempty lines and

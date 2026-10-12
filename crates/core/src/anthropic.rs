@@ -601,6 +601,8 @@ impl AnthropicStreamEncoder {
                 }
                 Some(self.start_message())
             }
+            // Image output currently has a native mapping only in Gemini.
+            StreamEvent::Image { .. } => None,
             StreamEvent::TextDelta { text } => {
                 let mut out = self.start_message();
                 if self.open.as_ref().map(|(_, k)| *k) != Some(BlockKind::Text) {

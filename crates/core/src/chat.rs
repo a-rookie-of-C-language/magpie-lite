@@ -625,6 +625,8 @@ impl ChatChunkEncoder {
                     None,
                 )))
             }
+            // Image output currently has a native mapping only in Gemini.
+            StreamEvent::Image { .. } => None,
             StreamEvent::TextDelta { text } => Some(sse(&chunk(
                 &self.id,
                 &self.model,

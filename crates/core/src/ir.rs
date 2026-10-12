@@ -49,7 +49,7 @@ pub enum PartKind {
 
 /// One block of a message. Fields are shared across kinds; `kind` decides
 /// which of them carry meaning.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Part {
     /// Which block this is.
     pub kind: Option<PartKind>,

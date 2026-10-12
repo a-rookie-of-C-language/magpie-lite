@@ -99,14 +99,7 @@ impl StreamClock {
     }
 
     pub(crate) fn observe(&mut self, event: &StreamEvent) {
-        let content = match event {
-            StreamEvent::TextDelta { text } | StreamEvent::ThinkingDelta { text } => {
-                !text.is_empty()
-            }
-            StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallEnd { .. } => true,
-            StreamEvent::ToolCallDelta { args, .. } => !args.is_empty(),
-            _ => false,
-        };
+        let content = event.is_content();
         if content {
             self.first_content = None;
         }

@@ -419,8 +419,8 @@ config snapshots, client/history usage (including missing final usage), header
 deadlines and real-socket cancellation. Updated EOF and sentinel fixtures keep
 clean answered EOF separate from JSON/transport errors. Classifier unit tests
 and core finish-reason tests cover bounded state and stop/filter mapping.
-Image/search classification prevents replay but does not add image/search events
-to the stream IR. These are synthetic loopback HTTP/1.1 tests, not CodeAssist
+At that increment, image/search classification prevented replay without adding
+image/search events to the stream IR. Native image support is described below. These are synthetic loopback HTTP/1.1 tests, not CodeAssist
 subscription, paid/live Gemini, HTTP/2 or real-Agent conformance evidence.
 
 ## Accounting and cancellation
@@ -565,3 +565,27 @@ policy-error envelopes, usage, fallback, and post-commit behavior. This is not
 live-vendor validation. Lite still commits reasoning earlier than the reference;
 longer reasoning holding, broader multimodal rendering and HTTP/2 evidence remain
 open. Usage arriving after a terminal refusal is not guaranteed to be read.
+
+
+## Native Gemini image content
+
+`StreamEvent::Image` carries an IR image part. Gemini reply decoding preserves
+nonempty final inline data or file references, including MIME type and thought
+signature (camelCase and snake_case inputs). Thought/draft images and empty
+attachments do not become visible answers. Empty text in an image part does not
+mask its attachment. Native Gemini encoding flushes any pending tool before the
+image, retaining the upstream text/tool/image order. Nonstreaming replies apply
+the same final-versus-draft filtering.
+
+The shared content/answer predicates count images for first-content timing,
+stream commitment and no-replay decisions. An image followed by a refusal or
+reasoning loop cannot be retried through another key/provider/group or re-asked
+as a reasoning-only answer. Loopback tests cover both first-content deadlines,
+post-image safety/loop termination, socket cancellation and retained usage.
+Request history stores neither image data nor thought signatures. The existing
+32 MiB raw SSE-event bound still applies; this does not introduce image fetching.
+
+Only native Gemini stream output renders image events in this increment. Chat,
+Anthropic and Responses stream encoders omit them, so image-only replies to
+those clients do not gain an image presentation. Search-result stream IR,
+subscription wrappers and paid/live multimodal compatibility remain unverified.

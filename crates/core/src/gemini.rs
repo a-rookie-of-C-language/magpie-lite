@@ -356,20 +356,36 @@ fn decode_attachment(part: &Value) -> Option<Part> {
             .get("data")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        return Some(Part::image(media, data));
+        return Some(Part {
+            signature: get_either(part, "thoughtSignature", "thought_signature")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            ..Part::image(media, data)
+        });
     }
     if let Some(file) = get_either(part, "fileData", "file_data") {
         let url = file
             .get("fileUri")
             .or_else(|| file.get("file_uri"))
             .and_then(Value::as_str)?;
-        return Some(Part::image_url(url));
+        return Some(Part {
+            media_type: get_either(file, "mimeType", "mime_type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            signature: get_either(part, "thoughtSignature", "thought_signature")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            ..Part::image_url(url)
+        });
     }
     None
 }
 
 fn attachment_value(p: &Part) -> Value {
-    if !p.data.is_empty() {
+    let mut value = if !p.data.is_empty() {
         json!({
             "inlineData": {
                 "mimeType": if p.media_type.is_empty() { "image/png" } else { &p.media_type },
@@ -383,7 +399,11 @@ fn attachment_value(p: &Part) -> Value {
                 "fileUri": p.url,
             }
         })
+    };
+    if !p.signature.is_empty() {
+        value["thoughtSignature"] = json!(p.signature);
     }
+    value
 }
 
 /// Encode an IR request as a Gemini generateContent body for `model`.
@@ -587,7 +607,14 @@ fn decode_parts(parts: &[Value]) -> Vec<Part> {
             continue;
         }
         if let Some(attachment) = decode_attachment(part) {
-            out.push(attachment);
+            if !part
+                .get("thought")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                && (!attachment.data.is_empty() || !attachment.url.is_empty())
+            {
+                out.push(attachment);
+            }
             continue;
         }
         let thought = part
@@ -799,10 +826,11 @@ impl GeminiStreamDecoder {
             .and_then(Value::as_array)
             .unwrap_or(&Vec::new())
         {
-            if let Some(text) = part.get("text").and_then(Value::as_str) {
-                if text.is_empty() {
-                    continue;
-                }
+            if let Some(text) = part
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
                 if part
                     .get("thought")
                     .and_then(Value::as_bool)
@@ -816,6 +844,17 @@ impl GeminiStreamDecoder {
                         text: text.to_owned(),
                     });
                 }
+            }
+            if !part
+                .get("thought")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                && let Some(image) = decode_attachment(part)
+                && (!image.data.is_empty() || !image.url.is_empty())
+            {
+                out.push(StreamEvent::Image {
+                    image: Box::new(image),
+                });
             }
             if let Some(call) = get_either(part, "functionCall", "function_call") {
                 let index = self.next_tool_index;
@@ -964,6 +1003,11 @@ impl GeminiStreamEncoder {
                     }
                     None => chunk,
                 })
+            }
+            StreamEvent::Image { image } => {
+                let mut frame = self.flush_tool().unwrap_or_default();
+                frame.push_str(&self.sse(json!([attachment_value(image)]), None, false));
+                Some(frame)
             }
             StreamEvent::ToolCallStart { id, name, .. } => {
                 let frame = self.flush_tool();

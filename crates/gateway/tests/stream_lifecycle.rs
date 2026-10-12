@@ -5920,3 +5920,220 @@ async fn safety_unspecified_gemini_feedback_does_not_mask_refusal_or_empty_recov
         }
     }
 }
+
+// The native Gemini image path must participate in the same routing, accounting
+// and cancellation contracts as text; these are local fragmented HTTP fixtures.
+fn gemini_image_frame(draft: bool, finish: Option<&str>) -> String {
+    let mut candidate = json!({"content":{"parts":[{"thought":draft,
+        "inlineData":{"mimeType":"image/png","data":if draft {"ZHJhZnQ="} else {"aGVsbG8="}},
+        "thoughtSignature":"image-sig"}]}});
+    if let Some(finish) = finish {
+        candidate["finishReason"] = json!(finish);
+    }
+    format!(
+        "data: {}\n\n",
+        json!({"modelVersion":"up-model", "candidates":[candidate],
+        "usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}})
+    )
+}
+
+#[tokio::test]
+async fn gemini_images_native_stream_and_json_preserve_final_images_not_drafts() {
+    for stream in [false, true] {
+        let draft = gemini_image_frame(true, None);
+        let image = gemini_image_frame(false, Some("STOP"));
+        let script =
+            if stream {
+                draft + &image
+            } else {
+                let mut value: Value =
+                    serde_json::from_str(image.trim().strip_prefix("data: ").unwrap()).unwrap();
+                value["candidates"][0]["content"]["parts"].as_array_mut().unwrap().insert(0,
+                json!({"thought":true,"inlineData":{"mimeType":"image/png","data":"ZHJhZnQ="}}));
+                value.to_string()
+            };
+        let f = Fixture::new(Protocol::Gemini, script, Ending::Eof).await;
+        let (path, body) = client_request(Protocol::Gemini, "mock/up-model", stream);
+        let response = reqwest::Client::new()
+            .post(format!("{}{path}", f.gateway.url))
+            .bearer_auth("secret-local-token")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = tokio::time::timeout(LIMIT, response.text())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(body.contains("aGVsbG8="), "{body}");
+        assert!(body.contains("image-sig"), "{body}");
+        assert!(!body.contains("ZHJhZnQ="), "{body}");
+        if stream {
+            assert_completed(&body, Protocol::Gemini);
+        }
+        assert_eq!(*f.attempts.lock().unwrap(), [0]);
+        let record = f.record().await;
+        assert_eq!(record["status"], "ok");
+        assert_eq!(record["usage"]["input"], 7);
+        assert_eq!(record["usage"]["output"], 3);
+        assert!(!record.to_string().contains("aGVsbG8="));
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn gemini_image_satisfies_first_content_and_group_deadlines() {
+    for grouped in [false, true] {
+        let f = Fixture::with_config(
+            Protocol::Gemini,
+            vec![
+                gemini_image_frame(false, None),
+                prefix(Protocol::Gemini) + completion(Protocol::Gemini),
+            ],
+            Ending::Paced(vec![(
+                Duration::from_millis(650),
+                completion(Protocol::Gemini).into(),
+            )]),
+            |config| {
+                configure_timeout_fallback(config, grouped);
+                config.stream_first_content_timeout_ms = 300;
+                config.stream_idle_timeout_ms = 2_000;
+                if grouped {
+                    config.group[0].first_token_timeout_ms = 300;
+                }
+            },
+        )
+        .await;
+        let response = f
+            .request_model(
+                Protocol::Gemini,
+                if grouped {
+                    "group/daily"
+                } else {
+                    "mock/up-model"
+                },
+            )
+            .await;
+        let body = tokio::time::timeout(LIMIT, response.text())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(body.contains("aGVsbG8="), "{body}");
+        assert_completed(&body, Protocol::Gemini);
+        assert_eq!(*f.attempts.lock().unwrap(), [0]);
+        assert_eq!(f.record().await["status"], "ok");
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn gemini_image_then_filter_never_switches_configured_routes() {
+    for grouped in [false, true] {
+        let f = Fixture::with_config(
+            Protocol::Gemini,
+            vec![
+                gemini_image_frame(false, Some("SAFETY")),
+                prefix(Protocol::Gemini) + completion(Protocol::Gemini),
+            ],
+            Ending::Hold,
+            |config| configure_timeout_fallback(config, grouped),
+        )
+        .await;
+        let response = f
+            .request_model(
+                Protocol::Gemini,
+                if grouped {
+                    "group/daily"
+                } else {
+                    "mock/up-model"
+                },
+            )
+            .await;
+        let body = tokio::time::timeout(LIMIT, response.text())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(body.contains("aGVsbG8="), "{body}");
+        assert_filtered(&body, Protocol::Gemini);
+        assert!(!body.contains("upstream refused"));
+        assert_eq!(*f.attempts.lock().unwrap(), [0]);
+        assert_eq!(f.record().await["status"], "ok");
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn gemini_image_before_reasoning_loop_is_never_reasked_or_replayed() {
+    for client in PROTOCOLS {
+        let mut script = gemini_image_frame(false, None);
+        for _ in 0..300 {
+            script += &loop_delta(
+                Protocol::Gemini,
+                true,
+                "Now. Writing. Go. Let me write. OK. Here. Produce.\n",
+            );
+        }
+        let f = Fixture::with_config(
+            Protocol::Gemini,
+            vec![
+                script,
+                prefix(Protocol::Gemini) + completion(Protocol::Gemini),
+            ],
+            Ending::Hold,
+            |config| configure_timeout_fallback(config, false),
+        )
+        .await;
+        let response = f.request(client).await;
+        let body = tokio::time::timeout(LIMIT, response.text())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(body.contains("stuck in a loop"), "{body}");
+        if client == Protocol::Gemini {
+            assert_eq!(body.matches("aGVsbG8=").count(), 1);
+        }
+        assert_eq!(*f.attempts.lock().unwrap(), [0]);
+        let record = f.record().await;
+        assert_eq!(record["status"], "upstream_stream_error");
+        assert_eq!(record["usage"]["input"], 7);
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn gemini_image_client_disconnect_retains_usage_without_payload_in_history() {
+    let f = Fixture::new(
+        Protocol::Gemini,
+        gemini_image_frame(false, None),
+        Ending::Hold,
+    )
+    .await;
+    let history = f.persistent_history();
+    let mut socket = f
+        .socket_request(Protocol::Gemini, "mock/up-model", true)
+        .await;
+    use tokio::io::AsyncReadExt;
+    tokio::time::timeout(LIMIT, async {
+        let mut received = Vec::new();
+        while !String::from_utf8_lossy(&received).contains("aGVsbG8=") {
+            let mut buffer = [0; 4096];
+            let n = socket.read(&mut buffer).await.unwrap();
+            assert_ne!(n, 0, "socket ended before its image");
+            received.extend_from_slice(&buffer[..n]);
+            assert!(received.len() < 256 * 1024);
+        }
+    })
+    .await
+    .unwrap();
+    drop(socket);
+    let record = f.record().await;
+    assert_eq!(record["status"], "client_disconnected");
+    assert_eq!(record["usage"]["input"], 7);
+    assert_eq!(record["usage"]["output"], 3);
+    let persisted = std::fs::read_to_string(history.path().join("requests.jsonl")).unwrap();
+    assert!(!persisted.contains("aGVsbG8="));
+    assert!(!persisted.contains("image-sig"));
+    assert_eq!(*f.attempts.lock().unwrap(), [0]);
+    f.assert_released().await;
+}
