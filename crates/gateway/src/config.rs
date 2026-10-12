@@ -645,6 +645,8 @@ pub struct ConfigSnapshot {
     pub stream_keepalive_interval_ms: u64,
     /// Stop comments after this much upstream silence; zero disables keepalive.
     pub stream_keepalive_max_silence_ms: u64,
+    /// Responses opening-event hold budget across all attempts; zero disables it.
+    pub stream_responses_hold_timeout_ms: u64,
     /// Upstream routing metadata.
     pub providers: Vec<ProviderConfigSnapshot>,
     /// Named route chains.
@@ -681,6 +683,10 @@ pub struct Config {
     /// Zero disables keepalive; transport activity or a new attempt restarts it.
     #[serde(default = "default_stream_keepalive_max_silence_ms")]
     pub stream_keepalive_max_silence_ms: u64,
+    /// Request-wide hold budget for Responses opening events, across attempts.
+    /// Zero disables it. Releasing actual metadata commits the current attempt.
+    #[serde(default = "default_stream_responses_hold_timeout_ms")]
+    pub stream_responses_hold_timeout_ms: u64,
     /// Optional JSONL file for sanitized request-history metadata. Setting this
     /// makes recent `/stats` records survive gateway restarts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -717,6 +723,10 @@ fn default_stream_keepalive_max_silence_ms() -> u64 {
     300_000
 }
 
+fn default_stream_responses_hold_timeout_ms() -> u64 {
+    240_000
+}
+
 fn default_token() -> String {
     "magpie-lite".to_owned()
 }
@@ -732,6 +742,7 @@ impl Default for Config {
             stream_idle_timeout_ms: default_stream_idle_timeout_ms(),
             stream_keepalive_interval_ms: default_stream_keepalive_interval_ms(),
             stream_keepalive_max_silence_ms: default_stream_keepalive_max_silence_ms(),
+            stream_responses_hold_timeout_ms: default_stream_responses_hold_timeout_ms(),
             history_path: None,
             provider: Vec::new(),
             group: Vec::new(),
@@ -886,6 +897,7 @@ impl Config {
             stream_idle_timeout_ms: self.stream_idle_timeout_ms,
             stream_keepalive_interval_ms: self.stream_keepalive_interval_ms,
             stream_keepalive_max_silence_ms: self.stream_keepalive_max_silence_ms,
+            stream_responses_hold_timeout_ms: self.stream_responses_hold_timeout_ms,
             providers: self
                 .provider
                 .iter()
@@ -1023,10 +1035,12 @@ mod tests {
         assert_eq!(config.stream_idle_timeout_ms, 300_000);
         assert_eq!(config.stream_keepalive_interval_ms, 15_000);
         assert_eq!(config.stream_keepalive_max_silence_ms, 300_000);
+        assert_eq!(config.stream_responses_hold_timeout_ms, 240_000);
         config.stream_first_content_timeout_ms = 0;
         config.stream_idle_timeout_ms = 1234;
         config.stream_keepalive_interval_ms = 0;
         config.stream_keepalive_max_silence_ms = 5678;
+        config.stream_responses_hold_timeout_ms = 890;
         let encoded = toml::to_string(&config).unwrap();
         let restored: Config = toml::from_str(&encoded).unwrap();
         let snapshot = restored.snapshot();
@@ -1034,6 +1048,7 @@ mod tests {
         assert_eq!(snapshot.stream_idle_timeout_ms, 1234);
         assert_eq!(snapshot.stream_keepalive_interval_ms, 0);
         assert_eq!(snapshot.stream_keepalive_max_silence_ms, 5678);
+        assert_eq!(snapshot.stream_responses_hold_timeout_ms, 890);
     }
 
     #[test]

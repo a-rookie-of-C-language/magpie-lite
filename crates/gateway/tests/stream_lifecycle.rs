@@ -111,6 +111,7 @@ enum Ending {
     Reset(Arc<tokio::sync::Notify>),
     Heartbeats,
     Paced(Vec<(Duration, String)>),
+    PerSlot(Vec<Ending>),
 }
 
 struct Transport {
@@ -216,7 +217,10 @@ impl Fixture {
                     let model = body.get("model").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| uri.path().split("/models/").nth(1).unwrap().split(':').next().unwrap().to_owned());
                     captured_models.lock().unwrap().push(model);
                     let script = scripts[slot].clone();
-                    let ending = ending.clone();
+                    let ending = match &ending {
+                        Ending::PerSlot(slots) => slots[slot].clone(),
+                        ending => ending.clone(),
+                    };
                     let guard = Dropped(flag.clone());
                     async move {
                         if slot == header_delay_slot { tokio::time::sleep(header_delay).await; }
@@ -228,6 +232,7 @@ impl Fixture {
                             yield Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(bytes));
                         }
                         match ending {
+                            Ending::PerSlot(_) => unreachable!("selected before response"),
                             Ending::Eof => {},
                             Ending::Hold => std::future::pending::<()>().await,
                             Ending::Heartbeats => loop {
@@ -1204,7 +1209,7 @@ async fn oversized_frames_after_content_never_retry_and_keep_partial_usage() {
 
 #[tokio::test]
 async fn opening_metadata_byte_budget_commits_before_a_later_error() {
-    for upstream in [Protocol::Anthropic, Protocol::Responses, Protocol::Gemini] {
+    for upstream in PROTOCOLS {
         let opening = opening(upstream).replace("abandoned-model", &"m".repeat(70 * 1024));
         let f = Fixture::with_chunk_size(
             upstream,
@@ -1231,13 +1236,17 @@ async fn opening_metadata_byte_budget_commits_before_a_later_error() {
 
 #[tokio::test]
 async fn discarded_chat_model_metadata_does_not_spend_the_opening_memory_budget() {
-    // The Chat decoder does not retain model-only metadata in a Start event.
-    // A wire-size budget here would incorrectly prevent a safe early retry.
+    // A usage-only Chat chunk has no assistant delta and cannot create Start.
+    // Its ignored model must not spend retained metadata or prevent safe retry.
+    let usage_only = json!({
+        "model": "m".repeat(70 * 1024),
+        "choices": [],
+        "usage": {"prompt_tokens": 99, "completion_tokens": 0}
+    });
     let f = Fixture::with_chunk_size(
         Protocol::Chat,
         vec![
-            opening(Protocol::Chat).replace("abandoned-model", &"m".repeat(70 * 1024))
-                + limited(Protocol::Chat),
+            format!("data: {usage_only}\n\n{}", limited(Protocol::Chat)),
             prefix(Protocol::Chat) + completion(Protocol::Chat),
         ],
         Ending::Hold,
@@ -2738,5 +2747,391 @@ async fn keepalive_stops_during_late_known_http_error_body_without_background_wo
         assert_eq!(f.record().await["status"], "client_disconnected");
         assert_eq!(*f.attempts.lock().unwrap(), vec![0]);
         f.assert_released().await;
+    }
+}
+
+// Comments keep proxies alive, but Responses agents may require actual events.
+fn enable_fast_responses_hold(config: &mut Config) {
+    enable_fast_keepalive(config);
+    config.stream_responses_hold_timeout_ms = 120;
+}
+
+async fn responses_opening(response: &mut reqwest::Response) -> String {
+    tokio::time::timeout(Duration::from_millis(450), async {
+        let mut received = String::new();
+        loop {
+            let chunk = response
+                .chunk()
+                .await
+                .unwrap()
+                .expect("opening event missing");
+            received.push_str(std::str::from_utf8(&chunk).unwrap());
+            if received.contains("event: response.created") {
+                assert!(!received.contains("partial"));
+                assert!(!received.contains("response.completed"));
+                return received;
+            }
+        }
+    })
+    .await
+    .expect("Responses opening metadata stayed held beyond request-wide budget")
+}
+
+#[tokio::test]
+async fn responses_hold_releases_real_opening_event_before_quiet_upstream_content() {
+    for upstream in PROTOCOLS {
+        let f = Fixture::with_config(
+            upstream,
+            vec![opening(upstream).into()],
+            Ending::Paced(vec![(
+                Duration::from_millis(650),
+                prefix(upstream) + completion(upstream),
+            )]),
+            enable_fast_responses_hold,
+        )
+        .await;
+        let mut response = f.request(Protocol::Responses).await;
+        let opening = responses_opening(&mut response).await;
+        assert!(opening.contains("abandoned-model"));
+        assert!(f.log.lock().unwrap().snapshot().recent_requests.is_empty());
+        let body = opening + &response.text().await.unwrap();
+        assert_eq!(body.matches("event: response.created").count(), 1);
+        assert!(body.contains("partial"));
+        assert_completed(&body, Protocol::Responses);
+        assert_eq!(f.record().await["status"], "ok");
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn responses_hold_budget_spans_keys_providers_and_groups_without_leaking_abandoned_opening() {
+    for mode in 0..3 {
+        for upstream in PROTOCOLS {
+            for spare in PROTOCOLS {
+                if mode == 0 && upstream != spare {
+                    continue;
+                }
+                let f = Fixture::with_config(
+                    upstream,
+                    vec![
+                        opening(upstream).into(),
+                        opening(spare)
+                            .replace("abandoned-model", "selected-model")
+                            .replace("99", "7"),
+                    ],
+                    Ending::PerSlot(vec![
+                        Ending::Paced(vec![(Duration::from_millis(240), limited(upstream).into())]),
+                        Ending::Paced(vec![(Duration::from_millis(240), limited(spare).into())]),
+                    ]),
+                    |config| {
+                        enable_fast_responses_hold(config);
+                        config.stream_responses_hold_timeout_ms = 360;
+                        if mode != 0 {
+                            configure_timeout_fallback(config, mode == 2);
+                            config.provider[0].api_keys.truncate(1);
+                            config.provider[1].protocol = spare;
+                        }
+                    },
+                )
+                .await;
+                let model = if mode == 2 {
+                    "group/daily"
+                } else {
+                    "mock/up-model"
+                };
+                let mut response = f.request_model(Protocol::Responses, model).await;
+                let opening = responses_opening(&mut response).await;
+                assert!(opening.contains("selected-model") && !opening.contains("abandoned-model"));
+                assert_eq!(*f.attempts.lock().unwrap(), [0, 1]);
+                // After the shared budget commits the second candidate, its
+                // later error cannot retry or fabricate successful completion.
+                let body = opening + &response.text().await.unwrap();
+                assert_one_stream_error(&body, Protocol::Responses, "fixture rate limit");
+                assert_eq!(body.matches("event: response.created").count(), 1);
+                let record = f.record().await;
+                assert_eq!(record["status"], "upstream_stream_error");
+                assert_eq!(record["provider"], if mode == 0 { "mock" } else { "spare" });
+                assert_eq!(record["key_slot"], if mode == 0 { 1 } else { 0 });
+                if spare != Protocol::Responses {
+                    assert_eq!(record["usage"]["input"], 7);
+                }
+                f.assert_released().await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn responses_hold_commit_prevents_late_error_retry_but_preserves_partial_usage() {
+    for upstream in PROTOCOLS {
+        for grouped in [false, true] {
+            let f = Fixture::with_config(
+                upstream,
+                vec![
+                    opening(upstream).into(),
+                    prefix(upstream) + completion(upstream),
+                ],
+                Ending::Paced(vec![(Duration::from_millis(350), limited(upstream).into())]),
+                |config| {
+                    enable_fast_responses_hold(config);
+                    configure_timeout_fallback(config, grouped);
+                },
+            )
+            .await;
+            let model = if grouped {
+                "group/daily"
+            } else {
+                "mock/up-model"
+            };
+            let mut response = f.request_model(Protocol::Responses, model).await;
+            let opening = responses_opening(&mut response).await;
+            let body = opening + &response.text().await.unwrap();
+            assert_one_stream_error(&body, Protocol::Responses, "fixture rate limit");
+            assert_eq!(body.matches("event: response.created").count(), 1);
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            let record = f.record().await;
+            assert_eq!(record["status"], "upstream_stream_error");
+            if upstream != Protocol::Responses {
+                assert_eq!(record["usage"]["input"], 99);
+            }
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn responses_hold_release_does_not_satisfy_first_content_or_idle_deadline() {
+    for upstream in PROTOCOLS {
+        for idle in [false, true] {
+            let f = Fixture::with_config(
+                upstream,
+                vec![
+                    opening(upstream).into(),
+                    prefix(upstream) + completion(upstream),
+                ],
+                Ending::Hold,
+                |config| {
+                    enable_fast_responses_hold(config);
+                    config.stream_first_content_timeout_ms = if idle { 0 } else { 300 };
+                    config.stream_idle_timeout_ms = if idle { 300 } else { 0 };
+                    configure_timeout_fallback(config, false);
+                },
+            )
+            .await;
+            let mut response = f.request(Protocol::Responses).await;
+            let opening = responses_opening(&mut response).await;
+            let body = opening + &response.text().await.unwrap();
+            assert_one_stream_error(
+                &body,
+                Protocol::Responses,
+                if idle {
+                    "upstream stream idle timeout"
+                } else {
+                    "upstream first-content timeout"
+                },
+            );
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            assert_eq!(f.record().await["status"], "upstream_stream_error");
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn responses_hold_requires_real_opening_metadata_not_headers_comments_or_usage() {
+    for upstream in PROTOCOLS {
+        for headers in [false, true] {
+            let f = Fixture::with_transport(
+                upstream,
+                vec![if headers {
+                    opening(upstream).into()
+                } else {
+                    String::new()
+                }],
+                Ending::Paced(vec![(
+                    Duration::from_millis(550),
+                    prefix(upstream) + completion(upstream),
+                )]),
+                Transport {
+                    header_delay: if headers {
+                        Duration::from_millis(550)
+                    } else {
+                        Duration::ZERO
+                    },
+                    ..Transport::default()
+                },
+                enable_fast_responses_hold,
+            )
+            .await;
+            let mut response = f.request(Protocol::Responses).await;
+            first_comment(&mut response).await;
+            // After the hold budget, comments alone must not invent a start.
+            let no_event = tokio::time::timeout(Duration::from_millis(250), async {
+                while let Some(chunk) = response.chunk().await.unwrap() {
+                    assert!(
+                        !chunk.windows(5).any(|w| w == b"data:"),
+                        "fake event: {chunk:?}"
+                    );
+                }
+            })
+            .await;
+            assert!(no_event.is_err());
+            drop(response);
+            assert_eq!(f.record().await["status"], "client_disconnected");
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn responses_hold_ignores_upstream_heartbeats_and_runs_without_comment_keepalive() {
+    for upstream in PROTOCOLS {
+        for comments in [false, true] {
+            let f = Fixture::with_config(
+                upstream,
+                vec![opening(upstream).into()],
+                Ending::Heartbeats,
+                |config| {
+                    enable_fast_responses_hold(config);
+                    if !comments {
+                        config.stream_keepalive_interval_ms = 0;
+                    }
+                },
+            )
+            .await;
+            let mut response = f.request(Protocol::Responses).await;
+            let body = responses_opening(&mut response).await;
+            assert_eq!(body.contains(KEEPALIVE), comments);
+            drop(response);
+            assert_eq!(f.record().await["status"], "client_disconnected");
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn responses_hold_zero_and_nonresponses_clients_keep_existing_hold_policy() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            let f = Fixture::with_config(
+                upstream,
+                vec![opening(upstream).into()],
+                Ending::Hold,
+                |config| {
+                    enable_fast_responses_hold(config);
+                    if client == Protocol::Responses {
+                        config.stream_responses_hold_timeout_ms = 0;
+                    }
+                },
+            )
+            .await;
+            if client == Protocol::Gemini {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(300), f.request(client))
+                        .await
+                        .is_err()
+                );
+            } else {
+                let mut response = f.request(client).await;
+                first_comment(&mut response).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(250), async {
+                        while let Some(chunk) = response.chunk().await.unwrap() {
+                            assert!(
+                                !chunk.windows(5).any(|w| w == b"data:"),
+                                "unexpected opening: {chunk:?}"
+                            );
+                        }
+                    })
+                    .await
+                    .is_err()
+                );
+                drop(response);
+            }
+            assert_eq!(f.record().await["status"], "client_disconnected");
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn responses_hold_expired_budget_still_prefers_ready_stream_error_for_safe_retry() {
+    for upstream in PROTOCOLS {
+        let f = Fixture::with_transport(
+            upstream,
+            vec![
+                opening(upstream).to_owned() + limited(upstream),
+                prefix(upstream) + completion(upstream),
+            ],
+            Ending::Hold,
+            Transport {
+                chunk_size: usize::MAX,
+                header_delay: Duration::from_millis(180),
+                ..Transport::default()
+            },
+            |config| {
+                enable_fast_responses_hold(config);
+                config.stream_responses_hold_timeout_ms = 1;
+            },
+        )
+        .await;
+        let body = f.request(Protocol::Responses).await.text().await.unwrap();
+        assert!(
+            !body.contains("abandoned-model") && !body.contains("fixture rate limit"),
+            "{body}"
+        );
+        assert_completed(&body, Protocol::Responses);
+        assert_eq!(*f.attempts.lock().unwrap(), [0, 1]);
+        assert_eq!(f.record().await["status"], "ok");
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn responses_hold_committed_socket_disconnect_persists_one_safe_record() {
+    use tokio::io::AsyncReadExt;
+    for upstream in PROTOCOLS {
+        let f = Fixture::with_config(
+            upstream,
+            vec![opening(upstream).into()],
+            Ending::Hold,
+            enable_fast_responses_hold,
+        )
+        .await;
+        let history = f.persistent_history();
+        let mut socket = f
+            .socket_request(Protocol::Responses, "mock/up-model", true)
+            .await;
+        let mut body = String::new();
+        tokio::time::timeout(LIMIT, async {
+            let mut buffer = [0u8; 2048];
+            while !body.contains("event: response.created") {
+                let n = socket.read(&mut buffer).await.unwrap();
+                assert!(n > 0);
+                body.push_str(std::str::from_utf8(&buffer[..n]).unwrap());
+            }
+        })
+        .await
+        .unwrap();
+        drop(socket);
+        let record = f.record().await;
+        assert_eq!(record["status"], "client_disconnected");
+        f.assert_released().await;
+        let text = std::fs::read_to_string(history.path().join("requests.jsonl")).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        for private in [
+            "secret-upstream-key",
+            "secret-local-token",
+            "private cancellation prompt",
+        ] {
+            assert!(!text.contains(private));
+        }
+        let reloaded = RequestLog::open(&history.path().join("requests.jsonl"))
+            .unwrap()
+            .snapshot();
+        assert_eq!(
+            serde_json::to_value(&reloaded.recent_requests[0]).unwrap(),
+            record
+        );
     }
 }

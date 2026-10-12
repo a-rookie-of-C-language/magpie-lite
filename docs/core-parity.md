@@ -91,7 +91,8 @@ cover opening/after-content stalls across all four-by-four protocol pairs,
 ordinary/group timeout fallback, ignored-heartbeat and committed-metadata cases,
 header/error-body stalls, paced output, reasoning/tools and disable semantics.
 This adds gateway-wide safety bounds rather than replicating the reference's
-Group.FirstToken policy; keepalives and group overrides remain unimplemented.
+Group.FirstToken policy; group overrides remain unimplemented. Downstream SSE
+comment keepalive and Responses opening release are documented separately.
 See `docs/stream-lifecycle.md`.
 
 Real pre-header cancellation is now verified without a new production mechanism:
@@ -102,3 +103,13 @@ attempted upstreams and writes one persisted last-attempt record, preserving
 observed usage but never abandoned-attempt usage. This closes the prior
 HTTP/1.1 evidence gap, not HTTP/2, TLS/proxy or live-Agent compatibility gaps.
 See `docs/stream-lifecycle.md` for the exact fixture scope.
+
+Streaming Responses clients now have a request-wide opening hold budget
+(default four minutes, zero disables), independent of SSE comments. Real buffered
+opening events can be published before content, committing the selected attempt;
+headers/comments/usage-only input do not fabricate metadata. The budget survives
+key/provider/group fallback and does not reset first-content/read-idle limits.
+Nine local HTTP fixtures and paused-clock unit tests cover the release contract.
+This follows the opening-release subset of reference `internal/gateway/fallback.go`,
+not full group timing, queue, slow-final-route or real-Agent conformance.
+See `docs/stream-lifecycle.md`.

@@ -110,12 +110,12 @@ stream_keepalive_max_silence_ms = 300000 # stop after this much upstream silence
 
 These defaults apply to old configuration files. Either value set to `0` disables
 keepalive. Both appear in protected GET `/config`; edit the TOML and restart to
-change them. Requests pin all four streaming settings when they begin.
+change them. Requests pin all streaming settings when they begin.
 
 Only `: keepalive\n` is sent (no extra blank line), not opening model/usage from
 an attempt that may still fail over. Key, provider and group fallback remain
-available before actual content or the existing buffering safety bounds commit
-an attempt. Fast HTTP failures retain their status; once a comment has sent
+available before actual content, Responses opening release, or buffering safety
+bounds commit an attempt. Fast HTTP failures retain their status; once a comment has sent
 HTTP 200/SSE headers, a later HTTP failure becomes one protocol stream error,
 never a JSON body or a success marker. Known non-2xx body reads do not send
 comments. Gemini and all nonstreaming requests never get these comments.
@@ -129,6 +129,24 @@ window. Downstream comments never count as upstream progress or reset the
 first-content/read-idle deadlines, and they cannot satisfy clients that require
 actual protocol events. No background worker is spawned: closing the client
 connection drops pending work and preserves one final accounting record.
+
+## Responses opening-event hold budget
+
+```toml
+stream_responses_hold_timeout_ms = 240000 # request-wide budget; 0 disables
+```
+
+For streaming Responses clients only, this releases real buffered upstream
+opening metadata when the request-wide budget expires, even if answer content
+has not arrived. The default also applies to old configuration files and the
+setting appears in protected GET `/config`. It works independently of SSE
+comment keepalive, because some agents require actual protocol events.
+
+The budget is shared across key, provider and group retries. Pending headers,
+comments and usage-only input do not fabricate an opening event. Releasing an
+opening commits that attempt: later failures become stream errors, not retries.
+It does not reset first-content or upstream read-idle deadlines. This is not a
+post-content progress policy or a claim of real-Agent compatibility.
 
 ## Editing providers
 

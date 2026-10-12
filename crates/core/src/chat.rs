@@ -447,6 +447,39 @@ pub fn encode_response(resp: &CompletionResponse) -> Value {
     })
 }
 
+/// Retain Chat opening metadata once per upstream attempt. A role-only lead
+/// is a real beginning, not content; the gateway may safely hold it for retry.
+#[derive(Debug, Default)]
+pub struct ChatStreamDecoder {
+    started: bool,
+}
+
+impl ChatStreamDecoder {
+    /// Decode one chunk, including its first assistant opening when supplied.
+    pub fn decode(&mut self, value: &Value) -> Vec<StreamEvent> {
+        let mut events = decode_chunk(value);
+        if !self.started
+            && value.get("error").is_none()
+            && let Some(delta) = value.pointer("/choices/0/delta").filter(|v| v.is_object())
+        {
+            let model = value
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if delta.get("role").and_then(Value::as_str) == Some("assistant") || !model.is_empty() {
+                self.started = true;
+                events.insert(
+                    0,
+                    StreamEvent::Start {
+                        model: model.to_owned(),
+                    },
+                );
+            }
+        }
+        events
+    }
+}
+
 /// Decode one streamed chunk from an OpenAI-compatible upstream into IR
 /// events. `[DONE]` is handled by the caller (it is not JSON).
 pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
@@ -673,5 +706,51 @@ impl ChatChunkEncoder {
                 "error": {"message": message, "type": "upstream_error"}
             }))),
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_opening_tests {
+    use super::*;
+
+    #[test]
+    fn chat_opening_is_once_per_decoder_and_preserves_usage_and_content() {
+        let opening = json!({"model":"chosen", "choices":[{"delta":{"role":"assistant"}}], "usage":{"prompt_tokens":7}});
+        let mut decoder = ChatStreamDecoder::default();
+        assert!(
+            matches!(&decoder.decode(&opening)[..], [StreamEvent::Start { model }, StreamEvent::Usage(_)] if model == "chosen")
+        );
+        assert!(matches!(
+            &decoder.decode(&opening)[..],
+            [StreamEvent::Usage(_)]
+        ));
+        let content = json!({"model":"chosen", "choices":[{"delta":{"content":"hi"}}]});
+        assert!(
+            matches!(&decoder.decode(&content)[..], [StreamEvent::TextDelta { text }] if text == "hi")
+        );
+        assert!(matches!(
+            &ChatStreamDecoder::default().decode(&content)[..],
+            [StreamEvent::Start { .. }, StreamEvent::TextDelta { .. }]
+        ));
+    }
+
+    #[test]
+    fn chat_errors_usage_only_and_unknown_chunks_do_not_invent_opening() {
+        let mut decoder = ChatStreamDecoder::default();
+        for value in [
+            json!({}),
+            json!({"model":"chosen", "choices":[], "usage":{"prompt_tokens":7}}),
+            json!({"model":"chosen", "choices":[{"delta":{"role":"assistant"}}], "error":{"message":"failed"}}),
+        ] {
+            assert!(
+                decoder
+                    .decode(&value)
+                    .iter()
+                    .all(|e| !matches!(e, StreamEvent::Start { .. }))
+            );
+        }
+        assert!(
+            matches!(&decoder.decode(&json!({"choices":[{"delta":{"role":"assistant"}}]}))[..], [StreamEvent::Start { model }] if model.is_empty())
+        );
     }
 }

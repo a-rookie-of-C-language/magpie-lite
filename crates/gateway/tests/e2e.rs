@@ -198,6 +198,7 @@ async fn spawn_gateway_with_protocol_and_history(
         stream_idle_timeout_ms: Config::default().stream_idle_timeout_ms,
         stream_keepalive_interval_ms: Config::default().stream_keepalive_interval_ms,
         stream_keepalive_max_silence_ms: Config::default().stream_keepalive_max_silence_ms,
+        stream_responses_hold_timeout_ms: Config::default().stream_responses_hold_timeout_ms,
         history_path,
         default_provider: "mock".into(),
         provider: vec![ProviderConfig {
@@ -634,6 +635,7 @@ async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) ->
         stream_idle_timeout_ms: Config::default().stream_idle_timeout_ms,
         stream_keepalive_interval_ms: Config::default().stream_keepalive_interval_ms,
         stream_keepalive_max_silence_ms: Config::default().stream_keepalive_max_silence_ms,
+        stream_responses_hold_timeout_ms: Config::default().stream_responses_hold_timeout_ms,
         history_path: None,
         default_provider: "primary".into(),
         provider: providers,
@@ -664,6 +666,7 @@ async fn spawn_gateway_with_fallback(primary: String, backup: String) -> String 
         stream_idle_timeout_ms: Config::default().stream_idle_timeout_ms,
         stream_keepalive_interval_ms: Config::default().stream_keepalive_interval_ms,
         stream_keepalive_max_silence_ms: Config::default().stream_keepalive_max_silence_ms,
+        stream_responses_hold_timeout_ms: Config::default().stream_responses_hold_timeout_ms,
         history_path: None,
         default_provider: "primary".into(),
         provider: vec![
@@ -722,6 +725,7 @@ async fn spawn_gateway_with_same_provider_group(upstream: String) -> String {
         stream_idle_timeout_ms: Config::default().stream_idle_timeout_ms,
         stream_keepalive_interval_ms: Config::default().stream_keepalive_interval_ms,
         stream_keepalive_max_silence_ms: Config::default().stream_keepalive_max_silence_ms,
+        stream_responses_hold_timeout_ms: Config::default().stream_responses_hold_timeout_ms,
         history_path: None,
         default_provider: "mock".into(),
         provider: vec![ProviderConfig {
@@ -773,6 +777,7 @@ async fn spawn_gateway_with_group(
         stream_idle_timeout_ms: Config::default().stream_idle_timeout_ms,
         stream_keepalive_interval_ms: Config::default().stream_keepalive_interval_ms,
         stream_keepalive_max_silence_ms: Config::default().stream_keepalive_max_silence_ms,
+        stream_responses_hold_timeout_ms: Config::default().stream_responses_hold_timeout_ms,
         history_path: None,
         default_provider: "primary".into(),
         provider: vec![
@@ -909,7 +914,15 @@ async fn responses_client_stream_over_chat_upstream() {
     }
 
     assert_eq!(events[0]["type"], "response.created");
-    assert_eq!(events[0]["response"]["model"], "mock/mock-model");
+    // A real Chat opening now preserves the upstream model, as other dialects do.
+    assert_eq!(events[0]["response"]["model"], "mock-model");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["type"] == "response.created")
+            .count(),
+        1
+    );
     assert!(
         events.iter().any(|e| {
             e["type"] == "response.output_item.added" && e["item"]["type"] == "message"
@@ -932,6 +945,7 @@ async fn responses_client_stream_over_chat_upstream() {
         .rev()
         .find(|e| e["type"] == "response.completed")
         .expect("terminal event");
+    assert_eq!(completed["response"]["model"], "mock-model");
     assert_eq!(completed["response"]["usage"]["input_tokens"], 8);
     assert_eq!(completed["response"]["usage"]["output_tokens"], 4);
     assert!(

@@ -25,7 +25,7 @@ use crate::config::{Config, GroupConfig, Protocol, ProviderConfig};
 use crate::config_store::{ConfigStore, IdempotencyRequest};
 use crate::cooldown::quota_cooldown;
 use crate::stream_keepalive::{self, Keepalive, UpstreamActivity};
-use crate::stream_timeout::{StreamClock, StreamTimeout};
+use crate::stream_timeout::{ResponsesHold, StreamClock, StreamTimeout};
 use crate::upstream;
 use crate::usage::{RequestLog, RequestTracker};
 
@@ -658,6 +658,7 @@ impl ClientStreamEncoder {
 /// independently.
 #[derive(Default)]
 struct UpstreamDecoders {
+    chat: chat::ChatStreamDecoder,
     anthropic: anthropic::AnthropicStreamDecoder,
     gemini: gemini::GeminiStreamDecoder,
 }
@@ -861,6 +862,30 @@ fn route_retryable_status(status: reqwest::StatusCode) -> bool {
 
 type UpstreamEvents = Pin<Box<dyn futures::Stream<Item = UpstreamEvent> + Send>>;
 
+/// Internal handoff signal, never a synthetic protocol event.
+enum UpstreamRead {
+    Event(UpstreamEvent),
+    ReleaseOpening,
+}
+
+impl From<UpstreamEvent> for UpstreamRead {
+    fn from(event: UpstreamEvent) -> Self {
+        Self::Event(event)
+    }
+}
+
+impl From<StreamEvent> for UpstreamRead {
+    fn from(event: StreamEvent) -> Self {
+        Self::Event(event.into())
+    }
+}
+
+/// Owned by one request, including every key/provider/group attempt.
+struct StreamLiveness {
+    activity: UpstreamActivity,
+    responses_hold: ResponsesHold,
+}
+
 enum UpstreamReply {
     Json(reqwest::Response),
     Stream(UpstreamEvents),
@@ -901,7 +926,7 @@ async fn send_with_fallback(
     initial: UpstreamRoute,
     group_plan: Option<&GroupRoutePlan>,
     tracker: &mut RequestTracker,
-    activity: &UpstreamActivity,
+    liveness: &StreamLiveness,
 ) -> Result<(UpstreamReply, UpstreamCandidate), (ProxyFailure, UpstreamCandidate)> {
     let routes = upstream_routes(
         config,
@@ -934,7 +959,7 @@ async fn send_with_fallback(
         for (attempt, (key_slot, api_key)) in route.api_keys.iter().enumerate() {
             let candidate = UpstreamCandidate::new(&route, *key_slot);
             tracker.begin_attempt(&route.provider.id, &route.model, *key_slot);
-            activity.attempt();
+            liveness.activity.attempt();
             let body = upstream::build_request(&route.provider, creq, &route.model);
             tracing::debug!(
                 provider = %route.provider.id,
@@ -992,21 +1017,15 @@ async fn send_with_fallback(
             };
 
             let status = resp.status();
-            activity.headers(status.is_success());
+            liveness.activity.headers(status.is_success());
             if status.is_success() {
                 if !creq.stream {
                     tracker.record_attempt(&route.provider.id, *key_slot, "ok");
                     return Ok((UpstreamReply::Json(resp), candidate));
                 }
                 let headers = resp.headers().clone();
-                let (events, failure) = prefetch_stream(
-                    resp,
-                    route.provider.protocol,
-                    tracker,
-                    clock,
-                    activity.clone(),
-                )
-                .await;
+                let (events, failure) =
+                    prefetch_stream(resp, route.provider.protocol, tracker, clock, liveness).await;
                 if let Some(failure) = failure {
                     tracker.record_attempt(&route.provider.id, *key_slot, "upstream_stream_error");
                     if quota_limited_status(failure.status) {
@@ -1138,7 +1157,7 @@ fn decode_upstream_chunk(
     decoders: &mut UpstreamDecoders,
 ) -> Vec<StreamEvent> {
     match protocol {
-        Protocol::Chat => chat::decode_chunk(data),
+        Protocol::Chat => decoders.chat.decode(data),
         Protocol::Anthropic => decoders.anthropic.decode(data),
         Protocol::Responses => responses::decode_chunk(data),
         Protocol::Gemini => decoders.gemini.decode(data),
@@ -1171,6 +1190,16 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
     } else {
         (UpstreamActivity::default(), None)
     };
+    let liveness = StreamLiveness {
+        activity,
+        responses_hold: ResponsesHold::new(
+            if creq.stream && matches!(wire, ClientWire::Responses) {
+                config.stream_responses_hold_timeout_ms
+            } else {
+                0
+            },
+        ),
+    };
     let model = creq.model.clone();
     // Keep ownership through both header waiting and body polling. Dropping
     // either stage cancels the same work and finalizes the same tracker.
@@ -1190,7 +1219,7 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
             initial,
             group_plan.as_ref(),
             &mut tracker,
-            &activity,
+            &liveness,
         )
         .await
         {
@@ -1367,14 +1396,23 @@ async fn prefetch_stream(
     protocol: Protocol,
     tracker: &mut RequestTracker,
     clock: StreamClock,
-    activity: UpstreamActivity,
+    liveness: &StreamLiveness,
 ) -> (UpstreamEvents, Option<StreamFailure>) {
     const MAX_OPENING_EVENTS: usize = 64;
     const MAX_OPENING_METADATA_BYTES: usize = 64 * 1024;
     let mut metadata_bytes = 0;
-    let mut events: UpstreamEvents = Box::pin(upstream_events(response, protocol, clock, activity));
+    let mut reads = Box::pin(upstream_events(
+        response,
+        protocol,
+        clock,
+        liveness.activity.clone(),
+        liveness.responses_hold,
+    ));
     let mut prefix = Vec::new();
-    while let Some(mut item) = events.next().await {
+    while let Some(read) = reads.next().await {
+        let UpstreamRead::Event(mut item) = read else {
+            break;
+        };
         if let StreamEvent::Usage(usage) = &item.event {
             tracker.observe_usage(usage);
             // Replaying buffered frames must not roll back newer observed usage.
@@ -1396,7 +1434,7 @@ async fn prefetch_stream(
         prefix.push(item);
         if terminal {
             // Close held HTTP connections even if the downstream never polls.
-            drop(events);
+            drop(reads);
             return (Box::pin(futures::stream::iter(prefix)), failure);
         }
         if visible
@@ -1406,6 +1444,12 @@ async fn prefetch_stream(
             break;
         }
     }
+    let events = reads.filter_map(|read| {
+        std::future::ready(match read {
+            UpstreamRead::Event(event) => Some(event),
+            UpstreamRead::ReleaseOpening => None,
+        })
+    });
     (Box::pin(futures::stream::iter(prefix).chain(events)), None)
 }
 
@@ -1429,18 +1473,30 @@ fn upstream_events(
     protocol: Protocol,
     mut clock: StreamClock,
     activity: UpstreamActivity,
-) -> impl futures::Stream<Item = UpstreamEvent> {
+    responses_hold: ResponsesHold,
+) -> impl futures::Stream<Item = UpstreamRead> {
     async_stream::stream! {
         let mut bytes = response.bytes_stream();
         let mut parser = SseParser::new();
         let mut decoders = UpstreamDecoders::new();
         let mut chat_stopped = false;
+        let mut hold = Some(responses_hold);
+        let mut opening_held = false;
         loop {
-            let chunk = match clock.chunk(bytes.next()).await {
-                Ok(Some(chunk)) => chunk,
-                Ok(None) => break,
+            let read = match hold.as_ref().filter(|_| opening_held) {
+                Some(hold) => clock.held_chunk(bytes.next(), hold).await,
+                None => clock.chunk(bytes.next()).await.map(Some),
+            };
+            let chunk = match read {
+                Ok(Some(Some(chunk))) => chunk,
+                Ok(Some(None)) => break,
+                Ok(None) => {
+                    hold = None;
+                    yield UpstreamRead::ReleaseOpening;
+                    continue;
+                }
                 Err(timeout) => {
-                    yield stream_timeout_event(timeout);
+                    yield stream_timeout_event(timeout).into();
                     return;
                 }
             };
@@ -1465,8 +1521,14 @@ fn upstream_events(
                 };
                 for event in decode_upstream_data(protocol, &data, &mut decoders) {
                     clock.observe(&event.event);
+                    match &event.event {
+                        StreamEvent::Start { .. } => opening_held = true,
+                        StreamEvent::Usage(_) => {},
+                        StreamEvent::TextDelta { text } | StreamEvent::ThinkingDelta { text } if text.is_empty() => {},
+                        _ => hold = None,
+                    }
                     chat_stopped |= protocol == Protocol::Chat && matches!(event.event, StreamEvent::Stop(_));
-                    yield event;
+                    yield event.into();
                 }
             }
         }
@@ -1475,7 +1537,7 @@ fn upstream_events(
             Ok(Some(data)) => {
                 for event in decode_upstream_data(protocol, &data, &mut decoders) {
                     chat_stopped |= protocol == Protocol::Chat && matches!(event.event, StreamEvent::Stop(_));
-                    yield event;
+                    yield event.into();
                 }
             }
             Ok(None) => {}

@@ -1,10 +1,34 @@
-//! Per-attempt streaming deadlines, independent of protocol and credentials.
+//! Upstream deadlines and the request-wide Responses opening-event hold budget.
 
 use std::future::Future;
 use std::time::Duration;
 
 use magpie_core::stream::StreamEvent;
 use tokio::time::Instant;
+
+/// A Responses agent may ignore SSE comments for its event-idle timeout. Once
+/// this request-wide budget expires, release a real buffered opening event.
+/// Unlike upstream deadlines this never fails or resets on retry, or fabricates
+/// metadata when the upstream has not supplied an encodable Start event.
+#[derive(Clone, Copy)]
+pub(crate) struct ResponsesHold(Option<Instant>);
+
+impl ResponsesHold {
+    pub(crate) fn new(timeout_ms: u64) -> Self {
+        Self(
+            (timeout_ms > 0)
+                .then(|| Instant::now().checked_add(Duration::from_millis(timeout_ms)))
+                .flatten(),
+        )
+    }
+
+    pub(crate) async fn wait(&self) {
+        match self.0 {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending().await,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamTimeout {
@@ -25,6 +49,7 @@ pub(crate) struct StreamClock {
     started: Instant,
     first_content: Option<Duration>,
     idle: Option<Duration>,
+    remaining_idle: Option<Duration>,
 }
 
 impl StreamClock {
@@ -33,6 +58,7 @@ impl StreamClock {
             started: Instant::now(),
             first_content: (first_content_ms > 0).then(|| Duration::from_millis(first_content_ms)),
             idle: (idle_ms > 0).then(|| Duration::from_millis(idle_ms)),
+            remaining_idle: None,
         }
     }
 
@@ -58,12 +84,41 @@ impl StreamClock {
     }
 
     pub(crate) async fn chunk<T>(
-        &self,
+        &mut self,
         future: impl Future<Output = T>,
     ) -> Result<T, StreamTimeout> {
         // Start a fresh idle interval only when actually waiting for transport.
         // Time spent yielding to a backpressured downstream does not count.
-        self.wait(future, self.idle).await
+        let idle = self.remaining_idle.take().or(self.idle);
+        self.wait(future, idle).await
+    }
+
+    /// Interrupt one upstream read to release buffered opening metadata. Carry
+    /// the unused idle budget across the yield, without counting downstream
+    /// backpressure or granting a new full interval for this same read.
+    pub(crate) async fn held_chunk<T>(
+        &mut self,
+        future: impl Future<Output = T>,
+        hold: &ResponsesHold,
+    ) -> Result<Option<T>, StreamTimeout> {
+        let began = Instant::now();
+        let idle = self.remaining_idle.take().or(self.idle);
+        let result = self
+            .wait(
+                async {
+                    tokio::select! {
+                        biased;
+                        chunk = future => Some(chunk),
+                        _ = hold.wait() => None,
+                    }
+                },
+                idle,
+            )
+            .await;
+        if matches!(result, Ok(None)) {
+            self.remaining_idle = idle.map(|limit| limit.saturating_sub(began.elapsed()));
+        }
+        result
     }
 
     async fn wait<T>(
@@ -97,6 +152,64 @@ impl StreamClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn responses_hold_defaults_to_four_minutes_and_is_not_rearmed_by_waiting() {
+        let hold = ResponsesHold::new(240_000);
+        let started = Instant::now();
+        tokio::time::sleep(Duration::from_secs(180)).await;
+        hold.wait().await;
+        assert_eq!(started.elapsed(), Duration::from_secs(240));
+        // The next attempt shares the same expired budget, not another 4 min.
+        hold.wait().await;
+        assert_eq!(started.elapsed(), Duration::from_secs(240));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn opening_release_preserves_remaining_idle_and_excludes_yield_backpressure() {
+        let mut clock = StreamClock::new(0, 300);
+        let hold = ResponsesHold::new(120);
+        let began = Instant::now();
+        assert_eq!(
+            clock.held_chunk(std::future::pending::<()>(), &hold).await,
+            Ok(None)
+        );
+        assert_eq!(began.elapsed(), Duration::from_millis(120));
+        // The opening event is downstream-backpressured for longer than idle.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            clock.chunk(std::future::pending::<()>()).await,
+            Err(StreamTimeout::Idle)
+        );
+        assert_eq!(began.elapsed(), Duration::from_millis(900));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn opening_release_does_not_rearm_the_absolute_first_content_deadline() {
+        let mut clock = StreamClock::new(300, 0);
+        let hold = ResponsesHold::new(120);
+        let began = Instant::now();
+        assert_eq!(
+            clock.held_chunk(std::future::pending::<()>(), &hold).await,
+            Ok(None)
+        );
+        assert_eq!(
+            clock.chunk(std::future::pending::<()>()).await,
+            Err(StreamTimeout::FirstContent)
+        );
+        assert_eq!(began.elapsed(), Duration::from_millis(300));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn responses_hold_zero_is_disabled_and_extreme_settings_are_safe() {
+        for hold in [ResponsesHold::new(0), ResponsesHold::new(u64::MAX)] {
+            assert!(
+                tokio::time::timeout(Duration::from_secs(3600), hold.wait())
+                    .await
+                    .is_err()
+            );
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn first_content_includes_headers_and_cannot_be_extended_by_metadata() {
@@ -178,7 +291,7 @@ mod tests {
                 .await,
             Err(StreamTimeout::Idle)
         );
-        let clock = StreamClock::new(0, 30);
+        let mut clock = StreamClock::new(0, 30);
         clock
             .headers(tokio::time::sleep(Duration::from_secs(1)))
             .await
@@ -187,7 +300,7 @@ mod tests {
             clock.chunk(std::future::pending::<()>()).await,
             Err(StreamTimeout::Idle)
         );
-        let clock = StreamClock::new(0, 0);
+        let mut clock = StreamClock::new(0, 0);
         clock
             .chunk(tokio::time::sleep(Duration::from_secs(3600)))
             .await

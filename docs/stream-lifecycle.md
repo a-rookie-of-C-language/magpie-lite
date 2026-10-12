@@ -167,10 +167,42 @@ by a scheduled comment. Dropping either handler or body cancels the owned work.
 A heartbeat tick must not recreate an upstream header/read timeout.
 
 These are comments, not protocol events: they do not satisfy first-content,
-meaningful-progress or an Agent's event-only idle policy. Reference held-Responses
-quiet-agent metadata flushing, group timing/queue policies, and slow-final-route
-exceptions remain separate, unimplemented policies; this is not a claim of full
+meaningful-progress or an Agent's event-only idle policy. Responses opening
+release is a separate policy described below. Group timing/queue policies and
+slow-final-route exceptions remain unimplemented; this is not a claim of full
 reference keepalive or real-Agent conformance.
+
+## Responses opening-event release
+
+The root TOML setting `stream_responses_hold_timeout_ms = 240000` defaults to
+four minutes; `0` disables it. Old configurations inherit the default and the
+secret-free configuration snapshot exposes the value. Only streaming Responses
+clients enable the policy, regardless of the upstream dialect. SSE comment
+keepalive may be disabled independently.
+
+One budget starts per request and is never reset by key, provider or group
+fallback. Once it expires, prefetch releases already buffered real Start metadata.
+Headers, comments, unknown chunks and usage-only input cannot synthesize a Start.
+A Chat assistant role/model opening is decoded once per upstream attempt. Ready
+transport events take priority over the release timer, allowing a ready opening
+error to retry safely before any candidate metadata is published.
+
+Publishing opening metadata commits the selected attempt, even without answer
+content: a later error is delivered once, with selected-attempt accounting and
+no replay. Release does not satisfy or restart the absolute first-content
+limit. An interrupted upstream read retains its remaining idle budget across
+metadata replay without charging downstream backpressure or receiving a fresh
+full idle interval. Dropping the downstream still cancels the owned upstream.
+
+Nine `responses_hold_*` local HTTP tests cover four upstream dialects, shared
+budgets through retries, late-error commitment, independent upstream deadlines,
+missing opening metadata, ignored heartbeats, disabled/non-Responses exclusions,
+ready-error precedence and real socket disconnect/persisted accounting. Paused
+clock tests cover the default budget, disable/extreme values and retained idle
+and first-content deadlines. This implements the request-level opening-release
+subset of reference `internal/gateway/fallback.go`, not its complete group
+FirstToken, queue, slow-final-route or post-content event-idle policies. Local
+fixtures do not establish live vendor or installed Agent compatibility.
 
 ### Retry classification
 
@@ -247,7 +279,7 @@ upstream/client pair. Default 32 MiB unterminated-frame fixtures cover four
 upstream protocols, four client dialects in selected pairs, ordinary/group
 fallback, no extra same-endpoint key attempts, and no retry after partial output.
 Retained-metadata byte-budget tests distinguish model-bearing Start events from
-discarded Chat model metadata.
+discarded model metadata on Chat usage-only chunks.
 
 `server::tests::cancelled_pending_fallback_accounts_for_last_attempt_before_headers`
 is an explicit handler-abort accounting test, not a real socket test. The five
@@ -296,6 +328,6 @@ The policy was compared to local reference `internal/gateway/fallback.go`
 This evidence is local HTTP/1.1 and synthetic SSE, not a live vendor, TLS/proxy,
 HTTP/2 or real-Agent validation.
 
-Group-specific timeout overrides, held-Responses quiet-agent flushing, HTTP/2
+Group-specific timeout overrides, post-content event-idle policies, HTTP/2
 cancellation conformance, post-content progress/loop detection and broader
 tool/multimodal conformance remain open.
