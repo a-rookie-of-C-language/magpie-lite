@@ -50,7 +50,7 @@ fn chat_request_decodes_into_ir() {
 #[test]
 fn chat_request_encodes_to_anthropic() {
     let ir = chat::decode_request(&chat_request()).expect("decode");
-    let out = anthropic::encode_request(&ir, "deepseek-chat");
+    let out = anthropic::encode_request(&ir, "deepseek-chat").unwrap();
     assert_eq!(out["model"], "deepseek-chat");
     assert_eq!(out["system"], "You are terse.");
     let msgs = out["messages"].as_array().unwrap();
@@ -72,9 +72,9 @@ fn chat_request_encodes_to_anthropic() {
 #[test]
 fn anthropic_request_round_trips_back_to_chat() {
     let ir = chat::decode_request(&chat_request()).expect("decode");
-    let anthropic_req = anthropic::encode_request(&ir, "deepseek-chat");
+    let anthropic_req = anthropic::encode_request(&ir, "deepseek-chat").unwrap();
     let back = anthropic::decode_request(&anthropic_req).expect("decode");
-    let chat_req = chat::encode_request(&back, "deepseek-chat");
+    let chat_req = chat::encode_request(&back, "deepseek-chat").unwrap();
     assert_eq!(chat_req["model"], "deepseek-chat");
     let msgs = chat_req["messages"].as_array().unwrap();
     assert_eq!(msgs[0]["role"], "system");

@@ -166,6 +166,10 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
         system,
         messages,
         tools,
+        web_search: crate::search::WebSearchRequest::decode(
+            crate::search::SearchProtocol::Chat,
+            v,
+        )?,
         tool_choice: v.get("tool_choice").filter(|t| !t.is_null()).cloned(),
         max_tokens: v.get("max_tokens").and_then(Value::as_u64),
         temperature: v.get("temperature").and_then(Value::as_f64),
@@ -186,7 +190,7 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
 
 /// Encode an IR request as an OpenAI Chat Completions body, asking for
 /// `model` upstream (the routing-resolved name, not the agent's spelling).
-pub fn encode_request(req: &CompletionRequest, model: &str) -> Value {
+pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
     let mut messages = Vec::new();
 
     let system_text: String = req
@@ -306,7 +310,8 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Value {
         out.insert("stop".into(), json!(req.stop));
     }
     out.insert("stream".into(), json!(req.stream));
-    Value::Object(out)
+    crate::search::encode(req, crate::search::SearchProtocol::Chat, &mut out)?;
+    Ok(Value::Object(out))
 }
 
 fn decode_usage(v: &Value) -> Usage {

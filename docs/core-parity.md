@@ -6,7 +6,7 @@ Target: multiple coding agents sharing one Rust backend, provider adapters for d
 
 | Area | Current evidence | Remaining work |
 |---|---|---|
-| Shared Rust gateway | Core wire codecs; real local HTTP/SSE terminal/error/EOF and after-header disconnect fixtures across four adapters; incremental 32 MiB raw-event bounds, BOM/CR/UTF-8 handling, opening event/metadata-byte budgets, early stream-error key/fallback/group retry, no ordinary fallback after text/reasoning/tool output, configurable per-attempt first-content/read-idle deadlines with timeout fallback, group non-final first-content switching, request-wide Responses opening release, downstream pre-header/mid-answer SSE comments with safe fallback, protocol error conversion, bounded upstream-silence windows and activity-driven cadence, bounded per-channel text/reasoning repetition protection with no answer/tool replay and one same-candidate reasoning-only reask plus bounded Gemini empty-reply reasks with combined client/history usage, and real HTTP/1.1 before/after-header cancellation with persisted accounting; see docs/stream-lifecycle.md | Recorded real-agent fixtures, broader multimodal/tool/stream conformance, queue/slow-final-route behavior, built-in search request translation, Anthropic search ingress and cross-client image rendering, provider-specific prefill continuation, optional post-content progress policies, and HTTP/2 cancellation conformance |
+| Shared Rust gateway | Core wire codecs; real local HTTP/SSE terminal/error/EOF and after-header disconnect fixtures across four adapters; incremental 32 MiB raw-event bounds, BOM/CR/UTF-8 handling, opening event/metadata-byte budgets, early stream-error key/fallback/group retry, no ordinary fallback after text/reasoning/tool output, configurable per-attempt first-content/read-idle deadlines with timeout fallback, group non-final first-content switching, request-wide Responses opening release, downstream pre-header/mid-answer SSE comments with safe fallback, protocol error conversion, bounded upstream-silence windows and activity-driven cadence, bounded per-channel text/reasoning repetition protection with no answer/tool replay and one same-candidate reasoning-only reask plus bounded Gemini empty-reply reasks with combined client/history usage, and real HTTP/1.1 before/after-header cancellation with persisted accounting; see docs/stream-lifecycle.md | Recorded real-agent fixtures, broader multimodal/tool/stream conformance, queue/slow-final-route behavior, cross-protocol search-option translation, Anthropic search ingress and cross-client image rendering, provider-specific prefill continuation, optional post-content progress policies, and HTTP/2 cancellation conformance |
 | Agent adapters | Shared magpie-agents adapters for Claude Code, Codex, Crush, Gemini CLI, Goose, OpenCode and Zed; private staged preview, revision-checked apply, OS lock, schema-2 journaled selective field restore preserving unrelated edits, disconnect, managed-field drift and explicit recovery. Agent unit, HTTP, sandboxed child CLI and real-gateway console browser tests; Windows ACL/junction checks; recursive duplicate-key JSON/JSONC refusal, format-preserving JSON edits, compact comment-free JSON object additions that preserve single-line layout, native OpenCode/Zed JSONC, shared passive CLI/config discovery with bounded user-prefix/Node-version searches, npmrc prefix and nvm default-alias handling, and PATH/unknown metadata, native absolute config-directory overrides for Claude/Codex/OpenCode/Zed, and seven-Agent selective restore through HTTP/CLI/browser | Native project overrides, login-shell/registry PATH refresh, process/reachability and real-version compatibility evidence; compact layout preservation is intentionally limited to single-line objects without direct comments |
 | Provider metadata and keys | Protected provider CRUD and console; providers.rs covers saved/live edits, secret-free capability metadata (`supported_protocols`, nullable streaming/tools/vision), protocol validation and preserve/clear semantics. provider_tools.rs covers four-protocol catalogs/probes, pagination, saved/draft/no-auth credentials and bounded read-only operations | Capability presets, specialized/stream-only probes and paid/live vendor evidence |
 | Hot edits and key rotation | ConfigStore saves before publishing; requests own snapshots. Versioned key schedules ignore stale requests. providers.rs checks an old in-flight request after a smaller pool is saved; config.rs checks stale scheduler calls. Durable config revisions/ETags and optional If-Match checks reject stale provider/group writes across restarts; the revision is committed in the atomically replaced TOML document, store and HTTP tests check unchanged disk/memory and a single winner for concurrent checked edits; gateway writers also serialize through a bounded file lock. Provider/group CRUD and agent apply now have durable idempotency with 256-entry retention, token-keyed HMAC digests, restart replay, pending fail-closed behavior, and secret-free ledgers | Encrypted secret storage with recovery; durable idempotency for any future agent rotate endpoint |
@@ -202,3 +202,39 @@ upstream search decoding, Responses open_page/find actions, cross-provider
 citation annotations and Chat search presentation. Gemini emits the first valid
 grounding result only. Search results are not replayable tool requests in chat
 history, and vendor-encrypted search content is not copied across providers.
+
+
+## Built-in web-search requests (2026-10-12)
+
+All four request decoders retain provider-executed search separately from agent
+function declarations. Anthropic/Responses web_search tools, Chat
+web_search_options (or a bare compatibility tool marker), and Gemini
+Google Search tools can coexist with functions. A function named web_search is
+not itself a hosted-search request. Duplicate/malformed search definitions fail
+at decode time.
+
+Native routes retain search options and original tool choices, including Gemini
+function allowlists. Bare search intent translates between all four dialects;
+Anthropic uses web_search_20250305 with max_uses=5, and Responses requests search
+sources. Cross-protocol domain/location/budget/context policies and unsupported
+forced choices return an encoding error instead of silently losing restrictions.
+Core request encoders now return Result<Value>.
+
+Anthropic/Responses NONE disables all tools and omits hosted search. Chat/Gemini
+NONE disables only functions: hosted search remains enabled; cross-protocol
+routes omit function declarations to preserve that distinction. Function-only
+required cannot become a global required choice, and neither Chat tool_choice
+nor Gemini functionCallingConfig can force hosted search.
+
+The gateway uses a web plugin only for the exact openrouter.ai Chat host and
+omits the OpenAI sources include only for the exact api.x.ai Responses host.
+Configured Chat search options cannot be silently converted to plugin options.
+Encoding failures skip incompatible routes without sending HTTP or recording a
+credential failure/cooldown; a compatible configured fallback may proceed. An
+exhausted routing plan returns HTTP 400 with a configuration-free error message.
+
+Evidence is local core fixtures, host-specific gateway unit tests and real
+loopback HTTP/SSE fixtures, not paid/live-provider or real-agent conformance.
+Remaining work includes configured cross-protocol option conversion, Anthropic
+search-result ingress, Responses open_page/find, cross-provider citations and
+Chat search-result presentation.

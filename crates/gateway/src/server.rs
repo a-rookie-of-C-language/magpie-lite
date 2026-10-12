@@ -975,7 +975,7 @@ async fn send_with_fallback(
         })
         .expect("initial route");
 
-    for (route_index, route) in routes.into_iter().enumerate() {
+    'routes: for (route_index, route) in routes.into_iter().enumerate() {
         if let (Some(group_id), Some(group_route_index)) =
             (&route.group_id, route.group_route_index)
             && let Some(group) = config.group(group_id)
@@ -993,7 +993,22 @@ async fn send_with_fallback(
             let mut empty_retries = 0;
             'candidate: loop {
                 liveness.activity.attempt();
-                let body = upstream::build_request(&route.provider, creq, &route.model);
+                let body = match upstream::build_request(&route.provider, creq, &route.model) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        // A local conversion error is not a bad credential or
+                        // upstream outage. Skip the entire key pool, with no
+                        // cooldown or network call, and try a compatible route.
+                        // Do not count a credential attempt: no HTTP request was sent.
+                        if route_index != last_route {
+                            continue 'routes;
+                        }
+                        return Err((
+                            ProxyFailure::new(StatusCode::BAD_REQUEST, error.to_string()),
+                            candidate,
+                        ));
+                    }
+                };
                 tracing::debug!(
                     provider = %route.provider.id,
                     model = %route.model,
@@ -1323,7 +1338,8 @@ async fn reask_stream(
         .into_iter()
         .nth(candidate.key_slot)
         .ok_or_else(|| "reask key is no longer available".to_owned())?;
-    let body = upstream::build_request(&candidate.provider, creq, &candidate.model);
+    let body = upstream::build_request(&candidate.provider, creq, &candidate.model)
+        .map_err(|error| error.to_string())?;
     let clock = StreamClock::new(
         config.stream_first_content_timeout_ms,
         config.stream_idle_timeout_ms,

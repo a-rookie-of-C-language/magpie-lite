@@ -88,6 +88,10 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
         system,
         messages,
         tools,
+        web_search: crate::search::WebSearchRequest::decode(
+            crate::search::SearchProtocol::Responses,
+            v,
+        )?,
         tool_choice: v.get("tool_choice").filter(|t| !t.is_null()).cloned(),
         max_tokens: v.get("max_output_tokens").and_then(Value::as_u64),
         temperature: v.get("temperature").and_then(Value::as_f64),
@@ -202,7 +206,7 @@ fn decode_input_item(item: &Value, messages: &mut Vec<Message>) {
 }
 
 /// Encode an IR request as an OpenAI Responses body, asking for `model`.
-pub fn encode_request(req: &CompletionRequest, model: &str) -> Value {
+pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
     let mut out = Map::new();
     out.insert("model".into(), json!(model));
     let system: String = req
@@ -315,7 +319,8 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Value {
     }
     out.insert("stream".into(), json!(req.stream));
     out.insert("store".into(), json!(false));
-    Value::Object(out)
+    crate::search::encode(req, crate::search::SearchProtocol::Responses, &mut out)?;
+    Ok(Value::Object(out))
 }
 
 // ---------------------------------------------------------------- replies

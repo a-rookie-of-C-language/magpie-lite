@@ -1,4 +1,4 @@
-//! Errors produced while decoding wire requests and responses.
+//! Errors produced while decoding or encoding wire requests and responses.
 
 #[derive(Debug, thiserror::Error)]
 #[allow(missing_docs)]

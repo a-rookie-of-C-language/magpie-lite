@@ -162,6 +162,10 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
         system,
         messages,
         tools,
+        web_search: crate::search::WebSearchRequest::decode(
+            crate::search::SearchProtocol::Anthropic,
+            v,
+        )?,
         tool_choice: v.get("tool_choice").filter(|t| !t.is_null()).cloned(),
         max_tokens: v.get("max_tokens").and_then(Value::as_u64),
         temperature: v.get("temperature").and_then(Value::as_f64),
@@ -182,7 +186,7 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
 
 /// Encode an IR request as an Anthropic Messages body, asking for `model`
 /// upstream (the routing-resolved name).
-pub fn encode_request(req: &CompletionRequest, model: &str) -> Value {
+pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
     let mut out = Map::new();
     out.insert("model".into(), json!(model));
     out.insert("max_tokens".into(), json!(req.max_tokens.unwrap_or(16384)));
@@ -271,7 +275,8 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Value {
         out.insert("stop_sequences".into(), json!(req.stop));
     }
     out.insert("stream".into(), json!(req.stream));
-    Value::Object(out)
+    crate::search::encode(req, crate::search::SearchProtocol::Anthropic, &mut out)?;
+    Ok(Value::Object(out))
 }
 
 fn decode_usage(v: &Value) -> Usage {

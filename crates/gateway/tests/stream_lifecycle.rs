@@ -6388,3 +6388,6 @@ async fn web_search_socket_disconnect_retains_usage_without_query_or_sources_in_
         f.assert_released().await;
     }
 }
+
+#[path = "support/search_requests.rs"]
+mod search_requests;

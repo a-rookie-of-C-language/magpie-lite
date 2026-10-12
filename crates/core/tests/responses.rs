@@ -41,7 +41,7 @@ fn responses_request_round_trips_tool_history() {
     assert_eq!(ir.messages[2].parts[0].call_id, "call_1");
     assert_eq!(ir.tools[0].name, "weather");
 
-    let encoded = magpie_core::responses::encode_request(&ir, "mock-model");
+    let encoded = magpie_core::responses::encode_request(&ir, "mock-model").unwrap();
     assert_eq!(encoded["model"], "mock-model");
     assert_eq!(encoded["instructions"], "You are terse.");
     let input = encoded["input"].as_array().unwrap();

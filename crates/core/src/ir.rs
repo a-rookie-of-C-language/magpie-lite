@@ -316,6 +316,8 @@ pub struct CompletionRequest {
     pub messages: Vec<Message>,
     /// Tools the model may call.
     pub tools: Vec<Tool>,
+    /// Provider-executed search and its native configuration, not a function tool.
+    pub web_search: Option<crate::search::WebSearchRequest>,
     /// How tools are chosen, in the asking protocol's own shape.
     pub tool_choice: Option<Value>,
     /// A token limit.

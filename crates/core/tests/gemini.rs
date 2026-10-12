@@ -74,7 +74,7 @@ fn gemini_request_decodes_tool_history_and_images() {
 #[test]
 fn ir_request_encodes_to_gemini_and_back() {
     let ir = gemini::decode_request(&gemini_request()).expect("decode");
-    let encoded = gemini::encode_request(&ir, "mock-model");
+    let encoded = gemini::encode_request(&ir, "mock-model").unwrap();
     assert_eq!(encoded["model"], "mock-model");
     assert_eq!(
         encoded["systemInstruction"]["parts"][0]["text"],

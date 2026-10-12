@@ -612,6 +612,26 @@ Fixtures cover both upstreams and all three supported output protocols in JSON
 and SSE, plus deadlines, refusal/loop no-replay and socket cancellation. The
 Responses disconnect fixture includes optional opening usage from a compatible
 upstream; ordinary missing/null opening usage produces no fabricated counters.
-Built-in search-tool request translation, Anthropic search ingress, Responses
+Cross-protocol configured search-option translation, Anthropic search ingress, Responses
 open_page/find, cross-provider citations, Chat presentation, subscription
 wrappers and live-provider/real-Agent conformance remain outside this increment.
+
+
+## Built-in search request routing (2026-10-12)
+
+Search availability is carried in the request IR independently of function
+calls and survives streaming/nonstreaming requests and native Gemini empty-reply
+reasks. Native options/choices are preserved. Bare intent can cross protocols;
+configured restrictions or forced choices that cannot be represented fail
+before upstream HTTP. The route loop may try a compatible configured fallback,
+including group routes, but does not retry keys or apply credential cooldown for
+this local encoding error. With no compatible remaining route the result is
+HTTP 400. Reask encoding errors propagate without restarting route fallback.
+
+Global NONE (Anthropic/Responses) suppresses search; function-only NONE
+(Chat/Gemini) does not. Translating function-only NONE omits function declarations
+while retaining the explicitly requested hosted search. OpenRouter/xAI adapters
+are exact-host checks; their behavior and native/cross-protocol choices are
+covered by local tests. Request history excludes private search policy values.
+These fixtures do not establish paid/live search or real-agent compatibility;
+see docs/core-parity.md for option-conversion and result-ingress limitations.

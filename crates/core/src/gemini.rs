@@ -322,6 +322,10 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
         system,
         messages,
         tools,
+        web_search: crate::search::WebSearchRequest::decode(
+            crate::search::SearchProtocol::Gemini,
+            v,
+        )?,
         tool_choice,
         max_tokens: generation
             .and_then(|g| get_either(g, "maxOutputTokens", "max_output_tokens"))
@@ -408,7 +412,7 @@ fn attachment_value(p: &Part) -> Value {
 }
 
 /// Encode an IR request as a Gemini generateContent body for `model`.
-pub fn encode_request(req: &CompletionRequest, model: &str) -> Value {
+pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
     let mut out = Map::new();
     out.insert("model".into(), json!(model));
 
@@ -537,7 +541,8 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Value {
     if !generation.is_empty() {
         out.insert("generationConfig".into(), Value::Object(generation));
     }
-    Value::Object(out)
+    crate::search::encode(req, crate::search::SearchProtocol::Gemini, &mut out)?;
+    Ok(Value::Object(out))
 }
 
 fn decode_usage(v: &Value) -> Usage {
