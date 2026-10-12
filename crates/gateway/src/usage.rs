@@ -69,7 +69,8 @@ pub struct RequestRecord {
 pub struct KeyStats {
     /// Upstream attempts made with this key, including fallback attempts.
     pub attempts: u64,
-    /// Attempts that received a successful upstream response.
+    /// Attempts accepted for handoff (after opening prefetch for SSE). A later
+    /// streaming error still makes the final request record unsuccessful.
     pub successes: u64,
     /// Attempts that were rejected, failed, or could not connect.
     pub errors: u64,
@@ -385,6 +386,13 @@ impl RequestTracker {
         self.record.provider = provider.to_owned();
         self.record.upstream_model = upstream_model.to_owned();
         self.record.key_slot = key_slot;
+    }
+
+    /// Switch accounting before awaiting a concrete attempt, so cancellation
+    /// records the actual route and never combines different attempts' usage.
+    pub fn begin_attempt(&mut self, provider: &str, upstream_model: &str, key_slot: usize) {
+        self.set_route(provider, upstream_model, key_slot);
+        self.usage = Usage::default();
     }
 
     /// Keep observed usage even if the response body is dropped mid-stream.

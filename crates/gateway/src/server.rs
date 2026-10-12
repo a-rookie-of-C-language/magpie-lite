@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use axum::body::{Body, Bytes};
@@ -852,8 +853,40 @@ fn quota_limited_status(status: reqwest::StatusCode) -> bool {
 fn route_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(
         status.as_u16(),
-        402 | 403 | 408 | 429 | 500 | 502 | 503 | 504 | 529
+        401 | 402 | 403 | 404 | 408 | 429 | 500..=599
     )
+}
+
+type UpstreamEvents = Pin<Box<dyn futures::Stream<Item = UpstreamEvent> + Send>>;
+
+enum UpstreamReply {
+    Json(reqwest::Response),
+    Stream(UpstreamEvents),
+}
+
+#[derive(Clone)]
+struct StreamFailure {
+    status: reqwest::StatusCode,
+    body: Value,
+}
+
+struct UpstreamEvent {
+    event: StreamEvent,
+    failure: Option<StreamFailure>,
+    usage_observed: bool,
+}
+impl From<StreamEvent> for UpstreamEvent {
+    fn from(event: StreamEvent) -> Self {
+        let failure = matches!(event, StreamEvent::Error { .. }).then(|| StreamFailure {
+            status: reqwest::StatusCode::BAD_GATEWAY,
+            body: Value::Null,
+        });
+        Self {
+            event,
+            failure,
+            usage_observed: false,
+        }
+    }
 }
 
 /// Send to the initial provider's key pool, then its fallback routes. All
@@ -865,9 +898,9 @@ async fn send_with_fallback(
     creq: &CompletionRequest,
     initial: UpstreamRoute,
     group_plan: Option<&GroupRoutePlan>,
-    tracker: &RequestTracker,
+    tracker: &mut RequestTracker,
     wire: ClientWire,
-) -> Result<(reqwest::Response, UpstreamCandidate), (Box<Response>, UpstreamCandidate)> {
+) -> Result<(UpstreamReply, UpstreamCandidate), (Box<Response>, UpstreamCandidate)> {
     let routes = upstream_routes(
         config,
         &state.key_rotation,
@@ -898,6 +931,7 @@ async fn send_with_fallback(
         }
         for (attempt, (key_slot, api_key)) in route.api_keys.iter().enumerate() {
             let candidate = UpstreamCandidate::new(&route, *key_slot);
+            tracker.begin_attempt(&route.provider.id, &route.model, *key_slot);
             let body = upstream::build_request(&route.provider, creq, &route.model);
             tracing::debug!(
                 provider = %route.provider.id,
@@ -938,15 +972,43 @@ async fn send_with_fallback(
             };
 
             let status = resp.status();
-            let attempt_status = if status.is_success() {
-                "ok".to_owned()
-            } else {
-                status.as_u16().to_string()
-            };
-            tracker.record_attempt(&route.provider.id, *key_slot, &attempt_status);
             if status.is_success() {
-                return Ok((resp, candidate));
+                if !creq.stream {
+                    tracker.record_attempt(&route.provider.id, *key_slot, "ok");
+                    return Ok((UpstreamReply::Json(resp), candidate));
+                }
+                let headers = resp.headers().clone();
+                let (events, failure) =
+                    prefetch_stream(resp, route.provider.protocol, tracker).await;
+                if let Some(failure) = failure {
+                    tracker.record_attempt(&route.provider.id, *key_slot, "upstream_stream_error");
+                    if quota_limited_status(failure.status) {
+                        let cooldown = quota_cooldown(
+                            &headers,
+                            Some(&failure.body),
+                            config.key_cooldown_for(&route.provider),
+                        );
+                        state.key_rotation.cool_down(
+                            &route.provider.id,
+                            route.provider.key_generation,
+                            *key_slot,
+                            cooldown,
+                        );
+                    }
+                    if attempt + 1 < route.api_keys.len() && key_retryable_status(failure.status) {
+                        drop(events);
+                        continue;
+                    }
+                    if route_index != last_route && route_retryable_status(failure.status) {
+                        drop(events);
+                        break;
+                    }
+                } else {
+                    tracker.record_attempt(&route.provider.id, *key_slot, "ok");
+                }
+                return Ok((UpstreamReply::Stream(events), candidate));
             }
+            tracker.record_attempt(&route.provider.id, *key_slot, &status.as_u16().to_string());
             let headers = resp.headers().clone();
             let error = upstream::error_detail(resp).await;
             if quota_limited_status(status) {
@@ -1058,13 +1120,13 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
         &initial.model,
         0,
     );
-    let (resp, candidate) = match send_with_fallback(
+    let (reply, candidate) = match send_with_fallback(
         &state,
         &config,
         &creq,
         initial,
         group_plan.as_ref(),
-        &tracker,
+        &mut tracker,
         wire,
     )
     .await
@@ -1081,34 +1143,37 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
     };
     let protocol = candidate.provider.protocol;
 
-    if !creq.stream {
-        let upstream_body: Value = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                let message = format!("bad upstream body: {e}");
-                tracker.finish("bad_upstream_body", &Usage::default());
-                return err_response(
-                    StatusCode::BAD_GATEWAY,
-                    wire.error_body(StatusCode::BAD_GATEWAY, &message),
-                );
-            }
-        };
-        let mut status = "ok";
-        let ir = decode_upstream_response(protocol, &upstream_body).unwrap_or_else(|e| {
-            tracing::warn!("decoding upstream reply: {e}");
-            status = "upstream_decode_error";
-            magpie_core::ir::CompletionResponse::default()
-        });
-        tracker.finish(status, &ir.usage);
-        return ok_json(wire.encode_response(&ir));
-    }
+    let mut events = match reply {
+        UpstreamReply::Json(resp) => {
+            let upstream_body: Value = match resp.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    let message = format!("bad upstream body: {e}");
+                    tracker.finish("bad_upstream_body", &Usage::default());
+                    return err_response(
+                        StatusCode::BAD_GATEWAY,
+                        wire.error_body(StatusCode::BAD_GATEWAY, &message),
+                    );
+                }
+            };
+            let mut status = "ok";
+            let ir = decode_upstream_response(protocol, &upstream_body).unwrap_or_else(|e| {
+                tracing::warn!("decoding upstream reply: {e}");
+                status = "upstream_decode_error";
+                magpie_core::ir::CompletionResponse::default()
+            });
+            tracker.finish(status, &ir.usage);
+            return ok_json(wire.encode_response(&ir));
+        }
+        UpstreamReply::Stream(events) => events,
+    };
 
     let client_model = creq.model.clone();
     let out = async_stream::stream! {
-        let mut events = Box::pin(upstream_events(resp, protocol));
         let mut encoder = ClientStreamEncoder::new(wire, &client_model);
-        while let Some(event) = events.next().await {
-            if let StreamEvent::Usage(usage) = &event {
+        while let Some(item) = events.next().await {
+            let event = item.event;
+            if !item.usage_observed && let StreamEvent::Usage(usage) = &event {
                 tracker.observe_usage(usage);
             }
             let terminal_status = match &event {
@@ -1139,13 +1204,66 @@ fn decode_upstream_data(
     protocol: Protocol,
     data: &str,
     decoders: &mut UpstreamDecoders,
-) -> Vec<StreamEvent> {
+) -> Vec<UpstreamEvent> {
     if protocol == Protocol::Chat && data.trim() == "[DONE]" {
-        return vec![StreamEvent::Done];
+        return vec![StreamEvent::Done.into()];
     }
-    serde_json::from_str(data)
-        .map(|value| decode_upstream_chunk(protocol, &value, decoders))
-        .unwrap_or_default()
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return Vec::new();
+    };
+    decode_upstream_chunk(protocol, &value, decoders)
+        .into_iter()
+        .map(|event| {
+            let failure = matches!(event, StreamEvent::Error { .. }).then(|| StreamFailure {
+                status: crate::stream_status::error_status(&value),
+                body: value.clone(),
+            });
+            UpstreamEvent {
+                event,
+                failure,
+                usage_observed: false,
+            }
+        })
+        .collect()
+}
+
+/// Hold only opening metadata, never a visible answer, while deciding whether
+/// an HTTP-200 stream is usable. A finite event budget commits pathological
+/// metadata-only streams instead of buffering indefinitely.
+async fn prefetch_stream(
+    response: reqwest::Response,
+    protocol: Protocol,
+    tracker: &mut RequestTracker,
+) -> (UpstreamEvents, Option<StreamFailure>) {
+    const MAX_OPENING_EVENTS: usize = 64;
+    let mut events: UpstreamEvents = Box::pin(upstream_events(response, protocol));
+    let mut prefix = Vec::new();
+    while let Some(mut item) = events.next().await {
+        if let StreamEvent::Usage(usage) = &item.event {
+            tracker.observe_usage(usage);
+            // Replaying buffered frames must not roll back newer observed usage.
+            item.usage_observed = true;
+        }
+        let failure = item.failure.clone();
+        let terminal = matches!(item.event, StreamEvent::Done | StreamEvent::Error { .. });
+        let visible = match &item.event {
+            StreamEvent::Start { .. } | StreamEvent::Usage(_) => false,
+            StreamEvent::TextDelta { text } | StreamEvent::ThinkingDelta { text } => {
+                !text.is_empty()
+            }
+            _ => true,
+        };
+        prefix.push(item);
+        if terminal {
+            // Close held HTTP connections even if the downstream never polls.
+            drop(events);
+            return (Box::pin(futures::stream::iter(prefix)), failure);
+        }
+        if visible || prefix.len() >= MAX_OPENING_EVENTS {
+            break;
+        }
+    }
+    (Box::pin(futures::stream::iter(prefix).chain(events)), None)
 }
 
 /// A dropped event stream owns and cancels its upstream response. Errors and
@@ -1153,7 +1271,7 @@ fn decode_upstream_data(
 fn upstream_events(
     response: reqwest::Response,
     protocol: Protocol,
-) -> impl futures::Stream<Item = StreamEvent> {
+) -> impl futures::Stream<Item = UpstreamEvent> {
     async_stream::stream! {
         let mut bytes = response.bytes_stream();
         let mut parser = SseParser::new();
@@ -1164,13 +1282,13 @@ fn upstream_events(
                 Ok(chunk) => parser.extend(&chunk),
                 Err(error) => {
                     tracing::warn!("upstream stream read failed: {error}");
-                    yield StreamEvent::Error { message: "upstream stream read failed".into() };
+                    yield StreamEvent::Error { message: "upstream stream read failed".into() }.into();
                     return;
                 }
             }
             while let Some(data) = parser.next_data() {
                 for event in decode_upstream_data(protocol, &data, &mut decoders) {
-                    chat_stopped |= protocol == Protocol::Chat && matches!(event, StreamEvent::Stop(_));
+                    chat_stopped |= protocol == Protocol::Chat && matches!(event.event, StreamEvent::Stop(_));
                     yield event;
                 }
             }
@@ -1178,18 +1296,18 @@ fn upstream_events(
         // Tolerate a complete final data frame lacking its blank separator.
         if let Some(data) = parser.flush() {
             for event in decode_upstream_data(protocol, &data, &mut decoders) {
-                chat_stopped |= protocol == Protocol::Chat && matches!(event, StreamEvent::Stop(_));
+                chat_stopped |= protocol == Protocol::Chat && matches!(event.event, StreamEvent::Stop(_));
                 yield event;
             }
         }
         // Some Chat-compatible endpoints close cleanly after finish_reason,
         // omitting [DONE]. Do not end at Stop: a later usage frame is valid.
         if chat_stopped {
-            yield StreamEvent::Done;
+            yield StreamEvent::Done.into();
         } else {
             yield StreamEvent::Error {
                 message: "upstream stream ended before a completion marker".into(),
-            };
+            }.into();
         }
     }
 }
@@ -1267,4 +1385,148 @@ async fn gemini_generate(
     value["stream"] = json!(stream);
     let bytes = Bytes::from(value.to_string());
     proxy(state, bytes, wire).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RoutingPolicy;
+    use std::time::Duration;
+
+    struct TestServer {
+        url: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+    async fn test_server(router: Router) -> TestServer {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        TestServer { url, task }
+    }
+    fn provider(id: &str, url: &str, model: &str) -> ProviderConfig {
+        ProviderConfig {
+            id: id.into(),
+            name: id.into(),
+            protocol: Protocol::Chat,
+            base_url: format!("{url}/v1"),
+            api_key: "private-test-key".into(),
+            api_keys: vec![],
+            models: vec![model.into()],
+            fallback: vec![],
+            key_cooldown_ms: None,
+            capabilities: Default::default(),
+            key_generation: 0,
+        }
+    }
+
+    /// This explicitly cancels the handler task, not a downstream HTTP socket.
+    /// It proves accounting while waiting for fallback headers, not automatic
+    /// cancellation of pending Axum handlers on a real client disconnect.
+    #[tokio::test]
+    async fn cancelled_pending_fallback_accounts_for_last_attempt_before_headers() {
+        for stream in [false, true] {
+            for grouped in [false, true] {
+                let first = test_server(Router::new().route("/v1/chat/completions", post(move || async move {
+                    if stream {
+                        let script = concat!(
+                            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":99,\"completion_tokens\":0}}\n\n",
+                            "data: {\"error\":{\"code\":429,\"message\":\"rate limited\"}}\n\n"
+                        );
+                        sse_response(Body::from_stream(async_stream::stream! {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(script.as_bytes()));
+                            std::future::pending::<()>().await;
+                        }))
+                    } else {
+                        err_response(StatusCode::TOO_MANY_REQUESTS, json!({"error":{"message":"rate limited"}}))
+                    }
+                }))).await;
+                let notified = Arc::new(tokio::sync::Notify::new());
+                let received = Arc::new(Mutex::new(None));
+                let signal = notified.clone();
+                let captured = received.clone();
+                let second = test_server(Router::new().route(
+                    "/v1/chat/completions",
+                    post(move |Json(body): Json<Value>| {
+                        let signal = signal.clone();
+                        let captured = captured.clone();
+                        async move {
+                            *captured.lock().unwrap() = Some(body["model"].clone());
+                            signal.notify_one();
+                            std::future::pending::<Response>().await
+                        }
+                    }),
+                ))
+                .await;
+                let mut primary = provider("primary", &first.url, "first-model");
+                if !grouped {
+                    primary.fallback = vec!["spare/second-model".into()];
+                }
+                let config = Config {
+                    provider: vec![primary, provider("spare", &second.url, "second-model")],
+                    group: if grouped {
+                        vec![GroupConfig {
+                            id: "daily".into(),
+                            name: "Daily".into(),
+                            routes: vec!["primary/first-model".into(), "spare/second-model".into()],
+                            routing: RoutingPolicy::Order,
+                        }]
+                    } else {
+                        vec![]
+                    },
+                    ..Config::default()
+                };
+                let directory = tempfile::tempdir().unwrap();
+                let history = directory.path().join("requests.jsonl");
+                let log = Arc::new(Mutex::new(RequestLog::open(&history).unwrap()));
+                let state = Arc::new(AppState {
+                    agents: None,
+                    config: ConfigStore::new(config, None),
+                    http: upstream::http_client().unwrap(),
+                    requests: log.clone(),
+                    key_rotation: Default::default(),
+                });
+                let requested = if grouped {
+                    "group/daily"
+                } else {
+                    "primary/first-model"
+                };
+                let body = Bytes::from(json!({"model":requested,"stream":stream,"messages":[{"role":"user","content":"private prompt"}]}).to_string());
+                let task = tokio::spawn(proxy(
+                    state,
+                    body,
+                    ClientWire::Chat {
+                        include_usage: true,
+                    },
+                ));
+                tokio::time::timeout(Duration::from_secs(4), notified.notified())
+                    .await
+                    .unwrap();
+                assert_eq!(*received.lock().unwrap(), Some(json!("second-model")));
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+                let records = log.lock().unwrap().snapshot().recent_requests;
+                assert_eq!(records.len(), 1);
+                let record = serde_json::to_value(&records[0]).unwrap();
+                assert_eq!(record["status"], "client_disconnected");
+                assert_eq!(record["requested_model"], requested);
+                assert_eq!(record["provider"], "spare");
+                assert_eq!(record["upstream_model"], "second-model");
+                assert!(record["usage"]["input"].is_null());
+                assert!(record["usage"]["output"].is_null());
+                let persisted = std::fs::read_to_string(&history).unwrap();
+                assert_eq!(persisted.lines().count(), 1);
+                assert_eq!(serde_json::from_str::<Value>(&persisted).unwrap(), record);
+                assert!(!persisted.contains("private"));
+            }
+        }
+    }
 }
