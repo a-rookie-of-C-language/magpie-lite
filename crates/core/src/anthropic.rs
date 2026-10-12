@@ -251,6 +251,7 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
             v,
         )?,
         tool_choice: v.get("tool_choice").filter(|t| !t.is_null()).cloned(),
+        tool_choice_protocol: Some(crate::ir::ToolChoiceProtocol::Anthropic),
         max_tokens: v.get("max_tokens").and_then(Value::as_u64),
         temperature: v.get("temperature").and_then(Value::as_f64),
         top_p: v.get("top_p").and_then(Value::as_f64),
@@ -271,6 +272,8 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
 /// Encode an IR request as an Anthropic Messages body, asking for `model`
 /// upstream (the routing-resolved name).
 pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
+    let prepared = crate::tool_choice::prepare(req, crate::tool_choice::Protocol::Anthropic)?;
+    let req = prepared.as_ref();
     let mut out = Map::new();
     out.insert("model".into(), json!(model));
     out.insert("max_tokens".into(), json!(req.max_tokens.unwrap_or(16384)));

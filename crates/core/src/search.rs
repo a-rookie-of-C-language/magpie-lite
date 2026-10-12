@@ -108,6 +108,23 @@ impl WebSearchRequest {
         }))
     }
 
+    /// An allowed-tools selector constrains offered declarations, including search.
+    pub(crate) fn with_allowed_tools(
+        &self,
+        allow_search: bool,
+        required: bool,
+        preserve_native: bool,
+    ) -> Option<Self> {
+        if self.protocol == SearchProtocol::Responses && !allow_search {
+            return None;
+        }
+        let mut restricted = self.clone();
+        if !(preserve_native && self.protocol == SearchProtocol::Responses) {
+            restricted.choice = Some(json!(if required { "required" } else { "auto" }));
+        }
+        Some(restricted)
+    }
+
     fn choice(&self) -> Result<Choice> {
         let Some(v) = &self.choice else {
             return Ok(Choice::Auto);

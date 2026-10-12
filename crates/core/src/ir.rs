@@ -394,6 +394,15 @@ impl StopReason {
     }
 }
 
+/// The dialect that supplied a tool-selection policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolChoiceProtocol {
+    Chat,
+    Responses,
+    Anthropic,
+    Gemini,
+}
+
 /// A completion request, decoded from any wire protocol.
 #[derive(Debug, Clone, Default)]
 pub struct CompletionRequest {
@@ -407,8 +416,10 @@ pub struct CompletionRequest {
     pub tools: Vec<Tool>,
     /// Provider-executed search and its native configuration, not a function tool.
     pub web_search: Option<crate::search::WebSearchRequest>,
-    /// How tools are chosen, in the asking protocol's own shape.
+    /// Tool selection in the asking dialect; encoders normalize it and enforce allowlists.
     pub tool_choice: Option<Value>,
+    /// Provenance for native selector preservation; None permits manually constructed IR.
+    pub tool_choice_protocol: Option<ToolChoiceProtocol>,
     /// A token limit.
     pub max_tokens: Option<u64>,
     /// Sampling temperature.

@@ -14,6 +14,7 @@ pub mod responses;
 pub mod search;
 pub mod stream;
 
+mod tool_choice;
 mod tool_output;
 
 pub use error::{CoreError, Result};

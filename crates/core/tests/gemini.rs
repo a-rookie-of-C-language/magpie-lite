@@ -65,7 +65,7 @@ fn gemini_request_decodes_tool_history_and_images() {
     assert_eq!(ir.tools[0].name, "weather");
     assert_eq!(
         ir.tool_choice,
-        Some(json!({"type": "function", "function": {"name": "weather"}}))
+        Some(json!({"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["weather"]}}))
     );
     assert_eq!(ir.max_tokens, Some(512));
     assert_eq!(ir.stop, vec!["\n"]);

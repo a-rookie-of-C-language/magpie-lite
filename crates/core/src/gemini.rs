@@ -95,52 +95,6 @@ fn function_response_text(v: &Value) -> (String, bool) {
     (v.to_string(), false)
 }
 
-fn tool_choice_from_gemini(v: &Value) -> Option<Value> {
-    let mode = v
-        .pointer("/functionCallingConfig/mode")
-        .or_else(|| v.pointer("/function_calling_config/mode"))
-        .and_then(Value::as_str)?;
-    match mode.to_ascii_uppercase().as_str() {
-        "NONE" => Some(json!("none")),
-        "ANY" | "VALIDATED" => {
-            let allowed = v
-                .pointer("/functionCallingConfig/allowedFunctionNames")
-                .or_else(|| v.pointer("/function_calling_config/allowed_function_names"))
-                .and_then(Value::as_array);
-            if allowed.map(|a| a.len()).unwrap_or(0) == 1 {
-                let name = allowed.and_then(|a| a.first()).and_then(Value::as_str)?;
-                return Some(json!({"type": "function", "function": {"name": name}}));
-            }
-            Some(json!("required"))
-        }
-        _ => Some(json!("auto")),
-    }
-}
-
-fn tool_choice_to_gemini(v: &Value) -> Value {
-    match v {
-        Value::String(s) if s == "none" => json!({
-            "functionCallingConfig": {"mode": "NONE"}
-        }),
-        Value::String(s) if s == "required" => json!({
-            "functionCallingConfig": {"mode": "ANY"}
-        }),
-        Value::Object(_) if v.pointer("/function/name").is_some() => {
-            let name = v
-                .pointer("/function/name")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            json!({
-                "functionCallingConfig": {
-                    "mode": "ANY",
-                    "allowedFunctionNames": [name],
-                }
-            })
-        }
-        _ => json!({"functionCallingConfig": {"mode": "AUTO"}}),
-    }
-}
-
 /// Decode a Gemini generateContent body. `model` comes from the URL and
 /// `stream` from which URL method the agent called.
 pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
@@ -344,7 +298,8 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
     let tool_choice = v
         .get("toolConfig")
         .or_else(|| v.get("tool_config"))
-        .and_then(tool_choice_from_gemini);
+        .filter(|v| !v.is_null())
+        .cloned();
 
     Ok(CompletionRequest {
         model,
@@ -356,6 +311,7 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
             v,
         )?,
         tool_choice,
+        tool_choice_protocol: Some(crate::ir::ToolChoiceProtocol::Gemini),
         max_tokens: generation
             .and_then(|g| get_either(g, "maxOutputTokens", "max_output_tokens"))
             .and_then(Value::as_u64),
@@ -442,6 +398,8 @@ fn attachment_value(p: &Part) -> Value {
 
 /// Encode an IR request as a Gemini generateContent body for `model`.
 pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
+    let prepared = crate::tool_choice::prepare(req, crate::tool_choice::Protocol::Gemini)?;
+    let req = prepared.as_ref();
     let mut out = Map::new();
     out.insert("model".into(), json!(model));
 
@@ -565,7 +523,7 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
         );
     }
     if let Some(choice) = &req.tool_choice {
-        out.insert("toolConfig".into(), tool_choice_to_gemini(choice));
+        out.insert("toolConfig".into(), choice.clone());
     }
 
     let mut generation = Map::new();

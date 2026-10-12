@@ -93,6 +93,7 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
             v,
         )?,
         tool_choice: v.get("tool_choice").filter(|t| !t.is_null()).cloned(),
+        tool_choice_protocol: Some(crate::ir::ToolChoiceProtocol::Responses),
         max_tokens: v.get("max_output_tokens").and_then(Value::as_u64),
         temperature: v.get("temperature").and_then(Value::as_f64),
         top_p: v.get("top_p").and_then(Value::as_f64),
@@ -238,6 +239,8 @@ fn decode_input_item(item: &Value, messages: &mut Vec<Message>) {
 
 /// Encode an IR request as an OpenAI Responses body, asking for `model`.
 pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
+    let prepared = crate::tool_choice::prepare(req, crate::tool_choice::Protocol::Responses)?;
+    let req = prepared.as_ref();
     let mut out = Map::new();
     out.insert("model".into(), json!(model));
     let system: String = req

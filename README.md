@@ -36,6 +36,11 @@ Native thinking/text/tool signature behavior and its limits are documented in
 [docs/native-signatures.md](docs/native-signatures.md), with loopback fixtures
 for native round trips, foreign-protocol isolation and safe stream commitment.
 
+Function-only tool selection is normalized across all four protocols, with
+request-local allowlist filtering and conservative errors for restrictions that
+cannot be translated. See [docs/tool-choices.md](docs/tool-choices.md) for the
+supported modes, native-only policies, and hosted-search boundary.
+
 ## Quick start
 
 ```sh
