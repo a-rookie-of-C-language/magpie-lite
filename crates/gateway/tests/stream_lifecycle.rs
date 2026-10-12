@@ -133,6 +133,15 @@ impl Fixture {
         ending: Ending,
         configure: impl FnOnce(&mut Config),
     ) -> Self {
+        Self::with_chunk_size(protocol, scripts, ending, 19, configure).await
+    }
+    async fn with_chunk_size(
+        protocol: Protocol,
+        scripts: Vec<String>,
+        ending: Ending,
+        chunk_size: usize,
+        configure: impl FnOnce(&mut Config),
+    ) -> Self {
         let sent_models = Arc::new(Mutex::new(Vec::new()));
         let captured_models = sent_models.clone();
         let extra_keys = (0..scripts.len())
@@ -169,7 +178,7 @@ impl Fixture {
                     .body(Body::from_stream(async_stream::stream! {
                         let _guard = guard;
                         // Deliberately cut inside JSON/SSE frame boundaries.
-                        for bytes in script.as_bytes().chunks(19) {
+                        for bytes in script.as_bytes().chunks(chunk_size) {
                             yield Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(bytes));
                         }
                         match ending {
@@ -295,10 +304,10 @@ impl Fixture {
 
 fn assert_completed(body: &str, protocol: Protocol) {
     let mut parser = magpie_core::stream::SseParser::new();
-    parser.extend(body.as_bytes());
+    let mut remaining = body.as_bytes();
     let mut frames = Vec::<Value>::new();
     let mut done = 0;
-    while let Some(data) = parser.next_data() {
+    while let Some(data) = parser.feed(&mut remaining).unwrap() {
         if data == "[DONE]" {
             done += 1;
         } else {
@@ -1024,4 +1033,216 @@ async fn cancelled_fallback_persists_only_selected_provider_and_partial_usage() 
             assert!(!persisted.contains(private));
         }
     }
+}
+
+#[tokio::test]
+async fn bom_and_cr_only_streams_complete_for_every_protocol_pair() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            let script =
+                format!("\u{feff}{}{}", prefix(upstream), completion(upstream)).replace('\n', "\r");
+            let f = Fixture::new(upstream, script, Ending::Hold).await;
+            let body = tokio::time::timeout(LIMIT, f.request(client).await.text())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_completed(&body, client);
+            f.assert_released().await;
+            assert_eq!(f.record().await["status"], "ok");
+        }
+    }
+}
+
+// No separator and no EOF: the size guard must terminate while the peer holds
+// the connection open, not wait for a completed frame before checking it.
+fn oversized_frame() -> String {
+    format!(
+        "data: {}",
+        "x".repeat(magpie_core::stream::MAX_SSE_EVENT_BYTES)
+    )
+}
+
+#[tokio::test]
+async fn oversized_opening_frames_fail_once_without_spending_other_keys() {
+    for (upstream, client) in PROTOCOLS.into_iter().zip(PROTOCOLS.into_iter().rev()) {
+        let f = Fixture::with_chunk_size(
+            upstream,
+            vec![
+                opening(upstream).to_owned() + &oversized_frame(),
+                prefix(upstream) + completion(upstream),
+            ],
+            Ending::Hold,
+            16 * 1024,
+            |_| {},
+        )
+        .await;
+        let body = tokio::time::timeout(LIMIT, f.request(client).await.text())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            body.matches("upstream SSE event exceeds").count(),
+            1,
+            "{body}"
+        );
+        assert!(!body.contains("xxx"));
+        assert_no_success(&body);
+        assert_eq!(*f.attempts.lock().unwrap(), vec![0]);
+        assert_eq!(f.record().await["status"], "upstream_stream_error");
+        assert!(
+            f.state
+                .key_rotation
+                .cooldown_snapshot(&f.state.config.current())
+                .is_empty()
+        );
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn oversized_opening_frames_fall_back_before_content_for_routes_and_groups() {
+    for upstream in PROTOCOLS {
+        for grouped in [false, true] {
+            let f = Fixture::with_chunk_size(
+                upstream,
+                vec![
+                    opening(upstream).to_owned() + &oversized_frame(),
+                    prefix(upstream) + completion(upstream),
+                ],
+                Ending::Hold,
+                16 * 1024,
+                |config| {
+                    let mut spare = config.provider[0].clone();
+                    spare.id = "spare".into();
+                    spare.api_keys = vec!["secret-upstream-key-1".into()];
+                    spare.models = vec!["backup-model".into()];
+                    config.provider[0].api_keys.truncate(1);
+                    if grouped {
+                        config.group.push(magpie_gateway::GroupConfig {
+                            id: "daily".into(),
+                            name: "".into(),
+                            routes: vec!["mock/up-model".into(), "spare/backup-model".into()],
+                            routing: magpie_gateway::RoutingPolicy::Order,
+                        });
+                    } else {
+                        config.provider[0].fallback = vec!["spare/backup-model".into()];
+                    }
+                    config.provider.push(spare);
+                },
+            )
+            .await;
+            let model = if grouped {
+                "group/daily"
+            } else {
+                "mock/up-model"
+            };
+            let body =
+                tokio::time::timeout(LIMIT, f.request_model(Protocol::Chat, model).await.text())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_completed(&body, Protocol::Chat);
+            assert!(!body.contains("exceeds"));
+            assert_eq!(*f.attempts.lock().unwrap(), vec![0, 1]);
+            let record = f.record().await;
+            assert_eq!(record["status"], "ok");
+            assert_eq!(record["provider"], "spare");
+            assert_eq!(record["upstream_model"], "backup-model");
+            assert_eq!(record["usage"]["input"], 7);
+            assert_eq!(record["usage"]["output"], 3);
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn oversized_frames_after_content_never_retry_and_keep_partial_usage() {
+    for (upstream, client) in PROTOCOLS.into_iter().zip(PROTOCOLS) {
+        let f = Fixture::with_chunk_size(
+            upstream,
+            vec![
+                prefix(upstream) + &oversized_frame(),
+                prefix(upstream) + completion(upstream),
+            ],
+            Ending::Hold,
+            16 * 1024,
+            |config| {
+                let mut spare = config.provider[0].clone();
+                spare.id = "spare".into();
+                spare.api_keys = vec!["secret-upstream-key-1".into()];
+                config.provider[0].api_keys.truncate(1);
+                config.provider[0].fallback = vec!["spare/up-model".into()];
+                config.provider.push(spare);
+            },
+        )
+        .await;
+        let body = tokio::time::timeout(LIMIT, f.request(client).await.text())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(body.contains("partial"));
+        assert_eq!(body.matches("upstream SSE event exceeds").count(), 1);
+        assert_no_success(&body);
+        assert_eq!(*f.attempts.lock().unwrap(), vec![0]);
+        let record = f.record().await;
+        assert_eq!(record["status"], "upstream_stream_error");
+        assert_eq!(record["provider"], "mock");
+        assert_partial_usage(&record, upstream);
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn opening_metadata_byte_budget_commits_before_a_later_error() {
+    for upstream in [Protocol::Anthropic, Protocol::Responses, Protocol::Gemini] {
+        let opening = opening(upstream).replace("abandoned-model", &"m".repeat(70 * 1024));
+        let f = Fixture::with_chunk_size(
+            upstream,
+            vec![
+                opening + limited(upstream),
+                prefix(upstream) + completion(upstream),
+            ],
+            Ending::Hold,
+            4096,
+            |_| {},
+        )
+        .await;
+        let body = tokio::time::timeout(LIMIT, f.request(Protocol::Chat).await.text())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(body.contains("fixture rate limit"));
+        assert_no_success(&body);
+        assert_eq!(*f.attempts.lock().unwrap(), vec![0]);
+        assert_eq!(f.record().await["status"], "upstream_stream_error");
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn discarded_chat_model_metadata_does_not_spend_the_opening_memory_budget() {
+    // The Chat decoder does not retain model-only metadata in a Start event.
+    // A wire-size budget here would incorrectly prevent a safe early retry.
+    let f = Fixture::with_chunk_size(
+        Protocol::Chat,
+        vec![
+            opening(Protocol::Chat).replace("abandoned-model", &"m".repeat(70 * 1024))
+                + limited(Protocol::Chat),
+            prefix(Protocol::Chat) + completion(Protocol::Chat),
+        ],
+        Ending::Hold,
+        4096,
+        |_| {},
+    )
+    .await;
+    let body = tokio::time::timeout(LIMIT, f.request(Protocol::Chat).await.text())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_completed(&body, Protocol::Chat);
+    assert_eq!(*f.attempts.lock().unwrap(), vec![0, 1]);
+    let record = f.record().await;
+    assert_eq!(record["status"], "ok");
+    assert_eq!(record["usage"]["input"], 7);
+    f.assert_released().await;
 }

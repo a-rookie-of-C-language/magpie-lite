@@ -55,86 +55,168 @@ pub enum StreamEvent {
     },
 }
 
-/// Parses SSE frames out of a byte stream. Feeds it chunks as they arrive;
-/// each `next_data` returns the joined `data:` payload of one frame.
-#[derive(Debug, Default)]
+/// Default byte budget for one raw SSE event, including nonempty lines and
+/// their line endings, but excluding the terminating blank line.
+/// The reference gateway accepts 32 MiB per line; we also bound the full event.
+pub const MAX_SSE_EVENT_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SseError {
+    #[error("upstream SSE event exceeds {limit} bytes")]
+    EventTooLarge { limit: usize },
+}
+
+/// Incremental, bounded SSE parser. Feed a borrowed transport chunk repeatedly
+/// until it is consumed; each call returns at most one data payload. No queue
+/// or copy of the whole transport chunk is retained. LF, CRLF and CR are valid
+/// line endings, even when split across chunks; a single leading BOM is ignored.
+#[derive(Debug)]
 pub struct SseParser {
-    buf: Vec<u8>,
+    line: Vec<u8>,
+    data: Vec<u8>,
+    event_bytes: usize,
+    max_event_bytes: usize,
+    skip_lf: bool,
+    first_line: bool,
+    failed: bool,
+}
+
+impl Default for SseParser {
+    fn default() -> Self {
+        Self::with_limit(MAX_SSE_EVENT_BYTES)
+    }
 }
 
 impl SseParser {
-    /// A parser with nothing buffered.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Buffer more bytes from the wire.
-    pub fn extend(&mut self, bytes: &[u8]) {
-        self.buf.extend_from_slice(bytes);
-    }
-
-    /// Whether anything is left buffered.
-    pub fn has_buffer(&self) -> bool {
-        !self.buf.is_empty()
-    }
-
-    /// The next complete frame's data payload, if one is buffered.
-    pub fn next_data(&mut self) -> Option<String> {
-        loop {
-            let (block_len, sep_len) = self.find_boundary()?;
-            let block: Vec<u8> = self.buf.drain(..block_len + sep_len).collect();
-            let block = String::from_utf8_lossy(&block[..block_len]);
-            let mut data = String::new();
-            for line in block.lines() {
-                let line = line.trim_end_matches('\r');
-                if let Some(rest) = line.strip_prefix("data:") {
-                    data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
-                    data.push('\n');
-                }
-            }
-            if data.is_empty() {
-                continue; // a comment or an event with no data
-            }
-            data.pop(); // the newline the loop appended
-            return Some(data);
+    /// Set a per-event byte budget. Transport chunks may contain any number of
+    /// individually bounded events and may be much larger than this limit.
+    pub fn with_limit(max_event_bytes: usize) -> Self {
+        Self {
+            line: Vec::new(),
+            data: Vec::new(),
+            event_bytes: 0,
+            max_event_bytes,
+            skip_lf: false,
+            first_line: true,
+            failed: false,
         }
     }
 
-    /// Flush a trailing frame that the upstream ended without a blank line
-    /// after (non-conforming, but cheap to tolerate).
-    pub fn flush(&mut self) -> Option<String> {
-        if self.buf.is_empty() {
+    pub fn has_buffer(&self) -> bool {
+        self.event_bytes != 0
+    }
+
+    /// Consume only through the next data event, advancing the caller's slice.
+    /// A size error is terminal and must never be followed by a successful EOF.
+    pub fn feed(&mut self, bytes: &mut &[u8]) -> Result<Option<String>, SseError> {
+        if self.failed {
+            return Err(self.size_error());
+        }
+        while !bytes.is_empty() {
+            if self.skip_lf {
+                self.skip_lf = false;
+                if bytes[0] == b'\n' {
+                    *bytes = &bytes[1..];
+                    // CRLF after a nonempty line belongs to that event. The LF
+                    // of a blank separator does not belong to the next event.
+                    if self.event_bytes != 0 {
+                        self.account(1)?;
+                    }
+                    continue;
+                }
+            }
+            let end = bytes
+                .iter()
+                .position(|b| matches!(b, b'\r' | b'\n'))
+                .unwrap_or(bytes.len());
+            self.account(end)?;
+            self.line.extend_from_slice(&bytes[..end]);
+            *bytes = &bytes[end..];
+            if bytes.is_empty() {
+                break;
+            }
+            let newline = bytes[0];
+            *bytes = &bytes[1..];
+            self.skip_lf = newline == b'\r';
+            // A BOM alone before the first newline is also a blank line.
+            if self.line.is_empty() || (self.first_line && self.line == b"\xef\xbb\xbf") {
+                self.line.clear();
+                self.first_line = false;
+                if let Some(data) = self.dispatch() {
+                    return Ok(Some(data));
+                }
+            } else {
+                self.account(1)?;
+                self.finish_line();
+            }
+        }
+        Ok(None)
+    }
+
+    /// Tolerate a final event without its blank separator, as the existing
+    /// gateway does. A stream size error can never be flushed into a payload.
+    pub fn flush(&mut self) -> Result<Option<String>, SseError> {
+        if self.failed {
+            return Err(self.size_error());
+        }
+        if !self.line.is_empty() {
+            self.finish_line();
+        }
+        Ok(self.dispatch())
+    }
+
+    fn size_error(&self) -> SseError {
+        SseError::EventTooLarge {
+            limit: self.max_event_bytes,
+        }
+    }
+
+    fn account(&mut self, count: usize) -> Result<(), SseError> {
+        if count > self.max_event_bytes.saturating_sub(self.event_bytes) {
+            self.failed = true;
+            self.line = Vec::new();
+            self.data = Vec::new();
+            self.event_bytes = 0;
+            return Err(self.size_error());
+        }
+        self.event_bytes += count;
+        Ok(())
+    }
+
+    fn finish_line(&mut self) {
+        let mut line = self.line.as_slice();
+        if self.first_line {
+            self.first_line = false;
+            line = line.strip_prefix(b"\xef\xbb\xbf").unwrap_or(line);
+        }
+        // A colon-less field has an empty value. Only one optional space after
+        // the colon is removed; comments and unknown fields are ignored.
+        let value = if line == b"data" {
+            Some(&b""[..])
+        } else {
+            line.strip_prefix(b"data:")
+                .map(|value| value.strip_prefix(b" ").unwrap_or(value))
+        };
+        if let Some(value) = value {
+            self.data.extend_from_slice(value);
+            self.data.push(b'\n');
+        }
+        self.line.clear();
+    }
+
+    fn dispatch(&mut self) -> Option<String> {
+        self.event_bytes = 0;
+        if self.data.is_empty() {
             return None;
         }
-        let block = String::from_utf8_lossy(&self.buf).into_owned();
-        self.buf.clear();
-        let mut data = String::new();
-        for line in block.lines() {
-            let line = line.trim_end_matches('\r');
-            if let Some(rest) = line.strip_prefix("data:") {
-                data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
-                data.push('\n');
-            }
-        }
-        data.pop();
-        if data.is_empty() { None } else { Some(data) }
-    }
-
-    /// Where the next frame ends: (bytes of the block, bytes of the blank
-    /// separator). Accepts `\n\n` and `\r\n\r\n` (and the mixed `\n\r\n`).
-    fn find_boundary(&self) -> Option<(usize, usize)> {
-        let b = &self.buf;
-        for i in 0..b.len().saturating_sub(1) {
-            if b[i] == b'\n' {
-                if b[i + 1] == b'\n' {
-                    return Some((i, 2));
-                }
-                if i + 2 < b.len() && b[i + 1] == b'\r' && b[i + 2] == b'\n' {
-                    return Some((i, 3));
-                }
-            }
-        }
-        None
+        self.data.pop();
+        let payload = String::from_utf8_lossy(&self.data).into_owned();
+        self.data.clear();
+        Some(payload)
     }
 }
 
@@ -142,29 +224,174 @@ impl SseParser {
 mod tests {
     use super::*;
 
+    fn parse(input: &[u8], chunk_size: usize) -> Vec<String> {
+        let mut parser = SseParser::new();
+        let mut events = Vec::new();
+        for chunk in input.chunks(chunk_size) {
+            let mut remaining = chunk;
+            while let Some(event) = parser.feed(&mut remaining).unwrap() {
+                events.push(event);
+            }
+            assert!(remaining.is_empty());
+        }
+        if let Some(event) = parser.flush().unwrap() {
+            events.push(event);
+        }
+        events
+    }
+
     #[test]
     fn parses_frames_across_chunk_boundaries() {
-        let mut p = SseParser::new();
-        p.extend(b"data: {\"a\":");
-        assert_eq!(p.next_data(), None);
-        p.extend(b"1}\n\ndata: [DONE]\n\n");
-        assert_eq!(p.next_data(), Some(r#"{"a":1}"#.into()));
-        assert_eq!(p.next_data(), Some("[DONE]".into()));
-        assert_eq!(p.next_data(), None);
+        let input = b"data: {\"a\":1}\n\ndata: [DONE]\n\n";
+        for chunk in 1..=input.len() {
+            assert_eq!(
+                parse(input, chunk),
+                [r#"{"a":1}"#.to_owned(), "[DONE]".into()]
+            );
+        }
     }
 
     #[test]
-    fn parses_crlf_frames_and_ignores_comments() {
-        let mut p = SseParser::new();
-        p.extend(b": ping\r\ndata: one\r\n\r\nevent: x\r\ndata: two\r\n\r\n");
-        assert_eq!(p.next_data(), Some("one".into()));
-        assert_eq!(p.next_data(), Some("two".into()));
+    fn parses_all_line_endings_bom_unicode_and_multiline_data() {
+        for ending in ["\n", "\r\n", "\r"] {
+            let input = format!(
+                "\u{feff}: ping{ending}event: x{ending}data: 中文 🦀{ending}data:  two{ending}{ending}data: done{ending}{ending}"
+            );
+            for chunk in 1..=input.len() {
+                assert_eq!(parse(input.as_bytes(), chunk), ["中文 🦀\n two", "done"]);
+            }
+        }
     }
 
     #[test]
-    fn joins_multi_line_data() {
-        let mut p = SseParser::new();
-        p.extend(b"data: a\ndata: b\n\n");
-        assert_eq!(p.next_data(), Some("a\nb".into()));
+    fn ignores_comments_and_unknown_fields_but_keeps_empty_data() {
+        let input = b": ping\n\nid: unused\n\nevent: unused\n\ndata\n\ndata:\n\ndata: \n\ndata : ignored\n\ndata:  space\n\n";
+        assert_eq!(parse(input, 1), ["", "", "", " space"]);
+    }
+
+    #[test]
+    fn tolerates_unterminated_final_data_and_replaces_invalid_utf8() {
+        assert_eq!(parse(b"data: one\rdata: two\xff", 1), ["one\ntwo\u{fffd}"]);
+        assert!(parse(b": comment without newline", 2).is_empty());
+        // Only the start of the stream may have a BOM.
+        assert_eq!(
+            parse("data: one\n\n\u{feff}data: ignored\n\n".as_bytes(), 1),
+            ["one"]
+        );
+    }
+
+    #[test]
+    fn bounds_full_events_including_ignored_lines_without_retaining_input() {
+        for input in [
+            b"data: 123456\n\n".as_slice(),
+            b": 1234567890\n\n",
+            b"x: 123456789\n\n",
+            b"data: a\ndata: b\n\n",
+        ] {
+            for size in 1..=input.len() {
+                let mut parser = SseParser::with_limit(10);
+                let mut failed = false;
+                for chunk in input.chunks(size) {
+                    let mut remaining = chunk;
+                    if parser.feed(&mut remaining).is_err() {
+                        failed = true;
+                        break;
+                    }
+                }
+                assert!(failed);
+                assert!(parser.line.is_empty() && parser.data.is_empty());
+                assert!(parser.flush().is_err());
+                assert!(parser.feed(&mut b"data: ok\n\n".as_slice()).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn leaves_later_frames_borrowed_and_never_reads_past_a_returned_event() {
+        let input = format!("data: ok\n\ndata: {}", "x".repeat(100_000));
+        let mut remaining = input.as_bytes();
+        let mut parser = SseParser::with_limit(9);
+        assert_eq!(parser.feed(&mut remaining).unwrap(), Some("ok".into()));
+        assert_eq!(remaining, &input.as_bytes()[10..]);
+        assert!(parser.line.is_empty() && parser.data.is_empty());
+        assert_eq!(
+            parser.feed(&mut remaining),
+            Err(SseError::EventTooLarge { limit: 9 })
+        );
+    }
+
+    #[test]
+    fn bom_only_first_line_does_not_join_the_following_event_budget() {
+        for ending in ["\n", "\r\n", "\r"] {
+            let input = format!("\u{feff}{ending}data: ok{ending}{ending}");
+            for chunk_size in 1..=input.len() {
+                let mut parser = SseParser::with_limit(8 + ending.len());
+                let mut events = Vec::new();
+                for chunk in input.as_bytes().chunks(chunk_size) {
+                    let mut remaining = chunk;
+                    while let Some(data) = parser.feed(&mut remaining).unwrap() {
+                        events.push(data);
+                    }
+                }
+                assert_eq!(events, ["ok"]);
+                assert!(!parser.has_buffer());
+            }
+        }
+    }
+
+    #[test]
+    fn fragmented_exact_limits_are_independent_of_crlf_chunk_boundaries() {
+        for ending in ["\n", "\r\n", "\r"] {
+            let input = format!("data: ok{ending}{ending}");
+            let limit = 8 + ending.len();
+            for size in 1..=input.len() {
+                for (budget, succeeds) in [(limit, true), (limit - 1, false)] {
+                    let mut parser = SseParser::with_limit(budget);
+                    let mut events = Vec::new();
+                    let mut failed = false;
+                    for chunk in input.as_bytes().chunks(size) {
+                        let mut remaining = chunk;
+                        loop {
+                            match parser.feed(&mut remaining) {
+                                Ok(Some(event)) => events.push(event),
+                                Ok(None) => break,
+                                Err(_) => {
+                                    failed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if failed {
+                            break;
+                        }
+                    }
+                    assert_eq!(
+                        !failed, succeeds,
+                        "ending={ending:?}, size={size}, budget={budget}"
+                    );
+                    if succeeds {
+                        assert_eq!(events, ["ok"]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn accepts_exact_limit_and_many_coalesced_frames_beyond_chunk_budget() {
+        for ending in ["\n", "\r\n", "\r"] {
+            let frame = format!("data: ok{ending}{ending}");
+            let input = frame.repeat(1000);
+            let mut remaining = input.as_bytes();
+            let mut parser = SseParser::with_limit(8 + ending.len());
+            let mut count = 0;
+            while let Some(data) = parser.feed(&mut remaining).unwrap() {
+                assert_eq!(data, "ok");
+                count += 1;
+            }
+            assert_eq!(count, 1000);
+            assert!(remaining.is_empty());
+            assert!(!parser.has_buffer());
+        }
     }
 }

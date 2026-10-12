@@ -1236,6 +1236,8 @@ async fn prefetch_stream(
     tracker: &mut RequestTracker,
 ) -> (UpstreamEvents, Option<StreamFailure>) {
     const MAX_OPENING_EVENTS: usize = 64;
+    const MAX_OPENING_METADATA_BYTES: usize = 64 * 1024;
+    let mut metadata_bytes = 0;
     let mut events: UpstreamEvents = Box::pin(upstream_events(response, protocol));
     let mut prefix = Vec::new();
     while let Some(mut item) = events.next().await {
@@ -1253,13 +1255,20 @@ async fn prefetch_stream(
             }
             _ => true,
         };
+        metadata_bytes += std::mem::size_of_val(&item);
+        if let StreamEvent::Start { model } = &item.event {
+            metadata_bytes += model.len();
+        }
         prefix.push(item);
         if terminal {
             // Close held HTTP connections even if the downstream never polls.
             drop(events);
             return (Box::pin(futures::stream::iter(prefix)), failure);
         }
-        if visible || prefix.len() >= MAX_OPENING_EVENTS {
+        if visible
+            || prefix.len() >= MAX_OPENING_EVENTS
+            || metadata_bytes >= MAX_OPENING_METADATA_BYTES
+        {
             break;
         }
     }
@@ -1278,15 +1287,24 @@ fn upstream_events(
         let mut decoders = UpstreamDecoders::new();
         let mut chat_stopped = false;
         while let Some(chunk) = bytes.next().await {
-            match chunk {
-                Ok(chunk) => parser.extend(&chunk),
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
                 Err(error) => {
                     tracing::warn!("upstream stream read failed: {error}");
                     yield StreamEvent::Error { message: "upstream stream read failed".into() }.into();
                     return;
                 }
-            }
-            while let Some(data) = parser.next_data() {
+            };
+            let mut remaining = chunk.as_ref();
+            loop {
+                let data = match parser.feed(&mut remaining) {
+                    Ok(Some(data)) => data,
+                    Ok(None) => break,
+                    Err(error) => {
+                        yield StreamEvent::Error { message: error.to_string() }.into();
+                        return;
+                    }
+                };
                 for event in decode_upstream_data(protocol, &data, &mut decoders) {
                     chat_stopped |= protocol == Protocol::Chat && matches!(event.event, StreamEvent::Stop(_));
                     yield event;
@@ -1294,10 +1312,17 @@ fn upstream_events(
             }
         }
         // Tolerate a complete final data frame lacking its blank separator.
-        if let Some(data) = parser.flush() {
-            for event in decode_upstream_data(protocol, &data, &mut decoders) {
-                chat_stopped |= protocol == Protocol::Chat && matches!(event.event, StreamEvent::Stop(_));
-                yield event;
+        match parser.flush() {
+            Ok(Some(data)) => {
+                for event in decode_upstream_data(protocol, &data, &mut decoders) {
+                    chat_stopped |= protocol == Protocol::Chat && matches!(event.event, StreamEvent::Stop(_));
+                    yield event;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                yield StreamEvent::Error { message: error.to_string() }.into();
+                return;
             }
         }
         // Some Chat-compatible endpoints close cleanly after finish_reason,

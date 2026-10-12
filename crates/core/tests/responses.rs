@@ -113,9 +113,9 @@ fn chat_stream_translates_to_responses_events() {
     }
 
     let mut parser = SseParser::new();
-    parser.extend(wire.as_bytes());
+    let mut remaining = wire.as_bytes();
     let mut events = Vec::new();
-    while let Some(data) = parser.next_data() {
+    while let Some(data) = parser.feed(&mut remaining).unwrap() {
         events.push(serde_json::from_str::<Value>(&data).expect("event JSON"));
     }
 

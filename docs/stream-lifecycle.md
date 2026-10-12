@@ -1,8 +1,9 @@
 # Stream lifecycle and failover
 
 Reference: `D:\code\magpie\internal\gateway\stream_error_open_test.go` and
-`canceled_usage_test.go`. This document describes the Rust gateway's implemented
-contract, not full Magpie or live-vendor conformance.
+`canceled_usage_test.go`, plus `sse.go` for the reference reader. This document
+describes the Rust gateway's implemented contract, not full Magpie or live-vendor
+conformance.
 
 ## Terminal events and errors
 
@@ -20,6 +21,37 @@ protocol completion marker, or an upstream transport read failure, becomes a
 sanitized stream error instead of fabricated success. Invalid JSON frames are
 currently ignored; this is not a strict SSE/JSON validation contract.
 
+## Incremental parsing and byte limits
+
+The core parser consumes borrowed transport slices through fallible
+`feed(&mut remaining)` calls, returning at most one data payload each time.
+It retains only the current line and joined data, not a transport-sized copy or
+a queue of every frame in a chunk. Consumed bytes are not repeatedly rescanned
+or drained from the front of a growing input buffer. One chunk may contain any
+number of individually valid events, even when its total exceeds the budget.
+
+LF, CRLF and CR line endings work across arbitrary chunk boundaries. One
+initial UTF-8 BOM is ignored; fragmented UTF-8 is joined before decoding, and
+invalid UTF-8 is replaced. Data lines join with one newline, only one optional
+space after the colon is removed, and colon-less or empty `data` fields produce
+an empty payload. Comments and unknown fields do not become data.
+
+The fixed gateway default is **32 MiB per raw event**: all nonempty lines and
+their line endings count, including ignored comments/fields; the terminating
+blank line does not. The reference reader has a 32 MiB scanner-line limit;
+lite additionally limits the aggregate multiline event. This deliberately
+rejects oversized multiline events that the reference may accept. An error is
+detected while feeding bytes, without waiting for a separator or EOF, releases
+the parser buffers, and cannot later flush into a successful payload. The error
+contains the limit, not raw upstream data. It uses the existing 502 stream-error
+path: early route/group fallback is allowed, extra keys on the same endpoint
+are not consumed or cooled down, and content already emitted is never replayed.
+
+This is a raw-event bound, **not a 32 MiB total request-memory guarantee**.
+Allocator capacity, joined payload/JSON decoding, protocol state and transport
+buffers add overhead. Long streams may contain indefinitely many bounded
+events; byte limits are not an elapsed-time deadline.
+
 ## Failover before an answer
 
 A successful HTTP status is not sufficient for an SSE attempt. Before handing
@@ -30,8 +62,12 @@ and reads until one of:
 - A completion marker commits even an empty answer.
 - An error closes the upstream immediately and permits retry according to its
   structured status, provided the attempt has not committed.
-- 64 decoded opening events commit the attempt as a buffering safety bound.
-  Errors after that bound do not retry, even if there has been no actual text.
+- 64 decoded opening events, or a 64 KiB retained-metadata estimate, commit the
+  attempt as buffering safety bounds. The estimate counts event storage and
+  retained model-string bytes; it may overshoot by one bounded event and is not
+  an allocator-exact memory cap. Errors after either bound do not retry, even if
+  there has been no actual text. Wire-only metadata discarded by the decoder
+  does not count toward retained metadata.
 
 Discarded attempts' opening frames are never encoded into the selected answer.
 A new attempt gets a fresh upstream decoder; the client encoder is created only
@@ -40,9 +76,9 @@ particular reasoning/tool activity counts as committed even if a particular
 client dialect buffers or hides that activity.
 
 The prefetch runs in the handler before downstream response headers. An upstream
-that sends fewer than 64 metadata events and then stalls can still hold the
-handler indefinitely: this stage adds neither a first-content timeout nor
-keepalive frames. The event bound is not a raw-byte or parser-buffer bound.
+that stays below the opening event/metadata budgets and then stalls can still
+hold the handler indefinitely: this stage adds neither a first-content timeout
+nor keepalive frames. The parser byte bound above does not solve this.
 
 ### Retry classification
 
@@ -95,13 +131,19 @@ no completed per-key attempt counter for the still-pending response.
 ## Evidence and limits
 
 `crates/gateway/tests/stream_lifecycle.rs` uses real local HTTP servers with
-19-byte fragmentation and held-open response bodies. It covers four upstream
+19-byte fragmentation and held-open response bodies, with 4/16 KiB chunks for
+large metadata and default-limit oversize fixtures. It covers four upstream
 by four client dialects for terminal/error/EOF behavior, early key failover,
 exhaustion, invalid requests and no-retry after text. Additional fixtures cover
 reasoning/tool commitment, bounded metadata, auth key exhaustion, every pair of
 upstream/fallback dialects through ordinary and grouped routing, and cancellation
 with JSONL persistence/reload. Drop guards check that all attempted response
-bodies, not merely the first, are released.
+bodies, not merely the first, are released. A BOM/CR-only fixture covers every
+upstream/client pair. Default 32 MiB unterminated-frame fixtures cover four
+upstream protocols, four client dialects in selected pairs, ordinary/group
+fallback, no extra same-endpoint key attempts, and no retry after partial output.
+Retained-metadata byte-budget tests distinguish model-bearing Start events from
+discarded Chat model metadata.
 
 `server::tests::cancelled_pending_fallback_accounts_for_last_attempt_before_headers`
 explicitly aborts the handler task while the fallback waits for HTTP headers.
@@ -112,7 +154,10 @@ That real-HTTP pre-header cancellation behavior still needs separate work.
 
 `crates/core/tests/stream_accounting.rs` covers cumulative counters and Chat /
 Responses error envelope decoding. `stream_status` unit fixtures cover structured
-error classification. These are synthetic protocol fixtures, not captured real
-Agent sessions or paid/live vendor compatibility evidence. Raw SSE byte/frame
-limits, first-content/idle timeout policy, real pre-header disconnect handling,
-and broader tool/multimodal conformance remain open.
+error classification. Core parser fixtures vary every chunk size across supported
+line endings, multibyte characters, BOM, empty/multiline data and exact size
+limits; they also cover oversized ignored lines, sticky failure and coalesced
+frames larger than the per-event budget. These are synthetic protocol fixtures,
+not captured real Agent sessions or paid/live vendor compatibility evidence.
+First-content/idle timeout policy, real pre-header disconnect handling, and
+broader tool/multimodal conformance remain open.

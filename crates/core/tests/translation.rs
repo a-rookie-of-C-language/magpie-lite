@@ -170,13 +170,13 @@ fn anthropic_stream_translates_to_chat_chunks() {
     // Every frame parses, the fragments reassemble, the tool call carries
     // over, usage is reported, and the stream ends as Chat does.
     let mut parser = SseParser::new();
-    parser.extend(out.as_bytes());
+    let mut remaining = out.as_bytes();
     let mut texts = String::new();
     let mut args = String::new();
     let mut saw_finish = false;
     let mut saw_usage = false;
     let mut saw_done = false;
-    while let Some(data) = parser.next_data() {
+    while let Some(data) = parser.feed(&mut remaining).unwrap() {
         if data == "[DONE]" {
             saw_done = true;
             continue;
@@ -251,13 +251,13 @@ fn chat_stream_translates_to_anthropic_events() {
     }
 
     let mut parser = SseParser::new();
-    parser.extend(out.as_bytes());
+    let mut remaining = out.as_bytes();
     let mut text = String::new();
     let mut args = String::new();
     let mut stop_reason = String::new();
     let mut output_tokens: Option<u64> = None;
     let mut saw_message_stop = false;
-    while let Some(data) = parser.next_data() {
+    while let Some(data) = parser.feed(&mut remaining).unwrap() {
         let v: Value = serde_json::from_str(&data).expect("event data is JSON");
         match v.get("type").and_then(Value::as_str).unwrap_or_default() {
             "content_block_delta" => match v

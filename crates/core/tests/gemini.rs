@@ -177,9 +177,9 @@ fn chat_stream_translates_to_gemini_events() {
     }
 
     let mut parser = SseParser::new();
-    parser.extend(wire.as_bytes());
+    let mut remaining = wire.as_bytes();
     let mut events = Vec::new();
-    while let Some(data) = parser.next_data() {
+    while let Some(data) = parser.feed(&mut remaining).unwrap() {
         events.push(serde_json::from_str::<Value>(&data).expect("event JSON"));
     }
     assert!(events.len() >= 4);
@@ -249,12 +249,12 @@ fn gemini_stream_translates_to_chat_chunks() {
     }
 
     let mut parser = SseParser::new();
-    parser.extend(wire.as_bytes());
+    let mut remaining = wire.as_bytes();
     let mut text = String::new();
     let mut args = String::new();
     let mut usage: Option<Value> = None;
     let mut done = false;
-    while let Some(data) = parser.next_data() {
+    while let Some(data) = parser.feed(&mut remaining).unwrap() {
         if data == "[DONE]" {
             done = true;
             continue;
