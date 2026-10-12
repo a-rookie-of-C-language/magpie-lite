@@ -1,7 +1,7 @@
 //! Streaming: the protocol-neutral event set every SSE dialect is decoded
 //! into, and a small server-sent-events frame parser.
 
-use crate::ir::{Part, StopReason, Usage, WebSearch};
+use crate::ir::{Part, SealedReasoning, StopReason, Usage, WebSearch};
 
 /// One thing that happened in a streamed completion.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,6 +35,12 @@ pub enum StreamEvent {
     /// Citation/attribution-only updates carry no public answer and must not
     /// fabricate a new search call in foreign protocols.
     SearchUpdate { search: Box<WebSearch> },
+    /// A new Responses reasoning item, even if it has no public summary.
+    /// This is metadata, not first content; native IDs never cross protocols.
+    ThinkingStart { id: String },
+    /// A complete native opaque reasoning block/item. It commits the attempt,
+    /// but is not visible answer text and must not enter the prose loop guard.
+    Sealed { reasoning: Box<SealedReasoning> },
     /// A fragment of reasoning text.
     ThinkingDelta {
         /// The fragment.
@@ -91,7 +97,9 @@ impl StreamEvent {
 
     /// Visible answer or reasoning; metadata does not satisfy first content.
     pub fn is_content(&self) -> bool {
-        self.is_answer() || matches!(self, Self::ThinkingDelta { text } if !text.is_empty())
+        self.is_answer()
+            || matches!(self, Self::Sealed { .. })
+            || matches!(self, Self::ThinkingDelta { text } if !text.is_empty())
     }
 }
 

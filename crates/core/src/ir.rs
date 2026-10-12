@@ -101,6 +101,50 @@ impl WebSearch {
     }
 }
 
+/// Wire protocol that owns opaque reasoning. Ciphertext is not portable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningProtocol {
+    Anthropic,
+    Responses,
+}
+
+/// A validated native opaque reasoning object. Its entire JSON value is kept,
+/// including unknown fields; only the owning protocol may render it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SealedReasoning {
+    protocol: ReasoningProtocol,
+    value: Value,
+}
+
+impl SealedReasoning {
+    /// Recognize only the protocol's opaque reasoning shape, never arbitrary
+    /// content or another protocol's ciphertext.
+    pub fn decode(protocol: ReasoningProtocol, value: &Value) -> Option<Self> {
+        let valid = match protocol {
+            ReasoningProtocol::Anthropic => {
+                value["type"] == "redacted_thinking"
+                    && value.get("data").is_some_and(Value::is_string)
+            }
+            ReasoningProtocol::Responses => {
+                value["type"] == "reasoning"
+                    && value
+                        .get("encrypted_content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|data| !data.is_empty())
+            }
+        };
+        valid.then(|| Self {
+            protocol,
+            value: value.clone(),
+        })
+    }
+
+    /// Get the original object only for its native wire protocol.
+    pub fn native(&self, protocol: ReasoningProtocol) -> Option<&Value> {
+        (self.protocol == protocol).then_some(&self.value)
+    }
+}
+
 /// One block of a message. Fields are shared across kinds; `kind` decides
 /// which of them carry meaning.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -129,6 +173,8 @@ pub struct Part {
     pub is_error: bool,
     /// Thinking signature (Anthropic's, or a Gemini thought's).
     pub signature: String,
+    /// Native opaque reasoning; never serialized to a different protocol.
+    pub sealed: Option<Box<SealedReasoning>>,
     /// An upstream web search, when the kind is Search.
     pub search: Option<Box<WebSearch>>,
 }

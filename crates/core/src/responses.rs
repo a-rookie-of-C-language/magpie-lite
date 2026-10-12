@@ -8,8 +8,8 @@ use std::collections::HashMap;
 
 use crate::error::{CoreError, Result};
 use crate::ir::{
-    CompletionRequest, CompletionResponse, Message, Part, PartKind, Role, SearchHit, StopReason,
-    Tool, Usage, WebSearch,
+    CompletionRequest, CompletionResponse, Message, Part, PartKind, ReasoningProtocol, Role,
+    SealedReasoning, SearchHit, StopReason, Tool, Usage, WebSearch,
 };
 use crate::stream::StreamEvent;
 use serde_json::{Map, Value, json};
@@ -99,6 +99,31 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
         stop: Vec::new(),
         stream: v.get("stream").and_then(Value::as_bool).unwrap_or(false),
     })
+}
+
+fn decode_reasoning(item: &Value) -> Part {
+    let text = item
+        .get("summary")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter(|s| s["type"] == "summary_text")
+                .filter_map(|s| s.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default();
+    Part {
+        sealed: SealedReasoning::decode(ReasoningProtocol::Responses, item).map(Box::new),
+        ..Part::thinking(text, "")
+    }
+}
+
+fn native_reasoning(p: &Part) -> Option<Value> {
+    p.sealed
+        .as_ref()?
+        .native(ReasoningProtocol::Responses)
+        .cloned()
 }
 
 /// One item of a Responses `input` array onto the message list.
@@ -203,22 +228,10 @@ fn decode_input_item(item: &Value, messages: &mut Vec<Message>) {
                 parts: vec![result],
             });
         }
-        "reasoning" => {
-            let text = item
-                .get("summary")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|s| s.get("text").and_then(Value::as_str))
-                        .collect::<Vec<_>>()
-                        .join("")
-                })
-                .unwrap_or_default();
-            messages.push(Message {
-                role: Role::Assistant,
-                parts: vec![Part::thinking(text, "")],
-            });
-        }
+        "reasoning" => messages.push(Message {
+            role: Role::Assistant,
+            parts: vec![decode_reasoning(item)],
+        }),
         _ => {}
     }
 }
@@ -268,10 +281,12 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
                     if let Some((role, content)) = open_message.take() {
                         input.push(json!({"type": "message", "role": role, "content": content}));
                     }
-                    input.push(json!({
-                        "type": "reasoning",
-                        "summary": [{"type": "summary_text", "text": p.text}],
-                    })); // signature fidelity is still on the roadmap
+                    input.push(native_reasoning(p).unwrap_or_else(|| {
+                        json!({
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": p.text}],
+                        })
+                    }));
                 }
                 PartKind::ToolCall => {
                     if let Some((role, content)) = open_message.take() {
@@ -488,19 +503,7 @@ pub fn decode_response(v: &Value) -> Result<CompletionResponse> {
                     args,
                 ));
             }
-            "reasoning" => {
-                let text = item
-                    .get("summary")
-                    .and_then(Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|s| s.get("text").and_then(Value::as_str))
-                            .collect::<Vec<_>>()
-                            .join("")
-                    })
-                    .unwrap_or_default();
-                parts.push(Part::thinking(text, ""));
-            }
+            "reasoning" => parts.push(decode_reasoning(item)),
             _ => {}
         }
     }
@@ -580,10 +583,12 @@ pub fn encode_response(resp: &CompletionResponse) -> Value {
                 "arguments": p.args.to_string(),
                 "status": "completed",
             })),
-            PartKind::Thinking => output.push(json!({
-                "type": "reasoning",
-                "id": format!("rs_{}", response_id()),
-                "summary": [{"type": "summary_text", "text": p.text}],
+            PartKind::Thinking => output.push(native_reasoning(p).unwrap_or_else(|| {
+                json!({
+                    "type": "reasoning",
+                    "id": format!("rs_{}", response_id()),
+                    "summary": [{"type": "summary_text", "text": p.text}],
+                })
             })),
             _ => {}
         }
@@ -635,6 +640,15 @@ pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
             }
         }
         "response.output_item.added" => {
+            if v.pointer("/item/type").is_some_and(|ty| ty == "reasoning") {
+                out.push(StreamEvent::ThinkingStart {
+                    id: v
+                        .pointer("/item/id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                });
+            }
             let index = v.get("output_index").and_then(Value::as_u64).unwrap_or(0) as usize;
             if v.pointer("/item/type").and_then(Value::as_str) == Some("function_call") {
                 out.push(StreamEvent::ToolCallStart {
@@ -653,6 +667,14 @@ pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
             }
         }
         "response.output_item.done" => {
+            if let Some(reasoning) = v
+                .get("item")
+                .and_then(|item| SealedReasoning::decode(ReasoningProtocol::Responses, item))
+            {
+                out.push(StreamEvent::Sealed {
+                    reasoning: Box::new(reasoning),
+                });
+            }
             let index = v.get("output_index").and_then(Value::as_u64).unwrap_or(0) as usize;
             if v.pointer("/item/type").and_then(Value::as_str) == Some("function_call") {
                 out.push(StreamEvent::ToolCallEnd { index });
@@ -776,6 +798,7 @@ pub struct ResponsesStreamEncoder {
     next_index: usize,
     open_message: Option<OpenItem>,
     open_reasoning: Option<OpenItem>,
+    pending_reasoning: Option<String>,
     tools: HashMap<usize, ToolItem>,
     output: Vec<Value>,
     usage: Usage,
@@ -795,6 +818,7 @@ impl ResponsesStreamEncoder {
             next_index: 0,
             open_message: None,
             open_reasoning: None,
+            pending_reasoning: None,
             tools: HashMap::new(),
             output: Vec::new(),
             usage: Usage::default(),
@@ -910,6 +934,44 @@ impl ResponsesStreamEncoder {
                 }
                 Some(self.ensure_created())
             }
+            StreamEvent::ThinkingStart { id } => {
+                let out = self.close_reasoning();
+                self.pending_reasoning = Some(id.clone());
+                (!out.is_empty()).then_some(out)
+            }
+            StreamEvent::Sealed { reasoning } => {
+                let item = reasoning.native(ReasoningProtocol::Responses)?;
+                let mut out = self.ensure_created();
+                out.push_str(&self.close_message());
+                let matches_open = self.pending_reasoning.is_none()
+                    && self.open_reasoning.as_ref().is_some_and(|open| {
+                        item.get("id")
+                            .and_then(Value::as_str)
+                            .is_none_or(|id| id.is_empty() || id == open.id)
+                    });
+                let output_index = if matches_open {
+                    self.open_reasoning
+                        .take()
+                        .expect("matched open reasoning")
+                        .output_index
+                } else {
+                    out.push_str(&self.close_reasoning());
+                    let index = self.next_index;
+                    self.next_index += 1;
+                    out.push_str(&event(
+                        "response.output_item.added",
+                        json!({"output_index":index,"item":item}),
+                    ));
+                    index
+                };
+                self.pending_reasoning = None;
+                out.push_str(&event(
+                    "response.output_item.done",
+                    json!({"output_index":output_index,"item":item}),
+                ));
+                self.output.push(item.clone());
+                Some(out)
+            }
             StreamEvent::SearchStarted => None,
             StreamEvent::Search { search } | StreamEvent::SearchUpdate { search } => {
                 if matches!(ev, StreamEvent::SearchUpdate { .. }) && !search.is_answer() {
@@ -982,7 +1044,11 @@ impl ResponsesStreamEncoder {
                 let mut out = self.ensure_created();
                 if self.open_reasoning.is_none() {
                     out.push_str(&self.close_message());
-                    let id = self.next_id("rs");
+                    let id = self
+                        .pending_reasoning
+                        .take()
+                        .filter(|id| !id.is_empty())
+                        .unwrap_or_else(|| self.next_id("rs"));
                     let index = self.next_index;
                     self.next_index += 1;
                     out.push_str(&event(

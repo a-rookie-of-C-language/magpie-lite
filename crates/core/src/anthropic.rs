@@ -8,8 +8,8 @@ use std::collections::HashMap;
 
 use crate::error::{CoreError, Result};
 use crate::ir::{
-    CompletionRequest, CompletionResponse, Message, Part, PartKind, Role, SearchHit, StopReason,
-    Tool, Usage, WebSearch,
+    CompletionRequest, CompletionResponse, Message, Part, PartKind, ReasoningProtocol, Role,
+    SealedReasoning, SearchHit, StopReason, Tool, Usage, WebSearch,
 };
 use crate::stream::StreamEvent;
 use serde_json::{Map, Value, json};
@@ -37,12 +37,13 @@ fn decode_block(b: &Value) -> Option<Part> {
                 .and_then(Value::as_str)
                 .unwrap_or_default(),
         )),
-        Some("redacted_thinking") => {
-            // The sealed payload cannot cross protocols; keep the block as
-            // empty thinking so the turn shape survives. TODO: pass sealed
-            // reasoning through when both ends speak Anthropic.
-            Some(Part::thinking("", ""))
-        }
+        Some("redacted_thinking") => Some(Part {
+            sealed: Some(Box::new(SealedReasoning::decode(
+                ReasoningProtocol::Anthropic,
+                b,
+            )?)),
+            ..Part::thinking("", "")
+        }),
         Some("image") => {
             let src = b.get("source")?;
             match src.get("type").and_then(Value::as_str) {
@@ -165,6 +166,14 @@ fn remember_search_query(search: &mut WebSearch, queries: &mut HashMap<String, S
 }
 
 fn part_to_block(p: &Part) -> Option<Value> {
+    if p.kind() == PartKind::Thinking
+        && let Some(block) = p
+            .sealed
+            .as_ref()
+            .and_then(|s| s.native(ReasoningProtocol::Anthropic))
+    {
+        return Some(block.clone());
+    }
     match p.kind() {
         PartKind::Search => p.search.as_ref()?.anthropic_block.clone(),
         PartKind::Text => Some(json!({"type": "text", "text": p.text})),
@@ -569,7 +578,13 @@ impl AnthropicStreamDecoder {
                     return self.search_error("upstream web search block was not closed");
                 }
                 self.tool_blocks.remove(&index);
-                if block.get("type").is_some_and(|ty| ty == "server_tool_use")
+                if let Some(reasoning) =
+                    SealedReasoning::decode(ReasoningProtocol::Anthropic, &block)
+                {
+                    out.push(StreamEvent::Sealed {
+                        reasoning: Box::new(reasoning),
+                    });
+                } else if block.get("type").is_some_and(|ty| ty == "server_tool_use")
                     && block.get("name").is_some_and(|name| name == "web_search")
                     && block
                         .get("id")
@@ -881,6 +896,36 @@ impl AnthropicStreamEncoder {
                     self.model = model.clone();
                 }
                 Some(self.start_message())
+            }
+            StreamEvent::ThinkingStart { .. } => {
+                // Separate public summaries of distinct foreign reasoning items.
+                if self
+                    .open
+                    .as_ref()
+                    .is_some_and(|(_, kind)| *kind == BlockKind::Thinking)
+                {
+                    self.close_open()
+                } else {
+                    None
+                }
+            }
+            StreamEvent::Sealed { reasoning } => {
+                let block = reasoning.native(ReasoningProtocol::Anthropic)?;
+                let mut out = self.start_message();
+                out.push_str(&self.close_open().unwrap_or_default());
+                let index = self.next_index;
+                self.next_index += 1;
+                out.push_str(&sse(
+                    "content_block_start",
+                    &json!({
+                        "type":"content_block_start", "index":index, "content_block":block
+                    }),
+                ));
+                out.push_str(&sse(
+                    "content_block_stop",
+                    &json!({"type":"content_block_stop", "index":index}),
+                ));
+                Some(out)
             }
             StreamEvent::SearchStarted => None,
             StreamEvent::Search { search } | StreamEvent::SearchUpdate { search } => {

@@ -16,6 +16,7 @@ Zed ─────────┘   Chat + Responses +
 
 - **Gateway** at `127.0.0.1:3426` speaking **OpenAI Chat Completions** (`/v1/chat/completions`), **OpenAI Responses** (`/v1/responses`), **Anthropic Messages** (`/v1/messages`), and **Gemini generateContent** (`/v1beta/models/...`)
 - **Cross-protocol translation** through a neutral IR: requests, replies, and **SSE streams** — text, tool calls, reasoning deltas, usage
+- **Native sealed reasoning**: Anthropic redacted thinking and Responses encrypted reasoning survive same-protocol history, JSON replies and SSE. Ciphertext and native reasoning IDs are not translated to other protocols; public summaries still translate. See `docs/sealed-reasoning.md` for evidence and limits.
 - **Chat-bound tool history repair**: join split assistant calls, order parallel results, explicitly mark interrupted calls, and preserve orphan/late outputs as user content. Request-local ID repair avoids collisions; ambiguous simultaneous IDs fail safely. This repair does not mutate the shared IR or affect non-Chat upstreams. See `docs/tool-transcripts.md` for the tested contract.
 - **Tool-returned images**: inline base64 and image URLs survive four-client/four-upstream request translation. Anthropic, Responses and Gemini keep images nested in the corresponding tool result; Chat sends text-only tool answers followed by source-labelled user images, after all parallel answers. No image fetching or file-ID resolution. See `docs/tool-transcripts.md` for evidence and limits.
 - **Native Gemini image replies**: streaming and nonstreaming final images preserve MIME type, file references and thought signatures; thought/draft images are suppressed. Image output counts toward stream deadlines and prevents unsafe replay. Cross-client image stream rendering remains unsupported.
@@ -90,8 +91,9 @@ stream_idle_timeout_ms = 300000          # waiting for the next upstream body ch
 ```
 
 These are the defaults for old files too. Set either value to `0` to disable it.
-Nonempty text/reasoning or a tool event satisfies the first-content limit; model,
-role, usage and comment heartbeats do not extend it. The idle limit resets on
+Nonempty text/reasoning, native opaque reasoning or a tool event satisfies the
+first-content limit; model, role, usage, reasoning-item-start metadata and comment
+heartbeats do not extend it. The idle limit resets on
 upstream transport bytes, not downstream backpressure. Before committing a
 stream, timeouts can try a configured fallback/group route (not another key on
 the same endpoint); after commitment they end with one protocol error and keep

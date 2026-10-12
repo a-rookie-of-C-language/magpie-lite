@@ -61,14 +61,15 @@ A successful HTTP status is not sufficient for an SSE attempt. Before handing
 it to the client encoder, the gateway holds opening model/role/usage metadata
 and reads until one of:
 
-- Nonempty text or reasoning, a tool event, or a stop event commits the attempt.
+- Nonempty text or reasoning, native opaque reasoning, a tool event, or a stop
+  event commits the attempt. Reasoning-item-start metadata alone does not.
 - A completion marker commits an empty answer for non-Gemini protocols. Gemini
   empty completions are intercepted before Stop/Done reaches the client.
 - An error closes the upstream immediately and permits retry according to its
   structured status, provided the attempt has not committed.
 - 64 decoded opening events, or a 64 KiB retained-metadata estimate, commit the
   attempt as buffering safety bounds. The estimate counts event storage and
-  retained model-string bytes; it may overshoot by one bounded event and is not
+  retained model-string and reasoning-item-ID bytes; it may overshoot by one bounded event and is not
   an allocator-exact memory cap. Errors after either bound do not retry, even if
   there has been no actual text. Wire-only metadata discarded by the decoder
   does not count toward retained metadata.
@@ -97,8 +98,9 @@ in the protected secret-free `/config` snapshot:
 - `stream_first_content_timeout_ms = 600000` (10 minutes by default): a fresh
   absolute budget for each concrete attempt, beginning before sending the
   upstream request. It includes HTTP response-header wait, an HTTP error-body
-  read, and opening SSE. Nonempty text/reasoning or tool activity satisfies it;
-  role/model/usage metadata, empty deltas, ignored chunks and comment heartbeats
+  read, and opening SSE. Nonempty text/reasoning, native opaque reasoning or tool
+  activity satisfies it; role/model/usage and reasoning-item-start metadata,
+  empty deltas, ignored chunks and comment heartbeats
   do not restart or satisfy it. Completed empty answers remain valid for
   non-Gemini protocols; empty Gemini completions use the bounded policy below.
 - `stream_idle_timeout_ms = 300000` (5 minutes by default): maximum wait for the
@@ -689,3 +691,6 @@ usage 7/3 and sanitized persisted history, and release after client disconnect.
 Core tests also verify native-only updates do not manufacture foreign searches
 and malformed/empty public metadata does not consume later valid results.
 No paid/live vendor, HTTP/2 or real-agent compatibility is implied.
+
+Native opaque reasoning commits an attempt even when the client protocol cannot
+render it. See `sealed-reasoning.md` for passthrough and privacy guarantees.

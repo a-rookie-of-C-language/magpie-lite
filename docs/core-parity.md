@@ -331,3 +331,14 @@ persisted usage/history, no retries after a committed-search overflow, safe
 first-content fallback before an answer, opening byte-budget commitment, and
 client cancellation after updates. These are local fixtures, not paid/live
 Gemini, CodeAssist subscription or actual-agent conformance evidence.
+
+Native opaque reasoning was compared with the reference gateway sealed IR and
+Anthropic/Responses adapters. Lite now retains complete native JSON values for
+redacted thinking and encrypted reasoning in request history, ordinary replies
+and SSE, with Responses item boundaries and native IDs. Eleven core regressions
+and two loopback HTTP tests cover 32 successful client/upstream/direct/group/
+JSON/SSE combinations and 16 errors after opaque content; the latter do not
+retry keys or switch fallback routes. Unknown native fields remain native, while
+only public summary_text crosses protocols. These fixtures do not establish
+live vendor compatibility or broader thinking-signature parity. See
+`sealed-reasoning.md` for the exact contract.

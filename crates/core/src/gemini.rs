@@ -1175,6 +1175,7 @@ impl GeminiStreamEncoder {
                     None => chunk,
                 })
             }
+            StreamEvent::ThinkingStart { .. } | StreamEvent::Sealed { .. } => None,
             StreamEvent::SearchStarted => None,
             StreamEvent::Search { search } | StreamEvent::SearchUpdate { search } => {
                 if !search.is_public_result() {

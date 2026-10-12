@@ -1892,7 +1892,9 @@ async fn prefetch_stream(
         let failure = item.failure.clone();
         let terminal = matches!(item.event, StreamEvent::Done | StreamEvent::Error { .. });
         let visible = match &item.event {
-            StreamEvent::Start { .. } | StreamEvent::Usage(_) => false,
+            StreamEvent::Start { .. }
+            | StreamEvent::Usage(_)
+            | StreamEvent::ThinkingStart { .. } => false,
             StreamEvent::SearchUpdate { search } => search.is_answer(),
             StreamEvent::TextDelta { text } | StreamEvent::ThinkingDelta { text } => {
                 !text.is_empty()
@@ -1902,6 +1904,9 @@ async fn prefetch_stream(
         metadata_bytes += std::mem::size_of_val(&item);
         if let StreamEvent::Start { model } = &item.event {
             metadata_bytes += model.len();
+        }
+        if let StreamEvent::ThinkingStart { id } = &item.event {
+            metadata_bytes = metadata_bytes.saturating_add(id.len());
         }
         if let StreamEvent::SearchUpdate { search } = &item.event {
             metadata_bytes = metadata_bytes.saturating_add(
@@ -2026,7 +2031,7 @@ fn upstream_events(
                     clock.observe(&event.event);
                     match &event.event {
                         StreamEvent::Start { .. } => opening_held = true,
-                        StreamEvent::Usage(_) => {},
+                        StreamEvent::Usage(_) | StreamEvent::ThinkingStart { .. } => {},
                         StreamEvent::TextDelta { text } | StreamEvent::ThinkingDelta { text } if text.is_empty() => {},
                         _ => hold = None,
                     }
