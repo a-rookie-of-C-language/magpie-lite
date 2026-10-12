@@ -72,12 +72,30 @@ pub struct WebSearch {
     pub gemini_grounding: Option<Value>,
     /// Original Responses search action, only re-emitted to Responses clients.
     pub responses_action: Option<Value>,
+    /// One original Anthropic search call/result block, for Anthropic only.
+    /// Retaining blocks separately preserves ordering and vendor ciphertext in
+    /// native replies/history without exposing it to other protocols.
+    pub anthropic_block: Option<Value>,
 }
 
 impl WebSearch {
-    /// An actual query or public source is evidence of search activity.
+    /// Whether a completed public result can be rendered in another protocol.
+    /// Native call blocks are rendered only once their matching result arrives;
+    /// native search errors must not become fabricated successful grounding.
+    pub fn is_public_result(&self) -> bool {
+        self.anthropic_block.as_ref().is_none_or(|block| {
+            block
+                .get("type")
+                .is_some_and(|t| t == "web_search_tool_result")
+                && block.get("content").is_some_and(Value::is_array)
+        })
+    }
+
+    /// Native search activity, a query or a public source prevents replay.
     pub fn is_answer(&self) -> bool {
-        !self.query.is_empty() || self.hits.iter().any(|hit| !hit.url.is_empty())
+        self.anthropic_block.is_some()
+            || !self.query.is_empty()
+            || self.hits.iter().any(|hit| !hit.url.is_empty())
     }
 }
 

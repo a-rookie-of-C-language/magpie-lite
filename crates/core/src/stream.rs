@@ -21,7 +21,11 @@ pub enum StreamEvent {
         /// Image media, payload/reference and optional provider signature.
         image: Box<Part>,
     },
-    /// A web search already executed by the upstream.
+    /// Hosted search execution began. This commits the upstream attempt even
+    /// before its input/result block is complete, but is not a function call.
+    /// Encoders wait for Search events rather than inventing a completed result.
+    SearchStarted,
+    /// A web search call/result block reported by the upstream.
     Search {
         /// Query and public sources, with optional native protocol metadata.
         search: Box<WebSearch>,
@@ -72,6 +76,7 @@ impl StreamEvent {
         match self {
             Self::TextDelta { text } => !text.is_empty(),
             Self::Image { image } => !image.data.is_empty() || !image.url.is_empty(),
+            Self::SearchStarted => true,
             Self::Search { search } => search.is_answer(),
             Self::ToolCallStart { .. } | Self::ToolCallEnd { .. } => true,
             Self::ToolCallDelta { args, .. } => !args.is_empty(),

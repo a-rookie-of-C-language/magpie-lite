@@ -827,7 +827,13 @@ pub fn encode_response(resp: &CompletionResponse) -> Value {
         "modelVersion": resp.model,
         "responseId": response_id(),
     });
-    if let Some(search) = resp.message.parts.iter().find_map(|p| p.search.as_deref()) {
+    if let Some(search) = resp
+        .message
+        .parts
+        .iter()
+        .filter_map(|p| p.search.as_deref())
+        .find(|s| s.is_public_result())
+    {
         body["candidates"][0]["groundingMetadata"] = search_metadata(search);
     }
     body
@@ -1072,7 +1078,11 @@ impl GeminiStreamEncoder {
                     None => chunk,
                 })
             }
+            StreamEvent::SearchStarted => None,
             StreamEvent::Search { search } => {
+                if !search.is_public_result() {
+                    return None;
+                }
                 let mut frame = self.flush_tool().unwrap_or_default();
                 let message = json!({"candidates":[{"content":{"role":"model","parts":[]},
                     "groundingMetadata":search_metadata(search), "index":0}],

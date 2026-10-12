@@ -631,6 +631,7 @@ impl ChatChunkEncoder {
                 )))
             }
             // Chat has no portable server-side search-result event.
+            StreamEvent::SearchStarted => None,
             StreamEvent::Search { .. } => None,
             // Image output currently has a native mapping only in Gemini.
             StreamEvent::Image { .. } => None,

@@ -8,8 +8,8 @@ use std::collections::HashMap;
 
 use crate::error::{CoreError, Result};
 use crate::ir::{
-    CompletionRequest, CompletionResponse, Message, Part, PartKind, Role, StopReason, Tool, Usage,
-    WebSearch,
+    CompletionRequest, CompletionResponse, Message, Part, PartKind, Role, SearchHit, StopReason,
+    Tool, Usage, WebSearch,
 };
 use crate::stream::StreamEvent;
 use serde_json::{Map, Value, json};
@@ -56,6 +56,59 @@ fn decode_block(b: &Value) -> Option<Part> {
                 _ => None,
             }
         }
+        Some("server_tool_use") if b.get("name").is_some_and(|n| n == "web_search") => {
+            b.get("id")?.as_str().filter(|id| !id.is_empty())?;
+            Some(Part::web_search(WebSearch {
+                query: b
+                    .pointer("/input/query")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .into(),
+                anthropic_block: Some(b.clone()),
+                ..Default::default()
+            }))
+        }
+        Some("web_search_tool_result") => {
+            b.get("tool_use_id")?.as_str().filter(|id| !id.is_empty())?;
+            let content = b.get("content")?;
+            if !content.is_array()
+                && content
+                    .get("type")
+                    .is_none_or(|t| t != "web_search_tool_result_error")
+            {
+                return None;
+            }
+            let hits = content
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|hit| {
+                    if hit.get("type").is_none_or(|t| t != "web_search_result") {
+                        return None;
+                    }
+                    let url = hit.get("url")?.as_str().filter(|url| !url.is_empty())?;
+                    Some(SearchHit {
+                        url: url.into(),
+                        title: hit
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(url)
+                            .into(),
+                        page_age: hit
+                            .get("page_age")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .into(),
+                    })
+                })
+                .collect();
+            Some(Part::web_search(WebSearch {
+                hits,
+                anthropic_block: Some(b.clone()),
+                ..Default::default()
+            }))
+        }
         Some("tool_use") => Some(Part::tool_call(
             b.get("id").and_then(Value::as_str).unwrap_or_default(),
             b.get("name").and_then(Value::as_str).unwrap_or_default(),
@@ -88,13 +141,38 @@ fn decode_block(b: &Value) -> Option<Part> {
 fn decode_content(content: &Value) -> Vec<Part> {
     match content {
         Value::String(s) => vec![Part::text(s.clone())],
-        Value::Array(blocks) => blocks.iter().filter_map(decode_block).collect(),
+        Value::Array(blocks) => {
+            let mut queries = HashMap::new();
+            blocks
+                .iter()
+                .filter_map(|block| {
+                    let mut part = decode_block(block)?;
+                    if let Some(search) = part.search.as_deref_mut() {
+                        remember_search_query(search, &mut queries);
+                    }
+                    Some(part)
+                })
+                .collect()
+        }
         _ => Vec::new(),
+    }
+}
+
+// Associate a result with its own call, never with the most recent function
+// or another outstanding search. Results consume the query's retained state.
+fn remember_search_query(search: &mut WebSearch, queries: &mut HashMap<String, String>) {
+    if let Some(block) = &search.anthropic_block {
+        if let Some(id) = block.get("id").and_then(Value::as_str) {
+            queries.insert(id.into(), search.query.clone());
+        } else if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
+            search.query = queries.remove(id).unwrap_or_default();
+        }
     }
 }
 
 fn part_to_block(p: &Part) -> Option<Value> {
     match p.kind() {
+        PartKind::Search => p.search.as_ref()?.anthropic_block.clone(),
         PartKind::Text => Some(json!({"type": "text", "text": p.text})),
         PartKind::Thinking => Some(json!({
             "type": "thinking",
@@ -349,7 +427,10 @@ fn message_id() -> String {
     format!("msg_magpie{now}")
 }
 
-fn search_blocks(search: &WebSearch, id: &str) -> [Value; 2] {
+fn search_blocks(search: &WebSearch, id: &str) -> Vec<Value> {
+    if let Some(block) = &search.anthropic_block {
+        return vec![block.clone()];
+    }
     let results: Vec<_> = search
         .hits
         .iter()
@@ -359,7 +440,7 @@ fn search_blocks(search: &WebSearch, id: &str) -> [Value; 2] {
         "page_age":if hit.page_age.is_empty() { Value::Null } else { json!(hit.page_age) }})
         })
         .collect();
-    [
+    vec![
         json!({"type":"server_tool_use","id":id,"name":"web_search","input":{"query":search.query}}),
         json!({"type":"web_search_tool_result","tool_use_id":id,"content":results}),
     ]
@@ -390,12 +471,35 @@ pub fn encode_response(resp: &CompletionResponse) -> Value {
     })
 }
 
-/// Decodes streamed Anthropic events into IR events. Stateful: it remembers
-/// which content blocks are tool calls so their `content_block_stop` can be
-/// told apart from text and thinking blocks.
-#[derive(Debug, Default)]
+/// Stateful Anthropic decoder. Function arguments and hosted search inputs
+/// are kept separate; search starts commit replay safety before results arrive.
+#[derive(Debug)]
 pub struct AnthropicStreamDecoder {
     tool_blocks: HashMap<usize, ()>,
+    search_blocks: HashMap<usize, SearchInput>,
+    search_queries: HashMap<String, String>,
+    search_limit: usize,
+    search_failed: bool,
+}
+
+#[derive(Debug)]
+struct SearchInput {
+    block: Value,
+    args: String,
+    whole: bool,
+    bytes: usize,
+}
+
+impl Default for AnthropicStreamDecoder {
+    fn default() -> Self {
+        Self {
+            tool_blocks: HashMap::new(),
+            search_blocks: HashMap::new(),
+            search_queries: HashMap::new(),
+            search_limit: crate::stream::MAX_SSE_EVENT_BYTES,
+            search_failed: false,
+        }
+    }
 }
 
 impl AnthropicStreamDecoder {
@@ -404,8 +508,37 @@ impl AnthropicStreamDecoder {
         Self::default()
     }
 
+    fn search_bytes(&self) -> usize {
+        self.search_blocks
+            .values()
+            .map(|b| b.bytes + b.args.len())
+            .sum::<usize>()
+            + self
+                .search_queries
+                .iter()
+                .map(|(id, query)| id.len() + query.len())
+                .sum::<usize>()
+    }
+
+    fn search_error(&mut self, message: &'static str) -> Vec<StreamEvent> {
+        self.search_blocks.clear();
+        self.search_queries.clear();
+        self.search_failed = true;
+        vec![StreamEvent::Error {
+            message: message.into(),
+        }]
+    }
+
     /// Decode one event's `data` payload.
     pub fn decode(&mut self, v: &Value) -> Vec<StreamEvent> {
+        if v.get("type").is_some_and(|ty| ty == "message_start") {
+            self.tool_blocks.clear();
+            self.search_blocks.clear();
+            self.search_queries.clear();
+            self.search_failed = false;
+        } else if self.search_failed {
+            return vec![];
+        }
         let mut out = Vec::new();
         match v.get("type").and_then(Value::as_str).unwrap_or_default() {
             "message_start" => {
@@ -422,7 +555,44 @@ impl AnthropicStreamDecoder {
             "content_block_start" => {
                 let index = v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
                 let block = v.get("content_block").cloned().unwrap_or(Value::Null);
-                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                self.tool_blocks.remove(&index);
+                if block.get("type").is_some_and(|ty| ty == "server_tool_use")
+                    && block.get("name").is_some_and(|name| name == "web_search")
+                    && block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| !id.is_empty())
+                {
+                    let bytes = block.to_string().len();
+                    if self.search_blocks.contains_key(&index)
+                        || self.search_blocks.len() + self.search_queries.len() >= 128
+                        || self.search_bytes().saturating_add(bytes) > self.search_limit
+                    {
+                        return self.search_error("upstream web search state exceeds its budget");
+                    }
+                    let whole = block
+                        .get("input")
+                        .and_then(Value::as_object)
+                        .is_some_and(|m| !m.is_empty());
+                    self.search_blocks.insert(
+                        index,
+                        SearchInput {
+                            block,
+                            args: String::new(),
+                            whole,
+                            bytes,
+                        },
+                    );
+                    out.push(StreamEvent::SearchStarted);
+                } else if block
+                    .get("type")
+                    .is_some_and(|ty| ty == "web_search_tool_result")
+                {
+                    if let Some(mut search) = decode_block(&block).and_then(|p| p.search) {
+                        remember_search_query(&mut search, &mut self.search_queries);
+                        out.push(StreamEvent::Search { search });
+                    }
+                } else if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                     self.tool_blocks.insert(index, ());
                     out.push(StreamEvent::ToolCallStart {
                         index,
@@ -465,10 +635,27 @@ impl AnthropicStreamDecoder {
                         if let Some(a) = delta.get("partial_json").and_then(Value::as_str)
                             && !a.is_empty()
                         {
-                            out.push(StreamEvent::ToolCallDelta {
-                                index,
-                                args: a.to_owned(),
-                            });
+                            if let Some(input) = self.search_blocks.get(&index) {
+                                if !input.whole {
+                                    if self.search_bytes().saturating_add(a.len())
+                                        > self.search_limit
+                                    {
+                                        return self.search_error(
+                                            "upstream web search input exceeds its byte budget",
+                                        );
+                                    }
+                                    self.search_blocks
+                                        .get_mut(&index)
+                                        .expect("known search block")
+                                        .args
+                                        .push_str(a);
+                                }
+                            } else if self.tool_blocks.contains_key(&index) {
+                                out.push(StreamEvent::ToolCallDelta {
+                                    index,
+                                    args: a.to_owned(),
+                                });
+                            }
                         }
                     }
                     _ => {}
@@ -476,7 +663,33 @@ impl AnthropicStreamDecoder {
             }
             "content_block_stop" => {
                 let index = v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                if self.tool_blocks.remove(&index).is_some() {
+                if let Some(mut input) = self.search_blocks.remove(&index) {
+                    if !input.whole && !input.args.is_empty() {
+                        let Ok(args) = serde_json::from_str::<Value>(&input.args) else {
+                            return self.search_error("upstream web search input is invalid JSON");
+                        };
+                        if !args.is_object() {
+                            return self
+                                .search_error("upstream web search input must be an object");
+                        }
+                        input.block["input"] = args;
+                    }
+                    if let Some(mut search) = decode_block(&input.block).and_then(|p| p.search) {
+                        let id = input.block["id"].as_str().expect("validated search id");
+                        if self.search_queries.contains_key(id)
+                            || self
+                                .search_bytes()
+                                .saturating_add(id.len())
+                                .saturating_add(search.query.len())
+                                > self.search_limit
+                        {
+                            return self
+                                .search_error("upstream web search state exceeds its budget");
+                        }
+                        remember_search_query(&mut search, &mut self.search_queries);
+                        out.push(StreamEvent::Search { search });
+                    }
+                } else if self.tool_blocks.remove(&index).is_some() {
                     out.push(StreamEvent::ToolCallEnd { index });
                 }
             }
@@ -488,7 +701,11 @@ impl AnthropicStreamDecoder {
                     out.push(StreamEvent::Stop(StopReason::from_anthropic(reason)));
                 }
             }
-            "message_stop" => out.push(StreamEvent::Done),
+            "message_stop" => {
+                self.search_blocks.clear();
+                self.search_queries.clear();
+                out.push(StreamEvent::Done);
+            }
             "error" => {
                 let detail = v
                     .pointer("/error/message")
@@ -628,16 +845,19 @@ impl AnthropicStreamEncoder {
                 }
                 Some(self.start_message())
             }
+            StreamEvent::SearchStarted => None,
             StreamEvent::Search { search } => {
                 let mut out = self.start_message();
                 out.push_str(&self.close_open().unwrap_or_default());
                 let id = format!("srvtoolu_{}_{}", self.id, self.next_index);
-                let [mut call, result] = search_blocks(search, &id);
-                call["input"] = json!({});
-                for (block, input) in [
-                    (call, Some(json!({"query":search.query}).to_string())),
-                    (result, None),
-                ] {
+                for mut block in search_blocks(search, &id) {
+                    let input = if block["type"] == "server_tool_use" {
+                        let input = block["input"].to_string();
+                        block["input"] = json!({});
+                        Some(input)
+                    } else {
+                        None
+                    };
                     let index = self.next_index;
                     self.next_index += 1;
                     out.push_str(&sse(

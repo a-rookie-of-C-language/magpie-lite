@@ -520,7 +520,9 @@ pub fn encode_response(resp: &CompletionResponse) -> Value {
     for p in &resp.message.parts {
         match p.kind() {
             PartKind::Search => {
-                if let Some(search) = &p.search {
+                if let Some(search) = &p.search
+                    && search.is_public_result()
+                {
                     output.push(search_item(
                         search,
                         &format!("ws_{}_{}", response_id(), output.len()),
@@ -873,7 +875,11 @@ impl ResponsesStreamEncoder {
                 }
                 Some(self.ensure_created())
             }
+            StreamEvent::SearchStarted => None,
             StreamEvent::Search { search } => {
+                if !search.is_public_result() {
+                    return None;
+                }
                 let mut out = self.ensure_created();
                 out.push_str(&self.close_message());
                 out.push_str(&self.close_reasoning());
