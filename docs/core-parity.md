@@ -6,7 +6,7 @@ Target: multiple coding agents sharing one Rust backend, provider adapters for d
 
 | Area | Current evidence | Remaining work |
 |---|---|---|
-| Shared Rust gateway | Core wire codecs; real local HTTP/SSE terminal/error/EOF and after-header disconnect fixtures across four adapters; incremental 32 MiB raw-event bounds, BOM/CR/UTF-8 handling, opening event/metadata-byte budgets, early stream-error key/fallback/group retry, no retry after text/reasoning/tool output, and pending-handler cancellation accounting; see docs/stream-lifecycle.md | Recorded real-agent fixtures, broader multimodal/tool/stream conformance, first-content/idle timeouts and real downstream cancellation before headers |
+| Shared Rust gateway | Core wire codecs; real local HTTP/SSE terminal/error/EOF and after-header disconnect fixtures across four adapters; incremental 32 MiB raw-event bounds, BOM/CR/UTF-8 handling, opening event/metadata-byte budgets, early stream-error key/fallback/group retry, no retry after text/reasoning/tool output, configurable per-attempt first-content/read-idle deadlines with timeout fallback, and pending-handler cancellation accounting; see docs/stream-lifecycle.md | Recorded real-agent fixtures, broader multimodal/tool/stream conformance, group-specific timeout policies, downstream keepalives and real downstream cancellation before headers |
 | Agent adapters | Shared magpie-agents adapters for Claude Code, Codex, Crush, Gemini CLI, Goose, OpenCode and Zed; private staged preview, revision-checked apply, OS lock, schema-2 journaled selective field restore preserving unrelated edits, disconnect, managed-field drift and explicit recovery. Agent unit, HTTP, sandboxed child CLI and real-gateway console browser tests; Windows ACL/junction checks; recursive duplicate-key JSON/JSONC refusal, format-preserving JSON edits, compact comment-free JSON object additions that preserve single-line layout, native OpenCode/Zed JSONC, shared passive CLI/config discovery with bounded user-prefix/Node-version searches, npmrc prefix and nvm default-alias handling, and PATH/unknown metadata, native absolute config-directory overrides for Claude/Codex/OpenCode/Zed, and seven-Agent selective restore through HTTP/CLI/browser | Native project overrides, login-shell/registry PATH refresh, process/reachability and real-version compatibility evidence; compact layout preservation is intentionally limited to single-line objects without direct comments |
 | Provider metadata and keys | Protected provider CRUD and console; providers.rs covers saved/live edits, secret-free capability metadata (`supported_protocols`, nullable streaming/tools/vision), protocol validation and preserve/clear semantics. provider_tools.rs covers four-protocol catalogs/probes, pagination, saved/draft/no-auth credentials and bounded read-only operations | Capability presets, specialized/stream-only probes and paid/live vendor evidence |
 | Hot edits and key rotation | ConfigStore saves before publishing; requests own snapshots. Versioned key schedules ignore stale requests. providers.rs checks an old in-flight request after a smaller pool is saved; config.rs checks stale scheduler calls. Durable config revisions/ETags and optional If-Match checks reject stale provider/group writes across restarts; the revision is committed in the atomically replaced TOML document, store and HTTP tests check unchanged disk/memory and a single winner for concurrent checked edits; gateway writers also serialize through a bounded file lock. Provider/group CRUD and agent apply now have durable idempotency with 256-entry retention, token-keyed HMAC digests, restart replay, pending fail-closed behavior, and secret-free ledgers | Encrypted secret storage with recovery; durable idempotency for any future agent rotate endpoint |
@@ -73,7 +73,7 @@ committed text/reasoning/tool calls do not replay. Tests distinguish real
 after-header HTTP disconnects from explicit pending-handler task cancellation;
 the latter is not proof of automatic real-socket cancellation before headers.
 See `docs/stream-lifecycle.md` for exact completion, cooldown, accounting and
-remaining timeout/vendor-compatibility limits.
+remaining timeout-policy/vendor-compatibility limits.
 
 The shared SSE reader was additionally compared with upstream `internal/gateway/sse.go`
 (32 MiB scanner-line bound). Lite now enforces a 32 MiB aggregate raw-event bound
@@ -83,3 +83,12 @@ and real held-open HTTP oversize fixtures verify failover before content, no
 replay after content and resource release. The event bound is stricter than the
 reference for aggregate multiline events; it is neither a total request-memory
 cap nor a timeout. See `docs/stream-lifecycle.md` for the exact accounting.
+
+Streaming now has independent root TOML first-content (default 10 minutes) and
+read-idle (default 5 minutes) limits; zero disables each. Real local HTTP fixtures
+cover opening/after-content stalls across all four-by-four protocol pairs,
+ordinary/group timeout fallback, ignored-heartbeat and committed-metadata cases,
+header/error-body stalls, paced output, reasoning/tools and disable semantics.
+This adds gateway-wide safety bounds rather than replicating the reference's
+Group.FirstToken policy; keepalives, group overrides and real pre-header socket
+cancellation remain unimplemented. See `docs/stream-lifecycle.md`.

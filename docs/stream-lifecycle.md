@@ -1,7 +1,8 @@
 # Stream lifecycle and failover
 
 Reference: `D:\code\magpie\internal\gateway\stream_error_open_test.go` and
-`canceled_usage_test.go`, plus `sse.go` for the reference reader. This document
+`canceled_usage_test.go`, plus `sse.go` for the reference reader and
+`first_token_test.go` / `fallback.go` for first-content handling. This document
 describes the Rust gateway's implemented contract, not full Magpie or live-vendor
 conformance.
 
@@ -75,10 +76,52 @@ for the selected attempt. An answer is never assembled from two upstreams. In
 particular reasoning/tool activity counts as committed even if a particular
 client dialect buffers or hides that activity.
 
-The prefetch runs in the handler before downstream response headers. An upstream
-that stays below the opening event/metadata budgets and then stalls can still
-hold the handler indefinitely: this stage adds neither a first-content timeout
-nor keepalive frames. The parser byte bound above does not solve this.
+The prefetch runs in the handler before downstream response headers. The
+streaming deadlines below now bound a below-budget stall when enabled. They do
+not prove automatic handler cancellation on a real pre-header socket disconnect,
+and the gateway still emits no downstream keepalive frames.
+
+## Streaming deadlines
+
+Two gateway-level root TOML settings apply to streaming requests, and are exposed
+in the protected secret-free `/config` snapshot:
+
+- `stream_first_content_timeout_ms = 600000` (10 minutes by default): a fresh
+  absolute budget for each concrete attempt, beginning before sending the
+  upstream request. It includes HTTP response-header wait, an HTTP error-body
+  read, and opening SSE. Nonempty text/reasoning or tool activity satisfies it;
+  role/model/usage metadata, empty deltas, ignored chunks and comment heartbeats
+  do not restart or satisfy it. A completed empty answer is still valid.
+- `stream_idle_timeout_ms = 300000` (5 minutes by default): maximum wait for the
+  next upstream body chunk. It applies both before and after content, separately
+  from the first-content budget. Transport bytes, including comments and partial
+  frames, begin a fresh interval; the first-content budget still prevents an
+  endless metadata drip before an answer. Time yielding decoded frames to a
+  backpressured client does not count as waiting for upstream transport.
+
+Set either to `0` to disable that limit independently. With both disabled, an
+upstream may again hold a handler indefinitely. Nonstreaming requests retain the
+previous behavior; these settings are not a total request-duration limit.
+Configuration is pinned for the request, and each fallback attempt gets a fresh
+clock. The first-content deadline remains active after a metadata safety budget
+commits headers, but a later timeout can no longer retry that committed response.
+
+Timeouts are endpoint failures, internally classified as 504. They skip any
+remaining credentials on that endpoint and never apply quota cooldown. Before
+commit they may try an ordinary fallback or next group route; after commit they
+produce one terminal protocol error, retain observed partial usage, release the
+upstream and never synthesize a success marker or splice another answer. A
+header/error-body timeout on the last route returns HTTP 504 in the client's
+error envelope; a timeout of an HTTP-200 SSE response uses the existing client
+stream-error encoder (the transport status is already 200).
+
+Timers are cooperative and enforced when the handler/event stream is polled;
+they are not a background cancellation service and cannot interrupt blocking
+CPU work or a downstream that never polls again. Idle time is transport silence,
+not a post-content meaningful-progress or loop-detection policy: an endless
+heartbeat stream after content can remain live. The reference group-specific
+FirstToken policy, keepalives and slow-final-route exceptions are not replicated
+by these gateway-wide safety settings.
 
 ### Retry classification
 
@@ -159,5 +202,16 @@ line endings, multibyte characters, BOM, empty/multiline data and exact size
 limits; they also cover oversized ignored lines, sticky failure and coalesced
 frames larger than the per-event budget. These are synthetic protocol fixtures,
 not captured real Agent sessions or paid/live vendor compatibility evidence.
-First-content/idle timeout policy, real pre-header disconnect handling, and
-broader tool/multimodal conformance remain open.
+Paused-clock unit tests verify absolute first-content accounting across header
+and metadata waits, empty-delta handling, independent disable semantics, read-idle
+reset and downstream-backpressure exclusion. Additional real HTTP fixtures cover
+all four upstream by all four client dialects for opening and post-content stalls;
+ordinary/group fallback, first-content caps despite comment heartbeats and after
+metadata commitment, paced completion, reasoning/tool first content, disabled
+limits, and HTTP header/error-body stalls. Drop guards verify release of every
+attempt, and assertions verify one error/record, selected-route usage and no extra
+same-endpoint key/cooldown spending.
+
+Group-specific timeout overrides, downstream keepalives, real pre-header socket
+disconnect handling, post-content progress/loop detection and broader tool/
+multimodal conformance remain open.

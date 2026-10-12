@@ -109,6 +109,24 @@ enum Ending {
     Eof,
     Hold,
     Reset(Arc<tokio::sync::Notify>),
+    Heartbeats,
+    Paced(Vec<(Duration, String)>),
+}
+
+struct Transport {
+    chunk_size: usize,
+    // Apply these only to slot zero; a fallback slot stays healthy.
+    header_delay: Duration,
+    status: axum::http::StatusCode,
+}
+impl Default for Transport {
+    fn default() -> Self {
+        Self {
+            chunk_size: 19,
+            header_delay: Duration::ZERO,
+            status: axum::http::StatusCode::OK,
+        }
+    }
 }
 
 struct Fixture {
@@ -142,6 +160,30 @@ impl Fixture {
         chunk_size: usize,
         configure: impl FnOnce(&mut Config),
     ) -> Self {
+        Self::with_transport(
+            protocol,
+            scripts,
+            ending,
+            Transport {
+                chunk_size,
+                ..Transport::default()
+            },
+            configure,
+        )
+        .await
+    }
+    async fn with_transport(
+        protocol: Protocol,
+        scripts: Vec<String>,
+        ending: Ending,
+        transport: Transport,
+        configure: impl FnOnce(&mut Config),
+    ) -> Self {
+        let Transport {
+            chunk_size,
+            header_delay,
+            status,
+        } = transport;
         let sent_models = Arc::new(Mutex::new(Vec::new()));
         let captured_models = sent_models.clone();
         let extra_keys = (0..scripts.len())
@@ -174,7 +216,8 @@ impl Fixture {
                     let ending = ending.clone();
                     let guard = Dropped(flag.clone());
                     async move {
-                        Response::builder().header("content-type", "text/event-stream").header("retry-after", "2")
+                        if slot == 0 { tokio::time::sleep(header_delay).await; }
+                        Response::builder().status(if slot == 0 { status } else { axum::http::StatusCode::OK }).header("content-type", "text/event-stream").header("retry-after", "2")
                     .body(Body::from_stream(async_stream::stream! {
                         let _guard = guard;
                         // Deliberately cut inside JSON/SSE frame boundaries.
@@ -184,6 +227,17 @@ impl Fixture {
                         match ending {
                             Ending::Eof => {},
                             Ending::Hold => std::future::pending::<()>().await,
+                            Ending::Heartbeats => loop {
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                                yield Ok(Bytes::from_static(b": heartbeat\n\n"));
+                            },
+                            Ending::Paced(frames) => {
+                                for (delay, frame) in frames {
+                                    tokio::time::sleep(delay).await;
+                                    yield Ok(Bytes::from(frame));
+                                }
+                                std::future::pending::<()>().await;
+                            },
                             Ending::Reset(signal) => {
                                 signal.notified().await;
                                 yield Err(std::io::Error::other("fixture upstream reset"));
@@ -245,6 +299,11 @@ impl Fixture {
         self.request_model(protocol, "mock/up-model").await
     }
     async fn request_model(&self, protocol: Protocol, model: &str) -> reqwest::Response {
+        let response = self.request_model_raw(protocol, model).await;
+        assert!(response.status().is_success());
+        response
+    }
+    async fn request_model_raw(&self, protocol: Protocol, model: &str) -> reqwest::Response {
         let (path, body) = match protocol {
             Protocol::Chat => (
                 "/v1/chat/completions".to_owned(),
@@ -263,7 +322,7 @@ impl Fixture {
                 json!({"contents": [{"role": "user", "parts": [{"text": "hello"}]}]}),
             ),
         };
-        let response = tokio::time::timeout(
+        tokio::time::timeout(
             LIMIT,
             reqwest::Client::new()
                 .post(format!("{}{path}", self.gateway.url))
@@ -273,9 +332,7 @@ impl Fixture {
         )
         .await
         .expect("gateway headers timed out")
-        .unwrap();
-        assert!(response.status().is_success());
-        response
+        .unwrap()
     }
     async fn record(&self) -> Value {
         tokio::time::timeout(LIMIT, async {
@@ -830,40 +887,7 @@ async fn early_stream_errors_fall_back_across_protocols_and_groups() {
 
 #[tokio::test]
 async fn reasoning_and_tool_calls_commit_the_route_before_a_later_error() {
-    let frames = [
-        (
-            Protocol::Chat,
-            json!({"choices":[{"delta":{"reasoning_content":"fixture reasoning"}}]}),
-        ),
-        (
-            Protocol::Chat,
-            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"fixture_tool"}}]}}]}),
-        ),
-        (
-            Protocol::Anthropic,
-            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"fixture reasoning"}}),
-        ),
-        (
-            Protocol::Anthropic,
-            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"fixture_tool","input":{}}}),
-        ),
-        (
-            Protocol::Responses,
-            json!({"type":"response.reasoning_summary_text.delta","delta":"fixture reasoning"}),
-        ),
-        (
-            Protocol::Responses,
-            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"fixture_tool"}}),
-        ),
-        (
-            Protocol::Gemini,
-            json!({"candidates":[{"content":{"parts":[{"thought":true,"text":"fixture reasoning"}]}}]}),
-        ),
-        (
-            Protocol::Gemini,
-            json!({"candidates":[{"content":{"parts":[{"functionCall":{"id":"call_1","name":"fixture_tool","args":{}}}]}}]}),
-        ),
-    ];
+    let frames = reasoning_and_tool_frames();
     for (upstream, frame) in frames {
         for client in PROTOCOLS {
             let f = Fixture::with_keys(
@@ -1245,4 +1269,399 @@ async fn discarded_chat_model_metadata_does_not_spend_the_opening_memory_budget(
     assert_eq!(record["status"], "ok");
     assert_eq!(record["usage"]["input"], 7);
     f.assert_released().await;
+}
+
+#[tokio::test]
+async fn stalled_opening_streams_timeout_once_without_spending_other_keys() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            let f = Fixture::with_config(
+                upstream,
+                vec![opening(upstream).to_owned(), "must not try this key".into()],
+                Ending::Hold,
+                |config| {
+                    config.stream_first_content_timeout_ms = 150;
+                    config.stream_idle_timeout_ms = 0;
+                },
+            )
+            .await;
+            let body = tokio::time::timeout(LIMIT, f.request(client).await.text())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                body.matches("upstream first-content timeout").count(),
+                1,
+                "{body}"
+            );
+            assert_no_success(&body);
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            assert!(
+                f.state
+                    .key_rotation
+                    .cooldown_snapshot(&f.state.config.current())
+                    .is_empty()
+            );
+            let record = f.record().await;
+            assert_eq!(record["status"], "upstream_stream_error");
+            if upstream == Protocol::Responses {
+                assert!(record["usage"]["input"].is_null());
+            } else {
+                assert_eq!(record["usage"]["input"], 99);
+                assert_eq!(record["usage"]["output"], 0);
+            }
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn stalled_opening_streams_fall_back_before_content_for_routes_and_groups() {
+    for upstream in PROTOCOLS {
+        for grouped in [false, true] {
+            let f = Fixture::with_config(
+                upstream,
+                vec![
+                    opening(upstream).into(),
+                    prefix(upstream) + completion(upstream),
+                ],
+                Ending::Hold,
+                |config| {
+                    config.stream_first_content_timeout_ms = 150;
+                    config.stream_idle_timeout_ms = 0;
+                    configure_timeout_fallback(config, grouped);
+                },
+            )
+            .await;
+            let body = tokio::time::timeout(
+                LIMIT,
+                f.request_model(
+                    upstream,
+                    if grouped {
+                        "group/daily"
+                    } else {
+                        "mock/up-model"
+                    },
+                )
+                .await
+                .text(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_completed(&body, upstream);
+            assert!(!body.contains("timeout"));
+            assert_eq!(*f.attempts.lock().unwrap(), [0, 1]);
+            let record = f.record().await;
+            assert_eq!(record["status"], "ok");
+            assert_eq!(record["provider"], "spare");
+            assert_eq!(record["usage"]["input"], 7);
+            assert_eq!(record["usage"]["output"], 3);
+            f.assert_released().await;
+        }
+    }
+}
+
+fn configure_timeout_fallback(config: &mut Config, grouped: bool) {
+    let mut spare = config.provider[0].clone();
+    spare.id = "spare".into();
+    spare.api_keys = vec!["secret-upstream-key-1".into()];
+    spare.models = vec!["backup-model".into()];
+    // Leave a second primary credential present: a timeout must skip it.
+    if grouped {
+        config.group.push(magpie_gateway::GroupConfig {
+            id: "daily".into(),
+            name: String::new(),
+            routes: vec!["mock/up-model".into(), "spare/backup-model".into()],
+            routing: magpie_gateway::RoutingPolicy::Order,
+        });
+    } else {
+        config.provider[0].fallback = vec!["spare/backup-model".into()];
+    }
+    config.provider.push(spare);
+}
+
+#[tokio::test]
+async fn stalled_streams_after_content_timeout_without_retry_and_retain_usage() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            let f = Fixture::with_config(
+                upstream,
+                vec![prefix(upstream), prefix(upstream) + completion(upstream)],
+                Ending::Hold,
+                |config| {
+                    config.stream_first_content_timeout_ms = 150;
+                    config.stream_idle_timeout_ms = 150;
+                    configure_timeout_fallback(config, false);
+                },
+            )
+            .await;
+            let body = tokio::time::timeout(LIMIT, f.request(client).await.text())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(body.contains("partial"), "{body}");
+            assert_eq!(
+                body.matches("upstream stream idle timeout").count(),
+                1,
+                "{body}"
+            );
+            assert_no_success(&body);
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            let record = f.record().await;
+            assert_eq!(record["status"], "upstream_stream_error");
+            assert_partial_usage(&record, upstream);
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn heartbeats_do_not_extend_first_content_deadline_even_after_metadata_commit() {
+    for upstream in PROTOCOLS {
+        for commit_metadata in [false, true] {
+            let f = Fixture::with_config(
+                upstream,
+                vec![
+                    opening(upstream).repeat(if commit_metadata { 100 } else { 1 }),
+                    prefix(upstream) + completion(upstream),
+                ],
+                Ending::Heartbeats,
+                |config| {
+                    config.stream_first_content_timeout_ms = 150;
+                    config.stream_idle_timeout_ms = 100;
+                    if commit_metadata {
+                        configure_timeout_fallback(config, false);
+                    }
+                },
+            )
+            .await;
+            let body = tokio::time::timeout(LIMIT, f.request(Protocol::Chat).await.text())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                body.matches("upstream first-content timeout").count(),
+                1,
+                "{body}"
+            );
+            assert_no_success(&body);
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            assert_eq!(f.record().await["status"], "upstream_stream_error");
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn paced_streams_reset_idle_and_content_disarms_first_deadline() {
+    for upstream in PROTOCOLS {
+        let f = Fixture::with_config(
+            upstream,
+            vec![prefix(upstream)],
+            Ending::Paced(vec![
+                (Duration::from_millis(100), ": heartbeat\n\n".into()),
+                (Duration::from_millis(100), ": heartbeat\n\n".into()),
+                (Duration::from_millis(100), completion(upstream).into()),
+            ]),
+            |config| {
+                config.stream_first_content_timeout_ms = 150;
+                config.stream_idle_timeout_ms = 250;
+            },
+        )
+        .await;
+        let body = tokio::time::timeout(LIMIT, f.request(upstream).await.text())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_completed(&body, upstream);
+        assert_eq!(f.record().await["status"], "ok");
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn header_and_error_body_stalls_use_504_and_skip_endpoint_keys() {
+    for client in PROTOCOLS {
+        for error_body in [false, true] {
+            for fallback in [false, true] {
+                let f = Fixture::with_transport(
+                    Protocol::Chat,
+                    vec![
+                        if error_body {
+                            "{\"error\":{\"message\":\"unfinished".into()
+                        } else {
+                            prefix(Protocol::Chat) + completion(Protocol::Chat)
+                        },
+                        prefix(Protocol::Chat) + completion(Protocol::Chat),
+                    ],
+                    Ending::Hold,
+                    Transport {
+                        header_delay: if error_body {
+                            Duration::ZERO
+                        } else {
+                            Duration::from_millis(250)
+                        },
+                        status: if error_body {
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                        } else {
+                            axum::http::StatusCode::OK
+                        },
+                        ..Transport::default()
+                    },
+                    |config| {
+                        config.stream_first_content_timeout_ms = 150;
+                        config.stream_idle_timeout_ms = 0;
+                        if fallback {
+                            configure_timeout_fallback(config, false);
+                        }
+                    },
+                )
+                .await;
+                let response = f.request_model_raw(client, "mock/up-model").await;
+                assert_eq!(response.status().as_u16(), if fallback { 200 } else { 504 });
+                let body = tokio::time::timeout(LIMIT, response.text())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if fallback {
+                    assert_completed(&body, client);
+                    assert_eq!(*f.attempts.lock().unwrap(), [0, 1]);
+                    assert_eq!(f.record().await["provider"], "spare");
+                } else {
+                    assert!(body.contains("upstream first-content timeout"), "{body}");
+                    assert_eq!(*f.attempts.lock().unwrap(), [0]);
+                    assert_eq!(f.record().await["status"], "upstream_error");
+                }
+                assert!(
+                    f.state
+                        .key_rotation
+                        .cooldown_snapshot(&f.state.config.current())
+                        .is_empty()
+                );
+                f.assert_released().await;
+            }
+        }
+    }
+}
+
+fn reasoning_and_tool_frames() -> [(Protocol, Value); 8] {
+    [
+        (
+            Protocol::Chat,
+            json!({"choices":[{"delta":{"reasoning_content":"fixture reasoning"}}]}),
+        ),
+        (
+            Protocol::Chat,
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"fixture_tool"}}]}}]}),
+        ),
+        (
+            Protocol::Anthropic,
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"fixture reasoning"}}),
+        ),
+        (
+            Protocol::Anthropic,
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"fixture_tool","input":{}}}),
+        ),
+        (
+            Protocol::Responses,
+            json!({"type":"response.reasoning_summary_text.delta","delta":"fixture reasoning"}),
+        ),
+        (
+            Protocol::Responses,
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"fixture_tool"}}),
+        ),
+        (
+            Protocol::Gemini,
+            json!({"candidates":[{"content":{"parts":[{"thought":true,"text":"fixture reasoning"}]}}]}),
+        ),
+        (
+            Protocol::Gemini,
+            json!({"candidates":[{"content":{"parts":[{"functionCall":{"id":"call_1","name":"fixture_tool","args":{}}}]}}]}),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn reasoning_and_tools_disarm_first_content_deadline_in_real_streams() {
+    for (upstream, frame) in reasoning_and_tool_frames() {
+        let f = Fixture::with_config(
+            upstream,
+            vec![format!(
+                "{}data: {frame}\n\n",
+                opening(upstream).replace("99", "7")
+            )],
+            Ending::Paced(vec![(
+                Duration::from_millis(250),
+                completion(upstream).into(),
+            )]),
+            |config| {
+                config.stream_first_content_timeout_ms = 150;
+                config.stream_idle_timeout_ms = 500;
+            },
+        )
+        .await;
+        let body = tokio::time::timeout(LIMIT, f.request(upstream).await.text())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_completed(&body, upstream);
+        assert_eq!(f.record().await["status"], "ok");
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn read_idle_can_fail_over_before_content_when_first_content_limit_is_disabled() {
+    for upstream in PROTOCOLS {
+        let f = Fixture::with_config(
+            upstream,
+            vec![
+                opening(upstream).into(),
+                prefix(upstream) + completion(upstream),
+            ],
+            Ending::Hold,
+            |config| {
+                config.stream_first_content_timeout_ms = 0;
+                config.stream_idle_timeout_ms = 150;
+                configure_timeout_fallback(config, true);
+            },
+        )
+        .await;
+        let body =
+            tokio::time::timeout(LIMIT, f.request_model(upstream, "group/daily").await.text())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_completed(&body, upstream);
+        assert_eq!(*f.attempts.lock().unwrap(), [0, 1]);
+        assert_eq!(f.record().await["provider"], "spare");
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn zero_timeouts_allow_a_delayed_first_answer() {
+    for upstream in PROTOCOLS {
+        let f = Fixture::with_config(
+            upstream,
+            vec![opening(upstream).into()],
+            Ending::Paced(vec![(
+                Duration::from_millis(250),
+                prefix(upstream) + completion(upstream),
+            )]),
+            |config| {
+                config.stream_first_content_timeout_ms = 0;
+                config.stream_idle_timeout_ms = 0;
+            },
+        )
+        .await;
+        let body = tokio::time::timeout(LIMIT, f.request(upstream).await.text())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_completed(&body, upstream);
+        assert_eq!(f.record().await["status"], "ok");
+        f.assert_released().await;
+    }
 }

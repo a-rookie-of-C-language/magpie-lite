@@ -637,6 +637,10 @@ pub struct ConfigSnapshot {
     pub default_provider: String,
     /// Gateway-wide cooldown default, in milliseconds.
     pub key_cooldown_ms: u64,
+    /// Per-attempt streaming first-content timeout; zero disables it.
+    pub stream_first_content_timeout_ms: u64,
+    /// Streaming upstream read-idle timeout; zero disables it.
+    pub stream_idle_timeout_ms: u64,
     /// Upstream routing metadata.
     pub providers: Vec<ProviderConfigSnapshot>,
     /// Named route chains.
@@ -657,6 +661,14 @@ pub struct Config {
     /// Default time to avoid a provider key after quota or rate-limit rejection.
     #[serde(default = "default_key_cooldown_ms")]
     pub key_cooldown_ms: u64,
+    /// Per-attempt streaming first-content timeout, including response headers.
+    /// Zero disables it. Metadata, comments and empty deltas do not satisfy it.
+    #[serde(default = "default_stream_first_content_timeout_ms")]
+    pub stream_first_content_timeout_ms: u64,
+    /// Maximum wait for the next upstream body chunk while streaming.
+    /// Zero disables it; downstream backpressure is not upstream read-idle time.
+    #[serde(default = "default_stream_idle_timeout_ms")]
+    pub stream_idle_timeout_ms: u64,
     /// Optional JSONL file for sanitized request-history metadata. Setting this
     /// makes recent `/stats` records survive gateway restarts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -677,6 +689,14 @@ fn default_key_cooldown_ms() -> u64 {
     60_000
 }
 
+fn default_stream_first_content_timeout_ms() -> u64 {
+    600_000
+}
+
+fn default_stream_idle_timeout_ms() -> u64 {
+    300_000
+}
+
 fn default_token() -> String {
     "magpie-lite".to_owned()
 }
@@ -688,6 +708,8 @@ impl Default for Config {
             token: default_token(),
             default_provider: String::new(),
             key_cooldown_ms: default_key_cooldown_ms(),
+            stream_first_content_timeout_ms: default_stream_first_content_timeout_ms(),
+            stream_idle_timeout_ms: default_stream_idle_timeout_ms(),
             history_path: None,
             provider: Vec::new(),
             group: Vec::new(),
@@ -838,6 +860,8 @@ impl Config {
             revision,
             default_provider: self.default_provider.clone(),
             key_cooldown_ms: self.key_cooldown_ms,
+            stream_first_content_timeout_ms: self.stream_first_content_timeout_ms,
+            stream_idle_timeout_ms: self.stream_idle_timeout_ms,
             providers: self
                 .provider
                 .iter()
@@ -967,6 +991,20 @@ pub fn config_path() -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_deadlines_default_round_trip_and_appear_in_secret_free_snapshot() {
+        let mut config: Config = toml::from_str("port = 3426").unwrap();
+        assert_eq!(config.stream_first_content_timeout_ms, 600_000);
+        assert_eq!(config.stream_idle_timeout_ms, 300_000);
+        config.stream_first_content_timeout_ms = 0;
+        config.stream_idle_timeout_ms = 1234;
+        let encoded = toml::to_string(&config).unwrap();
+        let restored: Config = toml::from_str(&encoded).unwrap();
+        let snapshot = restored.snapshot();
+        assert_eq!(snapshot.stream_first_content_timeout_ms, 0);
+        assert_eq!(snapshot.stream_idle_timeout_ms, 1234);
+    }
 
     #[test]
     fn api_key_pool_keeps_the_legacy_singular_key() {

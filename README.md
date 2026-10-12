@@ -75,6 +75,29 @@ magpie-lite serve --history-file 'D:\magpie\history.jsonl'
 
 Restart the agent after wiring it. For Zed, also set MAGPIE_LITE_API_KEY to the gateway token in Zed's environment, or enter that token in Zed's AI provider settings. Disconnect through the console or `magpie-lite agent disconnect <id>` to restore the saved original configuration, provided no conflicting edits were made.
 
+## Streaming timeouts
+
+The root of `config.toml` accepts two gateway-wide streaming safety limits:
+
+```toml
+stream_first_content_timeout_ms = 600000 # per attempt, includes response headers
+stream_idle_timeout_ms = 300000          # waiting for the next upstream body chunk
+```
+
+These are the defaults for old files too. Set either value to `0` to disable it.
+Nonempty text/reasoning or a tool event satisfies the first-content limit; model,
+role, usage and comment heartbeats do not extend it. The idle limit resets on
+upstream transport bytes, not downstream backpressure. Before committing a
+stream, timeouts can try a configured fallback/group route (not another key on
+the same endpoint); after commitment they end with one protocol error and keep
+observed partial usage. Header/error-body timeouts return HTTP 504 when no route
+remains. Each attempt gets a fresh budget. Nonstreaming requests are unchanged.
+
+Both settings appear in protected GET `/config`; edit the TOML and restart to
+change them (no timeout-edit API yet). They are not a total-duration limit, a
+keepalive facility, or proof of pre-header socket-disconnect cancellation.
+See `docs/stream-lifecycle.md` for exact policies and remaining reference gaps.
+
 ## Editing providers
 
 The protected web console can create, edit, and delete providers without restarting the gateway. Provider metadata and route lists are editable directly; API keys are never returned. When editing an existing provider, choose **Keep existing keys**, **Replace key pool**, or **No upstream authentication** explicitly. New requests use a saved provider immediately, while in-flight requests keep their original endpoint and credential snapshot.

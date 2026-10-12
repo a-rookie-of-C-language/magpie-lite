@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 use crate::config::{Config, GroupConfig, Protocol, ProviderConfig};
 use crate::config_store::{ConfigStore, IdempotencyRequest};
 use crate::cooldown::quota_cooldown;
+use crate::stream_timeout::{StreamClock, StreamTimeout};
 use crate::upstream;
 use crate::usage::{RequestLog, RequestTracker};
 
@@ -941,18 +942,41 @@ async fn send_with_fallback(
                 "routing upstream"
             );
 
-            let resp = match upstream::send(
-                &state.http,
-                &route.provider,
-                api_key,
-                &body,
-                &route.model,
-                creq.stream,
-            )
-            .await
+            let clock = StreamClock::new(
+                if creq.stream {
+                    config.stream_first_content_timeout_ms
+                } else {
+                    0
+                },
+                config.stream_idle_timeout_ms,
+            );
+            let resp = match clock
+                .headers(upstream::send(
+                    &state.http,
+                    &route.provider,
+                    api_key,
+                    &body,
+                    &route.model,
+                    creq.stream,
+                ))
+                .await
             {
-                Ok(resp) => resp,
-                Err(e) => {
+                Ok(Ok(resp)) => resp,
+                Err(timeout) => {
+                    tracker.record_attempt(&route.provider.id, *key_slot, "504");
+                    if route_index == last_route {
+                        return Err((
+                            Box::new(err_response(
+                                StatusCode::GATEWAY_TIMEOUT,
+                                wire.error_body(StatusCode::GATEWAY_TIMEOUT, timeout.message()),
+                            )),
+                            candidate,
+                        ));
+                    }
+                    // No response headers: an endpoint timeout is not a bad key.
+                    break;
+                }
+                Ok(Err(e)) => {
                     tracker.record_attempt(&route.provider.id, *key_slot, "network_error");
                     let message = format!("cannot reach {}: {e}", route.provider.id);
                     tracing::warn!("{message}");
@@ -979,7 +1003,7 @@ async fn send_with_fallback(
                 }
                 let headers = resp.headers().clone();
                 let (events, failure) =
-                    prefetch_stream(resp, route.provider.protocol, tracker).await;
+                    prefetch_stream(resp, route.provider.protocol, tracker, clock).await;
                 if let Some(failure) = failure {
                     tracker.record_attempt(&route.provider.id, *key_slot, "upstream_stream_error");
                     if quota_limited_status(failure.status) {
@@ -1008,9 +1032,24 @@ async fn send_with_fallback(
                 }
                 return Ok((UpstreamReply::Stream(events), candidate));
             }
-            tracker.record_attempt(&route.provider.id, *key_slot, &status.as_u16().to_string());
             let headers = resp.headers().clone();
-            let error = upstream::error_detail(resp).await;
+            let error = match clock.headers(upstream::error_detail(resp)).await {
+                Ok(error) => error,
+                Err(timeout) => {
+                    tracker.record_attempt(&route.provider.id, *key_slot, "504");
+                    if route_index == last_route {
+                        return Err((
+                            Box::new(err_response(
+                                StatusCode::GATEWAY_TIMEOUT,
+                                wire.error_body(StatusCode::GATEWAY_TIMEOUT, timeout.message()),
+                            )),
+                            candidate,
+                        ));
+                    }
+                    break;
+                }
+            };
+            tracker.record_attempt(&route.provider.id, *key_slot, &status.as_u16().to_string());
             if quota_limited_status(status) {
                 let cooldown = quota_cooldown(
                     &headers,
@@ -1234,11 +1273,12 @@ async fn prefetch_stream(
     response: reqwest::Response,
     protocol: Protocol,
     tracker: &mut RequestTracker,
+    clock: StreamClock,
 ) -> (UpstreamEvents, Option<StreamFailure>) {
     const MAX_OPENING_EVENTS: usize = 64;
     const MAX_OPENING_METADATA_BYTES: usize = 64 * 1024;
     let mut metadata_bytes = 0;
-    let mut events: UpstreamEvents = Box::pin(upstream_events(response, protocol));
+    let mut events: UpstreamEvents = Box::pin(upstream_events(response, protocol, clock));
     let mut prefix = Vec::new();
     while let Some(mut item) = events.next().await {
         if let StreamEvent::Usage(usage) = &item.event {
@@ -1275,18 +1315,40 @@ async fn prefetch_stream(
     (Box::pin(futures::stream::iter(prefix).chain(events)), None)
 }
 
+fn stream_timeout_event(timeout: StreamTimeout) -> UpstreamEvent {
+    UpstreamEvent {
+        event: StreamEvent::Error {
+            message: timeout.message().into(),
+        },
+        failure: Some(StreamFailure {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            body: Value::Null,
+        }),
+        usage_observed: false,
+    }
+}
+
 /// A dropped event stream owns and cancels its upstream response. Errors and
 /// protocol completion markers are terminal, not dependent on a TCP EOF.
 fn upstream_events(
     response: reqwest::Response,
     protocol: Protocol,
+    mut clock: StreamClock,
 ) -> impl futures::Stream<Item = UpstreamEvent> {
     async_stream::stream! {
         let mut bytes = response.bytes_stream();
         let mut parser = SseParser::new();
         let mut decoders = UpstreamDecoders::new();
         let mut chat_stopped = false;
-        while let Some(chunk) = bytes.next().await {
+        loop {
+            let chunk = match clock.chunk(bytes.next()).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(timeout) => {
+                    yield stream_timeout_event(timeout);
+                    return;
+                }
+            };
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(error) => {
@@ -1306,6 +1368,7 @@ fn upstream_events(
                     }
                 };
                 for event in decode_upstream_data(protocol, &data, &mut decoders) {
+                    clock.observe(&event.event);
                     chat_stopped |= protocol == Protocol::Chat && matches!(event.event, StreamEvent::Stop(_));
                     yield event;
                 }

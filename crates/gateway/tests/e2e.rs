@@ -194,6 +194,8 @@ async fn spawn_gateway_with_protocol_and_history(
         port: 0,
         token: "magpie-lite".into(),
         key_cooldown_ms: 60_000,
+        stream_first_content_timeout_ms: Config::default().stream_first_content_timeout_ms,
+        stream_idle_timeout_ms: Config::default().stream_idle_timeout_ms,
         history_path,
         default_provider: "mock".into(),
         provider: vec![ProviderConfig {
@@ -626,6 +628,8 @@ async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) ->
         port: 0,
         token: "magpie-lite".into(),
         key_cooldown_ms: 60_000,
+        stream_first_content_timeout_ms: Config::default().stream_first_content_timeout_ms,
+        stream_idle_timeout_ms: Config::default().stream_idle_timeout_ms,
         history_path: None,
         default_provider: "primary".into(),
         provider: providers,
@@ -652,6 +656,8 @@ async fn spawn_gateway_with_fallback(primary: String, backup: String) -> String 
         port: 0,
         token: "magpie-lite".into(),
         key_cooldown_ms: 60_000,
+        stream_first_content_timeout_ms: Config::default().stream_first_content_timeout_ms,
+        stream_idle_timeout_ms: Config::default().stream_idle_timeout_ms,
         history_path: None,
         default_provider: "primary".into(),
         provider: vec![
@@ -706,6 +712,8 @@ async fn spawn_gateway_with_same_provider_group(upstream: String) -> String {
         port: 0,
         token: "magpie-lite".into(),
         key_cooldown_ms: 60_000,
+        stream_first_content_timeout_ms: Config::default().stream_first_content_timeout_ms,
+        stream_idle_timeout_ms: Config::default().stream_idle_timeout_ms,
         history_path: None,
         default_provider: "mock".into(),
         provider: vec![ProviderConfig {
@@ -753,6 +761,8 @@ async fn spawn_gateway_with_group(
         port: 0,
         token: "magpie-lite".into(),
         key_cooldown_ms: 60_000,
+        stream_first_content_timeout_ms: Config::default().stream_first_content_timeout_ms,
+        stream_idle_timeout_ms: Config::default().stream_idle_timeout_ms,
         history_path: None,
         default_provider: "primary".into(),
         provider: vec![
