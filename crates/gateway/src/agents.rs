@@ -292,10 +292,10 @@ fn validate_model(
     config: &crate::config::Config,
 ) -> Result<(), magpie_agents::lifecycle::Error> {
     if edit.action == Action::Connect
-        && !edit
+        && edit
             .model
             .as_deref()
-            .is_some_and(|model| config.resolve(model).is_some())
+            .is_none_or(|model| config.resolve(model).is_none())
     {
         return Err(magpie_agents::lifecycle::Error {
             kind: ErrorKind::Invalid,

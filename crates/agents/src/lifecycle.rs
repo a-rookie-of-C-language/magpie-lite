@@ -160,7 +160,9 @@ impl Image {
         #[cfg(unix)]
         let mode = {
             use std::os::unix::fs::PermissionsExt;
-            fs::metadata(path).ok().map(|m| m.permissions().mode())
+            fs::metadata(path)
+                .ok()
+                .map(|m| m.permissions().mode() & 0o7777)
         };
         #[cfg(not(unix))]
         let mode = None;
@@ -168,6 +170,18 @@ impl Image {
             data: data.map(|bytes| STANDARD.encode(bytes)),
             mode,
         })
+    }
+    fn normalize_mode(&mut self) -> Result<()> {
+        if let Some(mode) = self.mode {
+            // Schema 1/2 captured stat modes, including S_IFREG, but rendered
+            // chmod modes. Canonicalize both without hiding permission drift.
+            // Never silently accept other file kinds or unknown/high bits.
+            if !matches!(mode & !0o7777, 0 | 0o100000) {
+                return Err(conflict("agent journal has invalid file permissions"));
+            }
+            self.mode = Some(mode & 0o7777);
+        }
+        Ok(())
     }
     pub(super) fn bytes(&self) -> Result<Option<Vec<u8>>> {
         self.data
@@ -410,16 +424,18 @@ impl Manager {
         }
         for image in journal
             .files
-            .iter()
-            .flat_map(|entry| [&entry.baseline, &entry.applied])
-            .chain(
-                journal
-                    .files
-                    .iter()
-                    .filter_map(|entry| entry.restore_base.as_ref()),
-            )
-            .chain(journal.rollback.iter().flatten())
-            .chain(journal.restore.iter().flatten())
+            .iter_mut()
+            .flat_map(|entry| {
+                [
+                    Some(&mut entry.baseline),
+                    Some(&mut entry.applied),
+                    entry.restore_base.as_mut(),
+                ]
+                .into_iter()
+                .flatten()
+            })
+            .chain(journal.rollback.iter_mut().flatten())
+            .chain(journal.restore.iter_mut().flatten())
         {
             if image
                 .bytes()?
@@ -430,6 +446,7 @@ impl Manager {
                     "agent journal exceeds file limits or has invalid images",
                 ));
             }
+            image.normalize_mode()?;
         }
         for (index, entry) in journal.files.iter_mut().enumerate() {
             if old {

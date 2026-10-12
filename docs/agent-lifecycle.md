@@ -206,8 +206,12 @@ do not delete backups to dismiss an error.
   their original baseline. Treat this directory as sensitive backup material;
   no encrypted secret store or automatic retention/purge policy exists yet.
 - Unix state directories use mode 700; journal and connected config files use
-  600. Disconnect restores the recorded original file mode. Unix-specific tests
-  are present but are not evidence of execution on this Windows development host.
+  600. Disconnect restores the recorded original file mode, or preserves a user
+  permission change during selective restoration. Snapshots retain permission
+  bits (including special bits), not file-type bits. Schema-1/2 journals with
+  legacy regular-file stat modes are normalized in memory; status/preview do not
+  rewrite them. Invalid file-type/high bits are refused. Permission changes stale
+  previews and block pending recovery, just like content changes.
 - Windows state/new secret files get a protected current-user-only DACL. Existing
   agent file ACLs are preserved on replacement/restoration; pre-existing broad
   ACLs are not automatically narrowed. Windows ACL tests verify both behaviors.
@@ -322,5 +326,10 @@ fixtures verify authenticated/secret-free metadata, unchanged configs/statistics
 and marker scripts that are never executed. The real-gateway browser suite checks
 all seven CLI paths; an explicitly injected metadata response additionally checks
 text-only rendering, unknown-membership warnings and long-path wrapping at 390px.
-Unix permission/symlink branches are platform-gated and have not been executed
-on this Windows host.
+Unix permission/symlink branches have also been executed under WSL/Arch Linux.
+Lifecycle regressions cover all seven adapters, exact and selective permission
+restoration, legacy schema-1/2 stat modes, missing files, and partial publication
+of synthetic pending-connect/disconnect journals after reopening the manager.
+A child-CLI regression checks stale permission revisions and legacy restoration
+without gateway configuration. These are filesystem and synthetic journal
+fixtures, not kill/crash experiments or real installed Agent-version evidence.

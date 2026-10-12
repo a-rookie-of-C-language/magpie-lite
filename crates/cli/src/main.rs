@@ -226,7 +226,7 @@ fn agent_config(
         return Ok(Config::default());
     }
     let config = load_config(path)?;
-    if !model.is_some_and(|model| config.resolve(model).is_some()) {
+    if model.is_none_or(|model| config.resolve(model).is_none()) {
         anyhow::bail!("model does not resolve to a configured provider or routing group");
     }
     Ok(config)

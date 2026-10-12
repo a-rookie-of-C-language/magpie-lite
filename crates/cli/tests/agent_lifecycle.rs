@@ -592,3 +592,105 @@ fn sandbox_discovery_ignores_machine_paths_and_reports_passive_user_launchers() 
         "must not count as a sandbox installation"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn unix_cli_checks_permission_revisions_and_restores_legacy_modes_without_config() {
+    use std::os::unix::fs::PermissionsExt;
+    for schema in [1, 2] {
+        for existing in [false, true] {
+            let s = Sandbox::new();
+            let preview = s.success(&["agent", "preview", "gemini", "mock/model"]);
+            let paths = managed_paths(&s, &preview);
+            let original = [
+                b"{\"user\":true}\n".as_slice(),
+                b"# retained\nUNRELATED=kept\n",
+            ];
+            if existing {
+                for (path, bytes) in paths.iter().zip(original) {
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    std::fs::write(path, bytes).unwrap();
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640)).unwrap();
+                }
+            }
+            s.success(&["agent", "connect", "gemini", "mock/model"]);
+            for path in &paths {
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+                    0o600
+                );
+            }
+            let preview = s.success(&["agent", "preview", "gemini", "--disconnect"]);
+            let connected: Vec<_> = paths
+                .iter()
+                .map(|path| std::fs::read(path).unwrap())
+                .collect();
+            std::fs::set_permissions(&paths[1], std::fs::Permissions::from_mode(0o660)).unwrap();
+            let failed = s.run(&[
+                "agent",
+                "disconnect",
+                "gemini",
+                "--revision",
+                preview["revision"].as_str().unwrap(),
+            ]);
+            assert!(!failed.status.success());
+            assert!(!String::from_utf8_lossy(&failed.stderr).contains(TOKEN));
+            assert_eq!(
+                paths
+                    .iter()
+                    .map(|path| std::fs::read(path).unwrap())
+                    .collect::<Vec<_>>(),
+                connected
+            );
+            assert_eq!(
+                std::fs::metadata(&paths[1]).unwrap().permissions().mode() & 0o7777,
+                0o660
+            );
+            std::fs::set_permissions(&paths[1], std::fs::Permissions::from_mode(0o600)).unwrap();
+
+            // A separate process must accept old stat modes and restore exactly
+            // without loading the gateway configuration or rewriting on preview.
+            let journal_path = s.root.path().join("agent-state/gemini.json");
+            let mut journal: Value =
+                serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+            journal["schema"] = json!(schema);
+            for entry in journal["files"].as_array_mut().unwrap() {
+                for key in ["baseline", "applied", "restore_base"] {
+                    if let Some(mode) = entry[key]["mode"].as_u64() {
+                        entry[key]["mode"] = json!(mode | 0o100000);
+                    }
+                }
+                if schema == 1 {
+                    entry.as_object_mut().unwrap().remove("owned");
+                    entry.as_object_mut().unwrap().remove("restore_base");
+                }
+            }
+            let bytes = serde_json::to_vec(&journal).unwrap();
+            std::fs::write(&journal_path, &bytes).unwrap();
+            std::fs::remove_file(&s.config).unwrap();
+            let preview = s.success(&["agent", "preview", "gemini", "--disconnect"]);
+            assert_eq!(std::fs::read(&journal_path).unwrap(), bytes);
+            assert_eq!(
+                s.success(&[
+                    "agent",
+                    "disconnect",
+                    "gemini",
+                    "--revision",
+                    preview["revision"].as_str().unwrap()
+                ])["connected"],
+                false
+            );
+            for (path, bytes) in paths.iter().zip(original) {
+                if existing {
+                    assert_eq!(std::fs::read(path).unwrap(), bytes);
+                    assert_eq!(
+                        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+                        0o640
+                    );
+                } else {
+                    assert!(!path.exists());
+                }
+            }
+        }
+    }
+}

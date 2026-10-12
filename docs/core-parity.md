@@ -56,3 +56,12 @@ real lts/* filenames and escaping symlinks). An authenticated HTTP test refreshe
 both inputs in one live manager and verifies unchanged config, statistics and
 preview revision. These fixtures do not execute Node or any Agent launcher and
 do not prove real terminal PATH equivalence.
+
+Unix lifecycle recovery is additionally covered under WSL/Arch Linux: snapshots
+canonicalize permission bits while accepting legacy schema-1/2 regular-file stat
+modes without rewriting journals on read. Seven-Agent fixtures exercise exact
+and selective restoration (including user chmod changes); pending-operation
+fixtures check partial publication, originally missing files and fail-closed
+permission drift. A child CLI restores legacy journals without gateway config.
+These synthetic recovery fixtures do not establish real process-crash durability
+or installed Agent-version compatibility.

@@ -1434,3 +1434,282 @@ fn passive_cli_changes_do_not_change_owned_fields_or_invalidate_lifecycle_revisi
             .all(|s| s.detection.cli.is_none())
     );
 }
+
+// Old Unix snapshots include stat's regular-file type bit, while rendered
+// images use chmod's permission-only representation (in both journal schemas).
+#[cfg(unix)]
+fn legacy_stat_modes(journal: &mut Journal, schema: u32) {
+    journal.schema = schema;
+    if schema == 1 {
+        for entry in &mut journal.files {
+            entry.owned = None;
+            entry.restore_base = None;
+        }
+        journal.restore = None;
+        if journal.phase != Phase::Connecting {
+            journal.rollback = None;
+        }
+    }
+    for image in journal
+        .files
+        .iter_mut()
+        .flat_map(|entry| {
+            [
+                Some(&mut entry.baseline),
+                Some(&mut entry.applied),
+                entry.restore_base.as_mut(),
+            ]
+            .into_iter()
+            .flatten()
+        })
+        .chain(journal.rollback.iter_mut().flatten())
+        .chain(journal.restore.iter_mut().flatten())
+    {
+        if let Some(mode) = &mut image.mode {
+            *mode |= 0o100000;
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_snapshots_contain_only_permission_bits() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_root, m) = setup();
+    let path = &m.paths(AgentId::Claude).unwrap()[0];
+    write(path, b"{}");
+    for mode in [0o600, 0o640, 0o755, 0o1640] {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(Image::capture(path).unwrap().mode, Some(mode));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_legacy_stat_modes_restore_all_agents_without_rewriting_on_read() {
+    use std::os::unix::fs::PermissionsExt;
+    for schema in [1, 2] {
+        for id in AgentId::ALL {
+            let (_root, m) = setup();
+            for (index, path) in m.paths(id).unwrap().iter().enumerate() {
+                write(path, original(id, index));
+                fs::set_permissions(path, fs::Permissions::from_mode(0o640)).unwrap();
+            }
+            let baseline = images(&m, id);
+            connect(&m, id, MODEL);
+            let mut journal = m.load(id).unwrap().unwrap();
+            legacy_stat_modes(&mut journal, schema);
+            m.save(&journal).unwrap();
+            let journal_bytes = fs::read(m.journal_path(id)).unwrap();
+            let connected = images(&m, id);
+            assert!(!m.status(id).unwrap().drifted);
+            let preview = m.preview(id, Action::Disconnect, None, gateway()).unwrap();
+            assert_eq!(fs::read(m.journal_path(id)).unwrap(), journal_bytes);
+            assert_eq!(images(&m, id), connected);
+            assert!(preview.files.iter().all(|file| file.operation == "update"));
+            connect(&m, id, "mock/rewired");
+            disconnect(&m, id);
+            assert_eq!(images(&m, id), baseline, "schema {schema}: {id:?}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_pending_legacy_modes_recover_partial_publish_after_restart() {
+    use std::os::unix::fs::PermissionsExt;
+    for schema in [1, 2] {
+        for phase in [Phase::Connecting, Phase::Disconnecting] {
+            for existing in [false, true] {
+                let (root, m) = setup();
+                let id = AgentId::Gemini;
+                if existing {
+                    for (index, path) in m.paths(id).unwrap().iter().enumerate() {
+                        write(path, original(id, index));
+                        fs::set_permissions(path, fs::Permissions::from_mode(0o640)).unwrap();
+                    }
+                }
+                let baseline = images(&m, id);
+                connect(&m, id, MODEL);
+                let mut journal = m.load(id).unwrap().unwrap();
+                journal.phase = phase;
+                if phase == Phase::Connecting {
+                    journal.rollback = Some(baseline.clone());
+                    for entry in &journal.files {
+                        atomic(&entry.path, &entry.baseline).unwrap();
+                    }
+                } else {
+                    journal.rollback = Some(images(&m, id));
+                    journal.restore = Some(baseline.clone());
+                }
+                legacy_stat_modes(&mut journal, schema);
+                // Also cover the mixed representation emitted by old plans:
+                // applied=0600, captured rollback/baseline=0100640.
+                for entry in &mut journal.files {
+                    entry.applied.mode = Some(0o600);
+                }
+                m.save(&journal).unwrap();
+                let first = &journal.files[0];
+                atomic(
+                    &first.path,
+                    if phase == Phase::Connecting {
+                        &first.applied
+                    } else {
+                        &first.baseline
+                    },
+                )
+                .unwrap();
+                drop(m);
+                let m =
+                    Manager::at_home(&root.path().join("home"), root.path().join("agent-state"))
+                        .unwrap();
+                let status = m.recover(id).unwrap();
+                assert!(!status.connected && !status.recovery_needed);
+                assert_eq!(
+                    images(&m, id),
+                    baseline,
+                    "schema {schema}, {phase:?}, existing={existing}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_selective_restore_keeps_original_or_user_changed_modes_across_rewire() {
+    use std::os::unix::fs::PermissionsExt;
+    for user_mode in [None, Some(0o660), Some(0o1600)] {
+        for id in AgentId::ALL {
+            let (_root, m) = setup();
+            for (index, path) in m.paths(id).unwrap().iter().enumerate() {
+                write(path, original(id, index));
+                fs::set_permissions(path, fs::Permissions::from_mode(0o640)).unwrap();
+            }
+            connect(&m, id, MODEL);
+            for (index, path) in m.paths(id).unwrap().iter().enumerate() {
+                add_unrelated(id, index, path, "retained");
+                if let Some(mode) = user_mode {
+                    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+                }
+            }
+            assert!(!m.status(id).unwrap().drifted);
+            connect(&m, id, "mock/rewired");
+            assert!(images(&m, id).iter().all(|image| image.mode == Some(0o600)));
+            disconnect(&m, id);
+            for (index, path) in m.paths(id).unwrap().iter().enumerate() {
+                assert_unrelated(id, index, path, "retained");
+                assert_eq!(
+                    Image::capture(path).unwrap().mode,
+                    Some(user_mode.unwrap_or(0o640))
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_permission_changes_stale_previews_and_block_pending_recovery() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_root, m) = setup();
+    let id = AgentId::Gemini;
+    let paths = m.paths(id).unwrap();
+    for (index, path) in paths.iter().enumerate() {
+        write(path, original(id, index));
+        fs::set_permissions(path, fs::Permissions::from_mode(0o640)).unwrap();
+    }
+    let preview = m
+        .preview(id, Action::Connect, Some(MODEL), gateway())
+        .unwrap();
+    fs::set_permissions(&paths[1], fs::Permissions::from_mode(0o660)).unwrap();
+    let before = images(&m, id);
+    assert_eq!(
+        m.apply(
+            id,
+            Action::Connect,
+            Some(MODEL),
+            &preview.revision,
+            gateway()
+        )
+        .unwrap_err()
+        .kind,
+        ErrorKind::Conflict
+    );
+    assert_eq!(images(&m, id), before);
+    assert!(!m.journal_path(id).exists());
+    connect(&m, id, MODEL);
+    for phase in [Phase::Connecting, Phase::Disconnecting] {
+        let mut journal = m.load(id).unwrap().unwrap();
+        journal.phase = phase;
+        journal.rollback = Some(
+            journal
+                .files
+                .iter()
+                .map(|entry| {
+                    if phase == Phase::Connecting {
+                        entry.baseline.clone()
+                    } else {
+                        entry.applied.clone()
+                    }
+                })
+                .collect(),
+        );
+        if phase == Phase::Disconnecting {
+            journal.restore = Some(
+                journal
+                    .files
+                    .iter()
+                    .map(|entry| entry.baseline.clone())
+                    .collect(),
+            );
+        }
+        legacy_stat_modes(&mut journal, 2);
+        m.save(&journal).unwrap();
+        // File 1 could be restored, but file 2 changed after the journal.
+        // Recovery must validate every input before writing any of them.
+        fs::set_permissions(&paths[1], fs::Permissions::from_mode(0o604)).unwrap();
+        let before = images(&m, id);
+        let journal_bytes = fs::read(m.journal_path(id)).unwrap();
+        assert_eq!(m.recover(id).unwrap_err().kind, ErrorKind::Conflict);
+        assert_eq!(images(&m, id), before);
+        assert_eq!(fs::read(m.journal_path(id)).unwrap(), journal_bytes);
+        fs::set_permissions(&paths[1], fs::Permissions::from_mode(0o600)).unwrap();
+        journal.phase = Phase::Connected;
+        journal.rollback = None;
+        journal.restore = None;
+        m.save(&journal).unwrap();
+    }
+}
+
+#[test]
+fn invalid_journal_modes_are_refused_in_every_recovery_image() {
+    let (_root, m) = setup();
+    let id = AgentId::Claude;
+    connect(&m, id, MODEL);
+    let original = m.load(id).unwrap().unwrap();
+    let before = images(&m, id);
+    for mode in [0o20000, 0o40600, 0o120600, 0o200600, u32::MAX] {
+        for image_index in 0..5 {
+            let mut journal = original.clone();
+            journal.phase = Phase::Disconnecting;
+            journal.rollback = Some(before.clone());
+            journal.restore = Some(vec![journal.files[0].baseline.clone()]);
+            let image = match image_index {
+                0 => &mut journal.files[0].baseline,
+                1 => &mut journal.files[0].applied,
+                2 => journal.files[0].restore_base.as_mut().unwrap(),
+                3 => &mut journal.rollback.as_mut().unwrap()[0],
+                _ => &mut journal.restore.as_mut().unwrap()[0],
+            };
+            // Present data isolates mode validation from missing-file checks.
+            image.data = before[0].data.clone();
+            image.mode = Some(mode);
+            m.save(&journal).unwrap();
+            let journal_bytes = fs::read(m.journal_path(id)).unwrap();
+            assert_eq!(m.recover(id).unwrap_err().kind, ErrorKind::Conflict);
+            assert_eq!(images(&m, id), before);
+            assert_eq!(fs::read(m.journal_path(id)).unwrap(), journal_bytes);
+        }
+    }
+}
