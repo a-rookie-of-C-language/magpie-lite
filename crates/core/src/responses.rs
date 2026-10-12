@@ -170,19 +170,37 @@ fn decode_input_item(item: &Value, messages: &mut Vec<Message>) {
         }
         "function_call_output" => {
             let output = item.get("output").cloned().unwrap_or(Value::Null);
-            let text = match &output {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
+            let structured = output.as_array().is_some_and(|blocks| {
+                blocks.iter().any(|block| {
+                    matches!(
+                        block["type"].as_str(),
+                        Some(
+                            "text"
+                                | "input_text"
+                                | "output_text"
+                                | "image"
+                                | "image_url"
+                                | "input_image"
+                        )
+                    )
+                })
+            });
+            let (text, images) = if output.is_string() || structured {
+                crate::tool_output::decode(&output)
+            } else {
+                (output.to_string(), Vec::new())
             };
+            let mut result = Part::tool_result(
+                item.get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                text,
+                false,
+            );
+            result.images = images;
             messages.push(Message {
                 role: Role::User,
-                parts: vec![Part::tool_result(
-                    item.get("call_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                    text,
-                    false,
-                )],
+                parts: vec![result],
             });
         }
         "reasoning" => {
@@ -270,10 +288,27 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
                     if let Some((role, content)) = open_message.take() {
                         input.push(json!({"type": "message", "role": role, "content": content}));
                     }
+                    let images: Vec<Value> = crate::tool_output::images(p)
+                        .map(|image| json!({
+                            "type":"input_image",
+                            "image_url": if image.data.is_empty() { image.url.clone() }
+                                else { format!("data:{};base64,{}", image.media_type, image.data) }
+                        }))
+                        .collect();
+                    let output = if images.is_empty() {
+                        json!(p.text)
+                    } else {
+                        let mut blocks = Vec::new();
+                        if !p.text.is_empty() {
+                            blocks.push(json!({"type":"input_text", "text":p.text}));
+                        }
+                        blocks.extend(images);
+                        Value::Array(blocks)
+                    };
                     input.push(json!({
                         "type": "function_call_output",
                         "call_id": p.call_id,
-                        "output": p.text,
+                        "output": output,
                     }));
                 }
                 PartKind::Image | PartKind::Search => {}

@@ -116,22 +116,16 @@ fn decode_block(b: &Value) -> Option<Part> {
         )),
         Some("tool_result") => {
             let content = b.get("content").unwrap_or(&Value::Null);
-            let text = match content {
-                Value::String(s) => s.clone(),
-                Value::Array(blocks) => blocks
-                    .iter()
-                    .filter_map(|x| x.get("text").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join(""),
-                _ => String::new(),
-            };
-            Some(Part::tool_result(
+            let (text, images) = crate::tool_output::decode(content);
+            let mut result = Part::tool_result(
                 b.get("tool_use_id")
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
                 text,
                 b.get("is_error").and_then(Value::as_bool).unwrap_or(false),
-            ))
+            );
+            result.images = images;
+            Some(result)
         }
         _ => None,
     }
@@ -291,10 +285,23 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
             // call inside the user turn that follows it.
             for p in &m.parts {
                 if p.kind() == PartKind::ToolResult {
+                    let images: Vec<Value> = crate::tool_output::images(p)
+                        .filter_map(part_to_block)
+                        .collect();
+                    let content = if images.is_empty() {
+                        json!(p.text)
+                    } else {
+                        let mut content = Vec::new();
+                        if !p.text.is_empty() {
+                            content.push(json!({"type":"text", "text":p.text}));
+                        }
+                        content.extend(images);
+                        Value::Array(content)
+                    };
                     blocks.push(json!({
                         "type": "tool_result",
                         "tool_use_id": p.call_id,
-                        "content": p.text,
+                        "content": content,
                         "is_error": p.is_error,
                     }));
                 }

@@ -14,5 +14,7 @@ pub mod responses;
 pub mod search;
 pub mod stream;
 
+mod tool_output;
+
 pub use error::{CoreError, Result};
 pub mod gemini;

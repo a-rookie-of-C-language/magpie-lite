@@ -123,6 +123,8 @@ pub struct Part {
     pub args: Value,
     /// The call a tool result answers.
     pub call_id: String,
+    /// Images returned by a tool beside its text; meaningful for ToolResult only.
+    pub images: Vec<Part>,
     /// Whether the tool failed.
     pub is_error: bool,
     /// Thinking signature (Anthropic's, or a Gemini thought's).

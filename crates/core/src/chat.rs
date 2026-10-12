@@ -55,19 +55,6 @@ fn decode_content(content: &Value) -> Vec<Part> {
     }
 }
 
-/// Flatten a chat `content` field into plain text (tool results carry text).
-fn content_to_string(content: &Value) -> String {
-    match content {
-        Value::String(s) => s.clone(),
-        Value::Array(blocks) => blocks
-            .iter()
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => String::new(),
-    }
-}
-
 fn part_to_content_block(p: &Part) -> Value {
     match p.kind() {
         PartKind::Text => json!({"type": "text", "text": p.text}),
@@ -128,13 +115,12 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 let is_error = m.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+                let (text, images) = crate::tool_output::decode(content);
+                let mut result = Part::tool_result(call_id, text, is_error);
+                result.images = images;
                 messages.push(Message {
                     role: Role::User,
-                    parts: vec![Part::tool_result(
-                        call_id,
-                        content_to_string(content),
-                        is_error,
-                    )],
+                    parts: vec![result],
                 });
             }
             _ => {}
@@ -211,10 +197,22 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
             Role::User => {
                 for p in &m.parts {
                     if p.kind() == PartKind::ToolResult {
+                        let images: Vec<Value> = crate::tool_output::images(p)
+                            .map(part_to_content_block)
+                            .collect();
+                        let content = if images.is_empty() {
+                            json!(p.text)
+                        } else {
+                            let mut blocks = vec![json!({"type":"text", "text":p.text})];
+                            blocks.extend(images);
+                            Value::Array(blocks)
+                        };
+                        // The private wire normalizer relocates these image blocks
+                        // after all answers, never sending a multimodal tool message.
                         messages.push(json!({
                             "role": "tool",
                             "tool_call_id": p.call_id,
-                            "content": p.text,
+                            "content": content,
                         }));
                     }
                 }

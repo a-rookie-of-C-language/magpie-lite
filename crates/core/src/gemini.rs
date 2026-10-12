@@ -227,17 +227,39 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
                     .unwrap_or_else(|| name.clone());
                 let (text, is_error) =
                     function_response_text(response.get("response").unwrap_or(&Value::Null));
-                current.parts.push(Part::tool_result(id, text, is_error));
-
+                let mut result = Part::tool_result(id, text, is_error);
+                let mut attachments = Vec::new();
                 for extra in response
                     .get("parts")
                     .and_then(Value::as_array)
-                    .unwrap_or(&Vec::new())
+                    .into_iter()
+                    .flatten()
                 {
                     if let Some(p) = decode_attachment(extra) {
-                        current.parts.push(p);
+                        if p.media_type.starts_with("image/") {
+                            result.images.push(p);
+                        } else {
+                            // Keep existing nonimage attachment behavior; do not
+                            // relabel files as nested tool-returned images.
+                            attachments.push(p);
+                        }
+                    } else if !extra
+                        .get("thought")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                        && let Some(text) = extra
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                    {
+                        if !result.text.trim().is_empty() {
+                            result.text.push_str("\n\n");
+                        }
+                        result.text.push_str(text);
                     }
                 }
+                current.parts.push(result);
+                current.parts.extend(attachments);
                 continue;
             }
 
@@ -483,13 +505,18 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
                     } else {
                         json!({"output": p.text})
                     };
-                    parts.push(json!({
-                        "functionResponse": {
-                            "id": p.call_id,
-                            "name": name,
-                            "response": response,
-                        }
-                    }));
+                    let mut result = json!({
+                        "id": p.call_id,
+                        "name": name,
+                        "response": response,
+                    });
+                    let images: Vec<Value> = crate::tool_output::images(p)
+                        .map(attachment_value)
+                        .collect();
+                    if !images.is_empty() {
+                        result["parts"] = Value::Array(images);
+                    }
+                    parts.push(json!({"functionResponse": result}));
                 }
                 PartKind::Thinking => {
                     let mut part = Map::new();

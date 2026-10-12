@@ -61,7 +61,7 @@ fn gemini_request_decodes_tool_history_and_images() {
     assert_eq!(ir.messages[1].parts[0].id, "call_1");
     assert_eq!(ir.messages[1].parts[0].signature, "sig-1");
     assert_eq!(ir.messages[2].parts[0].text, "Sunny, 23C");
-    assert_eq!(ir.messages[2].parts[1].media_type, "image/jpeg");
+    assert_eq!(ir.messages[2].parts[0].images[0].media_type, "image/jpeg");
     assert_eq!(ir.tools[0].name, "weather");
     assert_eq!(
         ir.tool_choice,
@@ -95,7 +95,7 @@ fn ir_request_encodes_to_gemini_and_back() {
         "weather"
     );
     assert_eq!(
-        encoded["contents"][2]["parts"][1]["inlineData"]["data"],
+        encoded["contents"][2]["parts"][0]["functionResponse"]["parts"][0]["inlineData"]["data"],
         "aW1nMg=="
     );
     assert_eq!(
@@ -111,7 +111,7 @@ fn ir_request_encodes_to_gemini_and_back() {
     let back = gemini::decode_request(&encoded).expect("decode back");
     assert_eq!(back.messages.len(), ir.messages.len());
     assert_eq!(back.messages[1].parts[0].id, "call_1");
-    assert_eq!(back.messages[2].parts[1].data, "aW1nMg==");
+    assert_eq!(back.messages[2].parts[0].images[0].data, "aW1nMg==");
 }
 
 #[test]
