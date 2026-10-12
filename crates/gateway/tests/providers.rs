@@ -638,3 +638,144 @@ async fn concurrent_creates_and_default_changes_are_serialized() {
     assert_eq!(Config::load(&gw.path).unwrap().default_provider, "two");
     assert_eq!(snapshot(&gw, "/config").await["default_provider"], "two");
 }
+
+async fn edit_revision(
+    gw: &Gateway,
+    method: Method,
+    path: &str,
+    body: Value,
+    revision: &str,
+) -> reqwest::Response {
+    Client::new()
+        .request(method, format!("{}{path}", gw.url))
+        .bearer_auth("magpie-lite")
+        .header("If-Match", revision)
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn revision_checks_cover_provider_and_group_writes_and_legacy_clients() {
+    let gw = gateway().await;
+    let initial = Client::new()
+        .get(format!("{}/config", gw.url))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(initial.headers()["etag"], "\"1\"");
+    assert_eq!(initial.json::<Value>().await.unwrap()["revision"], 1);
+    let created = edit_revision(
+        &gw,
+        Method::POST,
+        "/config/providers",
+        provider(&gw, "mock"),
+        "\"1\"",
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    assert_eq!(created.headers()["etag"], "\"2\"");
+    assert_eq!(created.json::<Value>().await.unwrap()["revision"], 2);
+
+    let group = json!({"id":"daily", "routes":["mock/first"]});
+    let before = std::fs::read(&gw.path).unwrap();
+    for (method, path, body) in [
+        (Method::POST, "/config/providers", provider(&gw, "other")),
+        (Method::PUT, "/config/providers/mock", provider(&gw, "mock")),
+        (Method::DELETE, "/config/providers/mock", Value::Null),
+        (Method::POST, "/config/groups", group.clone()),
+        (Method::PUT, "/config/groups/daily", group.clone()),
+        (Method::DELETE, "/config/groups/daily", Value::Null),
+    ] {
+        let response = edit_revision(&gw, method, path, body, "1").await;
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{path}");
+        assert!(response.text().await.unwrap().contains("revision is stale"));
+        assert_eq!(std::fs::read(&gw.path).unwrap(), before);
+        assert_eq!(snapshot(&gw, "/config").await["revision"], 2);
+    }
+    for invalid in ["bad", "W/\"2\"", "\"2", "2, 3", "-1"] {
+        assert_eq!(
+            edit_revision(&gw, Method::POST, "/config/groups", group.clone(), invalid)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(std::fs::read(&gw.path).unwrap(), before);
+    }
+    let created = edit_revision(&gw, Method::POST, "/config/groups", group.clone(), "2").await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    assert_eq!(created.headers()["etag"], "\"3\"");
+    assert_eq!(created.json::<Value>().await.unwrap()["revision"], 3);
+    let updated = edit_revision(&gw, Method::PUT, "/config/groups/daily", group, "3").await;
+    assert_eq!(updated.status(), StatusCode::OK);
+    assert_eq!(updated.headers()["etag"], "\"4\"");
+    let deleted = edit_revision(
+        &gw,
+        Method::DELETE,
+        "/config/groups/daily",
+        Value::Null,
+        "*",
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert_eq!(deleted.headers()["etag"], "\"5\"");
+    let legacy = edit(
+        &gw,
+        Method::PUT,
+        "/config/providers/mock",
+        provider(&gw, "mock"),
+    )
+    .await;
+    assert_eq!(legacy.status(), StatusCode::OK);
+    assert_eq!(legacy.json::<Value>().await.unwrap()["revision"], 6);
+    let deleted = edit_revision(
+        &gw,
+        Method::DELETE,
+        "/config/providers/mock",
+        Value::Null,
+        "6",
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert_eq!(deleted.headers()["etag"], "\"7\"");
+}
+
+#[tokio::test]
+async fn concurrent_clients_with_one_revision_have_exactly_one_winner() {
+    let gw = gateway().await;
+    let (one, two) = tokio::join!(
+        edit_revision(
+            &gw,
+            Method::POST,
+            "/config/providers",
+            provider(&gw, "one"),
+            "1"
+        ),
+        edit_revision(
+            &gw,
+            Method::POST,
+            "/config/providers",
+            provider(&gw, "two"),
+            "1"
+        )
+    );
+    let statuses = [one.status(), two.status()];
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|&&s| s == StatusCode::CREATED)
+            .count(),
+        1
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|&&s| s == StatusCode::CONFLICT)
+            .count(),
+        1
+    );
+    assert_eq!(Config::load(&gw.path).unwrap().provider.len(), 1);
+    assert_eq!(snapshot(&gw, "/config").await["revision"], 2);
+}

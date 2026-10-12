@@ -92,6 +92,8 @@ IDs permit ASCII letters, digits, hyphens and underscores; `group` is reserved. 
 
 `/config` returns `credential_count` (zero for no upstream auth), effective `key_cooldown_ms`, and nullable `key_cooldown_override_ms`. Endpoint/protocol/key-pool changes start a new process-local rotation schedule; metadata changes keep active cooldowns. A delayed quota rejection from an old request cannot cool a replacement key. Credentials remain in the local TOML file; a separate secret store is still planned.
 
+GET `/config` and successful provider/group edits return a numeric `revision` and a quoted `ETag` (for example, `"2"`). Send that ETag as `If-Match` on POST/PUT/DELETE to reject stale writes with 409 without changing memory or disk. Bare numeric revisions are also accepted; malformed values return 400. Omitting the header or using `*` keeps legacy unconditional updates. The console sends its latest loaded revision. Revisions are process-local and reset on gateway restart; clients must refresh after a restart, and this is not cross-process locking or durable concurrency control.
+
 Successful edits return the secret-free `/config` snapshot. Invalid provider IDs, protocols, URLs, models, keys, and fallback routes return 400. Duplicate providers return 409; missing providers return 404. Changes are persisted through the same atomic config update used by routing groups.
 
 ## Agent connection, restore and recovery

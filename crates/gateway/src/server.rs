@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{StatusCode, Uri, header};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -240,8 +240,39 @@ async fn stats(State(state): State<Arc<AppState>>, Query(query): Query<StatsQuer
 }
 
 /// GET `/config` — secret-free routing metadata for the console.
-async fn config(State(state): State<Arc<AppState>>) -> Json<crate::config::ConfigSnapshot> {
-    Json(state.config.current().snapshot())
+async fn config(State(state): State<Arc<AppState>>) -> Response {
+    config_response(StatusCode::OK, state.config.snapshot())
+}
+
+/// Parse the optional optimistic-concurrency precondition used by management writes.
+/// Bare numeric values and standard quoted ETags are accepted; `*` disables the check.
+pub(crate) fn expected_config_revision(headers: &HeaderMap) -> Result<Option<u64>, &'static str> {
+    let Some(value) = headers.get(header::IF_MATCH) else {
+        return Ok(None);
+    };
+    let raw = value
+        .to_str()
+        .map_err(|_| "If-Match must contain a numeric configuration revision")?
+        .trim();
+    if raw == "*" {
+        return Ok(None);
+    }
+    let revision = raw
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(raw);
+    revision
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| "If-Match must contain a numeric configuration revision")
+}
+
+pub(crate) fn config_response(
+    status: StatusCode,
+    snapshot: crate::config::ConfigSnapshot,
+) -> Response {
+    let etag = format!("\"{}\"", snapshot.revision);
+    (status, [(header::ETAG, etag)], Json(snapshot)).into_response()
 }
 
 fn group_error(status: StatusCode, message: &str) -> Response {
@@ -268,7 +299,15 @@ fn validate_group(config: &Config, group: &GroupConfig) -> Result<(), (StatusCod
     Ok(())
 }
 
-async fn create_group(State(state): State<Arc<AppState>>, bytes: Bytes) -> Response {
+async fn create_group(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Response {
+    let expected = match expected_config_revision(&headers) {
+        Ok(value) => value,
+        Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
+    };
     let group = match decode_group(&bytes) {
         Ok(group) => group,
         Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
@@ -276,7 +315,7 @@ async fn create_group(State(state): State<Arc<AppState>>, bytes: Bytes) -> Respo
     group_update_response(
         state
             .config
-            .update(move |config| {
+            .update_if_revision(expected, move |config| {
                 validate_group(config, &group)?;
                 if config.group.iter().any(|existing| existing.id == group.id) {
                     return Err((StatusCode::CONFLICT, "group already exists".to_owned()));
@@ -292,8 +331,13 @@ async fn create_group(State(state): State<Arc<AppState>>, bytes: Bytes) -> Respo
 async fn update_group(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     bytes: Bytes,
 ) -> Response {
+    let expected = match expected_config_revision(&headers) {
+        Ok(value) => value,
+        Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
+    };
     let group = match decode_group(&bytes) {
         Ok(group) => group,
         Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
@@ -304,7 +348,7 @@ async fn update_group(
     group_update_response(
         state
             .config
-            .update(move |config| {
+            .update_if_revision(expected, move |config| {
                 validate_group(config, &group)?;
                 let existing = config
                     .group
@@ -319,11 +363,19 @@ async fn update_group(
     )
 }
 
-async fn delete_group(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+async fn delete_group(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let expected = match expected_config_revision(&headers) {
+        Ok(value) => value,
+        Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
+    };
     group_update_response(
         state
             .config
-            .update(move |config| {
+            .update_if_revision(expected, move |config| {
                 let index = config
                     .group
                     .iter()
@@ -353,7 +405,7 @@ fn group_update_response(
     status: StatusCode,
 ) -> Response {
     match result {
-        Ok(snapshot) => (status, Json(snapshot)).into_response(),
+        Ok(snapshot) => config_response(status, snapshot),
         Err((status, message)) => group_error(status, &message),
     }
 }

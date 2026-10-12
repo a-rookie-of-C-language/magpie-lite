@@ -630,6 +630,9 @@ pub struct GroupConfigSnapshot {
 /// Secret-free routing configuration for the token-protected console.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigSnapshot {
+    /// Monotonic in-process revision used for optimistic management updates.
+    /// It is opaque to clients and never contains configuration or secret data.
+    pub revision: u64,
     /// Provider used when a model names none.
     pub default_provider: String,
     /// Gateway-wide cooldown default, in milliseconds.
@@ -790,7 +793,13 @@ impl Config {
 
     /// A secret-free view for `/config` and the console.
     pub fn snapshot(&self) -> ConfigSnapshot {
+        self.snapshot_with_revision(0)
+    }
+
+    /// Build a secret-free view with the store-owned optimistic-concurrency revision.
+    pub fn snapshot_with_revision(&self, revision: u64) -> ConfigSnapshot {
         ConfigSnapshot {
+            revision,
             default_provider: self.default_provider.clone(),
             key_cooldown_ms: self.key_cooldown_ms,
             providers: self

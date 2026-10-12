@@ -12,6 +12,7 @@ pub struct ConfigStore(Arc<Inner>);
 
 struct Inner {
     current: RwLock<Config>,
+    revision: AtomicU64,
     updates: Mutex<()>,
     path: Option<PathBuf>,
     next_key_generation: AtomicU64,
@@ -27,6 +28,7 @@ impl ConfigStore {
         let next_key_generation = AtomicU64::new(config.provider.len() as u64 + 1);
         Self(Arc::new(Inner {
             current: RwLock::new(config),
+            revision: AtomicU64::new(1),
             updates: Mutex::new(()),
             path,
             next_key_generation,
@@ -42,8 +44,28 @@ impl ConfigStore {
             .clone()
     }
 
+    /// The current secret-free management snapshot, including its opaque revision.
+    pub fn snapshot(&self) -> ConfigSnapshot {
+        let config = self.0.current.read().unwrap_or_else(|p| p.into_inner());
+        let revision = self.0.revision.load(Ordering::Acquire);
+        config.snapshot_with_revision(revision)
+    }
+
     /// Saving and publishing happen together even if the HTTP caller disconnects.
     pub async fn update<F>(&self, change: F) -> Result<ConfigSnapshot, ConfigError>
+    where
+        F: FnOnce(&mut Config) -> Result<(), ConfigError> + Send + 'static,
+    {
+        self.update_if_revision(None, change).await
+    }
+
+    /// Update configuration only if the client still owns the supplied revision.
+    /// Missing revisions remain supported for CLI/backwards-compatible callers.
+    pub async fn update_if_revision<F>(
+        &self,
+        expected_revision: Option<u64>,
+        change: F,
+    ) -> Result<ConfigSnapshot, ConfigError>
     where
         F: FnOnce(&mut Config) -> Result<(), ConfigError> + Send + 'static,
     {
@@ -57,6 +79,15 @@ impl ConfigStore {
                 )
             })?;
             let current = store.current();
+            let current_revision = store.0.revision.load(Ordering::Acquire);
+            if let Some(expected) = expected_revision
+                && expected != current_revision
+            {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "configuration revision is stale; refresh before editing".to_owned(),
+                ));
+            }
             let mut next = current.clone();
             change(&mut next)?;
             // Avoid overwriting edits made by the CLI or another gateway instance.
@@ -94,8 +125,12 @@ impl ConfigStore {
                     _ => store.0.next_key_generation.fetch_add(1, Ordering::Relaxed),
                 };
             }
-            let snapshot = next.snapshot();
-            *store.0.current.write().unwrap_or_else(|p| p.into_inner()) = next;
+            // Publish configuration and revision under the same lock so readers
+            // cannot pair old configuration with a new revision (or vice versa).
+            let mut published = store.0.current.write().unwrap_or_else(|p| p.into_inner());
+            let revision = store.0.revision.fetch_add(1, Ordering::AcqRel) + 1;
+            let snapshot = next.snapshot_with_revision(revision);
+            *published = next;
             Ok(snapshot)
         })
         .await
@@ -112,6 +147,36 @@ impl ConfigStore {
 mod tests {
     use super::*;
     use crate::config::{GroupConfig, RoutingPolicy};
+
+    #[tokio::test]
+    async fn stale_revision_never_changes_memory_or_disk() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let config = Config::default();
+        config.save(&path).unwrap();
+        let store = ConfigStore::new(config, Some(path.clone()));
+        assert_eq!(store.snapshot().revision, 1);
+        let updated = store
+            .update_if_revision(Some(1), |config| {
+                config.key_cooldown_ms = 123;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(updated.revision, 2);
+        let before = std::fs::read(&path).unwrap();
+        let error = store
+            .update_if_revision(Some(1), |_| {
+                panic!("stale edits must not run their mutation");
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert_eq!(store.current().key_cooldown_ms, 123);
+        assert_eq!(store.snapshot().revision, 2);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(store.update(|_| Ok(())).await.unwrap().revision, 3);
+    }
 
     #[tokio::test]
     async fn save_failure_does_not_publish_a_new_config() {

@@ -841,6 +841,7 @@
     let editingGroup = null;
     let editingProvider = null;
     let routingSnapshot = null;
+    let configRevision = null;
     let managementBusy = false;
     let statsQuery = null;
     let dataRevision = 0;
@@ -915,7 +916,11 @@
           cache: "no-store",
           ...options,
           signal: controller.signal,
-          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+            ...(options.headers || {})
+          }
         });
         if (response.status === 401) {
           const error = new Error("The gateway token was not accepted.");
@@ -1043,6 +1048,9 @@
     function renderRouting(configuration) {
       if (JSON.stringify(routingSnapshot) !== JSON.stringify(configuration)) invalidateAgentPreview();
       routingSnapshot = configuration;
+      configRevision = Number.isSafeInteger(Number(configuration.revision))
+        ? Number(configuration.revision)
+        : null;
       renderAgentModelOptions(configuration);
       elements.groupProviders.textContent = `Configured providers: ${(configuration.providers || []).map(p => p.id).join(", ") || "none"}`;
       renderRoutingProviders(configuration.providers || []);
@@ -1436,7 +1444,11 @@
       elements.providerMessage.textContent = method === "DELETE" ? "Deleting…" : "Saving…";
       let saved = false;
       try {
-        const snapshot = await authorized(path, { method, ...(body ? { body: JSON.stringify(body) } : {}) });
+        const snapshot = await authorized(path, {
+          method,
+          ...(body ? { body: JSON.stringify(body) } : {}),
+          headers: configRevision === null ? {} : { "If-Match": String(configRevision) }
+        });
         if (session !== sessionRevision) return;
         renderRouting(snapshot);
         saved = true;
@@ -1598,7 +1610,11 @@
       elements.groupMessage.textContent = method === "DELETE" ? "Deleting…" : "Saving…";
       let saved = false;
       try {
-        const snapshot = await authorized(path, { method, ...(body ? { body: JSON.stringify(body) } : {}) });
+        const snapshot = await authorized(path, {
+          method,
+          ...(body ? { body: JSON.stringify(body) } : {}),
+          headers: configRevision === null ? {} : { "If-Match": String(configRevision) }
+        });
         if (session !== sessionRevision) return;
         renderRouting(snapshot);
         saved = true;
@@ -1728,6 +1744,7 @@
       elements.providerMessage.textContent = "";
       editingProvider = null;
       routingSnapshot = null;
+      configRevision = null;
       elements.groupEditor.hidden = true;
       elements.groupEditor.reset();
       elements.groupMessage.textContent = "";
