@@ -67,6 +67,7 @@ async fn gateway(referenced: bool) -> Gateway {
                 Vec::new()
             },
             key_cooldown_ms: None,
+            capabilities: Default::default(),
             key_generation: 0,
         }],
         ..Config::default()

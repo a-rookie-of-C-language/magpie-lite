@@ -156,6 +156,11 @@
 
     .field label { font-weight: 680; }
 
+    .capability-field { min-width: 0; margin: 0; padding: 0; border: 0; }
+    .capability-field legend { margin-bottom: 7px; font-weight: 680; }
+    .capability-options { display: flex; flex-wrap: wrap; gap: 8px 12px; color: var(--muted); font-size: .82rem; }
+    .capability-options label { display: inline-flex; align-items: center; gap: 5px; font-weight: 650; }
+
     .token-input {
       width: 100%;
       min-height: 45px;
@@ -642,12 +647,16 @@
                   <div class="field"><label for="provider-id">Provider ID</label><input id="provider-id" class="token-input" required pattern="[A-Za-z0-9_-]+" placeholder="deepseek" aria-describedby="provider-id-help"><p id="provider-id-help" class="group-help">Letters, digits, hyphens and underscores. Agents use provider/model. The ID group is reserved.</p></div>
                   <div class="field"><label for="provider-name">Display name (optional)</label><input id="provider-name" class="token-input" placeholder="DeepSeek"></div>
                   <div class="field"><label for="provider-protocol">Protocol</label><select id="provider-protocol" class="token-input"><option value="chat">OpenAI Chat Completions</option><option value="responses">OpenAI Responses</option><option value="anthropic">Anthropic Messages</option><option value="gemini">Google Gemini</option></select></div>
+                  <div class="field"><fieldset class="capability-field"><legend>Supported protocols</legend><div class="capability-options"><label><input id="provider-cap-chat" type="checkbox"> Chat</label><label><input id="provider-cap-responses" type="checkbox"> Responses</label><label><input id="provider-cap-anthropic" type="checkbox"> Anthropic</label><label><input id="provider-cap-gemini" type="checkbox"> Gemini</label></div><p class="group-help">Select every wire protocol this provider accepts. The configured protocol is included automatically.</p></fieldset></div>
                   <div class="field"><label for="provider-url">Base URL</label><input id="provider-url" class="token-input" type="url" required placeholder="https://api.example.com/v1" aria-describedby="provider-url-help"><p id="provider-url-help" class="group-help">Chat and Responses: include /v1. Anthropic: host root. Gemini: include /v1beta.</p></div>
                 </div>
                 <div class="field"><label for="provider-models">Model IDs</label><textarea id="provider-models" class="token-input" placeholder="deepseek-chat&#10;deepseek-reasoner" aria-describedby="provider-models-help"></textarea><p id="provider-models-help" class="group-help">One upstream model ID per line. Listed models appear in the agent catalog; explicit provider/model routes also work for unlisted models.</p></div>
                 <div class="field"><label for="provider-key-mode">API keys</label><select id="provider-key-mode" class="token-input" aria-describedby="provider-key-help"><option value="keep">Keep existing keys</option><option value="replace">Replace key pool</option><option value="clear">No upstream authentication</option></select><p id="provider-key-help" class="group-help">Saved keys are never displayed. Choose Replace to rotate credentials, or No upstream authentication for a local service.</p></div>
                 <div id="provider-keys-field" class="field" hidden><label for="provider-keys">New key pool</label><textarea id="provider-keys" class="token-input" autocomplete="off" spellcheck="false" aria-describedby="provider-keys-help"></textarea><p id="provider-keys-help" class="group-help">One API key per line, in rotation order. These values are sent when you save, discover models or test a connection.</p></div>
                 <div class="editor-grid">
+                  <div class="field"><label for="provider-cap-streaming">Streaming support</label><select id="provider-cap-streaming" class="token-input"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></div>
+                  <div class="field"><label for="provider-cap-tools">Tools/function calling</label><select id="provider-cap-tools" class="token-input"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></div>
+                  <div class="field"><label for="provider-cap-vision">Vision/multimodal input</label><select id="provider-cap-vision" class="token-input"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></div>
                   <div class="field"><label for="provider-fallback">Fallback routes (optional)</label><textarea id="provider-fallback" class="token-input" placeholder="backup/model&#10;group/daily" aria-describedby="provider-fallback-help"></textarea><p id="provider-fallback-help" class="group-help">One route per line, tried in order. Providers and groups must already exist.</p></div>
                   <div class="field"><label for="provider-cooldown">Key cooldown in milliseconds (optional)</label><input id="provider-cooldown" class="token-input" type="number" min="0" step="1" placeholder="Gateway default" aria-describedby="provider-cooldown-help"><p id="provider-cooldown-help" class="group-help">Leave blank to inherit the gateway default. Use 0 to disable cooldown.</p><label class="switch"><input id="provider-default" type="checkbox">Make default provider</label><p class="group-help">To switch defaults, select this option on the provider you want to use.</p></div>
                 </div>
@@ -662,6 +671,7 @@
                     <tr>
                       <th scope="col">Provider</th>
                       <th scope="col">Protocol</th>
+                      <th scope="col">Capabilities</th>
                       <th scope="col">Base URL</th>
                       <th scope="col">Models</th>
                       <th scope="col">Keys</th>
@@ -754,6 +764,13 @@
       providerId: document.getElementById("provider-id"),
       providerName: document.getElementById("provider-name"),
       providerProtocol: document.getElementById("provider-protocol"),
+      providerCapChat: document.getElementById("provider-cap-chat"),
+      providerCapResponses: document.getElementById("provider-cap-responses"),
+      providerCapAnthropic: document.getElementById("provider-cap-anthropic"),
+      providerCapGemini: document.getElementById("provider-cap-gemini"),
+      providerCapStreaming: document.getElementById("provider-cap-streaming"),
+      providerCapTools: document.getElementById("provider-cap-tools"),
+      providerCapVision: document.getElementById("provider-cap-vision"),
       providerUrl: document.getElementById("provider-url"),
       providerModels: document.getElementById("provider-models"),
       providerKeyMode: document.getElementById("provider-key-mode"),
@@ -1245,6 +1262,7 @@
         elements.routingRows.append(row([
           name,
           text("td", provider.protocol),
+          text("td", capabilitySummary(provider.capabilities)),
           text("td", provider.base_url),
           text("td", listSummary(provider.models || [])),
           text("td", provider.credential_count === 0 ? "No auth" : `${fmt(provider.key_count)} slots`),
@@ -1289,6 +1307,17 @@
     function listSummary(values) {
       if (!Array.isArray(values) || values.length === 0) return "—";
       return `${values.length}: ${values.join(", ")}`;
+    }
+
+    function capabilitySummary(capabilities) {
+      if (!capabilities) return "—";
+      const protocols = (capabilities.supported_protocols || []).join(", ") || "configured";
+      const flags = [
+        ["streaming", capabilities.streaming],
+        ["tools", capabilities.tools],
+        ["vision", capabilities.vision]
+      ].map(([name, value]) => value === null || value === undefined ? name + "?" : name + (value ? "✓" : "✗"));
+      return protocols + " · " + flags.join(" ");
     }
 
     function renderModels(models) {
@@ -1337,6 +1366,17 @@
       elements.providerId.readOnly = Boolean(provider);
       elements.providerName.value = provider?.name || "";
       elements.providerProtocol.value = provider?.protocol || "chat";
+      const supported = provider?.capabilities?.supported_protocols || [elements.providerProtocol.value];
+      const protocolControls = {
+        chat: elements.providerCapChat,
+        responses: elements.providerCapResponses,
+        anthropic: elements.providerCapAnthropic,
+        gemini: elements.providerCapGemini
+      };
+      for (const [protocol, control] of Object.entries(protocolControls)) control.checked = supported.includes(protocol);
+      elements.providerCapStreaming.value = triState(provider?.capabilities?.streaming);
+      elements.providerCapTools.value = triState(provider?.capabilities?.tools);
+      elements.providerCapVision.value = triState(provider?.capabilities?.vision);
       elements.providerUrl.value = provider?.base_url || "";
       elements.providerModels.value = (provider?.models || []).join("\n");
       elements.providerFallback.value = (provider?.fallback || []).join("\n");
@@ -1365,6 +1405,27 @@
     }
 
     const lines = value => value.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+
+    function triState(value) {
+      return value === true ? "true" : value === false ? "false" : "";
+    }
+
+    function boolOrNull(value) {
+      return value === "true" ? true : value === "false" ? false : null;
+    }
+
+    function selectedCapabilityProtocols() {
+      const controls = {
+        chat: elements.providerCapChat,
+        responses: elements.providerCapResponses,
+        anthropic: elements.providerCapAnthropic,
+        gemini: elements.providerCapGemini
+      };
+      const selected = Object.entries(controls).filter(([, control]) => control.checked).map(([protocol]) => protocol);
+      const current = elements.providerProtocol.value;
+      if (!selected.includes(current)) selected.push(current);
+      return selected;
+    }
 
     async function mutateProvider(path, method, body, success) {
       if (managementBusy) return;
@@ -1417,6 +1478,12 @@
         id: elements.providerId.value.trim(),
         name: elements.providerName.value.trim(),
         protocol: elements.providerProtocol.value,
+        capabilities: {
+          supported_protocols: selectedCapabilityProtocols(),
+          streaming: boolOrNull(elements.providerCapStreaming.value),
+          tools: boolOrNull(elements.providerCapTools.value),
+          vision: boolOrNull(elements.providerCapVision.value)
+        },
         base_url: elements.providerUrl.value.trim(),
         models: lines(elements.providerModels.value),
         fallback: lines(elements.providerFallback.value),

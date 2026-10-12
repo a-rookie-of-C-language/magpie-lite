@@ -158,6 +158,7 @@ mod tests {
                     models: vec![],
                     fallback: vec![],
                     key_cooldown_ms: None,
+                    capabilities: Default::default(),
                     key_generation: 0,
                 };
                 config.set_provider(provider, true).unwrap();

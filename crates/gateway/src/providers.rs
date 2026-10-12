@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
-use crate::config::{Config, ConfigSnapshot, Protocol, ProviderConfig};
+use crate::config::{Config, ConfigSnapshot, Protocol, ProviderCapabilities, ProviderConfig};
 use crate::config_store::ConfigError;
 use crate::server::AppState;
 use crate::upstream;
@@ -23,6 +23,8 @@ pub(crate) struct ProviderEdit {
     name: String,
     protocol: Protocol,
     base_url: String,
+    /// Omitted on update to preserve existing metadata; `{}` clears it.
+    capabilities: Option<ProviderCapabilities>,
     api_keys: Option<Vec<String>>,
     #[serde(default)]
     models: Vec<String>,
@@ -36,6 +38,9 @@ pub(crate) struct ProviderEdit {
 impl ProviderEdit {
     pub(crate) fn materialize(self, config: &Config) -> ProviderConfig {
         let existing = config.provider(&self.id);
+        let capabilities = self
+            .capabilities
+            .unwrap_or_else(|| existing.map(|p| p.capabilities.clone()).unwrap_or_default());
         let (api_key, api_keys) = match self.api_keys {
             Some(keys) => (String::new(), keys),
             None => existing
@@ -47,6 +52,7 @@ impl ProviderEdit {
             name: self.name,
             protocol: self.protocol,
             base_url: self.base_url,
+            capabilities,
             api_key,
             api_keys,
             models: self.models,

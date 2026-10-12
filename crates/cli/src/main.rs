@@ -275,6 +275,7 @@ async fn main() -> Result<()> {
                     models,
                     fallback,
                     key_cooldown_ms,
+                    capabilities: Default::default(),
                     key_generation: 0,
                 };
                 cfg.set_provider(provider, default)?;

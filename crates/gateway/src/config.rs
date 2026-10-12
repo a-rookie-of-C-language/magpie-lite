@@ -50,6 +50,59 @@ impl Protocol {
     }
 }
 
+/// Optional, user-supplied capability metadata for an upstream provider.
+///
+/// A missing boolean means that the capability is unknown; it is deliberately
+/// not inferred from the wire protocol. This keeps old configuration files
+/// honest while still allowing a UI or routing policy to distinguish an
+/// explicitly unsupported feature from one that has not been checked yet.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCapabilities {
+    /// Protocols the provider is known to accept. An empty list means only
+    /// the configured `ProviderConfig::protocol` is known.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_protocols: Vec<Protocol>,
+    /// Whether the provider can return streamed responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streaming: Option<bool>,
+    /// Whether the provider accepts tool/function definitions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<bool>,
+    /// Whether the provider accepts image or other multimodal input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
+}
+
+impl ProviderCapabilities {
+    /// Return the protocols that are safe to display as supported.
+    pub fn effective_protocols(&self, current: Protocol) -> Vec<Protocol> {
+        if self.supported_protocols.is_empty() {
+            vec![current]
+        } else {
+            self.supported_protocols.clone()
+        }
+    }
+
+    fn validate(&self, current: Protocol) -> anyhow::Result<()> {
+        if !self.supported_protocols.is_empty() && !self.supported_protocols.contains(&current) {
+            anyhow::bail!("capabilities.supported_protocols must include the configured protocol");
+        }
+        for (index, protocol) in self.supported_protocols.iter().enumerate() {
+            if self.supported_protocols[..index].contains(protocol) {
+                anyhow::bail!("capabilities.supported_protocols cannot contain duplicates");
+            }
+        }
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.supported_protocols.is_empty()
+            && self.streaming.is_none()
+            && self.tools.is_none()
+            && self.vision.is_none()
+    }
+}
+
 /// One configured upstream vendor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
@@ -60,6 +113,11 @@ pub struct ProviderConfig {
     pub name: String,
     /// Wire protocol.
     pub protocol: Protocol,
+    /// Optional provider feature metadata. It does not change request
+    /// translation; it describes what the configured upstream is known to
+    /// support for management clients and future routing policies.
+    #[serde(default, skip_serializing_if = "ProviderCapabilities::is_empty")]
+    pub capabilities: ProviderCapabilities,
     /// Base URL: chat/responses bases end in `/v1`, Anthropic bases are the root, Gemini bases end in `/v1beta`.
     pub base_url: String,
     /// Compatibility key for configs written before key pools existed.
@@ -104,6 +162,7 @@ impl ProviderConfig {
         if self.base_url.chars().any(char::is_whitespace) {
             anyhow::bail!("base URL cannot contain whitespace");
         }
+        self.capabilities.validate(self.protocol)?;
         let url = reqwest::Url::parse(&self.base_url)
             .map_err(|_| anyhow::anyhow!("base URL must be an absolute HTTP or HTTPS URL"))?;
         if !matches!(url.scheme(), "http" | "https")
@@ -523,6 +582,8 @@ pub struct ProviderConfigSnapshot {
     pub name: String,
     /// Upstream wire protocol.
     pub protocol: Protocol,
+    /// Capability metadata; null feature values mean unknown.
+    pub capabilities: ProviderCapabilitiesSnapshot,
     /// Upstream base URL.
     pub base_url: String,
     /// Models explicitly listed for bare-name routing and `/v1/models`.
@@ -537,6 +598,20 @@ pub struct ProviderConfigSnapshot {
     pub fallback: Vec<String>,
     /// Effective cooldown after quota or rate-limit rejection.
     pub key_cooldown_ms: u64,
+}
+
+/// Capability metadata exposed by the secret-free configuration snapshot.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderCapabilitiesSnapshot {
+    /// Protocols the provider is known to accept, including the configured
+    /// protocol when no broader list was supplied.
+    pub supported_protocols: Vec<Protocol>,
+    /// Whether streamed responses are supported, or null when unknown.
+    pub streaming: Option<bool>,
+    /// Whether tools/functions are supported, or null when unknown.
+    pub tools: Option<bool>,
+    /// Whether multimodal input is supported, or null when unknown.
+    pub vision: Option<bool>,
 }
 
 /// One routing group as the console may show it.
@@ -725,6 +800,12 @@ impl Config {
                     id: p.id.clone(),
                     name: p.label().to_owned(),
                     protocol: p.protocol,
+                    capabilities: ProviderCapabilitiesSnapshot {
+                        supported_protocols: p.capabilities.effective_protocols(p.protocol),
+                        streaming: p.capabilities.streaming,
+                        tools: p.capabilities.tools,
+                        vision: p.capabilities.vision,
+                    },
                     base_url: p.base_url.clone(),
                     models: p.models.clone(),
                     key_count: p.api_key_pool().len(),
@@ -854,10 +935,102 @@ mod tests {
             models: Vec::new(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
+            capabilities: Default::default(),
             key_generation: 0,
         };
 
         assert_eq!(provider.api_key_pool(), vec!["legacy-key".to_owned()]);
+    }
+
+    #[test]
+    fn provider_capabilities_are_backward_compatible_and_round_trip() {
+        let legacy: ProviderConfig = toml::from_str(
+            r#"id = "legacy"
+protocol = "chat"
+base_url = "http://127.0.0.1:1/v1"
+"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.capabilities, ProviderCapabilities::default());
+
+        let configured = ProviderCapabilities {
+            supported_protocols: vec![Protocol::Chat, Protocol::Responses],
+            streaming: Some(true),
+            tools: Some(false),
+            vision: Some(true),
+        };
+        let provider = ProviderConfig {
+            id: "multi".into(),
+            name: String::new(),
+            protocol: Protocol::Chat,
+            capabilities: configured.clone(),
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: String::new(),
+            api_keys: Vec::new(),
+            models: Vec::new(),
+            fallback: Vec::new(),
+            key_cooldown_ms: None,
+            key_generation: 0,
+        };
+        let encoded = toml::to_string(&provider).unwrap();
+        assert!(encoded.contains("supported_protocols = [\"chat\", \"responses\"]"));
+        assert_eq!(
+            toml::from_str::<ProviderConfig>(&encoded)
+                .unwrap()
+                .capabilities,
+            configured
+        );
+    }
+
+    #[test]
+    fn provider_capabilities_validate_protocol_membership_and_duplicates() {
+        let mut provider = ProviderConfig {
+            id: "mock".into(),
+            name: String::new(),
+            protocol: Protocol::Chat,
+            capabilities: ProviderCapabilities {
+                supported_protocols: vec![Protocol::Responses],
+                ..Default::default()
+            },
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: String::new(),
+            api_keys: Vec::new(),
+            models: Vec::new(),
+            fallback: Vec::new(),
+            key_cooldown_ms: None,
+            key_generation: 0,
+        };
+        assert!(provider.validate().is_err());
+        provider.capabilities.supported_protocols = vec![Protocol::Chat, Protocol::Chat];
+        assert!(provider.validate().is_err());
+        provider.capabilities.supported_protocols = vec![Protocol::Chat, Protocol::Responses];
+        assert!(provider.validate().is_ok());
+    }
+
+    #[test]
+    fn provider_snapshot_defaults_empty_protocol_metadata_and_stays_secret_free() {
+        let mut config = Config::default();
+        config.provider.push(ProviderConfig {
+            id: "mock".into(),
+            name: String::new(),
+            protocol: Protocol::Anthropic,
+            capabilities: ProviderCapabilities::default(),
+            base_url: "http://127.0.0.1:1".into(),
+            api_key: "super-secret".into(),
+            api_keys: Vec::new(),
+            models: Vec::new(),
+            fallback: Vec::new(),
+            key_cooldown_ms: None,
+            key_generation: 0,
+        });
+        let snapshot = config.snapshot();
+        assert_eq!(
+            snapshot.providers[0].capabilities.supported_protocols,
+            vec![Protocol::Anthropic]
+        );
+        assert_eq!(snapshot.providers[0].capabilities.streaming, None);
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!json.contains("super-secret"));
     }
 
     #[test]
@@ -950,6 +1123,7 @@ mod tests {
                 models: vec![],
                 fallback: vec![],
                 key_cooldown_ms: None,
+                capabilities: Default::default(),
                 key_generation: 0,
             }],
             ..Default::default()
@@ -980,6 +1154,7 @@ mod tests {
             models: vec!["mock-model".into()],
             fallback: vec!["backup/other".into()],
             key_cooldown_ms: Some(1_200),
+            capabilities: Default::default(),
             key_generation: 0,
         });
         config.group.push(GroupConfig {
@@ -1090,6 +1265,7 @@ routes = ["mock/model"]
             models: Vec::new(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
+            capabilities: Default::default(),
             key_generation: 0,
         };
 

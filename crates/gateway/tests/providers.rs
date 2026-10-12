@@ -226,6 +226,83 @@ async fn provider_crud_persists_and_changes_live_routing_without_disclosing_keys
 }
 
 #[tokio::test]
+async fn provider_capabilities_round_trip_preserve_and_clear_without_secrets() {
+    let gw = gateway().await;
+    let mut body = provider(&gw, "capable");
+    body["capabilities"] = json!({
+        "supported_protocols": ["chat", "responses"],
+        "streaming": true,
+        "tools": false,
+        "vision": true
+    });
+    let response = edit(&gw, Method::POST, "/config/providers", body.clone()).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let text = response.text().await.unwrap();
+    assert!(!text.contains("private-one"));
+    let capabilities = snapshot(&gw, "/config").await["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["id"] == "capable")
+        .unwrap()["capabilities"]
+        .clone();
+    assert_eq!(
+        capabilities["supported_protocols"],
+        json!(["chat", "responses"])
+    );
+    assert_eq!(capabilities["streaming"], json!(true));
+    assert_eq!(capabilities["tools"], json!(false));
+    assert_eq!(capabilities["vision"], json!(true));
+
+    let mut preserve = body.clone();
+    preserve.as_object_mut().unwrap().remove("capabilities");
+    assert_eq!(
+        edit(&gw, Method::PUT, "/config/providers/capable", preserve)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        snapshot(&gw, "/config").await["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["id"] == "capable")
+            .unwrap()["capabilities"],
+        capabilities
+    );
+
+    let mut clear = provider(&gw, "capable");
+    clear["capabilities"] = json!({});
+    assert_eq!(
+        edit(&gw, Method::PUT, "/config/providers/capable", clear)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let cleared = snapshot(&gw, "/config").await["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["id"] == "capable")
+        .unwrap()["capabilities"]
+        .clone();
+    assert_eq!(cleared["supported_protocols"], json!(["chat"]));
+    assert_eq!(cleared["streaming"], Value::Null);
+    assert_eq!(cleared["tools"], Value::Null);
+    assert_eq!(cleared["vision"], Value::Null);
+
+    for invalid in [json!(["responses"]), json!(["chat", "chat"])] {
+        let mut invalid_body = provider(&gw, "invalid");
+        invalid_body["capabilities"] = json!({"supported_protocols": invalid});
+        let response = edit(&gw, Method::POST, "/config/providers", invalid_body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let text = response.text().await.unwrap();
+        assert!(!text.contains("private-one"));
+    }
+}
+
+#[tokio::test]
 async fn metadata_edit_preserves_legacy_keys_and_cooldown_then_explicit_clear_removes_auth() {
     let gw = gateway().await;
     // Existing legacy TOML remains editable without revealing its singular key.

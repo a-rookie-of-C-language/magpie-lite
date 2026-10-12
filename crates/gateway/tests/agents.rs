@@ -41,6 +41,7 @@ async fn server(enabled: bool) -> Server {
             models: vec!["model".into()],
             fallback: Vec::new(),
             key_cooldown_ms: None,
+            capabilities: Default::default(),
             key_generation: 0,
         }],
         group: vec![GroupConfig {
