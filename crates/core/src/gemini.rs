@@ -544,8 +544,12 @@ fn usage_to_json(u: &Usage) -> Value {
 fn stop_from_gemini(s: &str) -> StopReason {
     match s.to_ascii_uppercase().as_str() {
         "MAX_TOKENS" => StopReason::MaxTokens,
-        "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" => StopReason::Other,
-        _ => StopReason::EndTurn,
+        "STOP"
+        | "FINISH_REASON_UNSPECIFIED"
+        | "OTHER"
+        | "MALFORMED_FUNCTION_CALL"
+        | "UNEXPECTED_TOOL_CALL" => StopReason::EndTurn,
+        _ => StopReason::Other,
     }
 }
 
@@ -799,6 +803,7 @@ impl GeminiStreamDecoder {
             .get("finishReason")
             .or_else(|| candidate.get("finish_reason"))
             .and_then(Value::as_str)
+            .filter(|reason| !reason.is_empty())
         {
             let has_call = candidate
                 .pointer("/content/parts")

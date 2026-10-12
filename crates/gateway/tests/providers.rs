@@ -507,12 +507,10 @@ async fn replacing_a_smaller_key_pool_ignores_old_requests_cooldowns() {
 async fn deletes_reject_group_and_fallback_references_and_reassign_default() {
     let gw = gateway().await;
     for id in ["first", "second"] {
-        assert_eq!(
-            edit(&gw, Method::POST, "/config/providers", provider(&gw, id))
-                .await
-                .status(),
-            StatusCode::CREATED
-        );
+        let response = edit(&gw, Method::POST, "/config/providers", provider(&gw, id)).await;
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, StatusCode::CREATED, "provider {id}: {body}");
     }
     assert_eq!(
         edit(

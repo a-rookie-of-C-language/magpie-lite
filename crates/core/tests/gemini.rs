@@ -283,3 +283,34 @@ fn gemini_stream_translates_to_chat_chunks() {
     assert_eq!(usage["completion_tokens"], 2);
     assert!(done);
 }
+
+#[test]
+fn gemini_finish_reasons_distinguish_stops_length_and_filters() {
+    for (reason, expected) in [
+        ("STOP", StopReason::EndTurn),
+        ("FINISH_REASON_UNSPECIFIED", StopReason::EndTurn),
+        ("OTHER", StopReason::EndTurn),
+        ("MALFORMED_FUNCTION_CALL", StopReason::EndTurn),
+        ("UNEXPECTED_TOOL_CALL", StopReason::EndTurn),
+        ("stop", StopReason::EndTurn),
+        ("MAX_TOKENS", StopReason::MaxTokens),
+        ("SAFETY", StopReason::Other),
+        ("IMAGE_SAFETY", StopReason::Other),
+        ("NEW_FILTER", StopReason::Other),
+    ] {
+        let body = json!({"modelVersion":"mock", "candidates":[{"finishReason":reason}]});
+        assert_eq!(gemini::decode_response(&body).unwrap().stop, expected);
+        let events = GeminiStreamDecoder::new().decode(&body);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Stop(stop) if *stop == expected)),
+            "{reason}"
+        );
+        assert!(matches!(events.last(), Some(StreamEvent::Done)));
+    }
+    let events = GeminiStreamDecoder::new().decode(&json!({"candidates":[{
+        "content":{"parts":[{"text":"not finished"}]}, "finishReason":""
+    }]}));
+    assert!(matches!(events.as_slice(), [StreamEvent::TextDelta { .. }]));
+}

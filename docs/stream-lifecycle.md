@@ -17,10 +17,12 @@ without its trailing blank separator are supported.
 
 Chat recognizes `[DONE]`. A clean EOF after Chat `finish_reason` also completes,
 but `finish_reason` alone does not cut off later usage frames. The sentinel is
-not a completion marker for Anthropic, Responses or Gemini. EOF without a
-protocol completion marker, or an upstream transport read failure, becomes a
-sanitized stream error instead of fabricated success. Invalid JSON frames are
-currently ignored; this is not a strict SSE/JSON validation contract.
+not a completion marker for Anthropic, Responses or Gemini. Anthropic/Responses
+EOF without a completion marker is an error. Gemini clean EOF after an answer
+completes, while an empty Gemini EOF enters the bounded re-ask policy below.
+Transport read failures never become empty-success retries. Invalid Gemini JSON
+data frames are explicit errors (including a misplaced Chat sentinel); other
+protocols still ignore invalid JSON. This is not strict wire-schema validation.
 
 ## Incremental parsing and byte limits
 
@@ -60,7 +62,8 @@ it to the client encoder, the gateway holds opening model/role/usage metadata
 and reads until one of:
 
 - Nonempty text or reasoning, a tool event, or a stop event commits the attempt.
-- A completion marker commits even an empty answer.
+- A completion marker commits an empty answer for non-Gemini protocols. Gemini
+  empty completions are intercepted before Stop/Done reaches the client.
 - An error closes the upstream immediately and permits retry according to its
   structured status, provided the attempt has not committed.
 - 64 decoded opening events, or a 64 KiB retained-metadata estimate, commit the
@@ -73,8 +76,8 @@ and reads until one of:
 Discarded attempts' opening frames are never encoded into the selected answer.
 A new attempt gets a fresh upstream decoder; the client encoder is created only
 for the selected candidate. An answer is never assembled from different providers
-or models; the one allowed same-candidate reasoning re-ask preserves earlier
-reasoning while keeping one client response. In
+or models; bounded same-candidate empty-reply and reasoning re-asks preserve
+earlier reasoning while keeping one client response. In
 particular reasoning/tool activity counts as committed even if a particular
 client dialect buffers or hides that activity.
 
@@ -96,7 +99,8 @@ in the protected secret-free `/config` snapshot:
   upstream request. It includes HTTP response-header wait, an HTTP error-body
   read, and opening SSE. Nonempty text/reasoning or tool activity satisfies it;
   role/model/usage metadata, empty deltas, ignored chunks and comment heartbeats
-  do not restart or satisfy it. A completed empty answer is still valid.
+  do not restart or satisfy it. Completed empty answers remain valid for
+  non-Gemini protocols; empty Gemini completions use the bounded policy below.
 - `stream_idle_timeout_ms = 300000` (5 minutes by default): maximum wait for the
   next upstream body chunk. It applies both before and after content, separately
   from the first-content budget. Transport bytes, including comments and partial
@@ -368,6 +372,57 @@ retry pause and second-request header wait with JSONL reload and no late request
 or duplicate record. These are synthetic local HTTP/1.1 fixtures, not paid/live-
 vendor, real-Agent or HTTP/2 conformance evidence.
 
+## Gemini empty replies
+
+Reference: `D:\code\magpie\internal\gateway\gemini_empty_reply_test.go`,
+`continuation.go`, `fallback.go`, and `codeassist.go` in the same local checkout.
+
+Only Gemini upstreams use this policy; the client's wire dialect does not select
+it. An empty STOP, an ordinary stop reason with only thinking, or clean EOF with
+no candidate/answer is not successful completion. Nonempty ordinary text, tool
+calls, non-thought image data and grounding search activity count as answers;
+thinking and draft/thought images do not. MAX_TOKENS and filter finishes are
+exempt. Unknown finish reasons map to filter, matching the reference; an empty
+finish-reason string is not a completion marker. Prompt-feedback blocks never
+trigger an empty retry, but dedicated refusal rendering is still missing (a
+candidate-less block currently ends as a generic incomplete-stream error).
+
+Before commitment, the same provider/model/key is re-asked once after one second.
+Exhaustion can spend another configured key or fallback/group route. Once an
+attempt commits, ordinary streams allow at most two empty re-asks with one- and
+two-second pauses; group streams allow at most one. A held retry already spent on
+the selected candidate counts toward that budget, and an exhausted held failure
+does not gain extra retries when handed to the relay. Committed continuations
+never rotate keys, fall back, or set quota cooldowns. The reasoning-only loop
+re-ask has an independent one-retry budget; mixed paths remain bounded.
+
+Empty Stop/Done markers are withheld. Thinking already emitted is preserved,
+re-ask opening events are suppressed, and deferred usage is retained as bounded
+counters, not an unbounded frame list. Same-candidate usage accumulates in both
+client results and request history, even when the last try has no usage report.
+Changing candidate discards abandoned usage, just like ordinary failover.
+Streaming re-asks reuse the original configuration/conversation/key snapshot,
+with fresh header/opening and read-idle clocks after each pause. Disconnecting
+cancels the pause or owned upstream work; no detached retry runs later.
+
+Nonstreaming Gemini replies use the held one-retry policy and routing rules, with
+combined same-candidate usage and an HTTP 502 on exhaustion. Vendor errors,
+invalid JSON, transport resets and timeouts retain their own error behavior;
+they are not classified as empty replies. Nonstreaming requests still have no
+new total/header/body deadline from this feature.
+
+Eighteen new local HTTP fixtures cover the four client dialects, literal empty
+STOP/thinking/no-candidate EOF, held/committed/group limits, key/provider/group
+fallback in streaming and nonstreaming modes, length/filter/tool/image/search
+negatives, independent loop budgets, HTTP failures without committed fallback,
+config snapshots, client/history usage (including missing final usage), header
+deadlines and real-socket cancellation. Updated EOF and sentinel fixtures keep
+clean answered EOF separate from JSON/transport errors. Classifier unit tests
+and core finish-reason tests cover bounded state and stop/filter mapping.
+Image/search classification prevents replay but does not add image/search events
+to the stream IR. These are synthetic loopback HTTP/1.1 tests, not CodeAssist
+subscription, paid/live Gemini, HTTP/2 or real-Agent conformance evidence.
+
 ## Accounting and cancellation
 
 Usage reports are cumulative: later known fields replace earlier values,
@@ -379,9 +434,9 @@ The tracker switches provider/model/key slot and clears prior attempt usage
 **before** awaiting the next concrete upstream request. The final record belongs
 to the selected or last attempted route, never to the abandoned primary. Only
 that attempt's reported usage is retained across ordinary fallback; this is not
-a billing ledger summing possibly charged discarded candidates. The one allowed
-same-candidate reasoning re-ask is the exception: both attempts contribute to
-client/history totals. Unknown usage remains null, not estimated.
+a billing ledger summing possibly charged discarded candidates. Bounded
+same-candidate reasoning/empty-reply re-asks are the exception: their attempts
+contribute to client/history totals. Unknown usage remains null, not estimated.
 
 The current Axum HTTP/1.1 serving path drops the pending handler when its client
 closes the socket. This releases the owned upstream response/send future before

@@ -530,18 +530,25 @@ async fn explicit_errors_release_held_upstream_without_success_for_every_protoco
 }
 
 #[tokio::test]
-async fn eof_without_completion_is_an_error_for_every_protocol_pair() {
+async fn clean_eof_without_completion_only_succeeds_for_answered_gemini() {
     for upstream in PROTOCOLS {
         for client in PROTOCOLS {
             let f = Fixture::new(upstream, prefix(upstream), Ending::Eof).await;
             let body = f.request(client).await.text().await.unwrap();
-            assert!(
-                body.contains("upstream stream ended before a completion marker"),
-                "{upstream:?} -> {client:?}: {body}"
-            );
-            assert_no_success(&body);
             let record = f.record().await;
-            assert_eq!(record["status"], "upstream_stream_error");
+            if upstream == Protocol::Gemini {
+                assert!(body.contains("partial"), "{body}");
+                assert_completed_usage(&body, client, 7, 0);
+                assert_eq!(record["status"], "ok");
+                assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            } else {
+                assert!(
+                    body.contains("upstream stream ended before a completion marker"),
+                    "{upstream:?} -> {client:?}: {body}"
+                );
+                assert_no_success(&body);
+                assert_eq!(record["status"], "upstream_stream_error");
+            }
             assert_partial_usage(&record, upstream);
         }
     }
@@ -654,7 +661,13 @@ async fn chat_sentinel_is_not_a_completion_marker_in_other_protocols() {
     for upstream in [Protocol::Anthropic, Protocol::Responses, Protocol::Gemini] {
         let f = Fixture::new(upstream, prefix(upstream) + "data: [DONE]\n\n", Ending::Eof).await;
         let body = f.request(Protocol::Chat).await.text().await.unwrap();
-        assert!(body.contains("upstream stream ended before a completion marker"));
+        let message = if upstream == Protocol::Gemini {
+            "bad Gemini upstream stream payload"
+        } else {
+            "upstream stream ended before a completion marker"
+        };
+        assert!(body.contains(message), "{body}");
+        assert_eq!(*f.attempts.lock().unwrap(), [0]);
         assert_no_success(&body);
         assert_eq!(f.record().await["status"], "upstream_stream_error");
     }
@@ -1639,7 +1652,13 @@ async fn reasoning_and_tools_disarm_first_content_deadline_in_real_streams() {
             )],
             Ending::Paced(vec![(
                 Duration::from_millis(250),
-                completion(upstream).into(),
+                // A Gemini reasoning-only STOP is now an empty reply. This
+                // test isolates deadlines: the delayed completion answers.
+                if upstream == Protocol::Gemini {
+                    prefix(upstream) + completion(upstream)
+                } else {
+                    completion(upstream).into()
+                },
             )]),
             |config| {
                 config.stream_first_content_timeout_ms = 150;
@@ -3386,7 +3405,13 @@ async fn group_first_token_text_reasoning_and_tools_commit_before_slow_completio
             vec![script, prefix(upstream) + completion(upstream)],
             Ending::Paced(vec![(
                 Duration::from_millis(220),
-                completion(upstream).into(),
+                // A Gemini reasoning-only STOP is now an empty reply. This
+                // test isolates deadlines: the delayed completion answers.
+                if upstream == Protocol::Gemini {
+                    prefix(upstream) + completion(upstream)
+                } else {
+                    completion(upstream).into()
+                },
             )]),
             |config| {
                 disable_stream_deadlines(config);
@@ -4624,5 +4649,723 @@ async fn reasoning_reask_opening_and_http_error_body_share_first_content_deadlin
             );
             f.assert_released().await;
         }
+    }
+}
+
+// Reference gemini_empty_reply_test.go: an empty STOP must not end the agent's turn.
+#[tokio::test]
+async fn gemini_empty_reply_reasks_before_ending_the_client_turn() {
+    for client in PROTOCOLS {
+        let empty = completion(Protocol::Gemini).to_owned();
+        let success = format!(
+            "{}{}",
+            prefix(Protocol::Gemini),
+            completion(Protocol::Gemini)
+        );
+        let f = Fixture::new(
+            Protocol::Gemini,
+            empty.clone(),
+            Ending::PerRequest(vec![empty, success], Box::new(Ending::Hold)),
+        )
+        .await;
+        let body = tokio::time::timeout(LIMIT, f.request(client).await.text())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            body.contains("partial"),
+            "empty reply ended the turn: {body}"
+        );
+        assert_completed_usage(&body, client, 14, 6);
+        assert_eq!(*f.attempts.lock().unwrap(), [0, 0]);
+        assert_eq!(f.record().await["usage"]["input"], 14);
+        f.assert_released().await;
+    }
+}
+
+fn gemini_reasoning_empty() -> String {
+    "data: {\"modelVersion\":\"up-model\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Let me see.\",\"thought\":true}]}}],\"usageMetadata\":{\"promptTokenCount\":7,\"candidatesTokenCount\":0}}\n\n".to_owned() + completion(Protocol::Gemini)
+}
+
+#[tokio::test]
+async fn gemini_empty_reply_literal_stop_reasoning_and_no_candidate_eof_recover() {
+    let variants = [
+        ("data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":0}}\n\n".to_owned(), Ending::Hold, 7, 3),
+        (gemini_reasoning_empty(), Ending::Hold, 14, 6),
+        ("data: {\"usageMetadata\":{\"promptTokenCount\":7}}\n\n".to_owned(), Ending::Eof, 14, 3),
+    ];
+    for (empty, ending, input, output) in variants {
+        for client in PROTOCOLS {
+            let f = Fixture::new(
+                Protocol::Gemini,
+                empty.clone(),
+                Ending::PerRequest(
+                    vec![
+                        empty.clone(),
+                        prefix(Protocol::Gemini) + completion(Protocol::Gemini),
+                    ],
+                    Box::new(ending.clone()),
+                ),
+            )
+            .await;
+            let history = f.persistent_history();
+            let body = tokio::time::timeout(LIMIT, f.request(client).await.text())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_completed_usage(&body, client, input, output);
+            if empty.contains("Let me see.") {
+                assert!(body.contains("Let me see."), "reasoning was discarded");
+            }
+            assert!(body.contains("partial"));
+            assert_eq!(*f.attempts.lock().unwrap(), [0, 0]);
+            let bodies = f.sent_bodies.lock().unwrap().clone();
+            assert_eq!(bodies[0], bodies[1], "same conversation/model/key reask");
+            let record = f.record().await;
+            assert_eq!(record["usage"]["input"], input);
+            assert_eq!(record["usage"]["output"], output);
+            assert_loop_history(history.path(), &record);
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn gemini_empty_reply_committed_stream_allows_two_reasks_and_one_completion() {
+    for client in PROTOCOLS {
+        let empty = gemini_reasoning_empty();
+        let f = Fixture::new(
+            Protocol::Gemini,
+            empty.clone(),
+            Ending::PerRequest(
+                vec![
+                    empty.clone(),
+                    empty,
+                    prefix(Protocol::Gemini) + completion(Protocol::Gemini),
+                ],
+                Box::new(Ending::Hold),
+            ),
+        )
+        .await;
+        let body = tokio::time::timeout(LIMIT, f.request(client).await.text())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_completed_usage(&body, client, 21, 9);
+        assert!(body.contains("Let me see."));
+        if client != Protocol::Responses {
+            assert_eq!(body.matches("Let me see.").count(), 2);
+        }
+        assert_eq!(*f.attempts.lock().unwrap(), [0, 0, 0]);
+        if client == Protocol::Anthropic {
+            assert_eq!(body.matches("event: message_start").count(), 1);
+        }
+        if client == Protocol::Responses {
+            assert_eq!(body.matches("event: response.created").count(), 1);
+        }
+        let bodies = f.sent_bodies.lock().unwrap().clone();
+        assert!(bodies.windows(2).all(|b| b[0] == b[1]));
+        let record = f.record().await;
+        assert_eq!(record["usage"]["input"], 21);
+        assert_eq!(record["usage"]["output"], 9);
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn gemini_empty_reply_exhaustion_is_bounded_without_a_success_marker() {
+    for client in PROTOCOLS {
+        for committed in [false, true] {
+            let empty = if committed {
+                gemini_reasoning_empty()
+            } else {
+                completion(Protocol::Gemini).into()
+            };
+            let f = Fixture::new(Protocol::Gemini, empty, Ending::Hold).await;
+            let body = tokio::time::timeout(LIMIT, f.request(client).await.text())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_one_stream_error(&body, client, "an empty reply");
+            let count = if committed { 3 } else { 2 };
+            assert_eq!(*f.attempts.lock().unwrap(), vec![0; count]);
+            let record = f.record().await;
+            assert_eq!(record["usage"]["input"], count * 7);
+            assert_eq!(record["usage"]["output"], count * 3);
+            assert_eq!(record["status"], "upstream_stream_error");
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn gemini_empty_reply_can_change_keys_or_routes_only_while_held() {
+    for client in PROTOCOLS {
+        for mode in 0..3 {
+            let f = Fixture::with_config(
+                Protocol::Gemini,
+                vec![
+                    completion(Protocol::Gemini).into(),
+                    prefix(Protocol::Gemini) + completion(Protocol::Gemini),
+                ],
+                Ending::Hold,
+                |config| {
+                    if mode != 0 {
+                        configure_timeout_fallback(config, mode == 2);
+                        config.provider[0].api_keys = vec!["secret-upstream-key-0".into()];
+                    }
+                },
+            )
+            .await;
+            let history = f.persistent_history();
+            let requested = if mode == 2 {
+                "group/daily"
+            } else {
+                "mock/up-model"
+            };
+            let body = tokio::time::timeout(LIMIT, f.request_model(client, requested).await.text())
+                .await
+                .unwrap()
+                .unwrap();
+            // Usage on the abandoned key/route is never charged to the selected reply.
+            assert_completed_usage(&body, client, 7, 3);
+            assert_eq!(*f.attempts.lock().unwrap(), [0, 0, 1]);
+            let record = f.record().await;
+            assert_eq!(record["provider"], if mode == 0 { "mock" } else { "spare" });
+            assert_eq!(record["usage"]["input"], 7);
+            assert_eq!(record["usage"]["output"], 3);
+            assert_loop_history(history.path(), &record);
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn gemini_empty_reply_group_commit_limits_reask_to_one_without_fallback() {
+    for client in PROTOCOLS {
+        let f = Fixture::with_config(
+            Protocol::Gemini,
+            vec![
+                gemini_reasoning_empty(),
+                prefix(Protocol::Gemini) + completion(Protocol::Gemini),
+            ],
+            Ending::Hold,
+            |config| {
+                configure_timeout_fallback(config, true);
+                config.provider[0].api_keys = vec!["secret-upstream-key-0".into()];
+            },
+        )
+        .await;
+        let body = tokio::time::timeout(LIMIT, f.request_model(client, "group/daily").await.text())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_one_stream_error(&body, client, "an empty reply");
+        assert_eq!(*f.attempts.lock().unwrap(), [0, 0]);
+        assert_eq!(f.record().await["usage"]["input"], 14);
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn gemini_empty_reply_length_filter_tool_image_search_and_other_protocols_do_not_reask() {
+    let scripts = [
+        completion(Protocol::Gemini).replace("STOP", "MAX_TOKENS"),
+        completion(Protocol::Gemini).replace("STOP", "SAFETY"),
+        completion(Protocol::Gemini).replace("STOP", "IMAGE_SAFETY"),
+        completion(Protocol::Gemini).replace("STOP", "NEW_FILTER"),
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"read\",\"args\":{}}}]},\"finishReason\":\"STOP\"}]}\n\n".into(),
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"aGk=\"}}]},\"finishReason\":\"STOP\"}]}\n\n".into(),
+        "data: {\"candidates\":[{\"groundingMetadata\":{\"webSearchQueries\":[\"rust\"]},\"finishReason\":\"STOP\"}]}\n\n".into(),
+    ];
+    for client in PROTOCOLS {
+        for script in &scripts {
+            let script =
+                "data: {\"usageMetadata\":{\"promptTokenCount\":7,\"candidatesTokenCount\":3}}\n\n"
+                    .to_owned()
+                    + script;
+            let f = Fixture::new(Protocol::Gemini, script, Ending::Hold).await;
+            let body = f.request(client).await.text().await.unwrap();
+            assert_completed(&body, client);
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            f.assert_released().await;
+        }
+        for upstream in [Protocol::Chat, Protocol::Anthropic, Protocol::Responses] {
+            let f = Fixture::new(
+                upstream,
+                opening(upstream).replace("99", "7") + completion(upstream),
+                Ending::Hold,
+            )
+            .await;
+            let body = f.request(client).await.text().await.unwrap();
+            assert_completed(&body, client);
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            f.assert_released().await;
+        }
+        // Prompt filtering is not an empty-success retry, even without a candidate.
+        let f = Fixture::new(
+            Protocol::Gemini,
+            "data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}\n\n".into(),
+            Ending::Eof,
+        )
+        .await;
+        let body = f.request(client).await.text().await.unwrap();
+        assert_one_stream_error(&body, client, "upstream stream ended");
+        assert_eq!(*f.attempts.lock().unwrap(), [0]);
+    }
+}
+
+#[tokio::test]
+async fn gemini_empty_reply_does_not_reclassify_vendor_or_parser_errors() {
+    for client in PROTOCOLS {
+        for (script, message) in [
+            ("data: {broken\n\n", "bad Gemini upstream stream payload"),
+            (
+                "data: {\"error\":{\"code\":400,\"message\":\"known bad input\"}}\n\n",
+                "known bad input",
+            ),
+        ] {
+            let f = Fixture::new(Protocol::Gemini, script.into(), Ending::Eof).await;
+            let body = f.request(client).await.text().await.unwrap();
+            assert_one_stream_error(&body, client, message);
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn gemini_empty_reply_nonstream_recovery_and_exhaustion_share_routing_and_usage() {
+    for client in PROTOCOLS {
+        for recover in [false, true] {
+            let empty = r#"{"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}"#.to_owned();
+            let success = r#"{"modelVersion":"up-model","candidates":[{"content":{"parts":[{"text":"whole answer"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}"#.to_owned();
+            let f = Fixture::new(
+                Protocol::Gemini,
+                empty.clone(),
+                Ending::PerRequest(
+                    vec![empty.clone(), if recover { success } else { empty }],
+                    Box::new(Ending::Eof),
+                ),
+            )
+            .await;
+            let (path, body) = client_request(client, "mock/up-model", false);
+            let response = reqwest::Client::new()
+                .post(format!("{}{path}", f.gateway.url))
+                .bearer_auth("secret-local-token")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), if recover { 200 } else { 502 });
+            let body: Value = response.json().await.unwrap();
+            let record = f.record().await;
+            assert_eq!(record["usage"]["input"], 14);
+            assert_eq!(record["usage"]["output"], 6);
+            if recover {
+                let ir = match client {
+                    Protocol::Chat => magpie_core::chat::decode_response(&body),
+                    Protocol::Anthropic => magpie_core::anthropic::decode_response(&body),
+                    Protocol::Responses => magpie_core::responses::decode_response(&body),
+                    Protocol::Gemini => magpie_core::gemini::decode_response(&body),
+                }
+                .unwrap();
+                assert_eq!(ir.usage.input, Some(14));
+                assert_eq!(ir.usage.output, Some(6));
+                assert!(body.to_string().contains("whole answer"));
+            } else {
+                assert!(body.to_string().contains("an empty reply"));
+            }
+            assert_eq!(*f.attempts.lock().unwrap(), [0, 0]);
+            let bodies = f.sent_bodies.lock().unwrap().clone();
+            assert_eq!(bodies[0], bodies[1]);
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn gemini_empty_reply_disconnect_cancels_pause_headers_and_nonstream_retry() {
+    for client in PROTOCOLS {
+        for stream in [false, true] {
+            for awaiting_headers in [false, true] {
+                let empty = if stream {
+                    completion(Protocol::Gemini).to_owned()
+                } else {
+                    r#"{"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}"#.into()
+                };
+                let f = Fixture::with_transport(
+                    Protocol::Gemini,
+                    vec![empty],
+                    Ending::Eof,
+                    Transport {
+                        header_delay: Duration::from_secs(60),
+                        header_delay_request: Some(1),
+                        ..Transport::default()
+                    },
+                    disable_stream_deadlines,
+                )
+                .await;
+                let history = f.persistent_history();
+                let socket = f.socket_request(client, "mock/up-model", stream).await;
+                tokio::time::timeout(LIMIT, async {
+                    while f.dropped.load(Ordering::SeqCst) == 0 {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                if awaiting_headers {
+                    f.wait_for_attempts(&[0, 0]).await;
+                }
+                drop(socket);
+                let record = f.record().await;
+                assert_eq!(record["status"], "client_disconnected");
+                assert_eq!(record["usage"]["input"], 7);
+                assert_eq!(record["usage"]["output"], 3);
+                f.assert_released().await;
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+                assert_eq!(
+                    *f.attempts.lock().unwrap(),
+                    if awaiting_headers {
+                        vec![0, 0]
+                    } else {
+                        vec![0]
+                    }
+                );
+                assert_loop_history(history.path(), &record);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn gemini_empty_reply_reask_headers_are_bounded_and_commit_still_prevents_fallback() {
+    for client in PROTOCOLS {
+        for committed in [false, true] {
+            let f = Fixture::with_transport(
+                Protocol::Gemini,
+                vec![
+                    String::new(),
+                    prefix(Protocol::Gemini) + completion(Protocol::Gemini),
+                ],
+                Ending::PerRequest(
+                    vec![
+                        if committed {
+                            gemini_reasoning_empty()
+                        } else {
+                            completion(Protocol::Gemini).into()
+                        },
+                        prefix(Protocol::Gemini) + completion(Protocol::Gemini),
+                    ],
+                    Box::new(Ending::Hold),
+                ),
+                Transport {
+                    header_delay: Duration::from_secs(60),
+                    header_delay_request: Some(1),
+                    ..Transport::default()
+                },
+                |config| {
+                    configure_timeout_fallback(config, false);
+                    config.provider[0].api_keys = vec!["secret-upstream-key-0".into()];
+                    enable_fast_keepalive(config);
+                    config.stream_first_content_timeout_ms = 200;
+                    config.stream_idle_timeout_ms = 0;
+                },
+            )
+            .await;
+            let body = tokio::time::timeout(LIMIT, f.request(client).await.text())
+                .await
+                .unwrap()
+                .unwrap();
+            let record = f.record().await;
+            if committed {
+                assert_one_stream_error(&body, client, "upstream first-content timeout");
+                assert_eq!(*f.attempts.lock().unwrap(), [0, 0]);
+                assert_eq!(record["usage"]["input"], 7);
+                assert_eq!(record["provider"], "mock");
+            } else {
+                assert_completed_usage(&body, client, 7, 3);
+                assert_eq!(*f.attempts.lock().unwrap(), [0, 0, 1]);
+                assert_eq!(record["provider"], "spare");
+            }
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn gemini_empty_reply_config_edit_cannot_redirect_an_inflight_reask() {
+    for client in PROTOCOLS {
+        let empty = gemini_reasoning_empty();
+        let f = Fixture::with_config(
+            Protocol::Gemini,
+            vec![
+                empty.clone(),
+                prefix(Protocol::Gemini) + completion(Protocol::Gemini),
+            ],
+            Ending::PerRequest(
+                vec![
+                    empty,
+                    prefix(Protocol::Gemini) + completion(Protocol::Gemini),
+                ],
+                Box::new(Ending::Hold),
+            ),
+            |config| configure_timeout_fallback(config, false),
+        )
+        .await;
+        let mut response = f.request(client).await;
+        read_through(&mut response, "Let me see.").await;
+        f.state
+            .config
+            .update(|config| {
+                config.provider[0].api_keys = vec!["secret-upstream-key-1".into()];
+                config.provider[0].base_url = "http://127.0.0.1:1".into();
+                config.provider[0].models = vec!["changed-model".into()];
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let body = tokio::time::timeout(LIMIT, response.text())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(body.contains("partial"));
+        assert_eq!(*f.attempts.lock().unwrap(), [0, 0]);
+        assert_eq!(*f.sent_models.lock().unwrap(), ["up-model", "up-model"]);
+        let requests = f.sent_bodies.lock().unwrap().clone();
+        assert_eq!(requests[0], requests[1]);
+        assert_eq!(f.record().await["usage"]["input"], 14);
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn gemini_empty_reply_retry_with_no_new_usage_keeps_prior_client_and_history_usage() {
+    for client in PROTOCOLS {
+        let success = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]},\"finishReason\":\"STOP\"}]}\n\n".to_owned();
+        let f = Fixture::new(
+            Protocol::Gemini,
+            completion(Protocol::Gemini).into(),
+            Ending::PerRequest(
+                vec![completion(Protocol::Gemini).into(), success],
+                Box::new(Ending::Hold),
+            ),
+        )
+        .await;
+        let body = f.request(client).await.text().await.unwrap();
+        assert_completed_usage(&body, client, 7, 3);
+        assert_eq!(f.record().await["usage"]["input"], 7);
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn gemini_empty_reply_nonstream_can_fall_back_between_keys_providers_and_groups() {
+    for client in PROTOCOLS {
+        for mode in 0..3 {
+            let empty = r#"{"modelVersion":"up-model","candidates":[{"content":{"parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}"#;
+            let success = r#"{"modelVersion":"backup-model","candidates":[{"content":{"parts":[{"text":"whole answer"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}"#;
+            let f = Fixture::with_config(
+                Protocol::Gemini,
+                vec![empty.into(), success.into()],
+                Ending::Eof,
+                |config| {
+                    if mode != 0 {
+                        configure_timeout_fallback(config, mode == 2);
+                        config.provider[0].api_keys = vec!["secret-upstream-key-0".into()];
+                    }
+                },
+            )
+            .await;
+            let history = f.persistent_history();
+            let model = if mode == 2 {
+                "group/daily"
+            } else {
+                "mock/up-model"
+            };
+            let (path, body) = client_request(client, model, false);
+            let response = tokio::time::timeout(
+                LIMIT,
+                reqwest::Client::new()
+                    .post(format!("{}{path}", f.gateway.url))
+                    .bearer_auth("secret-local-token")
+                    .json(&body)
+                    .send(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.status(), 200);
+            let body: Value = response.json().await.unwrap();
+            let ir = match client {
+                Protocol::Chat => magpie_core::chat::decode_response(&body),
+                Protocol::Anthropic => magpie_core::anthropic::decode_response(&body),
+                Protocol::Responses => magpie_core::responses::decode_response(&body),
+                Protocol::Gemini => magpie_core::gemini::decode_response(&body),
+            }
+            .unwrap();
+            assert_eq!(ir.usage.input, Some(7));
+            assert_eq!(ir.usage.output, Some(3));
+            assert!(body.to_string().contains("whole answer"));
+            assert_eq!(*f.attempts.lock().unwrap(), [0, 0, 1]);
+            let record = f.record().await;
+            assert_eq!(record["provider"], if mode == 0 { "mock" } else { "spare" });
+            assert_eq!(record["usage"]["input"], 7);
+            assert_eq!(record["usage"]["output"], 3);
+            assert_loop_history(history.path(), &record);
+            assert!(
+                f.state
+                    .key_rotation
+                    .cooldown_snapshot(&f.state.config.current())
+                    .is_empty()
+            );
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn gemini_empty_reply_committed_http_errors_never_change_key_or_route() {
+    for client in PROTOCOLS {
+        for status in [401, 429, 500] {
+            let f = Fixture::with_transport(
+                Protocol::Gemini,
+                vec![
+                    String::new(),
+                    prefix(Protocol::Gemini) + completion(Protocol::Gemini),
+                ],
+                Ending::PerRequest(
+                    vec![
+                        gemini_reasoning_empty(),
+                        r#"{"error":{"message":"empty reask rejected"}}"#.into(),
+                    ],
+                    Box::new(Ending::Eof),
+                ),
+                Transport {
+                    status: axum::http::StatusCode::from_u16(status).unwrap(),
+                    status_request: Some(1),
+                    ..Transport::default()
+                },
+                |config| {
+                    disable_stream_deadlines(config);
+                    configure_timeout_fallback(config, true);
+                },
+            )
+            .await;
+            let body =
+                tokio::time::timeout(LIMIT, f.request_model(client, "group/daily").await.text())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_one_stream_error(&body, client, "empty reask rejected");
+            assert_eq!(*f.attempts.lock().unwrap(), [0, 0]);
+            let record = f.record().await;
+            assert_eq!(record["status"], "upstream_stream_error");
+            assert_eq!(record["provider"], "mock");
+            assert_eq!(record["usage"]["input"], 7);
+            assert_eq!(record["usage"]["output"], 3);
+            assert!(
+                f.state
+                    .key_rotation
+                    .cooldown_snapshot(&f.state.config.current())
+                    .is_empty()
+            );
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn gemini_empty_reply_and_reasoning_loop_have_independent_bounded_reasks() {
+    for client in PROTOCOLS {
+        for empty_first in [false, true] {
+            let empty = gemini_reasoning_empty();
+            let looping = "data: {\"modelVersion\":\"up-model\",\"usageMetadata\":{\"promptTokenCount\":7,\"candidatesTokenCount\":3}}\n\n".to_owned()
+                + &loop_delta(Protocol::Gemini, true, &"mcp ".repeat(4096));
+            let (first, second) = if empty_first {
+                (empty.clone(), looping)
+            } else {
+                (looping, empty.clone())
+            };
+            let f = Fixture::with_config(
+                Protocol::Gemini,
+                vec![String::new()],
+                Ending::PerRequest(
+                    vec![
+                        first,
+                        second,
+                        empty,
+                        prefix(Protocol::Gemini) + completion(Protocol::Gemini),
+                    ],
+                    Box::new(Ending::Hold),
+                ),
+                disable_stream_deadlines,
+            )
+            .await;
+            let history = f.persistent_history();
+            // One reasoning pause and the empty-reply 1s/2s pauses: allow headroom.
+            let body = tokio::time::timeout(Duration::from_secs(8), f.request(client).await.text())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_completed_usage(&body, client, 28, 12);
+            assert_eq!(*f.attempts.lock().unwrap(), [0, 0, 0, 0]);
+            let bodies = f.sent_bodies.lock().unwrap().clone();
+            assert!(bodies.windows(2).all(|pair| pair[0] == pair[1]));
+            let record = f.record().await;
+            assert_eq!(record["usage"]["input"], 28);
+            assert_eq!(record["usage"]["output"], 12);
+            assert_loop_history(history.path(), &record);
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn gemini_image_or_search_answer_prevents_reasoning_loop_replay() {
+    for client in PROTOCOLS {
+        for answer in [
+            json!({"content":{"parts":[{"inlineData":{"mimeType":"image/png","data":"aGk="}}]}}),
+            json!({"groundingMetadata":{"webSearchQueries":["rust"]}}),
+        ] {
+            let script = format!(
+                "data: {}\n\n",
+                json!({"modelVersion":"up-model", "candidates":[answer], "usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}})
+            ) + &loop_delta(Protocol::Gemini, true, &"mcp ".repeat(4096));
+            let f = Fixture::new(Protocol::Gemini, script, Ending::Hold).await;
+            let body = tokio::time::timeout(LIMIT, f.request(client).await.text())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_one_stream_error(&body, client, "model's reasoning was stuck in a loop");
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            let record = f.record().await;
+            assert_eq!(record["usage"]["input"], 7);
+            assert_eq!(record["usage"]["output"], 3);
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn gemini_empty_finish_reason_waits_for_answer_and_real_completion() {
+    for client in PROTOCOLS {
+        let pending =
+            "data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"\"}]}\n\n";
+        let f = Fixture::new(
+            Protocol::Gemini,
+            pending.to_owned() + &prefix(Protocol::Gemini) + completion(Protocol::Gemini),
+            Ending::Hold,
+        )
+        .await;
+        let body = tokio::time::timeout(LIMIT, f.request(client).await.text())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(body.contains("partial"));
+        assert_completed(&body, client);
+        assert_eq!(*f.attempts.lock().unwrap(), [0]);
+        f.assert_released().await;
     }
 }

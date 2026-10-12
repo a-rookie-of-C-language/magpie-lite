@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 use crate::config::{Config, GroupConfig, Protocol, ProviderConfig};
 use crate::config_store::{ConfigStore, IdempotencyRequest};
 use crate::cooldown::quota_cooldown;
+use crate::stream_empty::{EMPTY_REPLY, GeminiReply};
 use crate::stream_keepalive::{self, Keepalive, UpstreamActivity};
 use crate::stream_loop::LoopGuard;
 use crate::stream_timeout::{GroupFirstToken, ResponsesHold, StreamClock, StreamTimeout};
@@ -663,6 +664,8 @@ struct UpstreamDecoders {
     chat: chat::ChatStreamDecoder,
     anthropic: anthropic::AnthropicStreamDecoder,
     gemini: gemini::GeminiStreamDecoder,
+    gemini_reply: GeminiReply,
+    gemini_pending_usage: Option<Usage>,
 }
 
 impl UpstreamDecoders {
@@ -890,11 +893,18 @@ struct StreamLiveness {
 
 enum UpstreamReply {
     Json(reqwest::Response),
-    Stream(UpstreamEvents),
+    Decoded(magpie_core::ir::CompletionResponse),
+    Stream {
+        events: UpstreamEvents,
+        empty_retries: usize,
+        /// Held failures exhausted routing and must not gain a relay retry.
+        reask_allowed: bool,
+    },
 }
 
 #[derive(Clone)]
 struct StreamFailure {
+    empty_reply: bool,
     status: reqwest::StatusCode,
     body: Value,
 }
@@ -903,6 +913,10 @@ struct UpstreamEvent {
     event: StreamEvent,
     failure: Option<StreamFailure>,
     usage_observed: bool,
+    /// Account deferred Gemini usage without publishing a premature completion.
+    usage_hidden: bool,
+    /// Gemini image/search output counts even where the stream IR cannot carry it.
+    answer_observed: bool,
     /// True only for the loop guard's reasoning terminal. This is an internal
     /// control signal; ordinary vendor errors must never trigger a reask.
     loop_reasoning: bool,
@@ -910,6 +924,7 @@ struct UpstreamEvent {
 impl From<StreamEvent> for UpstreamEvent {
     fn from(event: StreamEvent) -> Self {
         let failure = matches!(event, StreamEvent::Error { .. }).then(|| StreamFailure {
+            empty_reply: false,
             status: reqwest::StatusCode::BAD_GATEWAY,
             body: Value::Null,
         });
@@ -917,6 +932,8 @@ impl From<StreamEvent> for UpstreamEvent {
             event,
             failure,
             usage_observed: false,
+            usage_hidden: false,
+            answer_observed: false,
             loop_reasoning: false,
         }
     }
@@ -962,178 +979,282 @@ async fn send_with_fallback(
                 group_route_index,
             );
         }
-        for (attempt, (key_slot, api_key)) in route.api_keys.iter().enumerate() {
+        'keys: for (attempt, (key_slot, api_key)) in route.api_keys.iter().enumerate() {
             let candidate = UpstreamCandidate::new(&route, *key_slot);
             tracker.begin_attempt(&route.provider.id, &route.model, *key_slot);
-            liveness.activity.attempt();
-            let body = upstream::build_request(&route.provider, creq, &route.model);
-            tracing::debug!(
-                provider = %route.provider.id,
-                model = %route.model,
-                key_slot,
-                route_index,
-                "routing upstream"
-            );
+            let mut empty_retries = 0;
+            'candidate: loop {
+                liveness.activity.attempt();
+                let body = upstream::build_request(&route.provider, creq, &route.model);
+                tracing::debug!(
+                    provider = %route.provider.id,
+                    model = %route.model,
+                    key_slot,
+                    route_index,
+                    "routing upstream"
+                );
 
-            let first_token = GroupFirstToken::new(if creq.stream && route_index != last_route {
-                route
-                    .group_id
-                    .as_deref()
-                    .and_then(|id| config.group(id))
-                    .map_or(0, |group| group.first_token_timeout_ms)
-            } else {
-                0
-            });
-            let clock = StreamClock::new(
-                if creq.stream {
-                    config.stream_first_content_timeout_ms
-                } else {
-                    0
-                },
-                config.stream_idle_timeout_ms,
-            );
-            let resp = match first_token
-                .wait(clock.headers(upstream::send(
-                    &state.http,
-                    &route.provider,
-                    api_key,
-                    &body,
-                    &route.model,
-                    creq.stream,
-                )))
-                .await
-                .and_then(|result| result)
-            {
-                Ok(Ok(resp)) => resp,
-                Err(timeout) => {
-                    tracker.record_attempt(&route.provider.id, *key_slot, timeout.attempt_status());
-                    if route_index == last_route {
-                        return Err((
-                            ProxyFailure::new(StatusCode::GATEWAY_TIMEOUT, timeout.message()),
-                            candidate,
-                        ));
-                    }
-                    // No response headers: an endpoint timeout is not a bad key.
-                    break;
-                }
-                Ok(Err(e)) => {
-                    tracker.record_attempt(&route.provider.id, *key_slot, "network_error");
-                    let message = format!("cannot reach {}: {e}", route.provider.id);
-                    tracing::warn!("{message}");
-                    if route_index == last_route {
-                        return Err((
-                            ProxyFailure::new(StatusCode::BAD_GATEWAY, message),
-                            candidate,
-                        ));
-                    }
-                    // A connection-level failure belongs to the endpoint, not
-                    // to one credential, so try the next route directly.
-                    break;
-                }
-            };
-
-            let status = resp.status();
-            liveness.activity.headers(status.is_success());
-            if status.is_success() {
-                if !creq.stream {
-                    tracker.record_attempt(&route.provider.id, *key_slot, "ok");
-                    return Ok((UpstreamReply::Json(resp), candidate));
-                }
-                let headers = resp.headers().clone();
-                let (events, failure) = match first_token
-                    .wait(prefetch_stream(
-                        resp,
-                        route.provider.protocol,
-                        tracker,
-                        clock,
-                        liveness,
-                        config.stream_loop_guard,
-                    ))
+                let first_token =
+                    GroupFirstToken::new(if creq.stream && route_index != last_route {
+                        route
+                            .group_id
+                            .as_deref()
+                            .and_then(|id| config.group(id))
+                            .map_or(0, |group| group.first_token_timeout_ms)
+                    } else {
+                        0
+                    });
+                let clock = StreamClock::new(
+                    if creq.stream {
+                        config.stream_first_content_timeout_ms
+                    } else {
+                        0
+                    },
+                    config.stream_idle_timeout_ms,
+                );
+                let resp = match first_token
+                    .wait(clock.headers(upstream::send(
+                        &state.http,
+                        &route.provider,
+                        api_key,
+                        &body,
+                        &route.model,
+                        creq.stream,
+                    )))
                     .await
+                    .and_then(|result| result)
                 {
-                    Ok(result) => result,
+                    Ok(Ok(resp)) => resp,
                     Err(timeout) => {
                         tracker.record_attempt(
                             &route.provider.id,
                             *key_slot,
                             timeout.attempt_status(),
                         );
-                        // Dropping prefetch cancels the held response. Slow starts
-                        // belong to this route, not a credential: skip its other
-                        // keys without cooldown. Only non-final routes have a cap.
-                        break;
+                        if route_index == last_route {
+                            return Err((
+                                ProxyFailure::new(StatusCode::GATEWAY_TIMEOUT, timeout.message()),
+                                candidate,
+                            ));
+                        }
+                        // No response headers: an endpoint timeout is not a bad key.
+                        break 'keys;
+                    }
+                    Ok(Err(e)) => {
+                        tracker.record_attempt(&route.provider.id, *key_slot, "network_error");
+                        let message = format!("cannot reach {}: {e}", route.provider.id);
+                        tracing::warn!("{message}");
+                        if route_index == last_route {
+                            return Err((
+                                ProxyFailure::new(StatusCode::BAD_GATEWAY, message),
+                                candidate,
+                            ));
+                        }
+                        // A connection-level failure belongs to the endpoint, not
+                        // to one credential, so try the next route directly.
+                        break 'keys;
                     }
                 };
-                if let Some(failure) = failure {
-                    tracker.record_attempt(&route.provider.id, *key_slot, "upstream_stream_error");
-                    if quota_limited_status(failure.status) {
-                        let cooldown = quota_cooldown(
-                            &headers,
-                            Some(&failure.body),
-                            config.key_cooldown_for(&route.provider),
-                        );
-                        state.key_rotation.cool_down(
+
+                let status = resp.status();
+                liveness.activity.headers(status.is_success());
+                if status.is_success() {
+                    if !creq.stream {
+                        if route.provider.protocol != Protocol::Gemini {
+                            tracker.record_attempt(&route.provider.id, *key_slot, "ok");
+                            return Ok((UpstreamReply::Json(resp), candidate));
+                        }
+                        let value: Value = match resp.json().await {
+                            Ok(value) => value,
+                            Err(error) => {
+                                tracker.record_attempt(
+                                    &route.provider.id,
+                                    *key_slot,
+                                    "bad_upstream_body",
+                                );
+                                return Err((
+                                    ProxyFailure::new(
+                                        StatusCode::BAD_GATEWAY,
+                                        format!("bad upstream body: {error}"),
+                                    ),
+                                    candidate,
+                                ));
+                            }
+                        };
+                        if value.get("error").is_some() {
+                            tracker.record_attempt(&route.provider.id, *key_slot, "upstream_error");
+                            return Err((
+                                ProxyFailure::new(
+                                    StatusCode::BAD_GATEWAY,
+                                    "Gemini returned an error instead of a reply",
+                                ),
+                                candidate,
+                            ));
+                        }
+                        for event in gemini::GeminiStreamDecoder::new().decode(&value) {
+                            if let StreamEvent::Usage(usage) = event {
+                                tracker.observe_usage(&usage);
+                            }
+                        }
+                        let mut reply = GeminiReply::default();
+                        reply.observe(&value);
+                        if reply.is_empty() {
+                            tracker.record_attempt(&route.provider.id, *key_slot, "empty_reply");
+                            if empty_retries == 0 {
+                                empty_retries += 1;
+                                tracker.begin_reask();
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                continue 'candidate;
+                            }
+                            if attempt + 1 < route.api_keys.len() {
+                                continue 'keys;
+                            }
+                            if route_index != last_route {
+                                break 'keys;
+                            }
+                            return Err((
+                                ProxyFailure::new(StatusCode::BAD_GATEWAY, EMPTY_REPLY),
+                                candidate,
+                            ));
+                        }
+                        let ir = match gemini::decode_response(&value) {
+                            Ok(ir) => ir,
+                            Err(error) => {
+                                tracker.record_attempt(
+                                    &route.provider.id,
+                                    *key_slot,
+                                    "upstream_decode_error",
+                                );
+                                return Err((
+                                    ProxyFailure::new(StatusCode::BAD_GATEWAY, error.to_string()),
+                                    candidate,
+                                ));
+                            }
+                        };
+                        tracker.record_attempt(&route.provider.id, *key_slot, "ok");
+                        return Ok((UpstreamReply::Decoded(ir), candidate));
+                    }
+                    let headers = resp.headers().clone();
+                    let (events, failure) = match first_token
+                        .wait(prefetch_stream(
+                            resp,
+                            route.provider.protocol,
+                            tracker,
+                            clock,
+                            liveness,
+                            config.stream_loop_guard,
+                        ))
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(timeout) => {
+                            tracker.record_attempt(
+                                &route.provider.id,
+                                *key_slot,
+                                timeout.attempt_status(),
+                            );
+                            // Dropping prefetch cancels the held response. Slow starts
+                            // belong to this route, not a credential: skip its other
+                            // keys without cooldown. Only non-final routes have a cap.
+                            break 'keys;
+                        }
+                    };
+                    if let Some(ref failure) = failure {
+                        tracker.record_attempt(
                             &route.provider.id,
-                            route.provider.key_generation,
                             *key_slot,
-                            cooldown,
+                            if failure.empty_reply {
+                                "empty_reply"
+                            } else {
+                                "upstream_stream_error"
+                            },
                         );
+                        if failure.empty_reply && empty_retries == 0 {
+                            drop(events);
+                            empty_retries += 1;
+                            tracker.begin_reask();
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue 'candidate;
+                        }
+                        if quota_limited_status(failure.status) {
+                            let cooldown = quota_cooldown(
+                                &headers,
+                                Some(&failure.body),
+                                config.key_cooldown_for(&route.provider),
+                            );
+                            state.key_rotation.cool_down(
+                                &route.provider.id,
+                                route.provider.key_generation,
+                                *key_slot,
+                                cooldown,
+                            );
+                        }
+                        if attempt + 1 < route.api_keys.len()
+                            && (failure.empty_reply || key_retryable_status(failure.status))
+                        {
+                            drop(events);
+                            continue 'keys;
+                        }
+                        if route_index != last_route && route_retryable_status(failure.status) {
+                            drop(events);
+                            break 'keys;
+                        }
+                    } else {
+                        tracker.record_attempt(&route.provider.id, *key_slot, "ok");
                     }
-                    if attempt + 1 < route.api_keys.len() && key_retryable_status(failure.status) {
-                        drop(events);
-                        continue;
-                    }
-                    if route_index != last_route && route_retryable_status(failure.status) {
-                        drop(events);
-                        break;
-                    }
-                } else {
-                    tracker.record_attempt(&route.provider.id, *key_slot, "ok");
+                    return Ok((
+                        UpstreamReply::Stream {
+                            events,
+                            empty_retries,
+                            reask_allowed: failure.is_none(),
+                        },
+                        candidate,
+                    ));
                 }
-                return Ok((UpstreamReply::Stream(events), candidate));
-            }
-            let headers = resp.headers().clone();
-            let error = match clock.headers(upstream::error_detail(resp)).await {
-                Ok(error) => error,
-                Err(timeout) => {
-                    tracker.record_attempt(&route.provider.id, *key_slot, "504");
-                    if route_index == last_route {
-                        return Err((
-                            ProxyFailure::new(StatusCode::GATEWAY_TIMEOUT, timeout.message()),
-                            candidate,
-                        ));
+                let headers = resp.headers().clone();
+                let error = match clock.headers(upstream::error_detail(resp)).await {
+                    Ok(error) => error,
+                    Err(timeout) => {
+                        tracker.record_attempt(&route.provider.id, *key_slot, "504");
+                        if route_index == last_route {
+                            return Err((
+                                ProxyFailure::new(StatusCode::GATEWAY_TIMEOUT, timeout.message()),
+                                candidate,
+                            ));
+                        }
+                        break 'keys;
                     }
-                    break;
+                };
+                tracker.record_attempt(&route.provider.id, *key_slot, &status.as_u16().to_string());
+                if quota_limited_status(status) {
+                    let cooldown = quota_cooldown(
+                        &headers,
+                        Some(&error.body),
+                        config.key_cooldown_for(&route.provider),
+                    );
+                    state.key_rotation.cool_down(
+                        &route.provider.id,
+                        route.provider.key_generation,
+                        *key_slot,
+                        cooldown,
+                    );
                 }
-            };
-            tracker.record_attempt(&route.provider.id, *key_slot, &status.as_u16().to_string());
-            if quota_limited_status(status) {
-                let cooldown = quota_cooldown(
-                    &headers,
-                    Some(&error.body),
-                    config.key_cooldown_for(&route.provider),
+                let detail = error.message;
+                tracing::warn!(
+                    "upstream {} key {}: {detail}",
+                    route.provider.id,
+                    key_slot + 1
                 );
-                state.key_rotation.cool_down(
-                    &route.provider.id,
-                    route.provider.key_generation,
-                    *key_slot,
-                    cooldown,
-                );
+                if attempt + 1 < route.api_keys.len() && key_retryable_status(status) {
+                    continue 'keys;
+                }
+                if route_index != last_route && route_retryable_status(status) {
+                    break 'keys;
+                }
+                let status =
+                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                return Err((ProxyFailure::new(status, detail), candidate));
             }
-            let detail = error.message;
-            tracing::warn!(
-                "upstream {} key {}: {detail}",
-                route.provider.id,
-                key_slot + 1
-            );
-            if attempt + 1 < route.api_keys.len() && key_retryable_status(status) {
-                continue;
-            }
-            if route_index != last_route && route_retryable_status(status) {
-                break;
-            }
-            let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            return Err((ProxyFailure::new(status, detail), candidate));
         }
     }
 
@@ -1143,20 +1264,21 @@ async fn send_with_fallback(
     ))
 }
 
-/// Re-ask a reasoning-only loop on the exact candidate that already
+/// Re-ask an empty reply or reasoning-only loop on the exact candidate that already
 /// committed the response. This deliberately bypasses fallback and key
 /// rotation: it is a continuation of the same upstream attempt, not a new
 /// routing decision.
-async fn reask_reasoning_stream(
+async fn reask_stream(
     state: &AppState,
     config: &Config,
     creq: &CompletionRequest,
     candidate: &UpstreamCandidate,
     tracker: &mut RequestTracker,
     liveness: &StreamLiveness,
+    pause: Duration,
 ) -> Result<UpstreamEvents, String> {
     tracker.begin_reask();
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(pause).await;
 
     let api_key = candidate
         .provider
@@ -1192,7 +1314,7 @@ async fn reask_reasoning_stream(
         }
         Ok(Err(error)) => {
             tracker.record_attempt(&candidate.provider.id, candidate.key_slot, "network_error");
-            return Err(format!("reasoning reask could not reach upstream: {error}"));
+            return Err(format!("reask could not reach upstream: {error}"));
         }
     };
 
@@ -1369,7 +1491,7 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
         };
         let protocol = candidate.provider.protocol;
 
-        let mut events = match reply {
+        let (mut events, mut empty_retries, reask_allowed) = match reply {
             UpstreamReply::Json(resp) => {
                 let upstream_body: Value = match resp.json().await {
                     Ok(v) => v,
@@ -1388,7 +1510,17 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
                 tracker.finish(status, &ir.usage);
                 return Ok(ok_json(wire.encode_response(&ir)));
             }
-            UpstreamReply::Stream(events) => events,
+            UpstreamReply::Decoded(mut ir) => {
+                tracker.observe_usage(&ir.usage);
+                ir.usage = tracker.total_usage();
+                tracker.finish("ok", &Usage::default());
+                return Ok(ok_json(wire.encode_response(&ir)));
+            }
+            UpstreamReply::Stream {
+                events,
+                empty_retries,
+                reask_allowed,
+            } => (events, empty_retries, reask_allowed),
         };
 
         let client_model = creq.model.clone();
@@ -1396,6 +1528,10 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
         let out = async_stream::stream! {
             let mut encoder = ClientStreamEncoder::new(wire, &client_model);
             let mut reasked = false;
+            let mut reasoning_reasked = false;
+            let mut continued = empty_retries > 0;
+            let mut usage_since_retry = false;
+            let empty_limit = if group_plan.is_some() { 1 } else { 2 };
             let mut emitted_text_or_tool = false;
             'attempt: loop {
                 while let Some(item) = events.next().await {
@@ -1407,7 +1543,7 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
                         // Providers report cumulative counters for each attempt.
                         // Account raw counters once, but expose the same logical
                         // response total to clients and request history.
-                        if reasked {
+                        if continued {
                             *usage = tracker.total_usage();
                         }
                     }
@@ -1423,22 +1559,31 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
                         StreamEvent::ToolCallDelta { args, .. } => !args.is_empty(),
                         _ => false,
                     };
-                    emitted_text_or_tool |= text_or_tool;
+                    emitted_text_or_tool |= text_or_tool || item.answer_observed;
 
-                    if item.loop_reasoning && !reasked && !emitted_text_or_tool {
-                        // The triggering reasoning delta has already been sent;
-                        // replace only the synthetic terminal error with one
+                    let retry_reasoning = item.loop_reasoning && !reasoning_reasked && !emitted_text_or_tool;
+                    let retry_empty = reask_allowed && item.failure.as_ref().is_some_and(|f| f.empty_reply)
+                        && empty_retries < empty_limit && !emitted_text_or_tool;
+                    if retry_reasoning || retry_empty {
+                        // Preserve any reasoning already sent; replace only the
+                        // internally classified terminal with a bounded
                         // same-candidate reask. Dropping the old stream first
                         // is what cancels its response body.
                         drop(events);
                         reasked = true;
-                        match reask_reasoning_stream(
+                        continued = true;
+                        usage_since_retry = false;
+                        reasoning_reasked |= retry_reasoning;
+                        empty_retries += usize::from(retry_empty);
+                        let pause = Duration::from_secs(if retry_empty { 1 << (empty_retries - 1) } else { 1 });
+                        match reask_stream(
                             &state,
                             &config,
                             &creq,
                             &reask_candidate,
                             &mut tracker,
                             &liveness,
+                            pause,
                         ).await {
                             Ok(next_events) => {
                                 events = next_events;
@@ -1461,6 +1606,11 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
                         _ => None,
                     };
                     if let Some(status) = terminal_status {
+                        if matches!(event, StreamEvent::Done) && continued && !usage_since_retry
+                            && let Some(frame) = encoder.encode(&StreamEvent::Usage(tracker.total_usage()))
+                        {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                        }
                         // Release the HTTP response before yielding the final frame,
                         // even if the downstream is backpressured or stops polling.
                         drop(events);
@@ -1470,7 +1620,8 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
                         }
                         return;
                     }
-                    if !suppress_start && let Some(frame) = encoder.encode(&event) {
+                    if !item.usage_hidden && !suppress_start && let Some(frame) = encoder.encode(&event) {
+                        usage_since_retry |= matches!(event, StreamEvent::Usage(_));
                         yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                     }
                 }
@@ -1566,23 +1717,59 @@ fn decode_upstream_data(
         return vec![StreamEvent::Done.into()];
     }
     let Ok(value) = serde_json::from_str::<Value>(data) else {
-        return Vec::new();
+        return if protocol == Protocol::Gemini {
+            vec![
+                StreamEvent::Error {
+                    message: "bad Gemini upstream stream payload".into(),
+                }
+                .into(),
+            ]
+        } else {
+            Vec::new()
+        };
     };
-    decode_upstream_chunk(protocol, &value, decoders)
-        .into_iter()
-        .map(|event| {
-            let failure = matches!(event, StreamEvent::Error { .. }).then(|| StreamFailure {
-                status: crate::stream_status::error_status(&value),
-                body: value.clone(),
-            });
-            UpstreamEvent {
-                event,
-                failure,
-                usage_observed: false,
-                loop_reasoning: false,
-            }
-        })
-        .collect()
+    if protocol == Protocol::Gemini {
+        decoders.gemini_reply.observe(&value);
+    }
+    let mut out = Vec::new();
+    if protocol == Protocol::Gemini
+        && !decoders.gemini_reply.is_empty()
+        && let Some(usage) = decoders.gemini_pending_usage.take()
+    {
+        out.push(StreamEvent::Usage(usage).into());
+    }
+    for event in decode_upstream_chunk(protocol, &value, decoders) {
+        let empty = protocol == Protocol::Gemini && decoders.gemini_reply.is_empty();
+        if empty && matches!(event, StreamEvent::Stop(_)) {
+            // Do not let any client encoder finish a turn that will be reasked.
+            continue;
+        }
+        if empty && matches!(event, StreamEvent::Done) {
+            out.push(empty_reply_event());
+            continue;
+        }
+        let hidden = empty && matches!(event, StreamEvent::Usage(_));
+        if hidden && let StreamEvent::Usage(usage) = &event {
+            decoders
+                .gemini_pending_usage
+                .get_or_insert_default()
+                .merge(usage);
+        }
+        let failure = matches!(event, StreamEvent::Error { .. }).then(|| StreamFailure {
+            empty_reply: false,
+            status: crate::stream_status::error_status(&value),
+            body: value.clone(),
+        });
+        out.push(UpstreamEvent {
+            event,
+            failure,
+            usage_observed: false,
+            usage_hidden: hidden,
+            answer_observed: protocol == Protocol::Gemini && decoders.gemini_reply.has_answer(),
+            loop_reasoning: false,
+        });
+    }
+    out
 }
 
 /// Hold only opening metadata, never a visible answer, while deciding whether
@@ -1652,16 +1839,36 @@ async fn prefetch_stream(
     (Box::pin(futures::stream::iter(prefix).chain(events)), None)
 }
 
+fn empty_reply_event() -> UpstreamEvent {
+    UpstreamEvent {
+        event: StreamEvent::Error {
+            message: EMPTY_REPLY.into(),
+        },
+        failure: Some(StreamFailure {
+            empty_reply: true,
+            status: StatusCode::BAD_GATEWAY,
+            body: Value::Null,
+        }),
+        usage_observed: false,
+        usage_hidden: false,
+        answer_observed: false,
+        loop_reasoning: false,
+    }
+}
+
 fn stream_timeout_event(timeout: StreamTimeout) -> UpstreamEvent {
     UpstreamEvent {
         event: StreamEvent::Error {
             message: timeout.message().into(),
         },
         failure: Some(StreamFailure {
+            empty_reply: false,
             status: StatusCode::GATEWAY_TIMEOUT,
             body: Value::Null,
         }),
         usage_observed: false,
+        usage_hidden: false,
+        answer_observed: false,
         loop_reasoning: false,
     }
 }
@@ -1736,10 +1943,13 @@ fn upstream_events(
                         yield UpstreamEvent {
                             event: StreamEvent::Error { message: trip.message().into() },
                             failure: Some(StreamFailure {
+                                empty_reply: false,
                                 status: StatusCode::BAD_GATEWAY,
                                 body: Value::Null,
                             }),
                             usage_observed: false,
+                            usage_hidden: false,
+                            answer_observed: false,
                             loop_reasoning: trip.is_reasoning(),
                         }.into();
                         return;
@@ -1758,10 +1968,13 @@ fn upstream_events(
                         yield UpstreamEvent {
                             event: StreamEvent::Error { message: trip.message().into() },
                             failure: Some(StreamFailure {
+                                empty_reply: false,
                                 status: StatusCode::BAD_GATEWAY,
                                 body: Value::Null,
                             }),
                             usage_observed: false,
+                            usage_hidden: false,
+                            answer_observed: false,
                             loop_reasoning: trip.is_reasoning(),
                         }.into();
                         return;
@@ -1776,7 +1989,13 @@ fn upstream_events(
         }
         // Some Chat-compatible endpoints close cleanly after finish_reason,
         // omitting [DONE]. Do not end at Stop: a later usage frame is valid.
-        if chat_stopped {
+        if protocol == Protocol::Gemini && decoders.gemini_reply.is_empty() {
+            yield empty_reply_event().into();
+        } else if chat_stopped
+            || (protocol == Protocol::Gemini && decoders.gemini_reply.has_answer())
+        {
+            // Unlike Anthropic/Responses, Gemini may end an answered
+            // reply by clean EOF without a separate finish marker.
             yield StreamEvent::Done.into();
         } else {
             yield StreamEvent::Error {

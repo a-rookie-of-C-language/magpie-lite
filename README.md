@@ -176,6 +176,24 @@ output ends with one client-protocol error. Errors do not quote the repeated
 reply; sanitized JSONL history stores neither prompt nor reply content. See
 `docs/stream-lifecycle.md` for exact limits and reproducible fixture evidence.
 
+## Gemini empty-reply recovery
+
+Gemini upstreams that end without an answer are re-asked on the same
+provider/model/key: once before commitment, or at most twice after ordinary stream
+commitment (once for groups), with one-/two-second pauses. Earlier thinking stays
+visible, and same-candidate usage is combined in client results and history.
+Held exhaustion may try configured keys/routes; committed continuations never
+rotate or fall back. Nonstreaming Gemini uses one held retry and returns 502 on
+exhaustion. This budget is independent of reasoning-loop recovery.
+
+Length limits, filter finishes, tool calls and image/search answers do not
+trigger empty retries. Neither do vendor, JSON or transport errors. Other
+upstream protocols keep valid empty-answer behavior. Gemini clean EOF after an
+answer completes; an empty finish-reason string does not end a stream. The
+feature does not add image/search stream events, subscription authentication or
+dedicated prompt-feedback refusal rendering. See [stream lifecycle](docs/stream-lifecycle.md)
+for limits, cancellation/accounting rules and synthetic fixture coverage.
+
 ## Editing providers
 
 The protected web console can create, edit, and delete providers without restarting the gateway. Provider metadata and route lists are editable directly; API keys are never returned. When editing an existing provider, choose **Keep existing keys**, **Replace key pool**, or **No upstream authentication** explicitly. New requests use a saved provider immediately, while in-flight requests keep their original endpoint and credential snapshot.

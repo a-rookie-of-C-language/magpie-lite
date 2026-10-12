@@ -398,13 +398,13 @@ impl RequestTracker {
         self.reask_usage = Usage::default();
     }
 
-    /// Begin the one allowed reasoning-only reask without mixing attempts.
+    /// Begin a same-candidate reask without mixing different routes or keys.
     pub fn begin_reask(&mut self) {
         self.reask_usage = add_usage(&self.reask_usage, &self.usage);
         self.usage = Usage::default();
     }
 
-    /// Usage across the initial attempt and any reasoning-only reask.
+    /// Usage across the initial attempt and its same-candidate reasks.
     pub fn total_usage(&self) -> Usage {
         add_usage(&self.reask_usage, &self.usage)
     }
