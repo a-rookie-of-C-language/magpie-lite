@@ -694,3 +694,11 @@ No paid/live vendor, HTTP/2 or real-agent compatibility is implied.
 
 Native opaque reasoning commits an attempt even when the client protocol cannot
 render it. See `sealed-reasoning.md` for passthrough and privacy guarantees.
+
+## Native signature content
+
+Nonempty native signatures commit an attempt and satisfy first-content, even
+when a foreign client has no rendering for them. They are not public answer
+text and do not enter prose-loop detection. Unsigned thinking starts remain
+metadata. See docs/native-signatures.md for native-only mappings, error/retry
+fixtures and the separate bounded reasoning-only re-ask policy.

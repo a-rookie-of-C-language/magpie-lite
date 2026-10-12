@@ -145,6 +145,13 @@ impl SealedReasoning {
     }
 }
 
+/// Signature provenance is distinct from public reasoning text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureProtocol {
+    Anthropic,
+    Gemini,
+}
+
 /// One block of a message. Fields are shared across kinds; `kind` decides
 /// which of them carry meaning.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -173,6 +180,8 @@ pub struct Part {
     pub is_error: bool,
     /// Thinking signature (Anthropic's, or a Gemini thought's).
     pub signature: String,
+    /// Protocol that supplied this signature; None retains legacy IR construction.
+    pub signature_protocol: Option<SignatureProtocol>,
     /// Native opaque reasoning; never serialized to a different protocol.
     pub sealed: Option<Box<SealedReasoning>>,
     /// An upstream web search, when the kind is Search.
@@ -250,6 +259,18 @@ impl Part {
             text: text.into(),
             signature: signature.into(),
             ..Default::default()
+        }
+    }
+
+    /// Only emit a decoded signature back to the protocol that supplied it.
+    pub fn native_signature(&self, protocol: SignatureProtocol) -> &str {
+        if self
+            .signature_protocol
+            .is_none_or(|source| source == protocol)
+        {
+            &self.signature
+        } else {
+            ""
         }
     }
 

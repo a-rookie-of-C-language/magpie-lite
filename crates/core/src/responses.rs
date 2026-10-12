@@ -972,6 +972,7 @@ impl ResponsesStreamEncoder {
                 self.output.push(item.clone());
                 Some(out)
             }
+            StreamEvent::Signature { .. } => None,
             StreamEvent::SearchStarted => None,
             StreamEvent::Search { search } | StreamEvent::SearchUpdate { search } => {
                 if matches!(ev, StreamEvent::SearchUpdate { .. }) && !search.is_answer() {

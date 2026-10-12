@@ -32,6 +32,10 @@ Zed ─────────┘   Chat + Responses +
 - **Agent wiring**: `magpie-lite claude <model>` (settings.json env block), `magpie-lite codex <model>` (config.toml provider table, native `wire_api = "responses"`), `magpie-lite crush <model>` (custom OpenAI-compatible provider and large-model pick), `magpie-lite gemini <model>` (`~/.gemini/settings.json` plus `.env`), `magpie-lite goose <model>` (custom OpenAI-compatible provider plus the active model), `magpie-lite opencode <model>` (`~/.config/opencode/opencode.json` provider block), `magpie-lite zed <model>` (OpenAI-compatible provider in Zed settings; the token goes in Zed provider settings or `MAGPIE_LITE_API_KEY`, not `settings.json`)
 - **Conformance tests** for every translation direction, and end-to-end tests over real HTTP with mock Chat and Gemini upstreams
 
+Native thinking/text/tool signature behavior and its limits are documented in
+[docs/native-signatures.md](docs/native-signatures.md), with loopback fixtures
+for native round trips, foreign-protocol isolation and safe stream commitment.
+
 ## Quick start
 
 ```sh
@@ -91,7 +95,7 @@ stream_idle_timeout_ms = 300000          # waiting for the next upstream body ch
 ```
 
 These are the defaults for old files too. Set either value to `0` to disable it.
-Nonempty text/reasoning, native opaque reasoning or a tool event satisfies the
+Nonempty text/reasoning, native opaque reasoning/signatures or a tool event satisfies the
 first-content limit; model, role, usage, reasoning-item-start metadata and comment
 heartbeats do not extend it. The idle limit resets on
 upstream transport bytes, not downstream backpressure. Before committing a

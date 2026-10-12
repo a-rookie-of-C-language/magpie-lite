@@ -342,3 +342,12 @@ retry keys or switch fallback routes. Unknown native fields remain native, while
 only public summary_text crosses protocols. These fixtures do not establish
 live vendor compatibility or broader thinking-signature parity. See
 `sealed-reasoning.md` for the exact contract.
+
+Native thinking signatures were compared with upstream gateway KThinkStart,
+KSig and KTextSig events and the Anthropic/Gemini encoders. Lite now preserves
+Anthropic initial/delta signatures and adjacent thinking blocks, Gemini
+thinking/text/function-call signatures and signed-only parts in JSON/history
+and SSE, with decoded signature provenance preventing foreign-protocol leaks.
+See docs/native-signatures.md and the core/gateway signatures suites for exact
+coverage, stream commitment/retry semantics and privacy evidence. Real vendor
+and model-specific signed transcript acceptance remain unverified.

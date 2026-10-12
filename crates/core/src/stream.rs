@@ -1,7 +1,15 @@
 //! Streaming: the protocol-neutral event set every SSE dialect is decoded
 //! into, and a small server-sent-events frame parser.
 
-use crate::ir::{Part, SealedReasoning, StopReason, Usage, WebSearch};
+use crate::ir::{Part, SealedReasoning, SignatureProtocol, StopReason, Usage, WebSearch};
+
+/// The native part to which a streamed signature belongs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureTarget {
+    Thinking,
+    Text,
+    Tool { index: usize },
+}
 
 /// One thing that happened in a streamed completion.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,7 +43,7 @@ pub enum StreamEvent {
     /// Citation/attribution-only updates carry no public answer and must not
     /// fabricate a new search call in foreign protocols.
     SearchUpdate { search: Box<WebSearch> },
-    /// A new Responses reasoning item, even if it has no public summary.
+    /// A new reasoning block/item, even if it has no public text.
     /// This is metadata, not first content; native IDs never cross protocols.
     ThinkingStart { id: String },
     /// A complete native opaque reasoning block/item. It commits the attempt,
@@ -45,6 +53,12 @@ pub enum StreamEvent {
     ThinkingDelta {
         /// The fragment.
         text: String,
+    },
+    /// A native signature, separate from public text and never prose-loop input.
+    Signature {
+        protocol: SignatureProtocol,
+        target: SignatureTarget,
+        signature: String,
     },
     /// A tool call opened. `index` numbers the call within the message.
     ToolCallStart {
@@ -95,10 +109,12 @@ impl StreamEvent {
         }
     }
 
-    /// Visible answer or reasoning; metadata does not satisfy first content.
+    /// Answer, public/opaque reasoning or a nonempty native signature.
+    /// Opening metadata alone does not satisfy first content.
     pub fn is_content(&self) -> bool {
         self.is_answer()
             || matches!(self, Self::Sealed { .. })
+            || matches!(self, Self::Signature { signature, .. } if !signature.is_empty())
             || matches!(self, Self::ThinkingDelta { text } if !text.is_empty())
     }
 }

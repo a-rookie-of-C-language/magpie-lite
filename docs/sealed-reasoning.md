@@ -46,5 +46,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-This does not implement general Anthropic signature_delta or Gemini thought
-signature streaming parity, nor prove compatibility with real vendor services.
+Anthropic signature_delta and Gemini thought signatures have a separate native-only
+JSON/history/SSE contract in docs/native-signatures.md. Neither fixture suite
+proves compatibility with real vendor services or model-specific validation.

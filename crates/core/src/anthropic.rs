@@ -9,9 +9,9 @@ use std::collections::HashMap;
 use crate::error::{CoreError, Result};
 use crate::ir::{
     CompletionRequest, CompletionResponse, Message, Part, PartKind, ReasoningProtocol, Role,
-    SealedReasoning, SearchHit, StopReason, Tool, Usage, WebSearch,
+    SealedReasoning, SearchHit, SignatureProtocol, StopReason, Tool, Usage, WebSearch,
 };
-use crate::stream::StreamEvent;
+use crate::stream::{SignatureTarget, StreamEvent};
 use serde_json::{Map, Value, json};
 
 fn missing(field: &'static str) -> CoreError {
@@ -29,14 +29,17 @@ fn str_field(v: &Value, field: &'static str) -> Result<String> {
 fn decode_block(b: &Value) -> Option<Part> {
     match b.get("type").and_then(Value::as_str) {
         Some("text") => b.get("text").and_then(Value::as_str).map(Part::text),
-        Some("thinking") => Some(Part::thinking(
-            b.get("thinking")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-            b.get("signature")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-        )),
+        Some("thinking") => Some(Part {
+            signature_protocol: Some(SignatureProtocol::Anthropic),
+            ..Part::thinking(
+                b.get("thinking")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                b.get("signature")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+        }),
         Some("redacted_thinking") => Some(Part {
             sealed: Some(Box::new(SealedReasoning::decode(
                 ReasoningProtocol::Anthropic,
@@ -180,7 +183,7 @@ fn part_to_block(p: &Part) -> Option<Value> {
         PartKind::Thinking => Some(json!({
             "type": "thinking",
             "thinking": p.text,
-            "signature": p.signature,
+            "signature": p.native_signature(SignatureProtocol::Anthropic),
         })),
         PartKind::Image if !p.data.is_empty() => Some(json!({
             "type": "image",
@@ -498,6 +501,7 @@ pub struct AnthropicStreamDecoder {
     search_queries: HashMap<String, String>,
     search_limit: usize,
     search_failed: bool,
+    thinking_index: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -516,6 +520,7 @@ impl Default for AnthropicStreamDecoder {
             search_queries: HashMap::new(),
             search_limit: crate::stream::MAX_SSE_EVENT_BYTES,
             search_failed: false,
+            thinking_index: None,
         }
     }
 }
@@ -552,6 +557,7 @@ impl AnthropicStreamDecoder {
     pub fn decode(&mut self, v: &Value) -> Vec<StreamEvent> {
         if v.get("type").is_some_and(|ty| ty == "message_start") {
             self.tool_blocks.clear();
+            self.thinking_index = None;
             self.search_blocks.clear();
             self.search_queries.clear();
             self.search_failed = false;
@@ -578,7 +584,31 @@ impl AnthropicStreamDecoder {
                     return self.search_error("upstream web search block was not closed");
                 }
                 self.tool_blocks.remove(&index);
-                if let Some(reasoning) =
+                self.thinking_index = None;
+                if block["type"] == "thinking" {
+                    self.thinking_index = Some(index);
+                    out.push(StreamEvent::ThinkingStart { id: String::new() });
+                    if let Some(text) = block
+                        .get("thinking")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                    {
+                        out.push(StreamEvent::ThinkingDelta {
+                            text: text.to_owned(),
+                        });
+                    }
+                    if let Some(signature) = block
+                        .get("signature")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                    {
+                        out.push(StreamEvent::Signature {
+                            protocol: SignatureProtocol::Anthropic,
+                            target: SignatureTarget::Thinking,
+                            signature: signature.to_owned(),
+                        });
+                    }
+                } else if let Some(reasoning) =
                     SealedReasoning::decode(ReasoningProtocol::Anthropic, &block)
                 {
                     out.push(StreamEvent::Sealed {
@@ -676,6 +706,20 @@ impl AnthropicStreamDecoder {
                             out.push(StreamEvent::ThinkingDelta { text: t.to_owned() });
                         }
                     }
+                    "signature_delta" => {
+                        if self.thinking_index == Some(index)
+                            && let Some(signature) = delta
+                                .get("signature")
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                        {
+                            out.push(StreamEvent::Signature {
+                                protocol: SignatureProtocol::Anthropic,
+                                target: SignatureTarget::Thinking,
+                                signature: signature.to_owned(),
+                            });
+                        }
+                    }
                     "input_json_delta" => {
                         if let Some(a) = delta.get("partial_json").and_then(Value::as_str)
                             && !a.is_empty()
@@ -708,6 +752,9 @@ impl AnthropicStreamDecoder {
             }
             "content_block_stop" => {
                 let index = v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                if self.thinking_index == Some(index) {
+                    self.thinking_index = None;
+                }
                 if let Some(mut input) = self.search_blocks.remove(&index) {
                     if !input.whole && !input.args.is_empty() {
                         let Ok(args) = serde_json::from_str::<Value>(&input.args) else {
@@ -800,6 +847,7 @@ pub struct AnthropicStreamEncoder {
     open: Option<(usize, BlockKind)>,
     tool_blocks: HashMap<usize, usize>, // IR call index -> block index
     usage: Usage,
+    pending_thinking: bool,
 }
 
 impl AnthropicStreamEncoder {
@@ -815,6 +863,7 @@ impl AnthropicStreamEncoder {
             open: None,
             tool_blocks: HashMap::new(),
             usage: Usage::default(),
+            pending_thinking: false,
         }
     }
 
@@ -855,6 +904,7 @@ impl AnthropicStreamEncoder {
     }
 
     fn open_block(&mut self, kind: BlockKind, extra: Value) -> String {
+        self.pending_thinking = false;
         let mut out = self.close_open().unwrap_or_default();
         let index = self.next_index;
         self.next_index += 1;
@@ -898,7 +948,8 @@ impl AnthropicStreamEncoder {
                 Some(self.start_message())
             }
             StreamEvent::ThinkingStart { .. } => {
-                // Separate public summaries of distinct foreign reasoning items.
+                // Start lazily: signed-only native blocks are real, unsigned empty ones are not.
+                self.pending_thinking = true;
                 if self
                     .open
                     .as_ref()
@@ -909,7 +960,32 @@ impl AnthropicStreamEncoder {
                     None
                 }
             }
+            StreamEvent::Signature {
+                protocol: SignatureProtocol::Anthropic,
+                target: SignatureTarget::Thinking,
+                signature,
+            } => {
+                if signature.is_empty()
+                    || (!self.pending_thinking
+                        && self.open.as_ref().map(|(_, kind)| *kind) != Some(BlockKind::Thinking))
+                {
+                    return None;
+                }
+                let mut out = self.start_message();
+                if self.open.as_ref().map(|(_, kind)| *kind) != Some(BlockKind::Thinking) {
+                    out.push_str(&self.open_block(BlockKind::Thinking, Value::Null));
+                }
+                let index = self.open.as_ref().expect("opened thinking block").0;
+                out.push_str(&sse(
+                    "content_block_delta",
+                    &json!({"type":"content_block_delta","index":index,
+                    "delta":{"type":"signature_delta","signature":signature}}),
+                ));
+                Some(out)
+            }
+            StreamEvent::Signature { .. } => None,
             StreamEvent::Sealed { reasoning } => {
+                self.pending_thinking = false;
                 let block = reasoning.native(ReasoningProtocol::Anthropic)?;
                 let mut out = self.start_message();
                 out.push_str(&self.close_open().unwrap_or_default());
@@ -966,6 +1042,7 @@ impl AnthropicStreamEncoder {
             // Image output currently has a native mapping only in Gemini.
             StreamEvent::Image { .. } => None,
             StreamEvent::TextDelta { text } => {
+                self.pending_thinking = false;
                 let mut out = self.start_message();
                 if self.open.as_ref().map(|(_, k)| *k) != Some(BlockKind::Text) {
                     out.push_str(&self.open_block(BlockKind::Text, Value::Null));
@@ -998,6 +1075,7 @@ impl AnthropicStreamEncoder {
                 Some(out)
             }
             StreamEvent::ToolCallStart { index, id, name } => {
+                self.pending_thinking = false;
                 let mut out = self.start_message();
                 let block_index = self.next_index;
                 self.next_index += 1;

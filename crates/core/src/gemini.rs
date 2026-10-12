@@ -11,10 +11,10 @@ use std::collections::HashMap;
 
 use crate::error::{CoreError, Result};
 use crate::ir::{
-    CompletionRequest, CompletionResponse, Message, Part, PartKind, Role, SearchHit, StopReason,
-    Tool, Usage, WebSearch,
+    CompletionRequest, CompletionResponse, Message, Part, PartKind, Role, SearchHit,
+    SignatureProtocol, StopReason, Tool, Usage, WebSearch,
 };
-use crate::stream::StreamEvent;
+use crate::stream::{SignatureTarget, StreamEvent};
 use serde_json::{Map, Value, json};
 
 fn missing(field: &'static str) -> CoreError {
@@ -207,6 +207,7 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
                     name: name.to_owned(),
                     args: call.get("args").cloned().unwrap_or_else(|| json!({})),
                     signature: signature.to_owned(),
+                    signature_protocol: Some(SignatureProtocol::Gemini),
                     ..Default::default()
                 });
                 continue;
@@ -287,12 +288,16 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             if thought {
-                current.parts.push(Part::thinking(text, signature));
+                current.parts.push(Part {
+                    signature_protocol: Some(SignatureProtocol::Gemini),
+                    ..Part::thinking(text, signature)
+                });
             } else if !text.is_empty() || !signature.is_empty() {
                 current.parts.push(Part {
                     kind: Some(PartKind::Text),
                     text: text.to_owned(),
                     signature: signature.to_owned(),
+                    signature_protocol: Some(SignatureProtocol::Gemini),
                     ..Default::default()
                 });
             }
@@ -429,8 +434,8 @@ fn attachment_value(p: &Part) -> Value {
             }
         })
     };
-    if !p.signature.is_empty() {
-        value["thoughtSignature"] = json!(p.signature);
+    if !p.native_signature(SignatureProtocol::Gemini).is_empty() {
+        value["thoughtSignature"] = json!(p.native_signature(SignatureProtocol::Gemini));
     }
     value
 }
@@ -471,8 +476,11 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
                 PartKind::Text => {
                     let mut part = Map::new();
                     part.insert("text".into(), json!(p.text));
-                    if !p.signature.is_empty() {
-                        part.insert("thoughtSignature".into(), json!(p.signature));
+                    if !p.native_signature(SignatureProtocol::Gemini).is_empty() {
+                        part.insert(
+                            "thoughtSignature".into(),
+                            json!(p.native_signature(SignatureProtocol::Gemini)),
+                        );
                     }
                     parts.push(Value::Object(part));
                 }
@@ -490,8 +498,11 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
                     call.insert("name".into(), json!(p.name));
                     call.insert("args".into(), p.args.clone());
                     part.insert("functionCall".into(), Value::Object(call));
-                    if !p.signature.is_empty() {
-                        part.insert("thoughtSignature".into(), json!(p.signature));
+                    if !p.native_signature(SignatureProtocol::Gemini).is_empty() {
+                        part.insert(
+                            "thoughtSignature".into(),
+                            json!(p.native_signature(SignatureProtocol::Gemini)),
+                        );
                     }
                     parts.push(Value::Object(part));
                 }
@@ -522,8 +533,11 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
                     let mut part = Map::new();
                     part.insert("text".into(), json!(p.text));
                     part.insert("thought".into(), json!(true));
-                    if !p.signature.is_empty() {
-                        part.insert("thoughtSignature".into(), json!(p.signature));
+                    if !p.native_signature(SignatureProtocol::Gemini).is_empty() {
+                        part.insert(
+                            "thoughtSignature".into(),
+                            json!(p.native_signature(SignatureProtocol::Gemini)),
+                        );
                     }
                     parts.push(Value::Object(part));
                 }
@@ -634,6 +648,7 @@ fn decode_parts(parts: &[Value]) -> Vec<Part> {
                     .unwrap_or_default()
                     .to_owned(),
                 args: call.get("args").cloned().unwrap_or_else(|| json!({})),
+                signature_protocol: Some(SignatureProtocol::Gemini),
                 signature: get_either(part, "thoughtSignature", "thought_signature")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
@@ -666,9 +681,16 @@ fn decode_parts(parts: &[Value]) -> Vec<Part> {
             .and_then(Value::as_str)
             .unwrap_or_default();
         if thought {
-            out.push(Part::thinking(text, signature));
-        } else if !text.is_empty() {
-            out.push(Part::text(text));
+            out.push(Part {
+                signature_protocol: Some(SignatureProtocol::Gemini),
+                ..Part::thinking(text, signature)
+            });
+        } else if !text.is_empty() || !signature.is_empty() {
+            out.push(Part {
+                signature: signature.to_owned(),
+                signature_protocol: Some(SignatureProtocol::Gemini),
+                ..Part::text(text)
+            });
         }
     }
     out
@@ -681,8 +703,11 @@ fn parts_to_json(parts: &[Part]) -> Value {
             PartKind::Text => {
                 let mut part = Map::new();
                 part.insert("text".into(), json!(p.text));
-                if !p.signature.is_empty() {
-                    part.insert("thoughtSignature".into(), json!(p.signature));
+                if !p.native_signature(SignatureProtocol::Gemini).is_empty() {
+                    part.insert(
+                        "thoughtSignature".into(),
+                        json!(p.native_signature(SignatureProtocol::Gemini)),
+                    );
                 }
                 out.push(Value::Object(part));
             }
@@ -698,13 +723,23 @@ fn parts_to_json(parts: &[Part]) -> Value {
                         "args": p.args,
                     }),
                 );
-                if !p.signature.is_empty() {
-                    part.insert("thoughtSignature".into(), json!(p.signature));
+                if !p.native_signature(SignatureProtocol::Gemini).is_empty() {
+                    part.insert(
+                        "thoughtSignature".into(),
+                        json!(p.native_signature(SignatureProtocol::Gemini)),
+                    );
                 }
                 out.push(Value::Object(part));
             }
             PartKind::ToolResult => out.push(json!({"text": p.text})),
-            PartKind::Thinking => out.push(json!({"text": p.text, "thought": true})),
+            PartKind::Thinking => {
+                let mut part = json!({"text":p.text,"thought":true});
+                let signature = p.native_signature(SignatureProtocol::Gemini);
+                if !signature.is_empty() {
+                    part["thoughtSignature"] = json!(signature);
+                }
+                out.push(part);
+            }
         }
     }
     Value::Array(out)
@@ -1009,11 +1044,13 @@ impl GeminiStreamDecoder {
                     });
                 }
             }
+            let attachment = decode_attachment(part);
+            let has_attachment = attachment.is_some();
             if !part
                 .get("thought")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
-                && let Some(image) = decode_attachment(part)
+                && let Some(image) = attachment
                 && (!image.data.is_empty() || !image.url.is_empty())
             {
                 out.push(StreamEvent::Image {
@@ -1040,7 +1077,31 @@ impl GeminiStreamDecoder {
                     .to_string();
                 out.push(StreamEvent::ToolCallStart { index, id, name });
                 out.push(StreamEvent::ToolCallDelta { index, args });
+                if let Some(signature) = get_either(part, "thoughtSignature", "thought_signature")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    out.push(StreamEvent::Signature {
+                        protocol: SignatureProtocol::Gemini,
+                        target: SignatureTarget::Tool { index },
+                        signature: signature.to_owned(),
+                    });
+                }
                 out.push(StreamEvent::ToolCallEnd { index });
+            } else if !has_attachment
+                && let Some(signature) = get_either(part, "thoughtSignature", "thought_signature")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+            {
+                out.push(StreamEvent::Signature {
+                    protocol: SignatureProtocol::Gemini,
+                    target: if part["thought"] == true {
+                        SignatureTarget::Thinking
+                    } else {
+                        SignatureTarget::Text
+                    },
+                    signature: signature.to_owned(),
+                });
             }
         }
         if let Some(event) = self.grounding.observe(candidate) {
@@ -1082,6 +1143,8 @@ impl GeminiStreamDecoder {
 
 #[derive(Debug)]
 struct PendingTool {
+    index: usize,
+    signature: String,
     id: String,
     name: String,
     args: String,
@@ -1131,18 +1194,18 @@ impl GeminiStreamEncoder {
 
     fn flush_tool(&mut self) -> Option<String> {
         let tool = self.tool.take()?;
-        Some(self.sse(
-            json!([{
-                "functionCall": {
-                    "id": if tool.id.is_empty() { format!("call_{}", response_id()) } else { tool.id.clone() },
-                    "name": tool.name,
-                    "args": serde_json::from_str::<Value>(&tool.args)
-                        .unwrap_or_else(|_| json!(tool.args)),
-                }
-            }]),
-            None,
-            false,
-        ))
+        let mut part = json!({
+            "functionCall": {
+                "id": if tool.id.is_empty() { format!("call_{}", response_id()) } else { tool.id.clone() },
+                "name": tool.name,
+                "args": serde_json::from_str::<Value>(&tool.args)
+                    .unwrap_or_else(|_| json!(tool.args)),
+            }
+        });
+        if !tool.signature.is_empty() {
+            part["thoughtSignature"] = json!(tool.signature);
+        }
+        Some(self.sse(json!([part]), None, false))
     }
 
     pub fn encode(&mut self, event: &StreamEvent) -> Option<String> {
@@ -1175,7 +1238,33 @@ impl GeminiStreamEncoder {
                     None => chunk,
                 })
             }
-            StreamEvent::ThinkingStart { .. } | StreamEvent::Sealed { .. } => None,
+            StreamEvent::Signature {
+                protocol: SignatureProtocol::Gemini,
+                target,
+                signature,
+            } => {
+                if signature.is_empty() {
+                    return None;
+                }
+                if let SignatureTarget::Tool { index } = target {
+                    if let Some(tool) = &mut self.tool
+                        && tool.index == *index
+                    {
+                        tool.signature.push_str(signature);
+                    }
+                    return None;
+                }
+                let mut out = self.flush_tool().unwrap_or_default();
+                let mut part = json!({"text":"","thoughtSignature":signature});
+                if *target == SignatureTarget::Thinking {
+                    part["thought"] = json!(true);
+                }
+                out.push_str(&self.sse(json!([part]), None, false));
+                Some(out)
+            }
+            StreamEvent::Signature { .. }
+            | StreamEvent::ThinkingStart { .. }
+            | StreamEvent::Sealed { .. } => None,
             StreamEvent::SearchStarted => None,
             StreamEvent::Search { search } | StreamEvent::SearchUpdate { search } => {
                 if !search.is_public_result() {
@@ -1193,9 +1282,11 @@ impl GeminiStreamEncoder {
                 frame.push_str(&self.sse(json!([attachment_value(image)]), None, false));
                 Some(frame)
             }
-            StreamEvent::ToolCallStart { id, name, .. } => {
+            StreamEvent::ToolCallStart { index, id, name } => {
                 let frame = self.flush_tool();
                 self.tool = Some(PendingTool {
+                    index: *index,
+                    signature: String::new(),
                     id: id.clone(),
                     name: name.clone(),
                     args: String::new(),
