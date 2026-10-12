@@ -142,6 +142,7 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_owned(),
+                        namespace: None,
                         parameters: f.get("parameters").cloned().unwrap_or_else(|| json!({})),
                     })
                 })

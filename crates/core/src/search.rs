@@ -193,7 +193,7 @@ impl WebSearchRequest {
         }
         let ty = v.get("type").and_then(Value::as_str).unwrap_or_default();
         let allowed_keys: &[&str] = match ty {
-            "tool" | "function" => &["type", "name", "function"],
+            "tool" | "function" => &["type", "name", "namespace", "function"],
             _ => &["type"],
         };
         if v.as_object()
@@ -210,16 +210,35 @@ impl WebSearchRequest {
             "any" => Ok(Choice::Required),
             t if t == "web_search" || t.starts_with("web_search_") => Ok(Choice::Search),
             "tool" | "function" => {
-                let name = v
-                    .get("name")
-                    .or_else(|| v.pointer("/function/name"))
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| invalid("tool_choice", "missing selected function name"))?;
+                let name = if let Some(namespace) = v.get("namespace") {
+                    let namespace = namespace
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| invalid("tool_choice", "invalid function namespace"))?;
+                    if v.get("function").is_some() {
+                        return Err(invalid(
+                            "tool_choice",
+                            "namespaced function selection cannot be nested",
+                        ));
+                    }
+                    let name = v
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| invalid("tool_choice", "missing selected function name"))?;
+                    format!("{namespace}__{name}")
+                } else {
+                    v.get("name")
+                        .or_else(|| v.pointer("/function/name"))
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| invalid("tool_choice", "missing selected function name"))?
+                        .to_owned()
+                };
                 if ty == "tool" && name == "web_search" {
                     Ok(Choice::Search)
                 } else {
-                    Ok(Choice::Function(name.into()))
+                    Ok(Choice::Function(name))
                 }
             }
             _ => Err(invalid("tool_choice", "unsupported search tool choice")),

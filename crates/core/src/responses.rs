@@ -4,7 +4,7 @@
 //! Spoken by Codex as a client and by OpenAI-compatible vendors that serve
 //! the newer endpoint (`POST /v1/responses`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::{CoreError, Result};
 use crate::ir::{
@@ -54,34 +54,13 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
         }),
         Value::Array(items) => {
             for item in items {
-                decode_input_item(item, &mut messages);
+                decode_input_item(item, &mut messages)?;
             }
         }
         _ => {}
     }
 
-    let tools = v
-        .get("tools")
-        .and_then(Value::as_array)
-        .map(|ts| {
-            ts.iter()
-                .filter(|t| t.get("type").is_none_or(|x| x == "function"))
-                .map(|t| Tool {
-                    name: t
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    description: t
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    parameters: t.get("parameters").cloned().unwrap_or_else(|| json!({})),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let tools = decode_tools(v.get("tools").and_then(Value::as_array))?;
 
     Ok(CompletionRequest {
         model,
@@ -100,6 +79,99 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
         stop: Vec::new(),
         stream: v.get("stream").and_then(Value::as_bool).unwrap_or(false),
     })
+}
+
+fn flat_name(namespace: &str, name: &str) -> String {
+    format!("{namespace}__{name}")
+}
+
+fn wire_name(name: &str, namespace: Option<&str>) -> String {
+    namespace
+        .and_then(|namespace| name.strip_prefix(&format!("{namespace}__")))
+        .filter(|name| !name.is_empty())
+        .unwrap_or(name)
+        .to_owned()
+}
+
+fn component(v: Option<&Value>, field: &'static str) -> Result<String> {
+    let value = v.and_then(Value::as_str).ok_or(missing(field))?;
+    if value.is_empty() || value.contains("__") {
+        return Err(CoreError::Invalid {
+            field,
+            detail: "invalid namespace or tool name".into(),
+        });
+    }
+    Ok(value.to_owned())
+}
+
+fn decode_tools(tools: Option<&Vec<Value>>) -> Result<Vec<Tool>> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for tool in tools.into_iter().flatten() {
+        match tool
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("function")
+        {
+            "function" => {
+                let name = component(tool.get("name"), "name")?;
+                if !seen.insert(name.clone()) {
+                    return Err(CoreError::Invalid {
+                        field: "tools",
+                        detail: "duplicate function name".into(),
+                    });
+                }
+                out.push(Tool {
+                    name,
+                    namespace: None,
+                    description: tool
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    parameters: tool.get("parameters").cloned().unwrap_or_else(|| json!({})),
+                });
+            }
+            "namespace" => {
+                let namespace = component(tool.get("name"), "namespace")?;
+                let nested = tool
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .ok_or(missing("tools"))?;
+                for child in nested {
+                    if child.get("type").and_then(Value::as_str) != Some("function") {
+                        return Err(CoreError::Invalid {
+                            field: "tools",
+                            detail: "nested namespaces and custom tools are unsupported".into(),
+                        });
+                    }
+                    let child_name = component(child.get("name"), "name")?;
+                    let name = flat_name(&namespace, &child_name);
+                    if !seen.insert(name.clone()) {
+                        return Err(CoreError::Invalid {
+                            field: "tools",
+                            detail: "duplicate flattened function name".into(),
+                        });
+                    }
+                    out.push(Tool {
+                        name,
+                        namespace: Some(namespace.clone()),
+                        description: child
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        parameters: child
+                            .get("parameters")
+                            .cloned()
+                            .unwrap_or_else(|| json!({})),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 fn decode_reasoning(item: &Value) -> Part {
@@ -128,7 +200,7 @@ fn native_reasoning(p: &Part) -> Option<Value> {
 }
 
 /// One item of a Responses `input` array onto the message list.
-fn decode_input_item(item: &Value, messages: &mut Vec<Message>) {
+fn decode_input_item(item: &Value, messages: &mut Vec<Message>) -> Result<()> {
     let ty = item.get("type").and_then(Value::as_str).unwrap_or_default();
     match ty {
         "message" | "" => {
@@ -177,21 +249,45 @@ fn decode_input_item(item: &Value, messages: &mut Vec<Message>) {
             }
         }
         "function_call" => {
+            let namespace = item.get("namespace");
+            if namespace.is_some()
+                && (namespace
+                    .and_then(Value::as_str)
+                    .is_none_or(|s| s.is_empty())
+                    || item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_none_or(|s| s.is_empty()))
+            {
+                return Err(CoreError::Invalid {
+                    field: "input",
+                    detail: "invalid namespaced function call".into(),
+                });
+            }
             let args_raw = item
                 .get("arguments")
                 .and_then(Value::as_str)
                 .unwrap_or("{}");
             let args: Value =
                 serde_json::from_str(args_raw).unwrap_or(Value::String(args_raw.to_owned()));
+            let namespace = item
+                .get("namespace")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+            let mut call = Part::tool_call(
+                item.get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                namespace
+                    .as_deref()
+                    .map_or_else(|| name.to_owned(), |n| flat_name(n, name)),
+                args,
+            );
+            call.namespace = namespace;
             messages.push(Message {
                 role: Role::Assistant,
-                parts: vec![Part::tool_call(
-                    item.get("call_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                    item.get("name").and_then(Value::as_str).unwrap_or_default(),
-                    args,
-                )],
+                parts: vec![call],
             });
         }
         "function_call_output" => {
@@ -235,6 +331,7 @@ fn decode_input_item(item: &Value, messages: &mut Vec<Message>) {
         }),
         _ => {}
     }
+    Ok(())
 }
 
 /// Encode an IR request as an OpenAI Responses body, asking for `model`.
@@ -295,12 +392,11 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
                     if let Some((role, content)) = open_message.take() {
                         input.push(json!({"type": "message", "role": role, "content": content}));
                     }
-                    input.push(json!({
-                        "type": "function_call",
-                        "call_id": p.id,
-                        "name": p.name,
-                        "arguments": p.args.to_string(),
-                    }));
+                    let mut call = json!({"type":"function_call","call_id":p.id,"name":wire_name(&p.name, p.namespace.as_deref()),"arguments":p.args.to_string()});
+                    if let Some(namespace) = &p.namespace {
+                        call["namespace"] = json!(namespace);
+                    }
+                    input.push(call);
                 }
                 PartKind::ToolResult => {
                     if let Some((role, content)) = open_message.take() {
@@ -339,23 +435,26 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
     out.insert("input".into(), Value::Array(input));
 
     if !req.tools.is_empty() {
-        out.insert(
-            "tools".into(),
-            Value::Array(
-                req.tools
-                    .iter()
-                    .map(|t| {
-                        json!({
-                            "type": "function",
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.parameters,
-                            "strict": false,
-                        })
-                    })
-                    .collect(),
-            ),
-        );
+        let mut tools = Vec::new();
+        let mut namespaces: HashMap<String, usize> = HashMap::new();
+        for t in &req.tools {
+            let name = t
+                .namespace
+                .as_ref()
+                .and_then(|n| t.name.strip_prefix(&format!("{n}__")))
+                .unwrap_or(&t.name);
+            let function = json!({"type":"function","name":name,"description":t.description,"parameters":t.parameters,"strict":false});
+            if let Some(namespace) = &t.namespace {
+                let index = *namespaces.entry(namespace.clone()).or_insert_with(|| {
+                    tools.push(json!({"type":"namespace","name":namespace,"tools":[]}));
+                    tools.len() - 1
+                });
+                tools[index]["tools"].as_array_mut().unwrap().push(function);
+            } else {
+                tools.push(function);
+            }
+        }
+        out.insert("tools".into(), Value::Array(tools));
         out.insert(
             "tool_choice".into(),
             req.tool_choice.clone().unwrap_or(json!("auto")),
@@ -498,13 +597,22 @@ pub fn decode_response(v: &Value) -> Result<CompletionResponse> {
                     .unwrap_or("{}");
                 let args: Value =
                     serde_json::from_str(args_raw).unwrap_or(Value::String(args_raw.to_owned()));
-                parts.push(Part::tool_call(
+                let namespace = item
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+                let mut call = Part::tool_call(
                     item.get("call_id")
                         .and_then(Value::as_str)
                         .unwrap_or_default(),
-                    item.get("name").and_then(Value::as_str).unwrap_or_default(),
+                    namespace
+                        .as_deref()
+                        .map_or_else(|| name.to_owned(), |n| flat_name(n, name)),
                     args,
-                ));
+                );
+                call.namespace = namespace;
+                parts.push(call);
             }
             "reasoning" => parts.push(decode_reasoning(item)),
             _ => {}
@@ -578,14 +686,13 @@ pub fn encode_response(resp: &CompletionResponse) -> Value {
                 "status": "completed",
                 "content": [{"type": "output_text", "text": p.text, "annotations": []}],
             })),
-            PartKind::ToolCall => output.push(json!({
-                "type": "function_call",
-                "id": format!("fc_{}", response_id()),
-                "call_id": p.id,
-                "name": p.name,
-                "arguments": p.args.to_string(),
-                "status": "completed",
-            })),
+            PartKind::ToolCall => {
+                let mut call = json!({"type":"function_call","id":format!("fc_{}", response_id()),"call_id":p.id,"name":wire_name(&p.name, p.namespace.as_deref()),"arguments":p.args.to_string(),"status":"completed"});
+                if let Some(namespace) = &p.namespace {
+                    call["namespace"] = json!(namespace);
+                }
+                output.push(call);
+            }
             PartKind::Thinking => output.push(native_reasoning(p).unwrap_or_else(|| {
                 json!({
                     "type": "reasoning",

@@ -168,8 +168,10 @@ pub struct Part {
     pub url: String,
     /// Tool call id.
     pub id: String,
-    /// Tool name.
+    /// Tool name, flattened with `__` when namespaced.
     pub name: String,
+    /// Original Responses namespace, when the call was namespaced.
+    pub namespace: Option<String>,
     /// Tool call arguments, a JSON object when well-formed.
     pub args: Value,
     /// The call a tool result answers.
@@ -232,6 +234,7 @@ impl Part {
             kind: Some(PartKind::ToolCall),
             id: id.into(),
             name: name.into(),
+            namespace: None,
             args,
             ..Default::default()
         }
@@ -292,8 +295,10 @@ pub struct Message {
 /// A tool the model may call.
 #[derive(Debug, Clone)]
 pub struct Tool {
-    /// Tool name.
+    /// Tool name, flattened with `__` when it belongs to a namespace.
     pub name: String,
+    /// Original Responses namespace, when the tool was namespaced.
+    pub namespace: Option<String>,
     /// What it does.
     pub description: String,
     /// JSON Schema for its arguments.

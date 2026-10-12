@@ -38,6 +38,18 @@ fn name(v: Option<&Value>) -> Result<String> {
         .ok_or_else(|| invalid("missing selected function name"))
 }
 fn selected_name(v: &Value) -> Result<String> {
+    if v.get("namespace").is_some() {
+        let namespace = v
+            .get("namespace")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid("missing namespace"))?;
+        if v.get("function").is_some() || extra(v, &["type", "name", "namespace"]) {
+            return Err(invalid("malformed namespaced function"));
+        }
+        let name = name(v.get("name"))?;
+        return Ok(format!("{namespace}__{name}"));
+    }
     if let Some(nested) = v.get("function") {
         if !nested.is_object() || v.get("name").is_some() {
             return Err(invalid("ambiguous or malformed selected function"));
@@ -153,11 +165,8 @@ fn parse(v: &Value) -> Result<Selection> {
             for tool in tools {
                 match tool.get("type").and_then(Value::as_str) {
                     Some("function") => {
-                        if tool.get("namespace").is_some() {
-                            return Err(invalid("namespaced allowed functions are not supported"));
-                        }
                         let nested = tool.get("function");
-                        if extra(tool, &["type", "name", "function"])
+                        if extra(tool, &["type", "name", "namespace", "function"])
                             || nested.is_some_and(|f| extra(f, &["name"]))
                         {
                             return Err(invalid("unsupported allowed function restrictions"));
@@ -190,7 +199,7 @@ fn parse(v: &Value) -> Result<Selection> {
             } else {
                 Protocol::Responses
             });
-            s.native_only = extra(v, &["type", "name", "function"])
+            s.native_only = extra(v, &["type", "name", "namespace", "function"])
                 || v.get("function").is_some_and(|f| extra(f, &["name"]));
         }
         "auto" | "none" | "any" => {
