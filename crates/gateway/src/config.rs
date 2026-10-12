@@ -630,7 +630,7 @@ pub struct GroupConfigSnapshot {
 /// Secret-free routing configuration for the token-protected console.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigSnapshot {
-    /// Monotonic in-process revision used for optimistic management updates.
+    /// Durable opaque revision used for optimistic management updates.
     /// It is opaque to clients and never contains configuration or secret data.
     pub revision: u64,
     /// Provider used when a model names none.
@@ -775,8 +775,38 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Save back to the same path, creating parents as needed.
+    const PERSISTENCE_METADATA_KEY: &str = "__magpie_lite";
+
+    /// Read the durable optimistic-concurrency revision embedded in the TOML.
+    ///
+    /// The metadata table is intentionally ignored by `Config` deserialization,
+    /// so older configuration files and hand-edited files remain compatible.
+    pub fn persisted_revision(path: &std::path::Path) -> anyhow::Result<u64> {
+        if !path.exists() {
+            return Ok(1);
+        }
+        let text = fs::read_to_string(path)?;
+        let document: toml::Value = toml::from_str(&text)?;
+        let revision = document
+            .get(Self::PERSISTENCE_METADATA_KEY)
+            .and_then(|value| value.get("revision"))
+            .and_then(toml::Value::as_integer)
+            .map(|value| value.max(1) as u64)
+            .unwrap_or(1);
+        Ok(revision)
+    }
+
+    /// Save back to the same path, preserving the durable revision if present.
     pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let revision = Self::persisted_revision(path).unwrap_or(1);
+        self.save_with_revision(path, revision)
+    }
+
+    /// Save an atomically replaced configuration and its durable revision.
+    ///
+    /// Keeping the revision in the same TOML document avoids the two-file
+    /// failure window that a sidecar would introduce during a crash.
+    pub fn save_with_revision(&self, path: &std::path::Path, revision: u64) -> anyhow::Result<()> {
         use std::io::Write;
 
         let parent = path
@@ -784,8 +814,14 @@ impl Config {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| std::path::Path::new("."));
         fs::create_dir_all(parent)?;
+        let mut text = toml::to_string_pretty(self)?;
+        text.push_str("\n[");
+        text.push_str(Self::PERSISTENCE_METADATA_KEY);
+        text.push_str("]\nrevision = ");
+        text.push_str(&revision.max(1).to_string());
+        text.push('\n');
         let mut file = tempfile::NamedTempFile::new_in(parent)?;
-        file.write_all(toml::to_string_pretty(self)?.as_bytes())?;
+        file.write_all(text.as_bytes())?;
         file.as_file().sync_all()?;
         file.persist(path)?;
         Ok(())

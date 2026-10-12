@@ -95,9 +95,13 @@ impl ConfigStore {
             provider.key_generation = index as u64 + 1;
         }
         let next_key_generation = AtomicU64::new(config.provider.len() as u64 + 1);
+        let revision = path
+            .as_deref()
+            .and_then(|path| Config::persisted_revision(path).ok())
+            .unwrap_or(1);
         Self(Arc::new(Inner {
             current: RwLock::new(config),
-            revision: AtomicU64::new(1),
+            revision: AtomicU64::new(revision),
             updates: Mutex::new(()),
             path,
             next_key_generation,
@@ -171,13 +175,23 @@ impl ConfigStore {
                         .to_owned(),
                 )
             })?;
-            if toml::to_string(&disk).ok() != toml::to_string(&current).ok() {
+            let disk_revision = Config::persisted_revision(path).map_err(|_| {
+                (
+                    StatusCode::CONFLICT,
+                    "configuration revision cannot be read; restart the gateway after fixing it"
+                        .to_owned(),
+                )
+            })?;
+            if disk_revision != current_revision
+                || toml::to_string(&disk).ok() != toml::to_string(&current).ok()
+            {
                 return Err((
                     StatusCode::CONFLICT,
                     "configuration changed on disk; restart the gateway before editing".to_owned(),
                 ));
             }
-            next.save(path).map_err(|error| {
+            let revision = current_revision.saturating_add(1);
+            next.save_with_revision(path, revision).map_err(|error| {
                 tracing::error!(%error, "could not persist configuration");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -201,7 +215,7 @@ impl ConfigStore {
             // Publish configuration and revision under the same lock so readers
             // cannot pair old configuration with a new revision (or vice versa).
             let mut published = store.0.current.write().unwrap_or_else(|p| p.into_inner());
-            let revision = store.0.revision.fetch_add(1, Ordering::AcqRel) + 1;
+            store.0.revision.store(revision, Ordering::Release);
             let snapshot = next.snapshot_with_revision(revision);
             *published = next;
             Ok(snapshot)
@@ -252,6 +266,57 @@ mod tests {
         assert_eq!(store.update(|_| Ok(())).await.unwrap().revision, 3);
     }
 
+    #[tokio::test]
+    async fn revision_survives_gateway_restart_and_advances_from_disk() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        Config::default().save(&path).unwrap();
+
+        let first = ConfigStore::new(Config::load(&path).unwrap(), Some(path.clone()));
+        assert_eq!(first.snapshot().revision, 1);
+        let committed = first
+            .update(|config| {
+                config.key_cooldown_ms = 123;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(committed.revision, 2);
+        drop(first);
+
+        let second = ConfigStore::new(Config::load(&path).unwrap(), Some(path.clone()));
+        assert_eq!(second.snapshot().revision, 2);
+        let committed = second
+            .update_if_revision(Some(2), |config| {
+                config.key_cooldown_ms = 456;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(committed.revision, 3);
+        assert_eq!(Config::persisted_revision(&path).unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn external_revision_change_is_not_overwritten() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        Config::default().save(&path).unwrap();
+        let store = ConfigStore::new(Config::load(&path).unwrap(), Some(path.clone()));
+
+        let disk = Config::load(&path).unwrap();
+        disk.save_with_revision(&path, 9).unwrap();
+        let error = store
+            .update(|config| {
+                config.key_cooldown_ms = 999;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert_eq!(Config::persisted_revision(&path).unwrap(), 9);
+        assert_eq!(store.snapshot().revision, 1);
+    }
     #[tokio::test]
     async fn save_failure_does_not_publish_a_new_config() {
         let directory = tempfile::tempdir().unwrap();

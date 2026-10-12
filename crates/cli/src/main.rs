@@ -194,6 +194,18 @@ fn load_config(path: &Option<std::path::PathBuf>) -> Result<Config> {
     Config::load(&path).with_context(|| format!("loading {}", path.display()))
 }
 
+fn save_config(path: &std::path::Path, config: &Config) -> Result<()> {
+    let revision = if path.exists() {
+        Config::persisted_revision(path)?
+            .checked_add(1)
+            .context("configuration revision exhausted")?
+    } else {
+        1
+    };
+    config.save_with_revision(path, revision)?;
+    Ok(())
+}
+
 fn provider_path(cli: &Option<std::path::PathBuf>) -> Result<std::path::PathBuf> {
     match cli {
         Some(p) => Ok(p.clone()),
@@ -279,7 +291,7 @@ async fn main() -> Result<()> {
                     key_generation: 0,
                 };
                 cfg.set_provider(provider, default)?;
-                cfg.save(&path)?;
+                save_config(&path, &cfg)?;
                 println!("saved provider `{}` to {}", id, path.display());
             }
             ProviderCommand::List => {
@@ -320,7 +332,7 @@ async fn main() -> Result<()> {
                 let path = provider_path(&cli.config)?;
                 let mut cfg = Config::load(&path)?;
                 cfg.remove_provider(&id)?;
-                cfg.save(&path)?;
+                save_config(&path, &cfg)?;
                 println!("removed provider `{id}`");
             }
         },
@@ -350,7 +362,7 @@ async fn main() -> Result<()> {
                     Some(i) => cfg.group[i] = group,
                     None => cfg.group.push(group),
                 }
-                cfg.save(&path)?;
+                save_config(&path, &cfg)?;
                 println!("saved group `group/{id}` to {}", path.display());
             }
             GroupCommand::List => {
@@ -387,7 +399,7 @@ async fn main() -> Result<()> {
                 if cfg.group.len() == before {
                     anyhow::bail!("no group `{id}`");
                 }
-                cfg.save(&path)?;
+                save_config(&path, &cfg)?;
                 println!("removed group `{id}`");
             }
         },
