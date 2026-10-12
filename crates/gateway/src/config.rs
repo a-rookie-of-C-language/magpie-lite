@@ -532,6 +532,10 @@ pub struct GroupConfig {
     /// Process-local route selection policy.
     #[serde(default)]
     pub routing: RoutingPolicy,
+    /// Per-attempt first-content budget for non-final streaming group routes.
+    /// Zero disables this group limit; gateway-wide stream limits still apply.
+    #[serde(default)]
+    pub first_token_timeout_ms: u64,
 }
 
 impl GroupConfig {
@@ -625,6 +629,9 @@ pub struct GroupConfigSnapshot {
     pub routes: Vec<String>,
     /// Route selection policy.
     pub routing: RoutingPolicy,
+    /// First-content budget for non-final streaming group routes (0 disables).
+    #[serde(default)]
+    pub first_token_timeout_ms: u64,
 }
 
 /// Secret-free routing configuration for the token-protected console.
@@ -933,6 +940,7 @@ impl Config {
                     name: g.label().to_owned(),
                     routes: g.routes.clone(),
                     routing: g.routing,
+                    first_token_timeout_ms: g.first_token_timeout_ms,
                 })
                 .collect(),
         }
@@ -1290,6 +1298,7 @@ base_url = "http://127.0.0.1:1/v1"
             name: "Daily coding".into(),
             routes: vec!["mock/mock-model".into(), "backup/other".into()],
             routing: RoutingPolicy::default(),
+            first_token_timeout_ms: 0,
         });
 
         let snapshot = config.snapshot();
@@ -1316,6 +1325,7 @@ base_url = "http://127.0.0.1:1/v1"
             name: String::new(),
             routes: vec!["mock/model-a".into(), "mock/model-b".into()],
             routing: RoutingPolicy::Order,
+            first_token_timeout_ms: 0,
         };
 
         assert!(group.validate().is_ok());
@@ -1334,6 +1344,12 @@ routes = ["mock/model"]
         )
         .unwrap();
         assert_eq!(group.routing, RoutingPolicy::Order);
+        assert_eq!(group.first_token_timeout_ms, 0);
+        let mut configured = group;
+        configured.first_token_timeout_ms = 1234;
+        let encoded = toml::to_string(&configured).unwrap();
+        let decoded: GroupConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.first_token_timeout_ms, 1234);
     }
 
     #[test]

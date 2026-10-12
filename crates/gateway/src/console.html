@@ -694,6 +694,7 @@
                 <div class="field"><label for="group-name">Display name (optional)</label><input id="group-name" class="token-input" placeholder="Daily coding"></div>
                 <div class="field"><label for="group-routes">Routes in fallback order</label><textarea id="group-routes" class="token-input" required placeholder="deepseek/deepseek-chat&#10;kimi/moonshot-v1-128k" aria-describedby="group-routes-help"></textarea><p id="group-routes-help" class="group-help">One provider/model per line. The selected policy chooses the starting route; remaining routes are fallback candidates.</p><p id="group-providers" class="group-help"></p></div>
                 <div class="field"><label for="group-routing">Route policy</label><select id="group-routing" class="token-input" aria-describedby="group-routing-help"><option value="order">Ordered</option><option value="rotate">Rotate</option><option value="usage">Least used</option></select><p id="group-routing-help" class="group-help">Ordered always starts at the first route. Rotate advances the starting route per request. Least used prefers routes with fewer attempts in this gateway process.</p></div>
+                <div class="field"><label for="group-first-token">First-content timeout (ms)</label><input id="group-first-token" class="token-input" type="number" min="0" max="9007199254740991" step="1" value="0" required aria-describedby="group-first-token-help"><p id="group-first-token-help" class="group-help">0 disables this group limit. Streaming requests only: a slow non-final route switches to the next candidate before any reply is released. The final route still obeys gateway-wide limits.</p></div>
                 <div class="group-actions"><button id="group-save" class="button" type="submit">Save group</button><button id="group-cancel" class="button secondary" type="button">Cancel</button></div>
               </form>
               <p id="group-message" class="console-message" role="status" aria-live="polite" aria-atomic="true"></p>
@@ -795,6 +796,7 @@
       groupName: document.getElementById("group-name"),
       groupRoutes: document.getElementById("group-routes"),
       groupRouting: document.getElementById("group-routing"),
+      groupFirstToken: document.getElementById("group-first-token"),
       groupProviders: document.getElementById("group-providers"),
       groupNew: document.getElementById("group-new"),
       groupSave: document.getElementById("group-save"),
@@ -1572,6 +1574,7 @@
       elements.groupName.value = group?.name || "";
       elements.groupRoutes.value = (group?.routes || []).join("\n");
       elements.groupRouting.value = group?.routing || "order";
+      elements.groupFirstToken.value = group?.first_token_timeout_ms ?? 0;
       elements.groupMessage.textContent = "";
       elements.groupEditor.hidden = false;
       (group ? elements.groupName : elements.groupId).focus();
@@ -1651,11 +1654,17 @@
         id: elements.groupId.value.trim(),
         name: elements.groupName.value.trim(),
         routes: elements.groupRoutes.value.split(/\r?\n/).map(route => route.trim()).filter(Boolean),
-        routing: elements.groupRouting.value
+        routing: elements.groupRouting.value,
+        first_token_timeout_ms: Number(elements.groupFirstToken.value)
       };
       if (!body.routes.length) {
         elements.groupMessage.textContent = "Enter at least one provider/model route.";
         elements.groupRoutes.focus();
+        return;
+      }
+      if (!Number.isSafeInteger(body.first_token_timeout_ms) || body.first_token_timeout_ms < 0) {
+        elements.groupMessage.textContent = "Enter a non-negative whole-number timeout in milliseconds (0 disables).";
+        elements.groupFirstToken.focus();
         return;
       }
       const path = editingGroup === null ? "/config/groups" : `/config/groups/${encodeURIComponent(editingGroup)}`;

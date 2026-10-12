@@ -746,6 +746,7 @@ async fn spawn_gateway_with_same_provider_group(upstream: String) -> String {
             name: "Same provider models".into(),
             routes: vec!["mock/model-a".into(), "mock/model-b".into()],
             routing: RoutingPolicy::Order,
+            first_token_timeout_ms: 0,
         }],
     };
     let requests = request_log(&config);
@@ -813,6 +814,7 @@ async fn spawn_gateway_with_group(
             name: "Daily coding".into(),
             routes: vec!["primary/mock-model".into(), "backup/mock-model".into()],
             routing,
+            first_token_timeout_ms: 0,
         }],
     };
     let requests = request_log(&config);

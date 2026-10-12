@@ -30,17 +30,53 @@ impl ResponsesHold {
     }
 }
 
+/// One upstream attempt's group budget. Use the same absolute deadline for
+/// headers and opening prefetch, then discard it once the candidate commits.
+/// Never apply it to the final available route or to an already-known HTTP error.
+pub(crate) struct GroupFirstToken(Option<Instant>);
+
+impl GroupFirstToken {
+    pub(crate) fn new(timeout_ms: u64) -> Self {
+        Self(
+            (timeout_ms > 0)
+                .then(|| Instant::now().checked_add(Duration::from_millis(timeout_ms)))
+                .flatten(),
+        )
+    }
+
+    pub(crate) async fn wait<T>(
+        &self,
+        future: impl Future<Output = T>,
+    ) -> Result<T, StreamTimeout> {
+        let Some(deadline) = self.0 else {
+            return Ok(future.await);
+        };
+        tokio::time::timeout_at(deadline, future)
+            .await
+            .map_err(|_| StreamTimeout::GroupFirstToken)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamTimeout {
     FirstContent,
     Idle,
+    GroupFirstToken,
 }
 
 impl StreamTimeout {
+    pub(crate) fn attempt_status(self) -> &'static str {
+        match self {
+            Self::GroupFirstToken => "group_first_token_timeout",
+            _ => "504",
+        }
+    }
+
     pub(crate) fn message(self) -> &'static str {
         match self {
             Self::FirstContent => "upstream first-content timeout",
             Self::Idle => "upstream stream idle timeout",
+            Self::GroupFirstToken => "group first-token timeout",
         }
     }
 }
@@ -152,6 +188,60 @@ impl StreamClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn group_budget_covers_headers_and_prefetch_without_rearming() {
+        let group = GroupFirstToken::new(300);
+        let began = Instant::now();
+        assert_eq!(
+            group
+                .wait(async {
+                    tokio::time::sleep(Duration::from_millis(180)).await;
+                    7
+                })
+                .await,
+            Ok(7)
+        );
+        assert_eq!(
+            group.wait(std::future::pending::<()>()).await,
+            Err(StreamTimeout::GroupFirstToken)
+        );
+        assert_eq!(began.elapsed(), Duration::from_millis(300));
+        let next_attempt = GroupFirstToken::new(300);
+        assert_eq!(
+            next_attempt.wait(std::future::pending::<()>()).await,
+            Err(StreamTimeout::GroupFirstToken)
+        );
+        assert_eq!(began.elapsed(), Duration::from_millis(600));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn group_budget_disabled_extreme_and_ready_result_semantics() {
+        let disabled = GroupFirstToken::new(0);
+        assert_eq!(
+            disabled
+                .wait(async {
+                    tokio::time::sleep(Duration::from_secs(600)).await;
+                    7
+                })
+                .await,
+            Ok(7)
+        );
+        assert_eq!(
+            GroupFirstToken::new(u64::MAX)
+                .wait(std::future::ready(7))
+                .await,
+            Ok(7)
+        );
+        let expired = GroupFirstToken::new(100);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Like timeout_at, a ready result wins over a simultaneously-ready cap.
+        assert_eq!(expired.wait(std::future::ready(7)).await, Ok(7));
+        assert_eq!(
+            expired.wait(std::future::pending::<()>()).await,
+            Err(StreamTimeout::GroupFirstToken)
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn responses_hold_defaults_to_four_minutes_and_is_not_rearmed_by_waiting() {

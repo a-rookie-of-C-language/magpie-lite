@@ -136,6 +136,9 @@ enum GroupCommand {
         /// Route policy: order, rotate, or usage.
         #[arg(long, default_value = "order")]
         routing: RoutingPolicy,
+        /// First-content budget (ms) for streaming non-final routes; 0 disables.
+        #[arg(long, default_value_t = 0)]
+        first_token_timeout_ms: u64,
     },
     /// List configured groups.
     List,
@@ -342,6 +345,7 @@ async fn main() -> Result<()> {
                 name,
                 routes,
                 routing,
+                first_token_timeout_ms,
             } => {
                 let path = provider_path(&cli.config)?;
                 let mut cfg = Config::load(&path)?;
@@ -350,6 +354,7 @@ async fn main() -> Result<()> {
                     name: name.unwrap_or_default(),
                     routes,
                     routing,
+                    first_token_timeout_ms,
                 };
                 group.validate()?;
                 for route in &group.routes {
@@ -380,10 +385,11 @@ async fn main() -> Result<()> {
                         g.name.as_str()
                     };
                     println!(
-                        "group/{:<18} {} [routing: {}]",
+                        "group/{:<18} {} [routing: {}, first-token: {} ms]",
                         g.id,
                         label,
-                        g.routing.as_str()
+                        g.routing.as_str(),
+                        g.first_token_timeout_ms
                     );
                     for (i, route) in g.routes.iter().enumerate() {
                         let marker = if i == 0 { "route" } else { "fallback" };

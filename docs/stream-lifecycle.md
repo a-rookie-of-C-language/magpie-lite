@@ -124,9 +124,55 @@ Timers are cooperative and enforced when the handler/event stream is polled;
 they are not a background cancellation service and cannot interrupt blocking
 CPU work or a downstream that never polls again. Idle time is transport silence,
 not a post-content meaningful-progress or loop-detection policy: an endless
-heartbeat stream after content can remain live. The reference group-specific
-FirstToken policy and slow-final-route exceptions are not replicated by these
-gateway-wide safety settings.
+heartbeat stream after content can remain live. Group first-content switching
+is a separate policy described below; disabling its cap on the final route does
+not disable these gateway-wide safety settings.
+
+## Group first-content switching
+
+The group TOML/API field `first_token_timeout_ms` defaults to zero (disabled).
+It follows the reference's `Group.FirstToken` slow-start switching policy,
+using milliseconds rather than the reference's seconds. It is exposed by the
+protected configuration snapshot, group POST/PUT, CLI
+`group add --first-token-timeout-ms`, and console editor.
+
+Only streaming group requests enable it, and only for non-final available
+candidates in the scheduled order. Each upstream attempt starts one absolute
+budget before sending; header latency and held opening prefetch share that same
+deadline. Start/usage/empty text, upstream comments and downstream keepalive do
+not rearm or satisfy it. When it expires, the held upstream is dropped, the
+attempt is internally classified as `group_first_token_timeout`, and routing
+moves to the next group candidate without consuming that route's other keys or
+placing any key in quota cooldown. Subsequent attempts get their own budget.
+Abandoned metadata/usage never appears in the selected answer or final record.
+
+The last scheduled candidate (including a single-member group) is exempt from
+the group cap, even when rotate/usage places an earlier configured route last.
+Gateway-wide first-content/read-idle clocks still run. Known non-2xx headers
+stop this opening policy before reading the error body; global clocks continue
+to bound that read. Ordinary provider fallback and nonstreaming requests do not
+use the group budget. In-flight requests retain their original configuration.
+
+Prefetch returning commits the candidate: actual text/reasoning/tool output,
+terminal events, opening event/metadata byte safety bounds, or a real Responses
+opening event released by its request-wide hold budget. Once committed, the
+group timer is discarded; a later slow chunk or error cannot trigger fallback.
+Global first-content/read-idle limits remain independent. Ready transport
+results are preferred over a simultaneously-ready group timer. This is
+cooperative cancellation while futures are polled, not a background watchdog.
+
+Thirteen `group_first_token_*` local HTTP tests cover the four-by-four
+client/upstream matrix, headers plus opening in one budget, header cancellation,
+final/single-route exemption with global bounds, reasoning/tools and metadata
+commit, ordinary/nonstream/HTTP-error exclusions, multiple models on one
+provider, rotate/usage ordering, pinned hot edits and real socket cancellation
+with persisted last-attempt accounting. Paused-clock tests check absolute and
+per-attempt budgets, zero/extreme values and ready-result precedence. API and
+child-CLI tests cover persistence, editing, defaults and invalid input; the
+browser fixture exercises save/reopen/reset and native field validation.
+This does not implement the reference's queue, slow-final-route waiting UI,
+post-content progress/loop policies or HTTP/2 cancellation conformance, and does
+not establish live-vendor or installed-Agent compatibility.
 
 ## Downstream keepalive
 
@@ -168,8 +214,8 @@ A heartbeat tick must not recreate an upstream header/read timeout.
 
 These are comments, not protocol events: they do not satisfy first-content,
 meaningful-progress or an Agent's event-only idle policy. Responses opening
-release is a separate policy described below. Group timing/queue policies and
-slow-final-route exceptions remain unimplemented; this is not a claim of full
+release is a separate policy described below. Group first-content switching is
+documented above; queue and slow-final-route exceptions remain unimplemented; this is not a claim of full
 reference keepalive or real-Agent conformance.
 
 ## Responses opening-event release
@@ -200,8 +246,9 @@ missing opening metadata, ignored heartbeats, disabled/non-Responses exclusions,
 ready-error precedence and real socket disconnect/persisted accounting. Paused
 clock tests cover the default budget, disable/extreme values and retained idle
 and first-content deadlines. This implements the request-level opening-release
-subset of reference `internal/gateway/fallback.go`, not its complete group
-FirstToken, queue, slow-final-route or post-content event-idle policies. Local
+subset of reference `internal/gateway/fallback.go`. Group first-content switching
+is documented separately; queue, slow-final-route and post-content event-idle
+policies remain outside this implementation. Local
 fixtures do not establish live vendor or installed Agent compatibility.
 
 ### Retry classification

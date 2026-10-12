@@ -25,7 +25,7 @@ use crate::config::{Config, GroupConfig, Protocol, ProviderConfig};
 use crate::config_store::{ConfigStore, IdempotencyRequest};
 use crate::cooldown::quota_cooldown;
 use crate::stream_keepalive::{self, Keepalive, UpstreamActivity};
-use crate::stream_timeout::{ResponsesHold, StreamClock, StreamTimeout};
+use crate::stream_timeout::{GroupFirstToken, ResponsesHold, StreamClock, StreamTimeout};
 use crate::upstream;
 use crate::usage::{RequestLog, RequestTracker};
 
@@ -969,6 +969,15 @@ async fn send_with_fallback(
                 "routing upstream"
             );
 
+            let first_token = GroupFirstToken::new(if creq.stream && route_index != last_route {
+                route
+                    .group_id
+                    .as_deref()
+                    .and_then(|id| config.group(id))
+                    .map_or(0, |group| group.first_token_timeout_ms)
+            } else {
+                0
+            });
             let clock = StreamClock::new(
                 if creq.stream {
                     config.stream_first_content_timeout_ms
@@ -977,20 +986,21 @@ async fn send_with_fallback(
                 },
                 config.stream_idle_timeout_ms,
             );
-            let resp = match clock
-                .headers(upstream::send(
+            let resp = match first_token
+                .wait(clock.headers(upstream::send(
                     &state.http,
                     &route.provider,
                     api_key,
                     &body,
                     &route.model,
                     creq.stream,
-                ))
+                )))
                 .await
+                .and_then(|result| result)
             {
                 Ok(Ok(resp)) => resp,
                 Err(timeout) => {
-                    tracker.record_attempt(&route.provider.id, *key_slot, "504");
+                    tracker.record_attempt(&route.provider.id, *key_slot, timeout.attempt_status());
                     if route_index == last_route {
                         return Err((
                             ProxyFailure::new(StatusCode::GATEWAY_TIMEOUT, timeout.message()),
@@ -1024,8 +1034,29 @@ async fn send_with_fallback(
                     return Ok((UpstreamReply::Json(resp), candidate));
                 }
                 let headers = resp.headers().clone();
-                let (events, failure) =
-                    prefetch_stream(resp, route.provider.protocol, tracker, clock, liveness).await;
+                let (events, failure) = match first_token
+                    .wait(prefetch_stream(
+                        resp,
+                        route.provider.protocol,
+                        tracker,
+                        clock,
+                        liveness,
+                    ))
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(timeout) => {
+                        tracker.record_attempt(
+                            &route.provider.id,
+                            *key_slot,
+                            timeout.attempt_status(),
+                        );
+                        // Dropping prefetch cancels the held response. Slow starts
+                        // belong to this route, not a credential: skip its other
+                        // keys without cooldown. Only non-final routes have a cap.
+                        break;
+                    }
+                };
                 if let Some(failure) = failure {
                     tracker.record_attempt(&route.provider.id, *key_slot, "upstream_stream_error");
                     if quota_limited_status(failure.status) {
@@ -1724,6 +1755,7 @@ mod tests {
                             name: "Daily".into(),
                             routes: vec!["primary/first-model".into(), "spare/second-model".into()],
                             routing: RoutingPolicy::Order,
+                            first_token_timeout_ms: 0,
                         }]
                     } else {
                         vec![]

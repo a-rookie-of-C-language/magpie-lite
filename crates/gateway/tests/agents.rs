@@ -49,6 +49,7 @@ async fn server(enabled: bool) -> Server {
             name: "Daily".into(),
             routes: vec!["mock/model".into()],
             routing: RoutingPolicy::default(),
+            first_token_timeout_ms: 0,
         }],
         ..Config::default()
     };

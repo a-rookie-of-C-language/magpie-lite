@@ -261,12 +261,32 @@ for each request, or `usage` to prefer routes with fewer attempts in this gatewa
 process. All remaining routes are still tried as fallbacks before response bytes
 are streamed.
 
+Each group also accepts `first_token_timeout_ms` (default `0`, disabled), available
+in the console as **First-content timeout (ms)** and from the CLI:
+
+```sh
+magpie-lite group add daily --route deepseek/deepseek-chat --route kimi/moonshot-v1-128k --first-token-timeout-ms 2000
+```
+
+For streaming requests, a non-final candidate gets one absolute budget covering
+both response headers and its held opening. If it produces no content before
+that budget, the gateway cancels it and tries the next group route without
+spending its other keys or applying quota cooldown. The last available route
+(in the selected routing order) and single-member groups have no group cap;
+gateway-wide first-content/read-idle limits still apply. Text, reasoning and
+tool output commit the candidate. Releasing opening metadata via safety bounds
+or the Responses hold budget also commits it, preventing any subsequent replay.
+Usage, comments and empty text do not satisfy the content test. Nonstreaming
+requests, ordinary provider fallback and already-known non-2xx HTTP error bodies
+are not governed by this group budget. Configuration is pinned per request.
+See `docs/stream-lifecycle.md` for the tested lifecycle and remaining gaps.
+
 The following endpoints require the same local token as inference routes:
 
 | Method | Endpoint | Body / response |
 |---|---|---|
-| POST | `/config/groups` | `{"id":"daily","name":"Daily","routing":"rotate","routes":["deepseek/deepseek-chat"]}`; 201 on creation |
-| PUT | `/config/groups/{id}` | Same body with matching ID; replaces name, routing, and routes; 200 |
+| POST | `/config/groups` | `{"id":"daily","name":"Daily","routing":"rotate","first_token_timeout_ms":2000,"routes":["deepseek/deepseek-chat"]}`; 201 on creation |
+| PUT | `/config/groups/{id}` | Same body with matching ID; replaces name, routing, routes, and first-token budget (omitted budget resets to 0); 200 |
 | DELETE | `/config/groups/{id}` | No body; 200 |
 
 Successful edits return the secret-free `/config` snapshot. Invalid input returns

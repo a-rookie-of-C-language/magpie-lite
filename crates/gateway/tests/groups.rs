@@ -396,3 +396,62 @@ async fn concurrent_edits_are_serialized_and_external_file_changes_are_preserved
             .any(|g| g["id"] == "a" && g["routes"][0] == "mock/a")
     );
 }
+
+#[tokio::test]
+async fn group_first_token_budget_is_persisted_exposed_editable_and_defaults_to_zero() {
+    let gw = gateway(false).await;
+    let mut body = group("timed", "original");
+    body["first_token_timeout_ms"] = json!(1234);
+    let created = edit(&gw, Method::POST, "/config/groups", body.clone()).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    assert_eq!(
+        created.json::<Value>().await.unwrap()["groups"][0]["first_token_timeout_ms"],
+        1234
+    );
+    assert_eq!(
+        Config::load(&gw.path).unwrap().group[0].first_token_timeout_ms,
+        1234
+    );
+    body["first_token_timeout_ms"] = json!(5678);
+    let updated = edit(&gw, Method::PUT, "/config/groups/timed", body).await;
+    assert_eq!(updated.status(), StatusCode::OK);
+    assert_eq!(
+        updated.json::<Value>().await.unwrap()["groups"][0]["first_token_timeout_ms"],
+        5678
+    );
+    assert_eq!(
+        Config::load(&gw.path).unwrap().group[0].first_token_timeout_ms,
+        5678
+    );
+    for invalid in [json!(-1), json!(1.5), json!("100"), json!(null)] {
+        let mut body = group("timed", "original");
+        body["first_token_timeout_ms"] = invalid;
+        assert_eq!(
+            edit(&gw, Method::PUT, "/config/groups/timed", body)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            Config::load(&gw.path).unwrap().group[0].first_token_timeout_ms,
+            5678
+        );
+    }
+    // PUT replaces the group, including defaulting an omitted budget to zero.
+    let reset = edit(
+        &gw,
+        Method::PUT,
+        "/config/groups/timed",
+        group("timed", "original"),
+    )
+    .await;
+    assert_eq!(reset.status(), StatusCode::OK);
+    assert_eq!(
+        reset.json::<Value>().await.unwrap()["groups"][0]["first_token_timeout_ms"],
+        0
+    );
+    assert_eq!(
+        Config::load(&gw.path).unwrap().group[0].first_token_timeout_ms,
+        0
+    );
+}

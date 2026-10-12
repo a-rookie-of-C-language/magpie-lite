@@ -6,7 +6,7 @@ Target: multiple coding agents sharing one Rust backend, provider adapters for d
 
 | Area | Current evidence | Remaining work |
 |---|---|---|
-| Shared Rust gateway | Core wire codecs; real local HTTP/SSE terminal/error/EOF and after-header disconnect fixtures across four adapters; incremental 32 MiB raw-event bounds, BOM/CR/UTF-8 handling, opening event/metadata-byte budgets, early stream-error key/fallback/group retry, no retry after text/reasoning/tool output, configurable per-attempt first-content/read-idle deadlines with timeout fallback, downstream pre-header/mid-answer SSE comments with safe fallback, protocol error conversion, bounded upstream-silence windows and activity-driven cadence, and real HTTP/1.1 before/after-header cancellation with persisted accounting; see docs/stream-lifecycle.md | Recorded real-agent fixtures, broader multimodal/tool/stream conformance, group-specific timeout and held-Responses quiet-agent policies, and HTTP/2 cancellation conformance |
+| Shared Rust gateway | Core wire codecs; real local HTTP/SSE terminal/error/EOF and after-header disconnect fixtures across four adapters; incremental 32 MiB raw-event bounds, BOM/CR/UTF-8 handling, opening event/metadata-byte budgets, early stream-error key/fallback/group retry, no retry after text/reasoning/tool output, configurable per-attempt first-content/read-idle deadlines with timeout fallback, group non-final first-content switching, request-wide Responses opening release, downstream pre-header/mid-answer SSE comments with safe fallback, protocol error conversion, bounded upstream-silence windows and activity-driven cadence, and real HTTP/1.1 before/after-header cancellation with persisted accounting; see docs/stream-lifecycle.md | Recorded real-agent fixtures, broader multimodal/tool/stream conformance, queue/slow-final-route and post-content progress/loop policies, and HTTP/2 cancellation conformance |
 | Agent adapters | Shared magpie-agents adapters for Claude Code, Codex, Crush, Gemini CLI, Goose, OpenCode and Zed; private staged preview, revision-checked apply, OS lock, schema-2 journaled selective field restore preserving unrelated edits, disconnect, managed-field drift and explicit recovery. Agent unit, HTTP, sandboxed child CLI and real-gateway console browser tests; Windows ACL/junction checks; recursive duplicate-key JSON/JSONC refusal, format-preserving JSON edits, compact comment-free JSON object additions that preserve single-line layout, native OpenCode/Zed JSONC, shared passive CLI/config discovery with bounded user-prefix/Node-version searches, npmrc prefix and nvm default-alias handling, and PATH/unknown metadata, native absolute config-directory overrides for Claude/Codex/OpenCode/Zed, and seven-Agent selective restore through HTTP/CLI/browser | Native project overrides, login-shell/registry PATH refresh, process/reachability and real-version compatibility evidence; compact layout preservation is intentionally limited to single-line objects without direct comments |
 | Provider metadata and keys | Protected provider CRUD and console; providers.rs covers saved/live edits, secret-free capability metadata (`supported_protocols`, nullable streaming/tools/vision), protocol validation and preserve/clear semantics. provider_tools.rs covers four-protocol catalogs/probes, pagination, saved/draft/no-auth credentials and bounded read-only operations | Capability presets, specialized/stream-only probes and paid/live vendor evidence |
 | Hot edits and key rotation | ConfigStore saves before publishing; requests own snapshots. Versioned key schedules ignore stale requests. providers.rs checks an old in-flight request after a smaller pool is saved; config.rs checks stale scheduler calls. Durable config revisions/ETags and optional If-Match checks reject stale provider/group writes across restarts; the revision is committed in the atomically replaced TOML document, store and HTTP tests check unchanged disk/memory and a single winner for concurrent checked edits; gateway writers also serialize through a bounded file lock. Provider/group CRUD and agent apply now have durable idempotency with 256-entry retention, token-keyed HMAC digests, restart replay, pending fail-closed behavior, and secret-free ledgers | Encrypted secret storage with recovery; durable idempotency for any future agent rotate endpoint |
@@ -90,8 +90,8 @@ read-idle (default 5 minutes) limits; zero disables each. Real local HTTP fixtur
 cover opening/after-content stalls across all four-by-four protocol pairs,
 ordinary/group timeout fallback, ignored-heartbeat and committed-metadata cases,
 header/error-body stalls, paced output, reasoning/tools and disable semantics.
-This adds gateway-wide safety bounds rather than replicating the reference's
-Group.FirstToken policy; group overrides remain unimplemented. Downstream SSE
+These are gateway-wide safety bounds; the separate Group.FirstToken slow-start
+switching policy is now implemented as described below. Downstream SSE
 comment keepalive and Responses opening release are documented separately.
 See `docs/stream-lifecycle.md`.
 
@@ -111,5 +111,17 @@ headers/comments/usage-only input do not fabricate metadata. The budget survives
 key/provider/group fallback and does not reset first-content/read-idle limits.
 Nine local HTTP fixtures and paused-clock unit tests cover the release contract.
 This follows the opening-release subset of reference `internal/gateway/fallback.go`,
-not full group timing, queue, slow-final-route or real-Agent conformance.
+not queue, slow-final-route or real-Agent conformance.
 See `docs/stream-lifecycle.md`.
+
+Group first-content switching now follows the reference's non-final streaming
+Group.FirstToken policy, with a disabled-by-default millisecond group budget.
+A single per-attempt deadline covers headers and held opening; slow routes skip
+remaining credentials without cooldown. The final scheduled route is exempt,
+not exempt from global stream limits. Content or released metadata commits the
+candidate and prevents replay; known HTTP errors stop this opening policy.
+TOML, snapshot, management API, CLI and console share the field. Thirteen local
+HTTP tests plus paused-clock/API/child-CLI/browser coverage exercise the contract,
+including scheduled order, pinned edits and persisted cancellation. Queue,
+slow-final-route UI, post-content progress policies and live-Agent/HTTP2 evidence
+remain open; see docs/stream-lifecycle.md.

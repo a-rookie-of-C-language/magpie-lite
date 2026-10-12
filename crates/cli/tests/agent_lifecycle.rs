@@ -694,3 +694,47 @@ fn unix_cli_checks_permission_revisions_and_restores_legacy_modes_without_config
         }
     }
 }
+
+#[test]
+fn group_first_token_cli_roundtrip_and_invalid_values() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&[
+        "group",
+        "add",
+        "daily",
+        "--route",
+        "mock/model",
+        "--first-token-timeout-ms",
+        "1234",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = magpie_gateway::Config::load(&sandbox.config).unwrap();
+    assert_eq!(config.group[0].first_token_timeout_ms, 1234);
+    let listed = sandbox.run(&["group", "list"]);
+    assert!(listed.status.success());
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("first-token: 1234 ms"));
+    let prior = std::fs::read(&sandbox.config).unwrap();
+    for value in ["-1", "1.5", "abc", "18446744073709551616"] {
+        let output = sandbox.run(&[
+            "group",
+            "add",
+            "daily",
+            "--route",
+            "mock/model",
+            "--first-token-timeout-ms",
+            value,
+        ]);
+        assert!(!output.status.success());
+        assert_eq!(std::fs::read(&sandbox.config).unwrap(), prior);
+    }
+    let output = sandbox.run(&["group", "add", "daily", "--route", "mock/model"]);
+    assert!(output.status.success());
+    assert_eq!(
+        magpie_gateway::Config::load(&sandbox.config).unwrap().group[0].first_token_timeout_ms,
+        0
+    );
+}

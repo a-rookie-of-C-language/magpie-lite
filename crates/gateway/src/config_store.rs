@@ -597,6 +597,7 @@ mod tests {
                     name: String::new(),
                     routes: vec!["mock/model".into()],
                     routing: RoutingPolicy::default(),
+                    first_token_timeout_ms: 0,
                 });
                 Ok(())
             })

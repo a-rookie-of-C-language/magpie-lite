@@ -111,6 +111,7 @@ enum Ending {
     Reset(Arc<tokio::sync::Notify>),
     Heartbeats,
     Paced(Vec<(Duration, String)>),
+    PacedEof(Vec<(Duration, String)>),
     PerSlot(Vec<Ending>),
 }
 
@@ -133,6 +134,7 @@ impl Default for Transport {
 }
 
 struct Fixture {
+    _config_directory: tempfile::TempDir,
     upstream: Server,
     gateway: Server,
     dropped: Arc<AtomicUsize>,
@@ -246,6 +248,12 @@ impl Fixture {
                                 }
                                 std::future::pending::<()>().await;
                             },
+                            Ending::PacedEof(frames) => {
+                                for (delay, frame) in frames {
+                                    tokio::time::sleep(delay).await;
+                                    yield Ok(Bytes::from(frame));
+                                }
+                            },
                             Ending::Reset(signal) => {
                                 signal.notified().await;
                                 yield Err(std::io::Error::other("fixture upstream reset"));
@@ -284,16 +292,20 @@ impl Fixture {
             ..Config::default()
         };
         configure(&mut config);
+        let config_directory = tempfile::tempdir().unwrap();
+        let config_path = config_directory.path().join("config.toml");
+        config.save(&config_path).unwrap();
         let log = Arc::new(Mutex::new(RequestLog::default()));
         let state = Arc::new(AppState {
             agents: None,
-            config: ConfigStore::new(config, None),
+            config: ConfigStore::new(config, Some(config_path)),
             http: magpie_gateway::upstream::http_client().unwrap(),
             requests: log.clone(),
             key_rotation: KeyRotator::default(),
         });
         let gateway = serve(build_router(state.clone())).await;
         Self {
+            _config_directory: config_directory,
             upstream,
             gateway,
             dropped,
@@ -834,6 +846,7 @@ async fn early_stream_errors_fall_back_across_protocols_and_groups() {
                                 name: "Daily".into(),
                                 routes: vec!["mock/up-model".into(), "spare/backup-model".into()],
                                 routing: RoutingPolicy::Order,
+                                first_token_timeout_ms: 0,
                             });
                         } else {
                             config.provider[0].fallback = vec!["spare/backup-model".into()];
@@ -997,6 +1010,7 @@ async fn cancelled_fallback_persists_only_selected_provider_and_partial_usage() 
                         name: "".into(),
                         routes: vec!["mock/up-model".into(), "spare/backup-model".into()],
                         routing: magpie_gateway::RoutingPolicy::Order,
+                        first_token_timeout_ms: 0,
                     });
                 } else {
                     config.provider[0].fallback = vec!["spare/backup-model".into()];
@@ -1138,6 +1152,7 @@ async fn oversized_opening_frames_fall_back_before_content_for_routes_and_groups
                             name: "".into(),
                             routes: vec!["mock/up-model".into(), "spare/backup-model".into()],
                             routing: magpie_gateway::RoutingPolicy::Order,
+                            first_token_timeout_ms: 0,
                         });
                     } else {
                         config.provider[0].fallback = vec!["spare/backup-model".into()];
@@ -1369,6 +1384,7 @@ fn configure_timeout_fallback(config: &mut Config, grouped: bool) {
             name: String::new(),
             routes: vec!["mock/up-model".into(), "spare/backup-model".into()],
             routing: magpie_gateway::RoutingPolicy::Order,
+            first_token_timeout_ms: 0,
         });
     } else {
         config.provider[0].fallback = vec!["spare/backup-model".into()];
@@ -1977,6 +1993,7 @@ async fn socket_disconnect_after_fallback_keeps_only_last_attempt_and_persists()
                                         "spare/backup-model".into(),
                                     ],
                                     routing: RoutingPolicy::Order,
+                                    first_token_timeout_ms: 0,
                                 });
                             } else {
                                 config.provider[0].fallback = vec!["spare/backup-model".into()];
@@ -3133,5 +3150,544 @@ async fn responses_hold_committed_socket_disconnect_persists_one_safe_record() {
             serde_json::to_value(&reloaded.recent_requests[0]).unwrap(),
             record
         );
+    }
+}
+
+#[tokio::test]
+async fn group_first_token_slow_opening_fails_over_without_leaks_or_key_cooldown() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            let f = Fixture::with_config(
+                upstream,
+                vec![
+                    opening(upstream).to_owned(),
+                    prefix(upstream) + completion(upstream),
+                ],
+                Ending::PerSlot(vec![Ending::Heartbeats, Ending::Eof]),
+                |config| {
+                    config.stream_first_content_timeout_ms = 0;
+                    config.stream_idle_timeout_ms = 0;
+                    config.stream_keepalive_interval_ms = 20;
+                    configure_timeout_fallback(config, true);
+                    config.group[0].first_token_timeout_ms = 120;
+                },
+            )
+            .await;
+            let body =
+                tokio::time::timeout(LIMIT, f.request_model(client, "group/daily").await.text())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_completed(&body, client);
+            assert!(!body.contains("abandoned"), "{body}");
+            assert!(!body.contains("timeout"), "{body}");
+            assert_eq!(*f.attempts.lock().unwrap(), [0, 1]);
+            assert!(
+                f.state
+                    .key_rotation
+                    .cooldown_snapshot(&f.state.config.current())
+                    .is_empty()
+            );
+            let record = f.record().await;
+            assert_eq!(record["provider"], "spare");
+            assert_eq!(record["status"], "ok");
+            assert_eq!(record["usage"]["input"], 7);
+            assert_eq!(record["usage"]["output"], 3);
+            assert!(!record.to_string().contains("secret"));
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn group_first_token_headers_and_opening_share_one_absolute_budget() {
+    for delayed_headers in [false, true] {
+        let f = Fixture::with_transport(
+            Protocol::Chat,
+            vec![
+                opening(Protocol::Chat).into(),
+                prefix(Protocol::Chat) + completion(Protocol::Chat),
+            ],
+            Ending::PerSlot(vec![
+                Ending::Paced(vec![(
+                    Duration::from_millis(350),
+                    prefix(Protocol::Chat) + completion(Protocol::Chat),
+                )]),
+                Ending::Eof,
+            ]),
+            Transport {
+                header_delay: Duration::from_millis(if delayed_headers { 350 } else { 0 }),
+                ..Transport::default()
+            },
+            |config| {
+                disable_stream_deadlines(config);
+                configure_timeout_fallback(config, true);
+                config.group[0].first_token_timeout_ms = 550;
+            },
+        )
+        .await;
+        let body = tokio::time::timeout(
+            LIMIT,
+            f.request_model(Protocol::Chat, "group/daily").await.text(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_completed(&body, Protocol::Chat);
+        assert_eq!(
+            *f.attempts.lock().unwrap(),
+            if delayed_headers { vec![0, 1] } else { vec![0] }
+        );
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn group_first_token_cancels_a_route_still_waiting_for_headers() {
+    let f = Fixture::with_transport(
+        Protocol::Chat,
+        vec![prefix(Protocol::Chat) + completion(Protocol::Chat); 2],
+        Ending::Eof,
+        Transport {
+            header_delay: Duration::from_millis(400),
+            ..Transport::default()
+        },
+        |config| {
+            disable_stream_deadlines(config);
+            configure_timeout_fallback(config, true);
+            config.group[0].first_token_timeout_ms = 120;
+        },
+    )
+    .await;
+    let body = f
+        .request_model(Protocol::Chat, "group/daily")
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert_completed(&body, Protocol::Chat);
+    assert_eq!(*f.attempts.lock().unwrap(), [0, 1]);
+    assert_eq!(f.record().await["provider"], "spare");
+    f.assert_released().await;
+}
+
+#[tokio::test]
+async fn group_first_token_final_and_single_routes_keep_waiting_for_content() {
+    for single in [false, true] {
+        let f = Fixture::with_config(
+            Protocol::Chat,
+            vec![opening(Protocol::Chat).into(); 2],
+            Ending::Paced(vec![(
+                Duration::from_millis(300),
+                prefix(Protocol::Chat) + completion(Protocol::Chat),
+            )]),
+            |config| {
+                disable_stream_deadlines(config);
+                configure_timeout_fallback(config, true);
+                config.group[0].first_token_timeout_ms = 100;
+                if single {
+                    config.group[0].routes.truncate(1);
+                }
+            },
+        )
+        .await;
+        let body = tokio::time::timeout(
+            LIMIT,
+            f.request_model(Protocol::Chat, "group/daily").await.text(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_completed(&body, Protocol::Chat);
+        assert_eq!(
+            *f.attempts.lock().unwrap(),
+            if single { vec![0] } else { vec![0, 1] }
+        );
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn group_first_token_final_route_still_obeys_gateway_first_content_limit() {
+    let f = Fixture::with_config(
+        Protocol::Chat,
+        vec![opening(Protocol::Chat).into(); 2],
+        Ending::Hold,
+        |config| {
+            config.stream_first_content_timeout_ms = 250;
+            config.stream_idle_timeout_ms = 0;
+            configure_timeout_fallback(config, true);
+            config.group[0].first_token_timeout_ms = 100;
+        },
+    )
+    .await;
+    let body = tokio::time::timeout(
+        LIMIT,
+        f.request_model(Protocol::Chat, "group/daily").await.text(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_one_stream_error(&body, Protocol::Chat, "upstream first-content timeout");
+    assert_eq!(*f.attempts.lock().unwrap(), [0, 1]);
+    let record = f.record().await;
+    assert_eq!(record["provider"], "spare");
+    assert_eq!(record["status"], "upstream_stream_error");
+    f.assert_released().await;
+}
+
+#[tokio::test]
+async fn group_first_token_text_reasoning_and_tools_commit_before_slow_completion() {
+    let mut scripts: Vec<_> = PROTOCOLS.into_iter().map(|p| (p, prefix(p))).collect();
+    scripts.extend(reasoning_and_tool_frames().into_iter().map(|(p, frame)| {
+        (
+            p,
+            format!("{}data: {frame}\n\n", opening(p).replace("99", "7")),
+        )
+    }));
+    for (upstream, script) in scripts {
+        let f = Fixture::with_config(
+            upstream,
+            vec![script, prefix(upstream) + completion(upstream)],
+            Ending::Paced(vec![(
+                Duration::from_millis(220),
+                completion(upstream).into(),
+            )]),
+            |config| {
+                disable_stream_deadlines(config);
+                configure_timeout_fallback(config, true);
+                config.group[0].first_token_timeout_ms = 100;
+            },
+        )
+        .await;
+        let body =
+            tokio::time::timeout(LIMIT, f.request_model(upstream, "group/daily").await.text())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_completed(&body, upstream);
+        assert_eq!(*f.attempts.lock().unwrap(), [0]);
+        assert_eq!(f.record().await["provider"], "mock");
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn group_first_token_metadata_bounds_and_responses_release_commit_the_candidate() {
+    for upstream in PROTOCOLS {
+        for responses_release in [false, true] {
+            let script = if responses_release {
+                opening(upstream).to_owned()
+            } else {
+                opening(upstream).replace("abandoned-model", &"m".repeat(70 * 1024))
+            };
+            let f = Fixture::with_chunk_size(
+                upstream,
+                vec![script, prefix(upstream) + completion(upstream)],
+                Ending::Paced(vec![(Duration::from_millis(350), limited(upstream).into())]),
+                4096,
+                |config| {
+                    disable_stream_deadlines(config);
+                    configure_timeout_fallback(config, true);
+                    config.group[0].first_token_timeout_ms = 240;
+                    config.stream_responses_hold_timeout_ms =
+                        if responses_release { 100 } else { 0 };
+                },
+            )
+            .await;
+            let body = tokio::time::timeout(
+                LIMIT,
+                f.request_model(Protocol::Responses, "group/daily")
+                    .await
+                    .text(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(body.contains("fixture rate limit"));
+            assert!(!body.contains("group first-token timeout"));
+            assert_no_success(&body);
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            assert_eq!(f.record().await["provider"], "mock");
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn group_first_token_zero_and_ordinary_provider_routes_are_excluded() {
+    for ordinary in [false, true] {
+        let f = Fixture::with_config(
+            Protocol::Chat,
+            vec![
+                opening(Protocol::Chat).into(),
+                prefix(Protocol::Chat) + completion(Protocol::Chat),
+            ],
+            Ending::Paced(vec![(
+                Duration::from_millis(250),
+                prefix(Protocol::Chat) + completion(Protocol::Chat),
+            )]),
+            |config| {
+                disable_stream_deadlines(config);
+                configure_timeout_fallback(config, true);
+                config.group[0].first_token_timeout_ms = if ordinary { 100 } else { 0 };
+                config.provider[0].fallback = vec!["spare/backup-model".into()];
+            },
+        )
+        .await;
+        let body = tokio::time::timeout(
+            LIMIT,
+            f.request_model(
+                Protocol::Chat,
+                if ordinary {
+                    "mock/up-model"
+                } else {
+                    "group/daily"
+                },
+            )
+            .await
+            .text(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_completed(&body, Protocol::Chat);
+        assert_eq!(*f.attempts.lock().unwrap(), [0]);
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn group_first_token_nonstream_and_known_http_errors_do_not_use_opening_budget() {
+    for nonstream in [false, true] {
+        let script = if nonstream {
+            json!({"model":"up-model", "choices":[{"message":{"role":"assistant", "content":"primary"},"finish_reason":"stop"}]}).to_string()
+        } else {
+            json!({"error":{"message":"known bad input"}}).to_string()
+        };
+        let f = Fixture::with_transport(
+            Protocol::Chat,
+            vec![
+                String::new(),
+                prefix(Protocol::Chat) + completion(Protocol::Chat),
+            ],
+            Ending::PacedEof(vec![(Duration::from_millis(300), script)]),
+            Transport {
+                status: if nonstream {
+                    axum::http::StatusCode::OK
+                } else {
+                    axum::http::StatusCode::BAD_REQUEST
+                },
+                ..Transport::default()
+            },
+            |config| {
+                disable_stream_deadlines(config);
+                configure_timeout_fallback(config, true);
+                config.group[0].first_token_timeout_ms = 100;
+            },
+        )
+        .await;
+        let (path, body) = client_request(Protocol::Chat, "group/daily", !nonstream);
+        let response = tokio::time::timeout(
+            LIMIT,
+            reqwest::Client::new()
+                .post(format!("{}{path}", f.gateway.url))
+                .bearer_auth("secret-local-token")
+                .json(&body)
+                .send(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            response.status(),
+            if nonstream {
+                reqwest::StatusCode::OK
+            } else {
+                reqwest::StatusCode::BAD_REQUEST
+            }
+        );
+        let body = tokio::time::timeout(LIMIT, response.text())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(body.contains(if nonstream {
+            "primary"
+        } else {
+            "known bad input"
+        }));
+        assert_eq!(*f.attempts.lock().unwrap(), [0]);
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn group_first_token_applies_to_distinct_models_on_one_provider() {
+    let f = Fixture::with_config(
+        Protocol::Chat,
+        vec![
+            opening(Protocol::Chat).into(),
+            prefix(Protocol::Chat) + completion(Protocol::Chat),
+        ],
+        Ending::PerSlot(vec![Ending::Hold, Ending::Eof]),
+        |config| {
+            disable_stream_deadlines(config);
+            config.group.push(magpie_gateway::GroupConfig {
+                id: "daily".into(),
+                name: String::new(),
+                routes: vec!["mock/up-model".into(), "mock/alternate-model".into()],
+                routing: magpie_gateway::RoutingPolicy::Order,
+                first_token_timeout_ms: 120,
+            });
+        },
+    )
+    .await;
+    let body = f
+        .request_model(Protocol::Chat, "group/daily")
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert_completed(&body, Protocol::Chat);
+    assert_eq!(*f.attempts.lock().unwrap(), [0, 1]);
+    assert_eq!(
+        *f.sent_models.lock().unwrap(),
+        ["up-model", "alternate-model"]
+    );
+    assert_eq!(f.record().await["upstream_model"], "alternate-model");
+    f.assert_released().await;
+}
+
+#[tokio::test]
+async fn group_first_token_final_means_last_scheduled_candidate_not_last_configured_index() {
+    use magpie_gateway::RoutingPolicy;
+    for policy in [RoutingPolicy::Rotate, RoutingPolicy::Usage] {
+        let f = Fixture::with_config(
+            Protocol::Chat,
+            vec![opening(Protocol::Chat).into(); 2],
+            Ending::PerSlot(vec![
+                Ending::Paced(vec![(
+                    Duration::from_millis(300),
+                    prefix(Protocol::Chat) + completion(Protocol::Chat),
+                )]),
+                Ending::Hold,
+            ]),
+            |config| {
+                disable_stream_deadlines(config);
+                configure_timeout_fallback(config, true);
+                config.group[0].first_token_timeout_ms = 100;
+                config.group[0].routing = policy;
+            },
+        )
+        .await;
+        let routes = f.state.config.current().group[0].routes.clone();
+        if policy == RoutingPolicy::Rotate {
+            f.state.key_rotation.group_order("daily", policy, &routes);
+        } else {
+            f.state
+                .key_rotation
+                .record_group_attempt("daily", policy, &routes, 0);
+        }
+        let body = tokio::time::timeout(
+            LIMIT,
+            f.request_model(Protocol::Chat, "group/daily").await.text(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_completed(&body, Protocol::Chat);
+        assert_eq!(*f.attempts.lock().unwrap(), [1, 0]);
+        assert_eq!(f.record().await["provider"], "mock");
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn group_first_token_inflight_config_is_pinned_and_future_requests_use_edits() {
+    let f = Fixture::with_config(
+        Protocol::Chat,
+        vec![opening(Protocol::Chat).into(); 2],
+        Ending::Paced(vec![(
+            Duration::from_millis(450),
+            prefix(Protocol::Chat) + completion(Protocol::Chat),
+        )]),
+        |config| {
+            disable_stream_deadlines(config);
+            configure_timeout_fallback(config, true);
+            config.group[0].first_token_timeout_ms = 200;
+        },
+    )
+    .await;
+    let request = f.request_model(Protocol::Chat, "group/daily");
+    let update = async {
+        f.wait_for_attempts(&[0]).await;
+        f.state
+            .config
+            .update(|config| {
+                config.group[0].first_token_timeout_ms = 0;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    };
+    let (response, ()) = tokio::join!(request, update);
+    let body = tokio::time::timeout(LIMIT, response.text())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_completed(&body, Protocol::Chat);
+    assert_eq!(
+        *f.attempts.lock().unwrap(),
+        [0, 1],
+        "inflight request must keep its original group budget"
+    );
+    assert_eq!(f.record().await["provider"], "spare");
+    let body = tokio::time::timeout(
+        LIMIT,
+        f.request_model(Protocol::Chat, "group/daily").await.text(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_completed(&body, Protocol::Chat);
+    // Key rotation selects the second primary key; the edited zero budget lets
+    // it finish on primary even though content takes longer than the old cap.
+    assert_eq!(*f.attempts.lock().unwrap(), [0, 1, 1]);
+    f.assert_released().await;
+}
+
+#[tokio::test]
+async fn group_first_token_socket_disconnect_after_failover_persists_only_last_attempt() {
+    for upstream in PROTOCOLS {
+        let f = Fixture::with_config(
+            upstream,
+            vec![
+                opening(upstream).into(),
+                opening(upstream).replace("99", "7"),
+            ],
+            Ending::Hold,
+            |config| {
+                disable_stream_deadlines(config);
+                configure_timeout_fallback(config, true);
+                config.group[0].first_token_timeout_ms = 120;
+            },
+        )
+        .await;
+        let history = f.persistent_history();
+        let socket = f.socket_request(upstream, "group/daily", true).await;
+        f.wait_for_attempts(&[0, 1]).await;
+        // The final candidate is held without a group timer; disconnect cancels
+        // it and records its usage, never the abandoned candidate's usage.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let record = f.disconnect_before_headers(socket, history.path()).await;
+        assert_eq!(record["provider"], "spare");
+        assert_eq!(record["requested_model"], "group/daily");
+        assert_eq!(record["upstream_model"], "backup-model");
+        assert_eq!(record["key_slot"], 0);
+        if upstream == Protocol::Responses {
+            assert!(record["usage"]["input"].is_null());
+        } else {
+            assert_eq!(record["usage"]["input"], 7);
+        }
     }
 }
