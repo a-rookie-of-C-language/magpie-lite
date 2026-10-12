@@ -280,3 +280,117 @@ fn multiple_grounding_parts_merge_queries_and_rebase_native_support_indices() {
         grounding()
     );
 }
+
+#[test]
+fn gemini_later_grounding_updates_retain_new_sources_without_public_duplicates() {
+    let initial = json!({"webSearchQueries":["rust release"],
+        "groundingChunks":[{"web":{"uri":"https://example.invalid/first","title":"First"}}]});
+    let cumulative = json!({"webSearchQueries":["rust release", "rust notes", "rust notes"],
+        "groundingChunks":[{"web":{"uri":"https://example.invalid/first","title":"First"}},
+            {"web":{"uri":"https://example.invalid/second","title":"Second"}},
+            {"web":{"uri":"https://example.invalid/second","title":"Second"}}],
+        "groundingSupports":[{"segment":{"text":"answer"},"groundingChunkIndices":[1]}]});
+    let independent = json!({"web_search_queries":["rust security"],
+        "grounding_chunks":[{"web":{"uri":"https://example.invalid/third"}}]});
+    let mut decoder = gemini::GeminiStreamDecoder::new();
+    let mut native = gemini::GeminiStreamEncoder::new("client-model");
+    let mut foreign = responses::ResponsesStreamEncoder::new("client-model");
+    let mut native_wire = String::new();
+    let mut foreign_wire = String::new();
+    let mut answer_updates = 0;
+    for metadata in [&initial, &initial, &cumulative, &cumulative, &independent] {
+        for event in decoder.decode(&json!({"candidates":[{"groundingMetadata":metadata}]})) {
+            answer_updates += usize::from(event.is_answer());
+            native_wire.push_str(&native.encode(&event).unwrap_or_default());
+            foreign_wire.push_str(&foreign.encode(&event).unwrap_or_default());
+        }
+    }
+    assert_eq!(answer_updates, 3, "later public search updates were lost");
+    let native_frames = frames(&native_wire);
+    let metadata: Vec<_> = native_frames
+        .iter()
+        .filter_map(|v| v.pointer("/candidates/0/groundingMetadata"))
+        .collect();
+    assert_eq!(metadata, [&initial, &cumulative, &independent]);
+    for text in [
+        "rust release",
+        "rust notes",
+        "rust security",
+        "https://example.invalid/first",
+        "https://example.invalid/second",
+        "https://example.invalid/third",
+    ] {
+        // Only completed items carry query/source values (no terminal frame yet).
+        assert_eq!(
+            foreign_wire.matches(text).count(),
+            1,
+            "{text}: {foreign_wire}"
+        );
+    }
+    assert!(!foreign_wire.contains("groundingSupports"));
+}
+
+#[test]
+fn gemini_citation_only_updates_reach_native_clients_without_fabricated_searches() {
+    let initial = json!({"webSearchQueries":["rust release"],
+        "groundingChunks":[{"web":{"uri":"https://example.invalid/first"}}]});
+    let citations = json!({"groundingSupports":[{"segment":{"startIndex":0,"endIndex":6,"text":"answer"},
+        "groundingChunkIndices":[0]}], "searchEntryPoint":{"renderedContent":"<div>Attribution</div>"}});
+    let mut decoder = gemini::GeminiStreamDecoder::new();
+    decoder.decode(&json!({"candidates":[{"groundingMetadata":initial}]}));
+    let mut native = gemini::GeminiStreamEncoder::new("client-model");
+    let mut anthropic = anthropic::AnthropicStreamEncoder::new("client-model");
+    let mut responses = responses::ResponsesStreamEncoder::new("client-model");
+    let mut wire = String::new();
+    let events = decoder.decode(&json!({"candidates":[{"groundingMetadata":citations}]}));
+    assert!(!events.iter().any(|event| event.is_content()));
+    for event in events {
+        wire.push_str(&native.encode(&event).unwrap_or_default());
+        assert!(anthropic.encode(&event).is_none());
+        assert!(responses.encode(&event).is_none());
+    }
+    assert_eq!(frames(&wire).len(), 1, "citation-only update was lost");
+    assert_eq!(
+        frames(&wire)[0]["candidates"][0]["groundingMetadata"],
+        citations
+    );
+}
+
+#[test]
+fn gemini_query_then_source_only_update_does_not_repeat_the_query() {
+    use magpie_core::stream::StreamEvent;
+    let query = json!({"webSearchQueries":["rust release"]});
+    let sources =
+        json!({"groundingChunks":[{"web":{"uri":"https://example.invalid/late-source"}}]});
+    let mut decoder = gemini::GeminiStreamDecoder::new();
+    let first = decoder.decode(&json!({"candidates":[{"groundingMetadata":query}]}));
+    assert!(matches!(first.as_slice(), [StreamEvent::Search { search }]
+        if search.query == "rust release" && search.hits.is_empty()));
+    let second = decoder.decode(&json!({"candidates":[{"groundingMetadata":sources}]}));
+    assert!(
+        matches!(second.as_slice(), [StreamEvent::SearchUpdate { search }]
+        if search.query.is_empty() && search.hits.len() == 1)
+    );
+    assert!(second[0].is_content());
+    let mut native = gemini::GeminiStreamEncoder::new("model");
+    let mut foreign = responses::ResponsesStreamEncoder::new("model");
+    let mut native_wire = String::new();
+    let mut foreign_wire = String::new();
+    for event in first.iter().chain(&second) {
+        native_wire.push_str(&native.encode(event).unwrap_or_default());
+        foreign_wire.push_str(&foreign.encode(event).unwrap_or_default());
+    }
+    let values = frames(&native_wire);
+    let metadata: Vec<_> = values
+        .iter()
+        .filter_map(|v| v.pointer("/candidates/0/groundingMetadata"))
+        .collect();
+    assert_eq!(metadata, [&query, &sources]);
+    assert_eq!(foreign_wire.matches("rust release").count(), 1);
+    assert_eq!(
+        foreign_wire
+            .matches("https://example.invalid/late-source")
+            .count(),
+        1
+    );
+}

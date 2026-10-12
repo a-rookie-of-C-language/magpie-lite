@@ -30,6 +30,11 @@ pub enum StreamEvent {
         /// Query and public sources, with optional native protocol metadata.
         search: Box<WebSearch>,
     },
+    /// A later hosted-search metadata update. Public query/hits contain only
+    /// newly observed items; native metadata preserves the exact upstream update.
+    /// Citation/attribution-only updates carry no public answer and must not
+    /// fabricate a new search call in foreign protocols.
+    SearchUpdate { search: Box<WebSearch> },
     /// A fragment of reasoning text.
     ThinkingDelta {
         /// The fragment.
@@ -77,7 +82,7 @@ impl StreamEvent {
             Self::TextDelta { text } => !text.is_empty(),
             Self::Image { image } => !image.data.is_empty() || !image.url.is_empty(),
             Self::SearchStarted => true,
-            Self::Search { search } => search.is_answer(),
+            Self::Search { search } | Self::SearchUpdate { search } => search.is_answer(),
             Self::ToolCallStart { .. } | Self::ToolCallEnd { .. } => true,
             Self::ToolCallDelta { args, .. } => !args.is_empty(),
             _ => false,

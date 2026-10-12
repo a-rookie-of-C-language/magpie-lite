@@ -69,6 +69,8 @@ pub struct WebSearch {
     pub hits: Vec<SearchHit>,
     /// Original Gemini grounding metadata, only re-emitted to Gemini clients.
     /// This retains citation offsets, chunk indices and required attribution.
+    /// In SearchUpdate events this is the exact native update; query/hits carry
+    /// only new public items, not a reconstructed native metadata object.
     pub gemini_grounding: Option<Value>,
     /// Original Responses search action, only re-emitted to Responses clients.
     pub responses_action: Option<Value>,

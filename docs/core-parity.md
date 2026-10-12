@@ -6,7 +6,7 @@ Target: multiple coding agents sharing one Rust backend, provider adapters for d
 
 | Area | Current evidence | Remaining work |
 |---|---|---|
-| Shared Rust gateway | Core wire codecs; real local HTTP/SSE terminal/error/EOF and after-header disconnect fixtures across four adapters; incremental 32 MiB raw-event bounds, BOM/CR/UTF-8 handling, opening event/metadata-byte budgets, early stream-error key/fallback/group retry, no ordinary fallback after text/reasoning/tool output, configurable per-attempt first-content/read-idle deadlines with timeout fallback, group non-final first-content switching, request-wide Responses opening release, downstream pre-header/mid-answer SSE comments with safe fallback, protocol error conversion, bounded upstream-silence windows and activity-driven cadence, bounded per-channel text/reasoning repetition protection with no answer/tool replay and one same-candidate reasoning-only reask plus bounded Gemini empty-reply reasks with combined client/history usage, and real HTTP/1.1 before/after-header cancellation with persisted accounting; see docs/stream-lifecycle.md | Recorded real-agent fixtures, broader multimodal/tool/stream conformance, queue/slow-final-route behavior, cross-protocol search-option translation, Anthropic search ingress and cross-client image rendering, provider-specific prefill continuation, optional post-content progress policies, and HTTP/2 cancellation conformance |
+| Shared Rust gateway | Core wire codecs; real local HTTP/SSE terminal/error/EOF and after-header disconnect fixtures across four adapters; incremental 32 MiB raw-event bounds, BOM/CR/UTF-8 handling, opening event/metadata-byte budgets, early stream-error key/fallback/group retry, no ordinary fallback after text/reasoning/tool output, configurable per-attempt first-content/read-idle deadlines with timeout fallback, group non-final first-content switching, request-wide Responses opening release, downstream pre-header/mid-answer SSE comments with safe fallback, protocol error conversion, bounded upstream-silence windows and activity-driven cadence, bounded per-channel text/reasoning repetition protection with no answer/tool replay and one same-candidate reasoning-only reask plus bounded Gemini empty-reply reasks with combined client/history usage, and real HTTP/1.1 before/after-header cancellation with persisted accounting; see docs/stream-lifecycle.md | Recorded real-agent fixtures, broader multimodal/tool/stream conformance, queue/slow-final-route behavior, cross-protocol search-option translation and cross-client image rendering, provider-specific prefill continuation, optional post-content progress policies, and HTTP/2 cancellation conformance |
 | Agent adapters | Shared magpie-agents adapters for Claude Code, Codex, Crush, Gemini CLI, Goose, OpenCode and Zed; private staged preview, revision-checked apply, OS lock, schema-2 journaled selective field restore preserving unrelated edits, disconnect, managed-field drift and explicit recovery. Agent unit, HTTP, sandboxed child CLI and real-gateway console browser tests; Windows ACL/junction checks; recursive duplicate-key JSON/JSONC refusal, format-preserving JSON edits, compact comment-free JSON object additions that preserve single-line layout, native OpenCode/Zed JSONC, shared passive CLI/config discovery with bounded user-prefix/Node-version searches, npmrc prefix and nvm default-alias handling, and PATH/unknown metadata, native absolute config-directory overrides for Claude/Codex/OpenCode/Zed, and seven-Agent selective restore through HTTP/CLI/browser | Native project overrides, login-shell/registry PATH refresh, process/reachability and real-version compatibility evidence; compact layout preservation is intentionally limited to single-line objects without direct comments |
 | Provider metadata and keys | Protected provider CRUD and console; providers.rs covers saved/live edits, secret-free capability metadata (`supported_protocols`, nullable streaming/tools/vision), protocol validation and preserve/clear semantics. provider_tools.rs covers four-protocol catalogs/probes, pagination, saved/draft/no-auth credentials and bounded read-only operations | Capability presets, specialized/stream-only probes and paid/live vendor evidence |
 | Hot edits and key rotation | ConfigStore saves before publishing; requests own snapshots. Versioned key schedules ignore stale requests. providers.rs checks an old in-flight request after a smaller pool is saved; config.rs checks stale scheduler calls. Durable config revisions/ETags and optional If-Match checks reject stale provider/group writes across restarts; the revision is committed in the atomically replaced TOML document, store and HTTP tests check unchanged disk/memory and a single winner for concurrent checked edits; gateway writers also serialize through a bounded file lock. Provider/group CRUD and agent apply now have durable idempotency with 256-entry retention, token-keyed HMAC digests, restart replay, pending fail-closed behavior, and secret-free ledgers | Encrypted secret storage with recovery; durable idempotency for any future agent rotate endpoint |
@@ -270,8 +270,8 @@ the first. Queries/chunks retain result order; merged native support chunk indic
 are rebased. A single native grounding object remains unchanged. Non-array native
 metadata conflicts keep the first value; this is not a general merger of arbitrary
 provider attribution documents. Gemini SSE emits a grounding chunk for each
-completed search; its upstream decoder still only consumes the first valid
-metadata event, so repeated/cumulative native grounding updates remain a gap.
+completed search. Repeated/cumulative upstream Gemini grounding updates now have
+a separate stream-update contract, described below.
 
 Evidence: core tests first reproduced dropped second-search results, accepted
 non-object inputs and fabricated completion for unclosed searches. Core fixtures
@@ -287,3 +287,47 @@ paid/live Anthropic or actual-agent conformance. The original reference decoder
 ignores hosted-search argument fragments; preserving complete inbound search
 results through IR extends that behavior rather than copying a completed reference
 implementation.
+
+
+## Gemini repeated/cumulative grounding updates (2026-10-12)
+
+The reference CodeAssist stream decoder uses a one-time searched flag. Lite's
+Gemini decoder previously inherited that limitation: subsequent sources and
+citation/attribution-only updates disappeared. It now retains bounded per-stream
+state instead of consuming a single search event. The first public result emits
+Search; later changes emit SearchUpdate with only new public queries and URLs,
+and the exact native grounding object attached separately. Query strings and
+source URLs are deduplicated within and across updates, preserving their first
+appearance order. Exact consecutive native objects are suppressed; changed
+objects, including snake_case fields, source-title corrections and native-only
+citation/attribution updates, reach Gemini clients intact. Native chunk indices
+are not rebased or interpreted as a synthetic combined document during streaming.
+
+Foreign Anthropic/Responses clients get synthetic search presentations for new
+public items, not repeated cumulative snapshots; native-only updates create no
+empty completed search. Chat still omits search presentation. URL deduplication
+means a later title correction is native-only. There is no claim that Gemini
+metadata identifies individual hosted-search executions or links each query to a
+particular source. Independent updates and cumulative updates are both accepted
+without guessing which native metadata model a vendor uses. Nonstream merging
+of distinct completed search parts retains its separate contract above.
+
+Only the latest native object and the seen public query/URL sets are retained.
+Their serialized native size plus UTF-8 query/URL bytes may not exceed 32 MiB;
+there may be at most 4096 unique public queries and URLs in total. An overflow
+clears retained state, emits one static error, and suppresses later frames even
+if the overflowing frame also reports a normal finish. Attribution-only metadata
+is not an answer and cannot itself satisfy first-content deadlines. It remains
+subject to the gateway's bounded opening-event/metadata commitment policy.
+
+Evidence: two core regressions failed before the change (later public results
+and citation-only metadata were lost). Core tests cover cumulative/independent
+updates, duplicate public items, exact consecutive native repeat suppression,
+metadata-only forwarding, exact-byte/one-byte-over budgets, 4096-item exhaustion,
+replacement rather than unbounded native-version retention, pre-search metadata,
+and terminal overflow. Five loopback HTTP/socket fixtures cover all four clients,
+ordinary/group routes, exact native updates, foreign deduplication, sanitized
+persisted usage/history, no retries after a committed-search overflow, safe
+first-content fallback before an answer, opening byte-budget commitment, and
+client cancellation after updates. These are local fixtures, not paid/live
+Gemini, CodeAssist subscription or actual-agent conformance evidence.

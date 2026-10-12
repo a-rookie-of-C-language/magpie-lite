@@ -876,7 +876,10 @@ impl AnthropicStreamEncoder {
                 Some(self.start_message())
             }
             StreamEvent::SearchStarted => None,
-            StreamEvent::Search { search } => {
+            StreamEvent::Search { search } | StreamEvent::SearchUpdate { search } => {
+                if matches!(ev, StreamEvent::SearchUpdate { .. }) && !search.is_answer() {
+                    return None;
+                }
                 let mut out = self.start_message();
                 out.push_str(&self.close_open().unwrap_or_default());
                 let id = format!("srvtoolu_{}_{}", self.id, self.next_index);

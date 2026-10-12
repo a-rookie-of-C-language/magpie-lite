@@ -6413,3 +6413,6 @@ mod search_requests;
 
 #[path = "support/anthropic_search.rs"]
 mod anthropic_search;
+
+#[path = "support/gemini_grounding.rs"]
+mod gemini_grounding;

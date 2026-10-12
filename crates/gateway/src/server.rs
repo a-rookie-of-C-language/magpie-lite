@@ -1893,6 +1893,7 @@ async fn prefetch_stream(
         let terminal = matches!(item.event, StreamEvent::Done | StreamEvent::Error { .. });
         let visible = match &item.event {
             StreamEvent::Start { .. } | StreamEvent::Usage(_) => false,
+            StreamEvent::SearchUpdate { search } => search.is_answer(),
             StreamEvent::TextDelta { text } | StreamEvent::ThinkingDelta { text } => {
                 !text.is_empty()
             }
@@ -1901,6 +1902,14 @@ async fn prefetch_stream(
         metadata_bytes += std::mem::size_of_val(&item);
         if let StreamEvent::Start { model } = &item.event {
             metadata_bytes += model.len();
+        }
+        if let StreamEvent::SearchUpdate { search } = &item.event {
+            metadata_bytes = metadata_bytes.saturating_add(
+                search
+                    .gemini_grounding
+                    .as_ref()
+                    .map_or(0, |metadata| metadata.to_string().len()),
+            );
         }
         prefix.push(item);
         if terminal {

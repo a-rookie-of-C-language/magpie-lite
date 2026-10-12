@@ -596,8 +596,8 @@ below; subscription wrappers and paid/live multimodal compatibility remain unver
 A nonempty Gemini grounding query/source or Responses search action becomes a
 search IR event. It is answer content: it satisfies first-content clocks and
 prevents unsafe fallback/re-ask after output, without changing the stop reason
-to client tool use. Empty/malformed grounding does not count as an answer or
-consume Gemini's one valid grounding event. Responses open_page/find actions
+to client tool use. Empty/malformed public grounding does not count as an answer
+or prevent later valid search updates. Responses open_page/find actions
 are not translated as searches.
 
 Anthropic encoders close pending blocks and emit paired server search call and
@@ -657,4 +657,35 @@ attempt. Client disconnect releases the owned upstream and persists one sanitize
 record without query, URL or encrypted result content. Local fixtures prove these
 properties for the four client dialects and ordinary/group routes, not live vendors,
 HTTP/2, TLS/proxies or real Agents. See docs/core-parity.md for budgets, block
-preservation and remaining citation, pause_turn and repeated-grounding limitations.
+preservation and remaining Anthropic citation and pause_turn limitations.
+Repeated Gemini grounding updates are described below.
+
+
+## Gemini grounding updates and opening commitment (2026-10-12)
+
+SearchUpdate distinguishes later search metadata from a new completed search.
+Its public query/hits are incremental; its optional native grounding object is
+an exact upstream update. New public items count as answer/content and disable
+replay. Native citation/attribution-only updates do neither. Gemini encoders
+forward changed native objects intact, while foreign encoders omit native-only
+updates and synthesize results only for new public items. Identical consecutive
+native objects and already-seen public queries/URLs do not emit duplicate results.
+The decoder bounds retained native metadata and public sets to 32 MiB and 4096
+unique public items; overflow is a static terminal error, never a success.
+
+Opening prefetch must classify native-only SearchUpdate as metadata rather than
+commit on the mere presence of this event. This permits ordinary and group
+first-content timeout fallback before any public answer. Buffered native update
+payloads also count toward the existing 64 KiB opening metadata budget (as well
+as the 64-event cap); crossing an opening budget intentionally commits the
+attempt to avoid unbounded buffering, but does not satisfy its first-content
+clock. Thus a large metadata-only update can end with a first-content error
+without replaying another key/route. This differs from a small metadata-only
+opening which may safely switch routes before client output.
+
+Local HTTP/socket fixtures verify these cases for all four client dialects,
+ordinary/group fallback, no success/retry after an answer's state overflow,
+usage 7/3 and sanitized persisted history, and release after client disconnect.
+Core tests also verify native-only updates do not manufacture foreign searches
+and malformed/empty public metadata does not consume later valid results.
+No paid/live vendor, HTTP/2 or real-agent compatibility is implied.

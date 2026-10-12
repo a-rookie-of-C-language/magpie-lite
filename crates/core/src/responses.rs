@@ -876,7 +876,10 @@ impl ResponsesStreamEncoder {
                 Some(self.ensure_created())
             }
             StreamEvent::SearchStarted => None,
-            StreamEvent::Search { search } => {
+            StreamEvent::Search { search } | StreamEvent::SearchUpdate { search } => {
+                if matches!(ev, StreamEvent::SearchUpdate { .. }) && !search.is_answer() {
+                    return None;
+                }
                 if !search.is_public_result() {
                     return None;
                 }

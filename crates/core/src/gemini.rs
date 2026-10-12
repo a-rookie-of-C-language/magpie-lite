@@ -5,6 +5,8 @@
 //! body; the gateway's route handler folds both into the IR before calling
 //! these codecs.
 
+mod grounding;
+
 use std::collections::HashMap;
 
 use crate::error::{CoreError, Result};
@@ -911,7 +913,7 @@ pub fn encode_response(resp: &CompletionResponse) -> Value {
 #[derive(Debug, Default)]
 pub struct GeminiStreamDecoder {
     next_tool_index: usize,
-    searched: bool,
+    grounding: grounding::GroundingState,
 }
 
 impl GeminiStreamDecoder {
@@ -920,6 +922,9 @@ impl GeminiStreamDecoder {
     }
 
     pub fn decode(&mut self, v: &Value) -> Vec<StreamEvent> {
+        if self.grounding.failed() {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         if let Some(model) = get_either(v, "modelVersion", "model_version").and_then(Value::as_str)
         {
@@ -1011,13 +1016,12 @@ impl GeminiStreamDecoder {
                 out.push(StreamEvent::ToolCallEnd { index });
             }
         }
-        if !self.searched
-            && let Some(search) = decode_search(candidate)
-        {
-            self.searched = true;
-            out.push(StreamEvent::Search {
-                search: Box::new(search),
-            });
+        if let Some(event) = self.grounding.observe(candidate) {
+            let failed = matches!(event, StreamEvent::Error { .. });
+            out.push(event);
+            if failed {
+                return out;
+            }
         }
         if let Some(finish) = candidate
             .get("finishReason")
@@ -1145,7 +1149,7 @@ impl GeminiStreamEncoder {
                 })
             }
             StreamEvent::SearchStarted => None,
-            StreamEvent::Search { search } => {
+            StreamEvent::Search { search } | StreamEvent::SearchUpdate { search } => {
                 if !search.is_public_result() {
                     return None;
                 }
