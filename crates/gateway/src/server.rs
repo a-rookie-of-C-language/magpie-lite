@@ -21,7 +21,7 @@ use magpie_core::{anthropic, chat, gemini, responses};
 use serde_json::{Value, json};
 
 use crate::config::{Config, GroupConfig, Protocol, ProviderConfig};
-use crate::config_store::ConfigStore;
+use crate::config_store::{ConfigStore, IdempotencyRequest};
 use crate::cooldown::quota_cooldown;
 use crate::upstream;
 use crate::usage::{RequestLog, RequestTracker};
@@ -267,6 +267,35 @@ pub(crate) fn expected_config_revision(headers: &HeaderMap) -> Result<Option<u64
         .map_err(|_| "If-Match must contain a numeric configuration revision")
 }
 
+/// Parse an optional durable idempotency key for one management operation.
+/// The request body is reduced to a token-keyed digest before it reaches the
+/// durable ledger, so neither the token nor raw credentials are persisted.
+pub(crate) fn idempotency_request(
+    config: &ConfigStore,
+    headers: &HeaderMap,
+    scope: &str,
+    payload: &[u8],
+) -> Result<Option<IdempotencyRequest>, &'static str> {
+    let Some(value) = headers.get("idempotency-key") else {
+        return Ok(None);
+    };
+    let key = value
+        .to_str()
+        .map_err(|_| "Idempotency-Key must contain visible ASCII characters")?
+        .trim();
+    if key.is_empty() {
+        return Err("Idempotency-Key cannot be empty");
+    }
+    if key.len() > 200 {
+        return Err("Idempotency-Key must be at most 200 bytes");
+    }
+    Ok(Some(IdempotencyRequest {
+        scope: scope.to_owned(),
+        key: key.to_owned(),
+        digest: config.idempotency_digest(scope, payload),
+    }))
+}
+
 pub(crate) fn config_response(
     status: StatusCode,
     snapshot: crate::config::ConfigSnapshot,
@@ -308,11 +337,28 @@ async fn create_group(
         Ok(value) => value,
         Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
     };
+    let request = match idempotency_request(&state.config, &headers, "group.create", &bytes) {
+        Ok(value) => value,
+        Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
+    };
     let group = match decode_group(&bytes) {
         Ok(group) => group,
         Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
     };
-    group_update_response(
+    let result = if let Some(request) = request {
+        state
+            .config
+            .update_idempotent(expected, request, move |config| {
+                validate_group(config, &group)?;
+                if config.group.iter().any(|existing| existing.id == group.id) {
+                    return Err((StatusCode::CONFLICT, "group already exists".to_owned()));
+                }
+                config.group.push(group);
+                Ok(())
+            })
+            .await
+            .map(|(snapshot, _)| snapshot)
+    } else {
         state
             .config
             .update_if_revision(expected, move |config| {
@@ -323,9 +369,9 @@ async fn create_group(
                 config.group.push(group);
                 Ok(())
             })
-            .await,
-        StatusCode::CREATED,
-    )
+            .await
+    };
+    group_update_response(result, StatusCode::CREATED)
 }
 
 async fn update_group(
@@ -338,6 +384,11 @@ async fn update_group(
         Ok(value) => value,
         Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
     };
+    let scope = format!("group.update:{id}");
+    let request = match idempotency_request(&state.config, &headers, &scope, &bytes) {
+        Ok(value) => value,
+        Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
+    };
     let group = match decode_group(&bytes) {
         Ok(group) => group,
         Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
@@ -345,7 +396,22 @@ async fn update_group(
     if group.id != id {
         return group_error(StatusCode::BAD_REQUEST, "body id must match path id");
     }
-    group_update_response(
+    let result = if let Some(request) = request {
+        state
+            .config
+            .update_idempotent(expected, request, move |config| {
+                validate_group(config, &group)?;
+                let existing = config
+                    .group
+                    .iter_mut()
+                    .find(|existing| existing.id == id)
+                    .ok_or_else(|| (StatusCode::NOT_FOUND, "group not found".to_owned()))?;
+                *existing = group;
+                Ok(())
+            })
+            .await
+            .map(|(snapshot, _)| snapshot)
+    } else {
         state
             .config
             .update_if_revision(expected, move |config| {
@@ -358,9 +424,9 @@ async fn update_group(
                 *existing = group;
                 Ok(())
             })
-            .await,
-        StatusCode::OK,
-    )
+            .await
+    };
+    group_update_response(result, StatusCode::OK)
 }
 
 async fn delete_group(
@@ -372,7 +438,37 @@ async fn delete_group(
         Ok(value) => value,
         Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
     };
-    group_update_response(
+    let scope = format!("group.delete:{id}");
+    let request = match idempotency_request(&state.config, &headers, &scope, &[]) {
+        Ok(value) => value,
+        Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
+    };
+    let result = if let Some(request) = request {
+        state
+            .config
+            .update_idempotent(expected, request, move |config| {
+                let index = config
+                    .group
+                    .iter()
+                    .position(|group| group.id == id)
+                    .ok_or_else(|| (StatusCode::NOT_FOUND, "group not found".to_owned()))?;
+                let reference = format!("group/{id}");
+                if config
+                    .provider
+                    .iter()
+                    .any(|provider| provider.fallback.contains(&reference))
+                {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        "group is referenced by a provider fallback".to_owned(),
+                    ));
+                }
+                config.group.remove(index);
+                Ok(())
+            })
+            .await
+            .map(|(snapshot, _)| snapshot)
+    } else {
         state
             .config
             .update_if_revision(expected, move |config| {
@@ -395,9 +491,9 @@ async fn delete_group(
                 config.group.remove(index);
                 Ok(())
             })
-            .await,
-        StatusCode::OK,
-    )
+            .await
+    };
+    group_update_response(result, StatusCode::OK)
 }
 
 fn group_update_response(

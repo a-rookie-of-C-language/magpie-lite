@@ -100,8 +100,61 @@ async fn edit(gw: &Gateway, method: Method, path: &str, body: Value) -> reqwest:
         .unwrap()
 }
 
+async fn edit_with_key(
+    gw: &Gateway,
+    method: Method,
+    path: &str,
+    body: Value,
+    key: &str,
+) -> reqwest::Response {
+    Client::new()
+        .request(method, format!("{}{path}", gw.url))
+        .bearer_auth("magpie-lite")
+        .header("Idempotency-Key", key)
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+}
+
 fn group(id: &str, model: &str) -> Value {
     json!({"id":id, "name":"Daily coding", "routes":[format!("mock/{model}")]})
+}
+
+#[tokio::test]
+async fn idempotency_replays_group_create_without_advancing_revision() {
+    let gw = gateway(false).await;
+    let body = group("durable", "first");
+    let first = edit_with_key(
+        &gw,
+        Method::POST,
+        "/config/groups",
+        body.clone(),
+        "group-create-1",
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_snapshot: Value = first.json().await.unwrap();
+    assert_eq!(first_snapshot["revision"], 2);
+
+    let replay = edit_with_key(&gw, Method::POST, "/config/groups", body, "group-create-1").await;
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    assert_eq!(replay.json::<Value>().await.unwrap(), first_snapshot);
+    assert_eq!(Config::load(&gw.path).unwrap().group.len(), 1);
+
+    let conflict = edit_with_key(
+        &gw,
+        Method::POST,
+        "/config/groups",
+        group("durable", "second"),
+        "group-create-1",
+    )
+    .await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        Config::load(&gw.path).unwrap().group[0].routes,
+        ["mock/first"]
+    );
 }
 
 #[tokio::test]

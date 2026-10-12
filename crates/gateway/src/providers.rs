@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 use crate::config::{Config, ConfigSnapshot, Protocol, ProviderCapabilities, ProviderConfig};
 use crate::config_store::ConfigError;
-use crate::server::{AppState, config_response, expected_config_revision};
+use crate::server::{AppState, config_response, expected_config_revision, idempotency_request};
 use crate::upstream;
 
 /// Metadata is replaced; omitted keys preserve existing credentials.
@@ -98,11 +98,26 @@ pub async fn create(
         Ok(value) => value,
         Err(message) => return error(StatusCode::BAD_REQUEST, message),
     };
+    let request = match idempotency_request(&state.config, &headers, "provider.create", &bytes) {
+        Ok(value) => value,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
     let edit = match decode(&bytes) {
         Ok(edit) => edit,
         Err(message) => return error(StatusCode::BAD_REQUEST, message),
     };
-    response(
+    let result = if let Some(request) = request {
+        state
+            .config
+            .update_idempotent(expected, request, move |config| {
+                if config.provider(&edit.id).is_some() {
+                    return Err((StatusCode::CONFLICT, "provider already exists".to_owned()));
+                }
+                edit.apply(config)
+            })
+            .await
+            .map(|(snapshot, _)| snapshot)
+    } else {
         state
             .config
             .update_if_revision(expected, move |config| {
@@ -111,9 +126,9 @@ pub async fn create(
                 }
                 edit.apply(config)
             })
-            .await,
-        StatusCode::CREATED,
-    )
+            .await
+    };
+    response(result, StatusCode::CREATED)
 }
 
 pub async fn update(
@@ -126,6 +141,11 @@ pub async fn update(
         Ok(value) => value,
         Err(message) => return error(StatusCode::BAD_REQUEST, message),
     };
+    let scope = format!("provider.update:{id}");
+    let request = match idempotency_request(&state.config, &headers, &scope, &bytes) {
+        Ok(value) => value,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
     let edit = match decode(&bytes) {
         Ok(edit) => edit,
         Err(message) => return error(StatusCode::BAD_REQUEST, message),
@@ -133,7 +153,18 @@ pub async fn update(
     if edit.id != id {
         return error(StatusCode::BAD_REQUEST, "body id must match path id");
     }
-    response(
+    let result = if let Some(request) = request {
+        state
+            .config
+            .update_idempotent(expected, request, move |config| {
+                if config.provider(&id).is_none() {
+                    return Err((StatusCode::NOT_FOUND, "provider not found".to_owned()));
+                }
+                edit.apply(config)
+            })
+            .await
+            .map(|(snapshot, _)| snapshot)
+    } else {
         state
             .config
             .update_if_revision(expected, move |config| {
@@ -142,9 +173,9 @@ pub async fn update(
                 }
                 edit.apply(config)
             })
-            .await,
-        StatusCode::OK,
-    )
+            .await
+    };
+    response(result, StatusCode::OK)
 }
 
 pub async fn delete(
@@ -156,7 +187,25 @@ pub async fn delete(
         Ok(value) => value,
         Err(message) => return error(StatusCode::BAD_REQUEST, message),
     };
-    response(
+    let scope = format!("provider.delete:{id}");
+    let request = match idempotency_request(&state.config, &headers, &scope, &[]) {
+        Ok(value) => value,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
+    let result = if let Some(request) = request {
+        state
+            .config
+            .update_idempotent(expected, request, move |config| {
+                if config.provider(&id).is_none() {
+                    return Err((StatusCode::NOT_FOUND, "provider not found".to_owned()));
+                }
+                config
+                    .remove_provider(&id)
+                    .map_err(|error| (StatusCode::CONFLICT, error.to_string()))
+            })
+            .await
+            .map(|(snapshot, _)| snapshot)
+    } else {
         state
             .config
             .update_if_revision(expected, move |config| {
@@ -167,7 +216,7 @@ pub async fn delete(
                     .remove_provider(&id)
                     .map_err(|error| (StatusCode::CONFLICT, error.to_string()))
             })
-            .await,
-        StatusCode::OK,
-    )
+            .await
+    };
+    response(result, StatusCode::OK)
 }

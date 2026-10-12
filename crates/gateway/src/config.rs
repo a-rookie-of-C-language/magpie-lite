@@ -574,7 +574,7 @@ impl GroupConfig {
 
 /// One provider as the console may show it: routing metadata only, never an
 /// upstream API key or the gateway token.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfigSnapshot {
     /// Short id models route by.
     pub id: String,
@@ -601,7 +601,7 @@ pub struct ProviderConfigSnapshot {
 }
 
 /// Capability metadata exposed by the secret-free configuration snapshot.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderCapabilitiesSnapshot {
     /// Protocols the provider is known to accept, including the configured
     /// protocol when no broader list was supplied.
@@ -615,7 +615,7 @@ pub struct ProviderCapabilitiesSnapshot {
 }
 
 /// One routing group as the console may show it.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupConfigSnapshot {
     /// Short id; agents use `group/<id>`.
     pub id: String,
@@ -628,7 +628,7 @@ pub struct GroupConfigSnapshot {
 }
 
 /// Secret-free routing configuration for the token-protected console.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigSnapshot {
     /// Durable opaque revision used for optimistic management updates.
     /// It is opaque to clients and never contains configuration or secret data.

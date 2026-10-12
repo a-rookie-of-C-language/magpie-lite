@@ -142,6 +142,23 @@ async fn edit(gw: &Gateway, method: Method, path: &str, body: Value) -> reqwest:
         .unwrap()
 }
 
+async fn edit_with_key(
+    gw: &Gateway,
+    method: Method,
+    path: &str,
+    body: Value,
+    key: &str,
+) -> reqwest::Response {
+    Client::new()
+        .request(method, format!("{}{path}", gw.url))
+        .bearer_auth("magpie-lite")
+        .header("Idempotency-Key", key)
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+}
+
 async fn snapshot(gw: &Gateway, path: &str) -> Value {
     Client::new()
         .get(format!("{}{path}", gw.url))
@@ -164,6 +181,52 @@ async fn call(gw: &Gateway, model: &str) -> reqwest::Response {
         json!({"model":model, "messages":[{"role":"user","content":"hello"}]}),
     )
     .await
+}
+
+#[tokio::test]
+async fn idempotency_replays_provider_create_and_rejects_key_reuse_with_a_new_body() {
+    let gw = gateway().await;
+    let body = provider(&gw, "idempotent");
+    let first = edit_with_key(
+        &gw,
+        Method::POST,
+        "/config/providers",
+        body.clone(),
+        "provider-create-1",
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_snapshot: Value = first.json().await.unwrap();
+    assert_eq!(first_snapshot["revision"], 2);
+
+    let replay = edit_with_key(
+        &gw,
+        Method::POST,
+        "/config/providers",
+        body,
+        "provider-create-1",
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    assert_eq!(replay.json::<Value>().await.unwrap(), first_snapshot);
+    assert_eq!(snapshot(&gw, "/config").await["revision"], 2);
+
+    let mut different = provider(&gw, "idempotent");
+    different["name"] = json!("changed");
+    let conflict = edit_with_key(
+        &gw,
+        Method::POST,
+        "/config/providers",
+        different,
+        "provider-create-1",
+    )
+    .await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(snapshot(&gw, "/config").await["revision"], 2);
+    assert_eq!(
+        Config::load(&gw.path).unwrap().provider[0].name,
+        "Test provider"
+    );
 }
 
 #[tokio::test]
