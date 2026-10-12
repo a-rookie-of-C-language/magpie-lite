@@ -255,11 +255,11 @@ async fn anthropic_client_nonstream_over_chat_upstream() {
             "max_tokens": 100,
             "system": "Be terse.",
             "messages": [
-                {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "call_prev", "content": "5-day forecast"}
-                ]},
                 {"role": "assistant", "content": [
                     {"type": "tool_use", "id": "call_prev", "name": "forecast", "input": {"city": "Beijing"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_prev", "content": "5-day forecast"}
                 ]},
                 {"role": "user", "content": "Summary?"}
             ]
@@ -286,10 +286,11 @@ async fn anthropic_client_nonstream_over_chat_upstream() {
     let upstream_req = last.lock().unwrap().clone().expect("upstream was called");
     let msgs = upstream_req["messages"].as_array().unwrap();
     assert_eq!(msgs[0]["role"], "system");
-    assert_eq!(msgs[1]["role"], "tool");
-    assert_eq!(msgs[1]["tool_call_id"], "call_prev");
-    assert_eq!(msgs[2]["role"], "assistant");
-    assert_eq!(msgs[2]["tool_calls"][0]["function"]["name"], "forecast");
+    assert_eq!(msgs[1]["role"], "assistant");
+    assert_eq!(msgs[1]["tool_calls"][0]["function"]["name"], "forecast");
+    assert_eq!(msgs[2]["role"], "tool");
+    assert_eq!(msgs[2]["tool_call_id"], "call_prev");
+    assert_eq!(msgs[2]["content"], "5-day forecast");
     assert_eq!(msgs[3]["role"], "user");
     assert_eq!(upstream_req["model"], "mock-model");
 }

@@ -12,6 +12,8 @@ use crate::ir::{
 use crate::stream::StreamEvent;
 use serde_json::{Map, Value, json};
 
+mod tool_pairing;
+
 fn missing(field: &'static str) -> CoreError {
     CoreError::MissingField(field)
 }
@@ -272,7 +274,10 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
 
     let mut out = Map::new();
     out.insert("model".into(), json!(model));
-    out.insert("messages".into(), Value::Array(messages));
+    out.insert(
+        "messages".into(),
+        Value::Array(tool_pairing::normalize(messages)?),
+    );
     if !req.tools.is_empty() {
         out.insert(
             "tools".into(),
