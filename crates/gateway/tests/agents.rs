@@ -58,11 +58,13 @@ async fn server(enabled: bool) -> Server {
         .unwrap();
     let address = listener.local_addr().unwrap();
     let port = address.port();
+    let agent_state_dir = root.path().join("agent-state");
     let agents = enabled.then(|| AgentService {
         manager: Arc::new(
-            Manager::at_home(&root.path().join("home"), root.path().join("agent-state")).unwrap(),
+            Manager::at_home(&root.path().join("home"), agent_state_dir.clone()).unwrap(),
         ),
         port,
+        state_dir: agent_state_dir,
     });
     let state = Arc::new(AppState {
         agents,
@@ -115,6 +117,57 @@ impl Server {
     async fn apply(&self, agent: &str, preview: &Value) -> Value {
         self.ok(Method::POST, &format!("/agents/{agent}/apply"), json!({"action":preview["action"],"model":preview["model"],"revision":preview["revision"]})).await
     }
+    async fn apply_with_key(&self, agent: &str, body: &Value, key: &str) -> reqwest::Response {
+        self.client
+            .post(format!("{}/agents/{agent}/apply", self.url))
+            .bearer_auth(TOKEN)
+            .header("Idempotency-Key", key)
+            .json(body)
+            .send()
+            .await
+            .unwrap()
+    }
+}
+#[tokio::test]
+async fn agent_apply_idempotency_replays_status_and_rejects_reuse_with_different_body() {
+    let s = server(true).await;
+    let preview = s.preview("claude", "connect", "mock/model").await;
+    let body = json!({
+        "action": preview["action"],
+        "model": preview["model"],
+        "revision": preview["revision"],
+    });
+
+    let first = s.apply_with_key("claude", &body, "agent-apply-once").await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_text = first.text().await.unwrap();
+    assert!(!first_text.contains(TOKEN));
+    assert!(!first_text.contains(UPSTREAM_KEY));
+    let first_status: Value = serde_json::from_str(&first_text).unwrap();
+
+    let replay = s.apply_with_key("claude", &body, "agent-apply-once").await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay_status: Value = replay.json().await.unwrap();
+    assert_eq!(replay_status, first_status);
+
+    let different_body = json!({
+        "action": body["action"],
+        "model": "model",
+        "revision": body["revision"],
+    });
+    let conflict = s
+        .apply_with_key("claude", &different_body, "agent-apply-once")
+        .await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    let conflict_text = conflict.text().await.unwrap();
+    assert!(!conflict_text.contains(TOKEN));
+    assert!(!conflict_text.contains(UPSTREAM_KEY));
+
+    let ledger_path = s.root.path().join("agent-state/agent-idempotency.json");
+    let ledger = std::fs::read_to_string(ledger_path).unwrap();
+    assert_eq!(ledger.matches("agent-apply-once").count(), 1);
+    assert!(!ledger.contains(TOKEN));
+    assert!(!ledger.contains(UPSTREAM_KEY));
 }
 #[tokio::test]
 async fn agent_routes_require_auth_and_missing_service_stays_sanitized() {

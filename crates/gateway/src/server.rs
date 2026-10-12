@@ -177,13 +177,13 @@ pub async fn serve_with_config_path(
         Some(path) => path.clone(),
         None => crate::config::config_path()?,
     };
-    let manager = magpie_agents::lifecycle::Manager::native(
-        magpie_agents::lifecycle::state_directory(&agent_config)?,
-    )?;
+    let agent_state_dir = magpie_agents::lifecycle::state_directory(&agent_config)?;
+    let manager = magpie_agents::lifecycle::Manager::native(agent_state_dir.clone())?;
     let state = Arc::new(AppState {
         agents: Some(crate::agents::AgentService {
             manager: Arc::new(manager),
             port,
+            state_dir: agent_state_dir,
         }),
         config: ConfigStore::new(config, config_path),
         http,
