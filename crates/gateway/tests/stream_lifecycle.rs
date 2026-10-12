@@ -6137,3 +6137,254 @@ async fn gemini_image_client_disconnect_retains_usage_without_payload_in_history
     assert_eq!(*f.attempts.lock().unwrap(), [0]);
     f.assert_released().await;
 }
+
+// Public query/source metadata must survive the IR, not merely block retries.
+const SEARCH_QUERY: &str = "private search fixture query";
+const SEARCH_URL: &str = "https://example.invalid/private-search-source";
+fn search_reply(upstream: Protocol) -> Value {
+    match upstream {
+        Protocol::Gemini => json!({"modelVersion":"up-model","candidates":[{"content":{"parts":[]},
+            "groundingMetadata":{"webSearchQueries":[SEARCH_QUERY],"groundingChunks":[{"web":{"uri":SEARCH_URL,"title":"Fixture page"}}]},
+            "finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}),
+        Protocol::Responses => {
+            json!({"model":"up-model","status":"completed","output":[{"type":"web_search_call","id":"ws_search_fixture","status":"completed",
+            "action":{"type":"search","query":SEARCH_QUERY,"sources":[{"type":"url","url":SEARCH_URL}]}}],
+            "usage":{"input_tokens":7,"output_tokens":3}})
+        }
+        _ => unreachable!(),
+    }
+}
+fn search_frame(upstream: Protocol) -> String {
+    let mut reply = search_reply(upstream);
+    match upstream {
+        Protocol::Gemini => {
+            reply["candidates"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("finishReason");
+            format!("data: {reply}\n\n")
+        }
+        Protocol::Responses => format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({"type":"response.created","response":{"model":"up-model","usage":{"input_tokens":7,"output_tokens":3}}}),
+            json!({"type":"response.output_item.done","output_index":0,"item":reply["output"][0]})
+        ),
+        _ => unreachable!(),
+    }
+}
+fn assert_search_output(body: &str, client: Protocol) {
+    assert!(body.contains(SEARCH_URL), "{client:?}: {body}");
+    // Anthropic query deltas are JSON-escaped inside their SSE JSON envelope.
+    assert!(body.contains(SEARCH_QUERY), "{body}");
+    let marker = match client {
+        Protocol::Anthropic => "web_search_tool_result",
+        Protocol::Responses => "web_search_call",
+        Protocol::Gemini => "groundingMetadata",
+        _ => unreachable!(),
+    };
+    assert!(body.contains(marker), "{body}");
+}
+#[tokio::test]
+async fn web_search_stream_and_json_reach_supported_clients_and_keep_usage() {
+    for upstream in [Protocol::Gemini, Protocol::Responses] {
+        for client in [Protocol::Anthropic, Protocol::Responses, Protocol::Gemini] {
+            for stream in [false, true] {
+                let script = if stream {
+                    search_frame(upstream) + completion(upstream)
+                } else {
+                    search_reply(upstream).to_string()
+                };
+                let f = Fixture::new(upstream, script, Ending::Eof).await;
+                let (path, body) = client_request(client, "mock/up-model", stream);
+                let response = reqwest::Client::new()
+                    .post(format!("{}{path}", f.gateway.url))
+                    .bearer_auth("secret-local-token")
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 200);
+                let body = tokio::time::timeout(LIMIT, response.text())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_search_output(&body, client);
+                if stream {
+                    assert_completed_usage(&body, client, 7, 3);
+                }
+                assert_eq!(*f.attempts.lock().unwrap(), [0]);
+                let record = f.record().await;
+                assert_eq!(record["status"], "ok");
+                assert_eq!(record["usage"]["input"], 7);
+                assert_eq!(record["usage"]["output"], 3);
+                assert!(!record.to_string().contains(SEARCH_QUERY));
+                assert!(!record.to_string().contains(SEARCH_URL));
+                f.assert_released().await;
+            }
+        }
+    }
+}
+#[tokio::test]
+async fn web_search_satisfies_first_content_and_group_deadlines() {
+    for upstream in [Protocol::Gemini, Protocol::Responses] {
+        for grouped in [false, true] {
+            let f = Fixture::with_config(
+                upstream,
+                vec![
+                    search_frame(upstream),
+                    prefix(upstream) + completion(upstream),
+                ],
+                Ending::Paced(vec![(
+                    Duration::from_millis(650),
+                    completion(upstream).into(),
+                )]),
+                |config| {
+                    configure_timeout_fallback(config, grouped);
+                    config.stream_first_content_timeout_ms = 300;
+                    config.stream_idle_timeout_ms = 2_000;
+                    if grouped {
+                        config.group[0].first_token_timeout_ms = 300;
+                    }
+                },
+            )
+            .await;
+            let response = f
+                .request_model(
+                    Protocol::Anthropic,
+                    if grouped {
+                        "group/daily"
+                    } else {
+                        "mock/up-model"
+                    },
+                )
+                .await;
+            let body = tokio::time::timeout(LIMIT, response.text())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_search_output(&body, Protocol::Anthropic);
+            assert_completed_usage(&body, Protocol::Anthropic, 7, 3);
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            assert_eq!(f.record().await["status"], "ok");
+            f.assert_released().await;
+        }
+    }
+}
+#[tokio::test]
+async fn web_search_before_reasoning_loop_never_reasks_or_replays() {
+    for upstream in [Protocol::Gemini, Protocol::Responses] {
+        for client in PROTOCOLS {
+            let mut script = search_frame(upstream);
+            for _ in 0..300 {
+                script += &loop_delta(
+                    upstream,
+                    true,
+                    "Now. Writing. Go. Let me write. OK. Here. Produce.\n",
+                );
+            }
+            let f = Fixture::with_config(
+                upstream,
+                vec![script, prefix(upstream) + completion(upstream)],
+                Ending::Hold,
+                |config| configure_timeout_fallback(config, false),
+            )
+            .await;
+            let response = f.request(client).await;
+            let body = tokio::time::timeout(LIMIT, response.text())
+                .await
+                .unwrap()
+                .unwrap();
+            if client != Protocol::Chat {
+                assert_search_output(&body, client);
+            }
+            assert!(body.contains("stuck in a loop"), "{body}");
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            assert_eq!(f.record().await["status"], "upstream_stream_error");
+            f.assert_released().await;
+        }
+    }
+}
+#[tokio::test]
+async fn web_search_then_refusal_does_not_switch_configured_routes() {
+    for upstream in [Protocol::Gemini, Protocol::Responses] {
+        for grouped in [false, true] {
+            let mut finish = search_reply(upstream);
+            let filter = match upstream {
+                Protocol::Gemini => {
+                    finish["candidates"][0]["finishReason"] = json!("SAFETY");
+                    format!("data: {finish}\n\n")
+                }
+                Protocol::Responses => format!(
+                    "data: {}\n\n",
+                    json!({"type":"response.incomplete","response":{"status":"incomplete",
+                    "incomplete_details":{"reason":"content_filter"},"output":[],"usage":{"input_tokens":7,"output_tokens":3}}})
+                ),
+                _ => unreachable!(),
+            };
+            let script = if upstream == Protocol::Gemini {
+                filter
+            } else {
+                search_frame(upstream) + &filter
+            };
+            let f = Fixture::with_config(
+                upstream,
+                vec![script, prefix(upstream) + completion(upstream)],
+                Ending::Hold,
+                |config| configure_timeout_fallback(config, grouped),
+            )
+            .await;
+            let response = f
+                .request_model(
+                    Protocol::Anthropic,
+                    if grouped {
+                        "group/daily"
+                    } else {
+                        "mock/up-model"
+                    },
+                )
+                .await;
+            let body = tokio::time::timeout(LIMIT, response.text())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_search_output(&body, Protocol::Anthropic);
+            assert_filtered(&body, Protocol::Anthropic);
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            assert_eq!(f.record().await["status"], "ok");
+            f.assert_released().await;
+        }
+    }
+}
+#[tokio::test]
+async fn web_search_socket_disconnect_retains_usage_without_query_or_sources_in_history() {
+    for upstream in [Protocol::Gemini, Protocol::Responses] {
+        let f = Fixture::new(upstream, search_frame(upstream), Ending::Hold).await;
+        let history = f.persistent_history();
+        let mut socket = f
+            .socket_request(Protocol::Anthropic, "mock/up-model", true)
+            .await;
+        use tokio::io::AsyncReadExt;
+        tokio::time::timeout(LIMIT, async {
+            let mut received = Vec::new();
+            while !String::from_utf8_lossy(&received).contains(SEARCH_URL) {
+                let mut buffer = [0; 4096];
+                let n = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(n, 0, "socket ended before its search results");
+                received.extend_from_slice(&buffer[..n]);
+                assert!(received.len() < 256 * 1024);
+            }
+        })
+        .await
+        .unwrap();
+        drop(socket);
+        let record = f.record().await;
+        assert_eq!(record["status"], "client_disconnected");
+        assert_eq!(record["usage"]["input"], 7);
+        assert_eq!(record["usage"]["output"], 3);
+        let persisted = std::fs::read_to_string(history.path().join("requests.jsonl")).unwrap();
+        assert!(!persisted.contains(SEARCH_QUERY));
+        assert!(!persisted.contains(SEARCH_URL));
+        assert_eq!(*f.attempts.lock().unwrap(), [0]);
+        f.assert_released().await;
+    }
+}

@@ -420,7 +420,7 @@ deadlines and real-socket cancellation. Updated EOF and sentinel fixtures keep
 clean answered EOF separate from JSON/transport errors. Classifier unit tests
 and core finish-reason tests cover bounded state and stop/filter mapping.
 At that increment, image/search classification prevented replay without adding
-image/search events to the stream IR. Native image support is described below. These are synthetic loopback HTTP/1.1 tests, not CodeAssist
+image/search events to the stream IR. Native image and search-result support are described below. These are synthetic loopback HTTP/1.1 tests, not CodeAssist
 subscription, paid/live Gemini, HTTP/2 or real-Agent conformance evidence.
 
 ## Accounting and cancellation
@@ -587,5 +587,31 @@ Request history stores neither image data nor thought signatures. The existing
 
 Only native Gemini stream output renders image events in this increment. Chat,
 Anthropic and Responses stream encoders omit them, so image-only replies to
-those clients do not gain an image presentation. Search-result stream IR,
-subscription wrappers and paid/live multimodal compatibility remain unverified.
+those clients do not gain an image presentation. Search-result support is described
+below; subscription wrappers and paid/live multimodal compatibility remain unverified.
+
+
+## Upstream web-search result contract (2026-10-12)
+
+A nonempty Gemini grounding query/source or Responses search action becomes a
+search IR event. It is answer content: it satisfies first-content clocks and
+prevents unsafe fallback/re-ask after output, without changing the stop reason
+to client tool use. Empty/malformed grounding does not count as an answer or
+consume Gemini's one valid grounding event. Responses open_page/find actions
+are not translated as searches.
+
+Anthropic encoders close pending blocks and emit paired server search call and
+result blocks; their public sources have empty encrypted_content, never foreign
+vendor ciphertext. Gemini encoders flush pending tools before grounding metadata
+and preserve original native attribution/citation metadata. Responses encoders
+close pending content, allocate distinct output indices/IDs and retain completed
+search items in the final response output. Chat encoders omit search events.
+Queries and source URLs are not persisted in sanitized request history.
+
+Fixtures cover both upstreams and all three supported output protocols in JSON
+and SSE, plus deadlines, refusal/loop no-replay and socket cancellation. The
+Responses disconnect fixture includes optional opening usage from a compatible
+upstream; ordinary missing/null opening usage produces no fabricated counters.
+Built-in search-tool request translation, Anthropic search ingress, Responses
+open_page/find, cross-provider citations, Chat presentation, subscription
+wrappers and live-provider/real-Agent conformance remain outside this increment.

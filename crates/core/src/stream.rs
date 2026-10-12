@@ -1,7 +1,7 @@
 //! Streaming: the protocol-neutral event set every SSE dialect is decoded
 //! into, and a small server-sent-events frame parser.
 
-use crate::ir::{Part, StopReason, Usage};
+use crate::ir::{Part, StopReason, Usage, WebSearch};
 
 /// One thing that happened in a streamed completion.
 #[derive(Debug, Clone, PartialEq)]
@@ -20,6 +20,11 @@ pub enum StreamEvent {
     Image {
         /// Image media, payload/reference and optional provider signature.
         image: Box<Part>,
+    },
+    /// A web search already executed by the upstream.
+    Search {
+        /// Query and public sources, with optional native protocol metadata.
+        search: Box<WebSearch>,
     },
     /// A fragment of reasoning text.
     ThinkingDelta {
@@ -67,6 +72,7 @@ impl StreamEvent {
         match self {
             Self::TextDelta { text } => !text.is_empty(),
             Self::Image { image } => !image.data.is_empty() || !image.url.is_empty(),
+            Self::Search { search } => search.is_answer(),
             Self::ToolCallStart { .. } | Self::ToolCallEnd { .. } => true,
             Self::ToolCallDelta { args, .. } => !args.is_empty(),
             _ => false,

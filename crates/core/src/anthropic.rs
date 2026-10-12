@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use crate::error::{CoreError, Result};
 use crate::ir::{
     CompletionRequest, CompletionResponse, Message, Part, PartKind, Role, StopReason, Tool, Usage,
+    WebSearch,
 };
 use crate::stream::StreamEvent;
 use serde_json::{Map, Value, json};
@@ -343,14 +344,35 @@ fn message_id() -> String {
     format!("msg_magpie{now}")
 }
 
+fn search_blocks(search: &WebSearch, id: &str) -> [Value; 2] {
+    let results: Vec<_> = search
+        .hits
+        .iter()
+        .map(|hit| {
+            json!({"type":"web_search_result",
+        "title":hit.title,"url":hit.url,"encrypted_content":"",
+        "page_age":if hit.page_age.is_empty() { Value::Null } else { json!(hit.page_age) }})
+        })
+        .collect();
+    [
+        json!({"type":"server_tool_use","id":id,"name":"web_search","input":{"query":search.query}}),
+        json!({"type":"web_search_tool_result","tool_use_id":id,"content":results}),
+    ]
+}
+
 /// Encode an IR reply as an Anthropic Messages body.
 pub fn encode_response(resp: &CompletionResponse) -> Value {
-    let content: Vec<Value> = resp
-        .message
-        .parts
-        .iter()
-        .filter_map(part_to_block)
-        .collect();
+    let mut content = Vec::new();
+    for part in &resp.message.parts {
+        if let Some(search) = &part.search {
+            content.extend(search_blocks(
+                search,
+                &format!("srvtoolu_{}_{}", message_id(), content.len()),
+            ));
+        } else if let Some(block) = part_to_block(part) {
+            content.push(block);
+        }
+    }
     json!({
         "id": message_id(),
         "type": "message",
@@ -600,6 +622,36 @@ impl AnthropicStreamEncoder {
                     self.model = model.clone();
                 }
                 Some(self.start_message())
+            }
+            StreamEvent::Search { search } => {
+                let mut out = self.start_message();
+                out.push_str(&self.close_open().unwrap_or_default());
+                let id = format!("srvtoolu_{}_{}", self.id, self.next_index);
+                let [mut call, result] = search_blocks(search, &id);
+                call["input"] = json!({});
+                for (block, input) in [
+                    (call, Some(json!({"query":search.query}).to_string())),
+                    (result, None),
+                ] {
+                    let index = self.next_index;
+                    self.next_index += 1;
+                    out.push_str(&sse(
+                        "content_block_start",
+                        &json!({"type":"content_block_start","index":index,"content_block":block}),
+                    ));
+                    if let Some(input) = input {
+                        out.push_str(&sse(
+                            "content_block_delta",
+                            &json!({"type":"content_block_delta","index":index,
+                            "delta":{"type":"input_json_delta","partial_json":input}}),
+                        ));
+                    }
+                    out.push_str(&sse(
+                        "content_block_stop",
+                        &json!({"type":"content_block_stop","index":index}),
+                    ));
+                }
+                Some(out)
             }
             // Image output currently has a native mapping only in Gemini.
             StreamEvent::Image { .. } => None,

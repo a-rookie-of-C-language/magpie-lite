@@ -6,7 +6,7 @@ Target: multiple coding agents sharing one Rust backend, provider adapters for d
 
 | Area | Current evidence | Remaining work |
 |---|---|---|
-| Shared Rust gateway | Core wire codecs; real local HTTP/SSE terminal/error/EOF and after-header disconnect fixtures across four adapters; incremental 32 MiB raw-event bounds, BOM/CR/UTF-8 handling, opening event/metadata-byte budgets, early stream-error key/fallback/group retry, no ordinary fallback after text/reasoning/tool output, configurable per-attempt first-content/read-idle deadlines with timeout fallback, group non-final first-content switching, request-wide Responses opening release, downstream pre-header/mid-answer SSE comments with safe fallback, protocol error conversion, bounded upstream-silence windows and activity-driven cadence, bounded per-channel text/reasoning repetition protection with no answer/tool replay and one same-candidate reasoning-only reask plus bounded Gemini empty-reply reasks with combined client/history usage, and real HTTP/1.1 before/after-header cancellation with persisted accounting; see docs/stream-lifecycle.md | Recorded real-agent fixtures, broader multimodal/tool/stream conformance, queue/slow-final-route behavior, search-result stream IR and cross-client image rendering, provider-specific prefill continuation, optional post-content progress policies, and HTTP/2 cancellation conformance |
+| Shared Rust gateway | Core wire codecs; real local HTTP/SSE terminal/error/EOF and after-header disconnect fixtures across four adapters; incremental 32 MiB raw-event bounds, BOM/CR/UTF-8 handling, opening event/metadata-byte budgets, early stream-error key/fallback/group retry, no ordinary fallback after text/reasoning/tool output, configurable per-attempt first-content/read-idle deadlines with timeout fallback, group non-final first-content switching, request-wide Responses opening release, downstream pre-header/mid-answer SSE comments with safe fallback, protocol error conversion, bounded upstream-silence windows and activity-driven cadence, bounded per-channel text/reasoning repetition protection with no answer/tool replay and one same-candidate reasoning-only reask plus bounded Gemini empty-reply reasks with combined client/history usage, and real HTTP/1.1 before/after-header cancellation with persisted accounting; see docs/stream-lifecycle.md | Recorded real-agent fixtures, broader multimodal/tool/stream conformance, queue/slow-final-route behavior, built-in search request translation, Anthropic search ingress and cross-client image rendering, provider-specific prefill continuation, optional post-content progress policies, and HTTP/2 cancellation conformance |
 | Agent adapters | Shared magpie-agents adapters for Claude Code, Codex, Crush, Gemini CLI, Goose, OpenCode and Zed; private staged preview, revision-checked apply, OS lock, schema-2 journaled selective field restore preserving unrelated edits, disconnect, managed-field drift and explicit recovery. Agent unit, HTTP, sandboxed child CLI and real-gateway console browser tests; Windows ACL/junction checks; recursive duplicate-key JSON/JSONC refusal, format-preserving JSON edits, compact comment-free JSON object additions that preserve single-line layout, native OpenCode/Zed JSONC, shared passive CLI/config discovery with bounded user-prefix/Node-version searches, npmrc prefix and nvm default-alias handling, and PATH/unknown metadata, native absolute config-directory overrides for Claude/Codex/OpenCode/Zed, and seven-Agent selective restore through HTTP/CLI/browser | Native project overrides, login-shell/registry PATH refresh, process/reachability and real-version compatibility evidence; compact layout preservation is intentionally limited to single-line objects without direct comments |
 | Provider metadata and keys | Protected provider CRUD and console; providers.rs covers saved/live edits, secret-free capability metadata (`supported_protocols`, nullable streaming/tools/vision), protocol validation and preserve/clear semantics. provider_tools.rs covers four-protocol catalogs/probes, pagination, saved/draft/no-auth credentials and bounded read-only operations | Capability presets, specialized/stream-only probes and paid/live vendor evidence |
 | Hot edits and key rotation | ConfigStore saves before publishing; requests own snapshots. Versioned key schedules ignore stale requests. providers.rs checks an old in-flight request after a smaller pool is saved; config.rs checks stale scheduler calls. Durable config revisions/ETags and optional If-Match checks reject stale provider/group writes across restarts; the revision is committed in the atomically replaced TOML document, store and HTTP tests check unchanged disk/memory and a single winner for concurrent checked edits; gateway writers also serialize through a bounded file lock. Provider/group CRUD and agent apply now have durable idempotency with 256-entry retention, token-keyed HMAC digests, restart replay, pending fail-closed behavior, and secret-free ledgers | Encrypted secret storage with recovery; durable idempotency for any future agent rotate endpoint |
@@ -151,7 +151,7 @@ a committed answer through another route. Local fixtures cover all four clients,
 streaming/nonstreaming fallback, independent reasoning-loop budgets, HTTP errors,
 EOF/JSON distinctions, pinned edits and cancellation. At that increment, image/search classification prevented retries without their
 stream IR. The later safety and image increments below add refusal routing and
-native Gemini image rendering; search IR, subscription adapters and
+native Gemini image rendering. The later search increment adds result IR; subscription adapters and
 provider-specific prefill remain gaps. See
 `docs/stream-lifecycle.md` for the contract and remaining queue/HTTP2/Agent gaps.
 
@@ -177,5 +177,28 @@ no-replay behavior, usage and sanitized history on client disconnect.
 
 This is native Gemini output support, not cross-client multimodal parity:
 Chat, Anthropic and Responses stream encoders do not render image events;
-search-result IR, CodeAssist subscription wrappers and real-provider/Agent
+the search-result increment below is separate. CodeAssist subscription wrappers and real-provider/Agent
 compatibility evidence remain open.
+
+
+## Upstream search-result increment (2026-10-12)
+
+Gemini grounding and Responses web_search_call search actions now become
+search parts/events in the shared IR, rather than disappearing or becoming
+agent-executed function calls. Anthropic replies expose paired server search
+call/result blocks; Gemini and Responses clients receive native result shapes.
+Native Gemini grounding metadata retains attribution, citation offsets and chunk
+indices. Responses native search actions survive round trips.
+
+Core and loopback HTTP/socket fixtures cover streaming/nonstreaming translation,
+valid/empty metadata, single Gemini emission, Responses output ordering and IDs,
+first-content deadlines, refusal and reasoning-loop no-replay behavior, observed
+usage and query/source-free history on disconnect. Optional opening usage from
+Responses-compatible upstreams is retained when reported; missing usage is not
+invented. These are synthetic fixtures, not paid-provider or real-Agent evidence.
+
+Remaining: enabling/translating built-in search tools in requests, Anthropic
+upstream search decoding, Responses open_page/find actions, cross-provider
+citation annotations and Chat search presentation. Gemini emits the first valid
+grounding result only. Search results are not replayable tool requests in chat
+history, and vendor-encrypted search content is not copied across providers.

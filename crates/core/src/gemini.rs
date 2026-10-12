@@ -9,7 +9,8 @@ use std::collections::HashMap;
 
 use crate::error::{CoreError, Result};
 use crate::ir::{
-    CompletionRequest, CompletionResponse, Message, Part, PartKind, Role, StopReason, Tool, Usage,
+    CompletionRequest, CompletionResponse, Message, Part, PartKind, Role, SearchHit, StopReason,
+    Tool, Usage, WebSearch,
 };
 use crate::stream::StreamEvent;
 use serde_json::{Map, Value, json};
@@ -448,6 +449,7 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Value {
                     parts.push(Value::Object(part));
                 }
                 PartKind::Image => parts.push(attachment_value(p)),
+                PartKind::Search => {} // Grounding is reply metadata, not a conversation part.
                 PartKind::ToolCall => {
                     let id = if p.id.is_empty() {
                         format!("call_{}", response_id())
@@ -651,6 +653,7 @@ fn parts_to_json(parts: &[Part]) -> Value {
                 out.push(Value::Object(part));
             }
             PartKind::Image => out.push(attachment_value(p)),
+            PartKind::Search => {}
             PartKind::ToolCall => {
                 let mut part = Map::new();
                 part.insert(
@@ -685,6 +688,50 @@ pub fn response_usage(v: &Value) -> Usage {
     get_either(v, "usageMetadata", "usage_metadata")
         .map(decode_usage)
         .unwrap_or_default()
+}
+
+fn decode_search(candidate: &Value) -> Option<WebSearch> {
+    let metadata = get_either(candidate, "groundingMetadata", "grounding_metadata")?;
+    let queries: Vec<_> = get_either(metadata, "webSearchQueries", "web_search_queries")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|q| !q.is_empty())
+        .collect();
+    let hits = get_either(metadata, "groundingChunks", "grounding_chunks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|chunk| {
+            let web = chunk.get("web")?;
+            let url = web.get("uri")?.as_str().filter(|s| !s.is_empty())?;
+            Some(SearchHit {
+                title: web
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or(url)
+                    .to_owned(),
+                url: url.to_owned(),
+                ..Default::default()
+            })
+        })
+        .collect();
+    let search = WebSearch {
+        query: queries.join("; "),
+        hits,
+        gemini_grounding: Some(metadata.clone()),
+        ..Default::default()
+    };
+    search.is_answer().then_some(search)
+}
+
+fn search_metadata(search: &WebSearch) -> Value {
+    search.gemini_grounding.clone().unwrap_or_else(|| json!({
+        "webSearchQueries": if search.query.is_empty() { vec![] } else { vec![&search.query] },
+        "groundingChunks": search.hits.iter().map(|hit| json!({"web":{"uri":hit.url,"title":hit.title}})).collect::<Vec<_>>()
+    }))
 }
 
 /// Decode a Gemini generateContent reply.
@@ -729,11 +776,14 @@ pub fn decode_response(v: &Value) -> Result<CompletionResponse> {
         .and_then(Value::as_array)
         .and_then(|a| a.first())
         .ok_or(missing("candidates"))?;
-    let parts = candidate
+    let mut parts = candidate
         .pointer("/content/parts")
         .and_then(Value::as_array)
         .map(|a| decode_parts(a))
         .unwrap_or_default();
+    if let Some(search) = decode_search(candidate) {
+        parts.push(Part::web_search(search));
+    }
     let has_tool_call = parts.iter().any(|p| p.kind() == PartKind::ToolCall);
     let finish = candidate
         .get("finishReason")
@@ -762,7 +812,7 @@ pub fn decode_response(v: &Value) -> Result<CompletionResponse> {
 
 /// Encode an IR reply as a Gemini generateContent response.
 pub fn encode_response(resp: &CompletionResponse) -> Value {
-    json!({
+    let mut body = json!({
         "candidates": [{
             "content": {"role": "model", "parts": parts_to_json(&resp.message.parts)},
             "finishReason": stop_to_gemini(resp.stop),
@@ -771,7 +821,11 @@ pub fn encode_response(resp: &CompletionResponse) -> Value {
         "usageMetadata": usage_to_json(&resp.usage),
         "modelVersion": resp.model,
         "responseId": response_id(),
-    })
+    });
+    if let Some(search) = resp.message.parts.iter().find_map(|p| p.search.as_deref()) {
+        body["candidates"][0]["groundingMetadata"] = search_metadata(search);
+    }
+    body
 }
 
 /// Stateful decoder for Gemini SSE chunks. Gemini sends complete parts in
@@ -780,6 +834,7 @@ pub fn encode_response(resp: &CompletionResponse) -> Value {
 #[derive(Debug, Default)]
 pub struct GeminiStreamDecoder {
     next_tool_index: usize,
+    searched: bool,
 }
 
 impl GeminiStreamDecoder {
@@ -878,6 +933,14 @@ impl GeminiStreamDecoder {
                 out.push(StreamEvent::ToolCallDelta { index, args });
                 out.push(StreamEvent::ToolCallEnd { index });
             }
+        }
+        if !self.searched
+            && let Some(search) = decode_search(candidate)
+        {
+            self.searched = true;
+            out.push(StreamEvent::Search {
+                search: Box::new(search),
+            });
         }
         if let Some(finish) = candidate
             .get("finishReason")
@@ -1003,6 +1066,14 @@ impl GeminiStreamEncoder {
                     }
                     None => chunk,
                 })
+            }
+            StreamEvent::Search { search } => {
+                let mut frame = self.flush_tool().unwrap_or_default();
+                let message = json!({"candidates":[{"content":{"role":"model","parts":[]},
+                    "groundingMetadata":search_metadata(search), "index":0}],
+                    "modelVersion":self.model,"responseId":self.id});
+                frame.push_str(&format!("data: {message}\n\n"));
+                Some(frame)
             }
             StreamEvent::Image { image } => {
                 let mut frame = self.flush_tool().unwrap_or_default();

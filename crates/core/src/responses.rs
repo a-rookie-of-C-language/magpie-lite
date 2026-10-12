@@ -8,7 +8,8 @@ use std::collections::HashMap;
 
 use crate::error::{CoreError, Result};
 use crate::ir::{
-    CompletionRequest, CompletionResponse, Message, Part, PartKind, Role, StopReason, Tool, Usage,
+    CompletionRequest, CompletionResponse, Message, Part, PartKind, Role, SearchHit, StopReason,
+    Tool, Usage, WebSearch,
 };
 use crate::stream::StreamEvent;
 use serde_json::{Map, Value, json};
@@ -271,7 +272,7 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Value {
                         "output": p.text,
                     }));
                 }
-                PartKind::Image => {}
+                PartKind::Image | PartKind::Search => {}
             }
         }
         if let Some((role, content)) = open_message.take() {
@@ -344,6 +345,54 @@ pub fn response_usage(v: &Value) -> Usage {
     v.get("usage").map(decode_usage).unwrap_or_default()
 }
 
+fn decode_search(item: &Value) -> Option<WebSearch> {
+    if item.get("type")?.as_str()? != "web_search_call" {
+        return None;
+    }
+    let action = item.get("action")?;
+    if action
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|t| t != "search")
+    {
+        return None;
+    }
+    let query = action
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let hits = action
+        .get("sources")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|source| {
+            let url = source.get("url")?.as_str().filter(|s| !s.is_empty())?;
+            Some(SearchHit {
+                title: url.to_owned(),
+                url: url.to_owned(),
+                ..Default::default()
+            })
+        })
+        .collect();
+    let search = WebSearch {
+        query,
+        hits,
+        responses_action: Some(action.clone()),
+        ..Default::default()
+    };
+    search.is_answer().then_some(search)
+}
+
+fn search_item(search: &WebSearch, id: &str, status: &str) -> Value {
+    let action = search.responses_action.clone().unwrap_or_else(|| {
+        json!({"type":"search","query":search.query,
+        "sources":search.hits.iter().map(|h|json!({"type":"url","url":h.url})).collect::<Vec<_>>()})
+    });
+    json!({"id":id,"type":"web_search_call","status":status,"action":action})
+}
+
 /// Decode an OpenAI Responses reply body.
 pub fn decode_response(v: &Value) -> Result<CompletionResponse> {
     if v.get("status") == Some(&json!("failed")) {
@@ -376,6 +425,11 @@ pub fn decode_response(v: &Value) -> Result<CompletionResponse> {
                     {
                         parts.push(Part::text(t));
                     }
+                }
+            }
+            "web_search_call" => {
+                if let Some(search) = decode_search(item) {
+                    parts.push(Part::web_search(search));
                 }
             }
             "function_call" => {
@@ -460,6 +514,15 @@ pub fn encode_response(resp: &CompletionResponse) -> Value {
     let mut output: Vec<Value> = Vec::new();
     for p in &resp.message.parts {
         match p.kind() {
+            PartKind::Search => {
+                if let Some(search) = &p.search {
+                    output.push(search_item(
+                        search,
+                        &format!("ws_{}_{}", response_id(), output.len()),
+                        "completed",
+                    ));
+                }
+            }
             PartKind::Text => output.push(json!({
                 "type": "message",
                 "id": format!("msg_{}", response_id()),
@@ -523,6 +586,11 @@ pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
                     model: model.to_owned(),
                 });
             }
+            // Preserve optional opening usage supplied by compatible upstreams,
+            // including when the client disconnects before a terminal event.
+            if let Some(u) = v.pointer("/response/usage").filter(|u| u.is_object()) {
+                out.push(StreamEvent::Usage(decode_usage(u)));
+            }
         }
         "response.output_item.added" => {
             let index = v.get("output_index").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -546,6 +614,11 @@ pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
             let index = v.get("output_index").and_then(Value::as_u64).unwrap_or(0) as usize;
             if v.pointer("/item/type").and_then(Value::as_str) == Some("function_call") {
                 out.push(StreamEvent::ToolCallEnd { index });
+            }
+            if let Some(search) = v.get("item").and_then(decode_search) {
+                out.push(StreamEvent::Search {
+                    search: Box::new(search),
+                });
             }
         }
         "response.output_text.delta" => {
@@ -794,6 +867,27 @@ impl ResponsesStreamEncoder {
                     self.model = model.clone();
                 }
                 Some(self.ensure_created())
+            }
+            StreamEvent::Search { search } => {
+                let mut out = self.ensure_created();
+                out.push_str(&self.close_message());
+                out.push_str(&self.close_reasoning());
+                out.push_str(&self.close_tools());
+                let id = self.next_id("ws");
+                let index = self.next_index;
+                self.next_index += 1;
+                out.push_str(&event(
+                    "response.output_item.added",
+                    json!({"output_index":index,
+                    "item":{"id":id,"type":"web_search_call","status":"in_progress"}}),
+                ));
+                let done = search_item(search, &id, "completed");
+                self.output.push(done.clone());
+                out.push_str(&event(
+                    "response.output_item.done",
+                    json!({"output_index":index,"item":done}),
+                ));
+                Some(out)
             }
             // Image output currently has a native mapping only in Gemini.
             StreamEvent::Image { .. } => None,

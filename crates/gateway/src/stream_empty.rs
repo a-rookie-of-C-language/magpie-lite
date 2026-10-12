@@ -78,7 +78,7 @@ impl GeminiReply {
                 .get("webSearchQueries")
                 .or_else(|| g.get("web_search_queries"))
                 .and_then(Value::as_array)
-                .is_some_and(|a| !a.is_empty())
+                .is_some_and(|a| a.iter().any(|q| q.as_str().is_some_and(|s| !s.is_empty())))
                 || g.get("groundingChunks")
                     .or_else(|| g.get("grounding_chunks"))
                     .and_then(Value::as_array)
@@ -141,6 +141,17 @@ mod tests {
         let mut reply = GeminiReply::default();
         reply.observe(&json!({"candidates":[{"content":{"parts":[{"thought":true,"inlineData":{"data":"aGk="}},{"inlineData":{"data":""}}]},"groundingMetadata":{"webSearchQueries":[],"groundingChunks":[{"web":{"uri":""}}]}}]}));
         assert!(reply.is_empty());
+    }
+
+    #[test]
+    fn malformed_search_queries_do_not_count_as_answers() {
+        for queries in [json!(["", null, 7, {}]), json!(null), json!("rust")] {
+            for key in ["webSearchQueries", "web_search_queries"] {
+                let mut reply = GeminiReply::default();
+                reply.observe(&json!({"candidates":[{"groundingMetadata":{key:queries},"finishReason":"STOP"}]}));
+                assert!(reply.is_empty(), "{key}: {queries}");
+            }
+        }
     }
 
     #[test]

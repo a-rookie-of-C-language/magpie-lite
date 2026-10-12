@@ -43,8 +43,42 @@ pub enum PartKind {
     ToolCall,
     /// The user side answering a tool call.
     ToolResult,
+    /// A web search already executed by the upstream, not a client tool call.
+    Search,
     /// Reasoning the model showed (with its signature, when it has one).
     Thinking,
+}
+
+/// One public source returned by an upstream web search.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchHit {
+    /// Page title, falling back to its URL when absent.
+    pub title: String,
+    /// Upstream source URL; the gateway does not fetch it.
+    pub url: String,
+    /// Provider-reported page age, when available.
+    pub page_age: String,
+}
+
+/// A search performed by the upstream model, distinct from function tools.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WebSearch {
+    /// Query text (Gemini's multiple queries are joined with "; ").
+    pub query: String,
+    /// Public result titles and URLs; never vendor-encrypted content.
+    pub hits: Vec<SearchHit>,
+    /// Original Gemini grounding metadata, only re-emitted to Gemini clients.
+    /// This retains citation offsets, chunk indices and required attribution.
+    pub gemini_grounding: Option<Value>,
+    /// Original Responses search action, only re-emitted to Responses clients.
+    pub responses_action: Option<Value>,
+}
+
+impl WebSearch {
+    /// An actual query or public source is evidence of search activity.
+    pub fn is_answer(&self) -> bool {
+        !self.query.is_empty() || self.hits.iter().any(|hit| !hit.url.is_empty())
+    }
 }
 
 /// One block of a message. Fields are shared across kinds; `kind` decides
@@ -73,9 +107,20 @@ pub struct Part {
     pub is_error: bool,
     /// Thinking signature (Anthropic's, or a Gemini thought's).
     pub signature: String,
+    /// An upstream web search, when the kind is Search.
+    pub search: Option<Box<WebSearch>>,
 }
 
 impl Part {
+    /// A search already performed by the upstream.
+    pub fn web_search(search: WebSearch) -> Self {
+        Self {
+            kind: Some(PartKind::Search),
+            search: Some(Box::new(search)),
+            ..Default::default()
+        }
+    }
+
     /// A text block.
     pub fn text(text: impl Into<String>) -> Self {
         Self {
