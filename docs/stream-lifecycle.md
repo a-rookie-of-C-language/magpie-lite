@@ -77,9 +77,10 @@ particular reasoning/tool activity counts as committed even if a particular
 client dialect buffers or hides that activity.
 
 The prefetch runs in the handler before downstream response headers. The
-streaming deadlines below now bound a below-budget stall when enabled. They do
-not prove automatic handler cancellation on a real pre-header socket disconnect,
-and the gateway still emits no downstream keepalive frames.
+streaming deadlines below bound a below-budget stall when enabled. Real HTTP/1.1
+fixtures additionally verify that closing the downstream socket cancels pending
+handlers even with both deadlines disabled (see Accounting and cancellation).
+The gateway still emits no downstream keepalive frames.
 
 ## Streaming deadlines
 
@@ -100,7 +101,7 @@ in the protected secret-free `/config` snapshot:
   backpressured client does not count as waiting for upstream transport.
 
 Set either to `0` to disable that limit independently. With both disabled, an
-upstream may again hold a handler indefinitely. Nonstreaming requests retain the
+upstream may hold a handler indefinitely while its client stays connected. Nonstreaming requests retain the
 previous behavior; these settings are not a total request-duration limit.
 Configuration is pinned for the request, and each fallback attempt gets a fresh
 clock. The first-content deadline remains active after a metadata safety budget
@@ -159,7 +160,19 @@ to the selected or last attempted route, never to the abandoned primary. Only
 that attempt's reported usage is retained; this is not a billing ledger summing
 possibly charged discarded attempts. Unknown usage remains null, not estimated.
 
-One final record is written for each tracked request. After downstream headers,
+The current Axum HTTP/1.1 serving path drops the pending handler when its client
+closes the socket. This releases the owned upstream response/send future before
+downstream headers, including while awaiting upstream headers, prefetching
+opening SSE, or reading a successful nonstreaming or non-2xx response body. No
+extra background cancellation task is needed. These assertions cover fully
+closed loopback TCP connections, not HTTP/2 stream resets, proxies, TLS or a
+client that leaves its connection open but stops reading.
+
+One final record is written for each tracked request. Before downstream headers,
+dropping the handler records `client_disconnected`; it preserves usage already
+observed during opening prefetch and keeps unknown usage unknown while awaiting
+headers or an undecoded JSON body. Fallback selects its accounting route and
+clears abandoned-attempt usage before awaiting the next upstream. After headers,
 dropping the response body releases the upstream and records
 `client_disconnected` with observed partial usage. JSONL stores routing/status
 and counters, not credentials, prompts or generated text. Reopening history
@@ -189,11 +202,19 @@ Retained-metadata byte-budget tests distinguish model-bearing Start events from
 discarded Chat model metadata.
 
 `server::tests::cancelled_pending_fallback_accounts_for_last_attempt_before_headers`
-explicitly aborts the handler task while the fallback waits for HTTP headers.
-It exercises ordinary/group routing and streaming/nonstreaming attempts with
-persisted accounting. **It does not establish that a real downstream socket
-disconnect automatically cancels an Axum handler before its response headers.**
-That real-HTTP pre-header cancellation behavior still needs separate work.
+is an explicit handler-abort accounting test, not a real socket test. The five
+`socket_disconnect_*` integration tests now add **160 real HTTP/1.1 cases** using
+the same `axum::serve(build_router(...))` path as the gateway. They send complete
+requests on raw TCP sockets, confirm no response byte or completed log record
+arrives, then close only the downstream socket, with both streaming deadlines
+disabled. They cover all four client/upstream dialects, streaming and nonstreaming
+header waits, opening SSE usage, nonstreaming JSON-body waits, non-2xx body waits
+without unintended fallback, and a Chat primary failing over through ordinary/
+group routing to each of the four spare dialects while awaiting spare headers. Drop guards verify all attempted upstreams release; records verify the
+last model/provider/key slot, no abandoned usage, no extra key attempts, one
+secret/prompt-free JSONL line and identical history after reload. Existing
+production behavior passes these tests; no separate cancellation mechanism was
+introduced. These tests do not establish HTTP/2 or live-Agent compatibility.
 
 `crates/core/tests/stream_accounting.rs` covers cumulative counters and Chat /
 Responses error envelope decoding. `stream_status` unit fixtures cover structured
@@ -212,6 +233,6 @@ limits, and HTTP header/error-body stalls. Drop guards verify release of every
 attempt, and assertions verify one error/record, selected-route usage and no extra
 same-endpoint key/cooldown spending.
 
-Group-specific timeout overrides, downstream keepalives, real pre-header socket
-disconnect handling, post-content progress/loop detection and broader tool/
-multimodal conformance remain open.
+Group-specific timeout overrides, downstream keepalives, HTTP/2 cancellation
+conformance, post-content progress/loop detection and broader tool/multimodal
+conformance remain open.

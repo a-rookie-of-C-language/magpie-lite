@@ -115,8 +115,9 @@ enum Ending {
 
 struct Transport {
     chunk_size: usize,
-    // Apply these only to slot zero; a fallback slot stays healthy.
+    // Delay one selected slot; non-2xx status still applies only to slot zero.
     header_delay: Duration,
+    header_delay_slot: usize,
     status: axum::http::StatusCode,
 }
 impl Default for Transport {
@@ -124,6 +125,7 @@ impl Default for Transport {
         Self {
             chunk_size: 19,
             header_delay: Duration::ZERO,
+            header_delay_slot: 0,
             status: axum::http::StatusCode::OK,
         }
     }
@@ -182,6 +184,7 @@ impl Fixture {
         let Transport {
             chunk_size,
             header_delay,
+            header_delay_slot,
             status,
         } = transport;
         let sent_models = Arc::new(Mutex::new(Vec::new()));
@@ -216,7 +219,7 @@ impl Fixture {
                     let ending = ending.clone();
                     let guard = Dropped(flag.clone());
                     async move {
-                        if slot == 0 { tokio::time::sleep(header_delay).await; }
+                        if slot == header_delay_slot { tokio::time::sleep(header_delay).await; }
                         Response::builder().status(if slot == 0 { status } else { axum::http::StatusCode::OK }).header("content-type", "text/event-stream").header("retry-after", "2")
                     .body(Body::from_stream(async_stream::stream! {
                         let _guard = guard;
@@ -304,24 +307,7 @@ impl Fixture {
         response
     }
     async fn request_model_raw(&self, protocol: Protocol, model: &str) -> reqwest::Response {
-        let (path, body) = match protocol {
-            Protocol::Chat => (
-                "/v1/chat/completions".to_owned(),
-                json!({"model": model, "stream": true, "stream_options": {"include_usage": true}, "messages": [{"role": "user", "content": "hello"}]}),
-            ),
-            Protocol::Anthropic => (
-                "/v1/messages".to_owned(),
-                json!({"model": model, "stream": true, "max_tokens": 32, "messages": [{"role": "user", "content": "hello"}]}),
-            ),
-            Protocol::Responses => (
-                "/v1/responses".to_owned(),
-                json!({"model": model, "stream": true, "input": "hello"}),
-            ),
-            Protocol::Gemini => (
-                format!("/v1beta/models/{model}:streamGenerateContent"),
-                json!({"contents": [{"role": "user", "parts": [{"text": "hello"}]}]}),
-            ),
-        };
+        let (path, body) = client_request(protocol, model, true);
         tokio::time::timeout(
             LIMIT,
             reqwest::Client::new()
@@ -1663,5 +1649,360 @@ async fn zero_timeouts_allow_a_delayed_first_answer() {
         assert_completed(&body, upstream);
         assert_eq!(f.record().await["status"], "ok");
         f.assert_released().await;
+    }
+}
+
+fn client_request(protocol: Protocol, model: &str, stream: bool) -> (String, Value) {
+    match protocol {
+        Protocol::Chat => (
+            "/v1/chat/completions".to_owned(),
+            json!({"model": model, "stream": stream, "stream_options": {"include_usage": true}, "messages": [{"role": "user", "content": "hello"}]}),
+        ),
+        Protocol::Anthropic => (
+            "/v1/messages".to_owned(),
+            json!({"model": model, "stream": stream, "max_tokens": 32, "messages": [{"role": "user", "content": "hello"}]}),
+        ),
+        Protocol::Responses => (
+            "/v1/responses".to_owned(),
+            json!({"model": model, "stream": stream, "input": "hello"}),
+        ),
+        Protocol::Gemini => (
+            format!(
+                "/v1beta/models/{model}:{}",
+                if stream {
+                    "streamGenerateContent"
+                } else {
+                    "generateContent"
+                }
+            ),
+            json!({"contents": [{"role": "user", "parts": [{"text": "hello"}]}]}),
+        ),
+    }
+}
+
+impl Fixture {
+    fn persistent_history(&self) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        *self.log.lock().unwrap() =
+            RequestLog::open(&directory.path().join("requests.jsonl")).unwrap();
+        directory
+    }
+
+    async fn socket_request(
+        &self,
+        client: Protocol,
+        model: &str,
+        stream: bool,
+    ) -> tokio::net::TcpStream {
+        use tokio::io::AsyncWriteExt;
+        let (path, mut body) = client_request(client, model, stream);
+        // This must not appear in persisted metadata, even on cancellation.
+        if client == Protocol::Responses {
+            body["input"] = json!("private cancellation prompt");
+        } else if client == Protocol::Gemini {
+            body["contents"][0]["parts"][0]["text"] = json!("private cancellation prompt");
+        } else {
+            body["messages"][0]["content"] = json!("private cancellation prompt");
+        }
+        let body = body.to_string();
+        let mut socket =
+            tokio::net::TcpStream::connect(self.gateway.url.trim_start_matches("http://"))
+                .await
+                .unwrap();
+        socket.write_all(format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret-local-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        socket
+    }
+
+    async fn wait_for_attempts(&self, expected: &[usize]) {
+        tokio::time::timeout(LIMIT, async {
+            loop {
+                let attempts = self.attempts.lock().unwrap().clone();
+                assert!(
+                    expected.starts_with(&attempts),
+                    "unexpected attempt: {attempts:?}"
+                );
+                if attempts == expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("upstream never received expected requests");
+    }
+
+    /// Drop the actual HTTP/1.1 socket while the gateway has sent no headers.
+    /// Neither server nor handler is aborted; all timeout policies are disabled.
+    async fn disconnect_before_headers(
+        &self,
+        mut socket: tokio::net::TcpStream,
+        history: &std::path::Path,
+    ) -> Value {
+        use tokio::io::AsyncReadExt;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), socket.read_u8())
+                .await
+                .is_err(),
+            "gateway sent a response or closed before downstream cancellation"
+        );
+        assert!(
+            self.log
+                .lock()
+                .unwrap()
+                .snapshot()
+                .recent_requests
+                .is_empty()
+        );
+        drop(socket);
+        let record = self.record().await;
+        self.assert_released().await;
+        assert_eq!(record["status"], "client_disconnected");
+        let records = self.log.lock().unwrap().snapshot().recent_requests;
+        assert_eq!(records.len(), 1);
+        let persisted = std::fs::read_to_string(history.join("requests.jsonl")).unwrap();
+        assert_eq!(persisted.lines().count(), 1);
+        assert_eq!(serde_json::from_str::<Value>(&persisted).unwrap(), record);
+        assert!(
+            !persisted.contains("secret-")
+                && !persisted.contains("private cancellation prompt")
+                && !persisted.contains("abandoned-model")
+        );
+        let restored = RequestLog::open(&history.join("requests.jsonl"))
+            .unwrap()
+            .snapshot()
+            .recent_requests;
+        assert_eq!(restored.len(), 1);
+        assert_eq!(serde_json::to_value(&restored[0]).unwrap(), record);
+        record
+    }
+}
+
+fn disable_stream_deadlines(config: &mut Config) {
+    config.stream_first_content_timeout_ms = 0;
+    config.stream_idle_timeout_ms = 0;
+}
+
+fn assert_pending_record(record: &Value, client: Protocol, stream: bool) {
+    assert_eq!(
+        record["client_protocol"],
+        serde_json::to_value(client).unwrap()
+    );
+    assert_eq!(record["stream"], stream);
+    assert_eq!(record["requested_model"], "mock/up-model");
+    assert_eq!(record["provider"], "mock");
+    assert_eq!(record["upstream_model"], "up-model");
+    assert_eq!(record["key_slot"], 0);
+}
+
+#[tokio::test]
+async fn socket_disconnect_before_headers_cancels_pending_upstream() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            for stream in [false, true] {
+                let f = Fixture::with_transport(
+                    upstream,
+                    vec![prefix(upstream)],
+                    Ending::Hold,
+                    Transport {
+                        header_delay: Duration::from_secs(60),
+                        ..Transport::default()
+                    },
+                    disable_stream_deadlines,
+                )
+                .await;
+                let history = f.persistent_history();
+                let socket = f.socket_request(client, "mock/up-model", stream).await;
+                f.wait_for_attempts(&[0]).await;
+                let record = f.disconnect_before_headers(socket, history.path()).await;
+                assert_pending_record(&record, client, stream);
+                assert!(record["usage"]["input"].is_null() && record["usage"]["output"].is_null());
+                assert_eq!(*f.attempts.lock().unwrap(), vec![0]);
+                assert!(
+                    f.state
+                        .key_rotation
+                        .cooldown_snapshot(&f.state.config.current())
+                        .is_empty()
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn socket_disconnect_during_opening_prefetch_keeps_partial_usage() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            let f = Fixture::with_config(
+                upstream,
+                vec![opening(upstream).into()],
+                Ending::Hold,
+                disable_stream_deadlines,
+            )
+            .await;
+            let history = f.persistent_history();
+            let socket = f.socket_request(client, "mock/up-model", true).await;
+            f.wait_for_attempts(&[0]).await;
+            let record = f.disconnect_before_headers(socket, history.path()).await;
+            assert_pending_record(&record, client, true);
+            if upstream == Protocol::Responses {
+                assert!(record["usage"]["input"].is_null() && record["usage"]["output"].is_null());
+            } else {
+                assert_eq!(record["usage"]["input"], 99);
+                assert_eq!(record["usage"]["output"], 0);
+            }
+            assert_eq!(*f.attempts.lock().unwrap(), vec![0]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn socket_disconnect_during_nonstream_body_cancels_upstream() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            // HTTP 200, but an incomplete JSON body that cannot be decoded yet.
+            let f = Fixture::with_config(
+                upstream,
+                vec!["{\"private\":".into()],
+                Ending::Hold,
+                disable_stream_deadlines,
+            )
+            .await;
+            let history = f.persistent_history();
+            let socket = f.socket_request(client, "mock/up-model", false).await;
+            f.wait_for_attempts(&[0]).await;
+            let record = f.disconnect_before_headers(socket, history.path()).await;
+            assert_pending_record(&record, client, false);
+            assert!(record["usage"]["input"].is_null() && record["usage"]["output"].is_null());
+            assert_eq!(*f.attempts.lock().unwrap(), vec![0]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn socket_disconnect_during_error_body_does_not_start_fallback() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            for stream in [false, true] {
+                let f = Fixture::with_transport(
+                    upstream,
+                    vec![
+                        "{\"error\":".into(),
+                        prefix(upstream) + completion(upstream),
+                    ],
+                    Ending::Hold,
+                    Transport {
+                        status: axum::http::StatusCode::BAD_GATEWAY,
+                        ..Transport::default()
+                    },
+                    |config| {
+                        disable_stream_deadlines(config);
+                        let mut backup = config.provider[0].clone();
+                        backup.id = "spare".into();
+                        backup.api_keys = vec!["secret-upstream-key-1".into()];
+                        config.provider[0].api_keys = vec!["secret-upstream-key-0".into()];
+                        config.provider[0].fallback = vec!["spare/up-model".into()];
+                        config.provider.push(backup);
+                    },
+                )
+                .await;
+                let history = f.persistent_history();
+                let socket = f.socket_request(client, "mock/up-model", stream).await;
+                f.wait_for_attempts(&[0]).await;
+                let record = f.disconnect_before_headers(socket, history.path()).await;
+                assert_pending_record(&record, client, stream);
+                assert!(record["usage"]["input"].is_null() && record["usage"]["output"].is_null());
+                assert_eq!(*f.attempts.lock().unwrap(), vec![0]);
+                assert!(
+                    f.state
+                        .key_rotation
+                        .cooldown_snapshot(&f.state.config.current())
+                        .is_empty()
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn socket_disconnect_after_fallback_keeps_only_last_attempt_and_persists() {
+    use magpie_gateway::{GroupConfig, RoutingPolicy};
+    for grouped in [false, true] {
+        for spare in PROTOCOLS {
+            for client in PROTOCOLS {
+                for stream in [false, true] {
+                    let f = Fixture::with_transport(
+                        Protocol::Chat,
+                        vec![
+                            opening(Protocol::Chat).to_owned() + limited(Protocol::Chat),
+                            prefix(spare),
+                            prefix(spare) + completion(spare),
+                        ],
+                        if stream { Ending::Hold } else { Ending::Eof },
+                        Transport {
+                            header_delay: Duration::from_secs(60),
+                            header_delay_slot: 1,
+                            status: if stream {
+                                axum::http::StatusCode::OK
+                            } else {
+                                axum::http::StatusCode::TOO_MANY_REQUESTS
+                            },
+                            ..Transport::default()
+                        },
+                        |config| {
+                            disable_stream_deadlines(config);
+                            let mut backup = config.provider[0].clone();
+                            backup.id = "spare".into();
+                            backup.protocol = spare;
+                            backup.api_keys = vec![
+                                "secret-upstream-key-1".into(),
+                                "secret-upstream-key-2".into(),
+                            ];
+                            backup.models = vec!["backup-model".into()];
+                            config.provider[0].api_keys = vec!["secret-upstream-key-0".into()];
+                            if grouped {
+                                config.group.push(GroupConfig {
+                                    id: "daily".into(),
+                                    name: "Daily".into(),
+                                    routes: vec![
+                                        "mock/up-model".into(),
+                                        "spare/backup-model".into(),
+                                    ],
+                                    routing: RoutingPolicy::Order,
+                                });
+                            } else {
+                                config.provider[0].fallback = vec!["spare/backup-model".into()];
+                            }
+                            config.provider.push(backup);
+                        },
+                    )
+                    .await;
+                    let history = f.persistent_history();
+                    let requested = if grouped {
+                        "group/daily"
+                    } else {
+                        "mock/up-model"
+                    };
+                    let socket = f.socket_request(client, requested, stream).await;
+                    // For nonstreaming, let the first non-2xx body reach EOF so
+                    // routing can select the spare. Streaming needs no EOF.
+                    f.wait_for_attempts(&[0, 1]).await;
+                    let record = f.disconnect_before_headers(socket, history.path()).await;
+                    assert_eq!(record["requested_model"], requested);
+                    assert_eq!(record["provider"], "spare");
+                    assert_eq!(record["upstream_model"], "backup-model");
+                    assert_eq!(record["key_slot"], 0);
+                    assert_eq!(record["stream"], stream);
+                    assert!(
+                        record["usage"]["input"].is_null() && record["usage"]["output"].is_null(),
+                        "abandoned usage leaked: {record}"
+                    );
+                    assert_eq!(*f.attempts.lock().unwrap(), vec![0, 1]);
+                    assert_eq!(
+                        *f.sent_models.lock().unwrap(),
+                        vec!["up-model", "backup-model"]
+                    );
+                }
+            }
+        }
     }
 }

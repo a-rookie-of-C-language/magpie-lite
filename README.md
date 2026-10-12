@@ -249,6 +249,11 @@ file path receive 503 for editing; use `serve_with_config_path` to enable it.
 
 Every request is decoded into [`ir::CompletionRequest`](crates/core/src/ir.rs), every reply is built from `CompletionResponse`, and every stream passes through `StreamEvent`. A protocol plugs in as one decoder plus one encoder — never N-squared pairwise translators. This is magpie's design, kept.
 
+Real loopback HTTP/1.1 tests verify that closing a client before response headers
+releases pending upstream work, retains observed usage and persists exactly one
+cancellation record, including after fallback. See [stream lifecycle](docs/stream-lifecycle.md)
+for tested scope and remaining HTTP/2/keepalive limits.
+
 Tests are the contract: `crates/core/tests/translation.rs` checks real wire shapes in every direction, and `crates/gateway/tests/e2e.rs` drives the whole server against mock Chat and Gemini upstreams, streaming included.
 
 ## Not yet (the roadmap)

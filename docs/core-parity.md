@@ -6,7 +6,7 @@ Target: multiple coding agents sharing one Rust backend, provider adapters for d
 
 | Area | Current evidence | Remaining work |
 |---|---|---|
-| Shared Rust gateway | Core wire codecs; real local HTTP/SSE terminal/error/EOF and after-header disconnect fixtures across four adapters; incremental 32 MiB raw-event bounds, BOM/CR/UTF-8 handling, opening event/metadata-byte budgets, early stream-error key/fallback/group retry, no retry after text/reasoning/tool output, configurable per-attempt first-content/read-idle deadlines with timeout fallback, and pending-handler cancellation accounting; see docs/stream-lifecycle.md | Recorded real-agent fixtures, broader multimodal/tool/stream conformance, group-specific timeout policies, downstream keepalives and real downstream cancellation before headers |
+| Shared Rust gateway | Core wire codecs; real local HTTP/SSE terminal/error/EOF and after-header disconnect fixtures across four adapters; incremental 32 MiB raw-event bounds, BOM/CR/UTF-8 handling, opening event/metadata-byte budgets, early stream-error key/fallback/group retry, no retry after text/reasoning/tool output, configurable per-attempt first-content/read-idle deadlines with timeout fallback, and real HTTP/1.1 before/after-header cancellation with persisted accounting; see docs/stream-lifecycle.md | Recorded real-agent fixtures, broader multimodal/tool/stream conformance, group-specific timeout policies, downstream keepalives and HTTP/2 cancellation conformance |
 | Agent adapters | Shared magpie-agents adapters for Claude Code, Codex, Crush, Gemini CLI, Goose, OpenCode and Zed; private staged preview, revision-checked apply, OS lock, schema-2 journaled selective field restore preserving unrelated edits, disconnect, managed-field drift and explicit recovery. Agent unit, HTTP, sandboxed child CLI and real-gateway console browser tests; Windows ACL/junction checks; recursive duplicate-key JSON/JSONC refusal, format-preserving JSON edits, compact comment-free JSON object additions that preserve single-line layout, native OpenCode/Zed JSONC, shared passive CLI/config discovery with bounded user-prefix/Node-version searches, npmrc prefix and nvm default-alias handling, and PATH/unknown metadata, native absolute config-directory overrides for Claude/Codex/OpenCode/Zed, and seven-Agent selective restore through HTTP/CLI/browser | Native project overrides, login-shell/registry PATH refresh, process/reachability and real-version compatibility evidence; compact layout preservation is intentionally limited to single-line objects without direct comments |
 | Provider metadata and keys | Protected provider CRUD and console; providers.rs covers saved/live edits, secret-free capability metadata (`supported_protocols`, nullable streaming/tools/vision), protocol validation and preserve/clear semantics. provider_tools.rs covers four-protocol catalogs/probes, pagination, saved/draft/no-auth credentials and bounded read-only operations | Capability presets, specialized/stream-only probes and paid/live vendor evidence |
 | Hot edits and key rotation | ConfigStore saves before publishing; requests own snapshots. Versioned key schedules ignore stale requests. providers.rs checks an old in-flight request after a smaller pool is saved; config.rs checks stale scheduler calls. Durable config revisions/ETags and optional If-Match checks reject stale provider/group writes across restarts; the revision is committed in the atomically replaced TOML document, store and HTTP tests check unchanged disk/memory and a single winner for concurrent checked edits; gateway writers also serialize through a bounded file lock. Provider/group CRUD and agent apply now have durable idempotency with 256-entry retention, token-keyed HMAC digests, restart replay, pending fail-closed behavior, and secret-free ledgers | Encrypted secret storage with recovery; durable idempotency for any future agent rotate endpoint |
@@ -70,8 +70,9 @@ Streaming fixtures are additionally compared with upstream `stream_error_open_te
 and `canceled_usage_test.go`. Held-open HTTP-200 rate-limit events can now retry
 before content, across keys, fallback providers and groups; invalid requests and
 committed text/reasoning/tool calls do not replay. Tests distinguish real
-after-header HTTP disconnects from explicit pending-handler task cancellation;
-the latter is not proof of automatic real-socket cancellation before headers.
+after-header HTTP disconnects from explicit pending-handler task cancellation.
+Separate real HTTP/1.1 pre-header socket fixtures now prove automatic cancellation
+in the current Axum serving path, with both streaming deadlines disabled.
 See `docs/stream-lifecycle.md` for exact completion, cooldown, accounting and
 remaining timeout-policy/vendor-compatibility limits.
 
@@ -90,5 +91,14 @@ cover opening/after-content stalls across all four-by-four protocol pairs,
 ordinary/group timeout fallback, ignored-heartbeat and committed-metadata cases,
 header/error-body stalls, paced output, reasoning/tools and disable semantics.
 This adds gateway-wide safety bounds rather than replicating the reference's
-Group.FirstToken policy; keepalives, group overrides and real pre-header socket
-cancellation remain unimplemented. See `docs/stream-lifecycle.md`.
+Group.FirstToken policy; keepalives and group overrides remain unimplemented.
+See `docs/stream-lifecycle.md`.
+
+Real pre-header cancellation is now verified without a new production mechanism:
+five `socket_disconnect_*` tests exercise 160 local HTTP/1.1 cases across all four
+client/upstream dialects, stream/nonstream waits, opening prefetch, HTTP error
+bodies and ordinary/group fallback. Closing only the client socket releases all
+attempted upstreams and writes one persisted last-attempt record, preserving
+observed usage but never abandoned-attempt usage. This closes the prior
+HTTP/1.1 evidence gap, not HTTP/2, TLS/proxy or live-Agent compatibility gaps.
+See `docs/stream-lifecycle.md` for the exact fixture scope.
