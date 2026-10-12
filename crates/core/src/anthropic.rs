@@ -299,6 +299,11 @@ fn usage_to_json(u: &Usage) -> Value {
     Value::Object(usage)
 }
 
+/// Read reported usage even when a refusal omits the ordinary reply fields.
+pub fn response_usage(v: &Value) -> Usage {
+    v.get("usage").map(decode_usage).unwrap_or_default()
+}
+
 /// Decode an Anthropic Messages reply body.
 pub fn decode_response(v: &Value) -> Result<CompletionResponse> {
     if v.get("type") == Some(&json!("error")) {
@@ -318,7 +323,7 @@ pub fn decode_response(v: &Value) -> Result<CompletionResponse> {
         .and_then(Value::as_str)
         .map(StopReason::from_anthropic)
         .unwrap_or_default();
-    let usage = v.get("usage").map(decode_usage).unwrap_or_default();
+    let usage = response_usage(v);
     Ok(CompletionResponse {
         model,
         message: Message {

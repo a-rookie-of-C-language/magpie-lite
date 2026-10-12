@@ -10,6 +10,7 @@ pub mod server;
 mod stream_empty;
 mod stream_keepalive;
 mod stream_loop;
+mod stream_refusal;
 mod stream_status;
 mod stream_timeout;
 pub mod upstream;

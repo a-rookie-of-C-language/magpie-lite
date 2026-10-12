@@ -339,6 +339,11 @@ fn usage_to_json(u: &Usage) -> Value {
     })
 }
 
+/// Read reported usage even when a refusal omits the ordinary reply fields.
+pub fn response_usage(v: &Value) -> Usage {
+    v.get("usage").map(decode_usage).unwrap_or_default()
+}
+
 /// Decode an OpenAI Responses reply body.
 pub fn decode_response(v: &Value) -> Result<CompletionResponse> {
     if v.get("status") == Some(&json!("failed")) {
@@ -406,13 +411,13 @@ pub fn decode_response(v: &Value) -> Result<CompletionResponse> {
         }
     }
     let stop = if v.get("status") == Some(&json!("incomplete")) {
-        StopReason::MaxTokens
+        incomplete_stop(v)
     } else if has_tool_call {
         StopReason::ToolUse
     } else {
         StopReason::EndTurn
     };
-    let usage = v.get("usage").map(decode_usage).unwrap_or_default();
+    let usage = response_usage(v);
     Ok(CompletionResponse {
         model,
         message: Message {
@@ -430,6 +435,24 @@ fn response_id() -> String {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     format!("resp_magpie{now}")
+}
+
+fn incomplete_stop(response: &Value) -> StopReason {
+    match response
+        .pointer("/incomplete_details/reason")
+        .and_then(Value::as_str)
+    {
+        Some("content_filter") => StopReason::ContentFilter,
+        _ => StopReason::MaxTokens,
+    }
+}
+
+fn incomplete_reason(reason: StopReason) -> Option<&'static str> {
+    match reason {
+        StopReason::MaxTokens => Some("max_output_tokens"),
+        StopReason::ContentFilter => Some("content_filter"),
+        _ => None,
+    }
 }
 
 /// Encode an IR reply as an OpenAI Responses body.
@@ -460,7 +483,7 @@ pub fn encode_response(resp: &CompletionResponse) -> Value {
             _ => {}
         }
     }
-    let status = if resp.stop == StopReason::MaxTokens {
+    let status = if incomplete_reason(resp.stop).is_some() {
         "incomplete"
     } else {
         "completed"
@@ -473,6 +496,7 @@ pub fn encode_response(resp: &CompletionResponse) -> Value {
         "model": resp.model,
         "output": output,
         "usage": usage_to_json(&resp.usage),
+        "incomplete_details": incomplete_reason(resp.stop).map(|reason| json!({"reason": reason})),
     })
 }
 
@@ -563,7 +587,7 @@ pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
                 })
                 .unwrap_or(false);
             let stop = if incomplete {
-                StopReason::MaxTokens
+                incomplete_stop(&v["response"])
             } else if has_call {
                 StopReason::ToolUse
             } else {
@@ -742,21 +766,23 @@ impl ResponsesStreamEncoder {
         out.push_str(&self.close_message());
         out.push_str(&self.close_reasoning());
         out.push_str(&self.close_tools());
-        let status = if reason == StopReason::MaxTokens {
+        let status = if incomplete_reason(reason).is_some() {
             "incomplete"
         } else {
             "completed"
         };
         let mut response = self.response_skeleton(status);
-        if reason == StopReason::MaxTokens {
-            response.insert(
-                "incomplete_details".into(),
-                json!({"reason": "max_output_tokens"}),
-            );
+        if let Some(reason) = incomplete_reason(reason) {
+            response.insert("incomplete_details".into(), json!({"reason": reason}));
         }
         response.insert("usage".into(), usage_to_json(&self.usage));
         self.completed = true;
-        out.push_str(&event("response.completed", json!({"response": response})));
+        let terminal = if status == "incomplete" {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        };
+        out.push_str(&event(terminal, json!({"response": response})));
         out
     }
 

@@ -294,9 +294,9 @@ fn gemini_finish_reasons_distinguish_stops_length_and_filters() {
         ("UNEXPECTED_TOOL_CALL", StopReason::EndTurn),
         ("stop", StopReason::EndTurn),
         ("MAX_TOKENS", StopReason::MaxTokens),
-        ("SAFETY", StopReason::Other),
-        ("IMAGE_SAFETY", StopReason::Other),
-        ("NEW_FILTER", StopReason::Other),
+        ("SAFETY", StopReason::ContentFilter),
+        ("IMAGE_SAFETY", StopReason::ContentFilter),
+        ("NEW_FILTER", StopReason::ContentFilter),
     ] {
         let body = json!({"modelVersion":"mock", "candidates":[{"finishReason":reason}]});
         assert_eq!(gemini::decode_response(&body).unwrap().stop, expected);

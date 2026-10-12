@@ -194,6 +194,15 @@ feature does not add image/search stream events, subscription authentication or
 dedicated prompt-feedback refusal rendering. See [stream lifecycle](docs/stream-lifecycle.md)
 for limits, cancellation/accounting rules and synthetic fixture coverage.
 
+## Safety-filtered replies
+
+The four protocol adapters preserve content filtering separately from normal
+completion and token limits. A held, answerless refusal may use configured
+fallback routes, never credential retries or cooldown. Exhaustion returns a
+sanitized HTTP 400; after output commits, the gateway does not replay a turn on
+another backend. Malformed nonstream success replies return HTTP 502 rather
+than empty success. See `docs/stream-lifecycle.md` for precise limits and tests.
+
 ## Editing providers
 
 The protected web console can create, edit, and delete providers without restarting the gateway. Provider metadata and route lists are editable directly; API keys are never returned. When editing an existing provider, choose **Keep existing keys**, **Replace key pool**, or **No upstream authentication** explicitly. New requests use a saved provider immediately, while in-flight requests keep their original endpoint and credential snapshot.

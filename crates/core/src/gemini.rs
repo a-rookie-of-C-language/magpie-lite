@@ -549,14 +549,14 @@ fn stop_from_gemini(s: &str) -> StopReason {
         | "OTHER"
         | "MALFORMED_FUNCTION_CALL"
         | "UNEXPECTED_TOOL_CALL" => StopReason::EndTurn,
-        _ => StopReason::Other,
+        _ => StopReason::ContentFilter,
     }
 }
 
 fn stop_to_gemini(s: StopReason) -> &'static str {
     match s {
         StopReason::MaxTokens => "MAX_TOKENS",
-        StopReason::Other => "SAFETY",
+        StopReason::ContentFilter | StopReason::Other => "SAFETY",
         _ => "STOP",
     }
 }
@@ -646,6 +646,20 @@ fn parts_to_json(parts: &[Part]) -> Value {
     Value::Array(out)
 }
 
+fn prompt_blocked(v: &Value) -> bool {
+    get_either(v, "promptFeedback", "prompt_feedback")
+        .and_then(|feedback| get_either(feedback, "blockReason", "block_reason"))
+        .and_then(Value::as_str)
+        .is_some_and(|reason| !matches!(reason, "" | "BLOCK_REASON_UNSPECIFIED"))
+}
+
+/// Read reported usage even when a refusal omits the ordinary reply fields.
+pub fn response_usage(v: &Value) -> Usage {
+    get_either(v, "usageMetadata", "usage_metadata")
+        .map(decode_usage)
+        .unwrap_or_default()
+}
+
 /// Decode a Gemini generateContent reply.
 pub fn decode_response(v: &Value) -> Result<CompletionResponse> {
     if let Some(error) = v.get("error") {
@@ -658,9 +672,29 @@ pub fn decode_response(v: &Value) -> Result<CompletionResponse> {
             detail: detail.to_owned(),
         });
     }
+    let blocked = prompt_blocked(v);
+    if blocked
+        && v.get("candidates")
+            .and_then(Value::as_array)
+            .is_none_or(|a| a.is_empty())
+    {
+        return Ok(CompletionResponse {
+            model: get_either(v, "modelVersion", "model_version")
+                .and_then(Value::as_str)
+                .or_else(|| v.get("model").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_owned(),
+            stop: StopReason::ContentFilter,
+            usage: get_either(v, "usageMetadata", "usage_metadata")
+                .map(decode_usage)
+                .unwrap_or_default(),
+            ..Default::default()
+        });
+    }
     let model = get_either(v, "modelVersion", "model_version")
         .and_then(Value::as_str)
         .or_else(|| v.get("model").and_then(Value::as_str))
+        .or_else(|| blocked.then_some(""))
         .map(str::to_owned)
         .ok_or(missing("modelVersion"))?;
     let candidate = v
@@ -679,7 +713,9 @@ pub fn decode_response(v: &Value) -> Result<CompletionResponse> {
         .or_else(|| candidate.get("finish_reason"))
         .and_then(Value::as_str)
         .unwrap_or("STOP");
-    let stop = if has_tool_call {
+    let stop = if blocked || stop_from_gemini(finish) == StopReason::ContentFilter {
+        StopReason::ContentFilter
+    } else if has_tool_call {
         StopReason::ToolUse
     } else {
         stop_from_gemini(finish)
@@ -746,11 +782,16 @@ impl GeminiStreamDecoder {
         if let Some(usage) = get_either(v, "usageMetadata", "usage_metadata") {
             out.push(StreamEvent::Usage(decode_usage(usage)));
         }
+        let blocked = prompt_blocked(v);
         let Some(candidate) = v
             .get("candidates")
             .and_then(Value::as_array)
             .and_then(|a| a.first())
         else {
+            if blocked {
+                out.push(StreamEvent::Stop(StopReason::ContentFilter));
+                out.push(StreamEvent::Done);
+            }
             return out;
         };
         for part in candidate
@@ -804,6 +845,7 @@ impl GeminiStreamDecoder {
             .or_else(|| candidate.get("finish_reason"))
             .and_then(Value::as_str)
             .filter(|reason| !reason.is_empty())
+            .or_else(|| blocked.then_some("SAFETY"))
         {
             let has_call = candidate
                 .pointer("/content/parts")
@@ -813,11 +855,15 @@ impl GeminiStreamDecoder {
                         .any(|p| get_either(p, "functionCall", "function_call").is_some())
                 })
                 .unwrap_or(false);
-            out.push(StreamEvent::Stop(if has_call {
-                StopReason::ToolUse
-            } else {
-                stop_from_gemini(finish)
-            }));
+            out.push(StreamEvent::Stop(
+                if blocked || stop_from_gemini(finish) == StopReason::ContentFilter {
+                    StopReason::ContentFilter
+                } else if has_call {
+                    StopReason::ToolUse
+                } else {
+                    stop_from_gemini(finish)
+                },
+            ));
             out.push(StreamEvent::Done);
         }
         out

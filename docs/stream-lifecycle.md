@@ -530,3 +530,38 @@ Queue/slow-final-route behavior, HTTP/2 cancellation conformance and broader
 tool/multimodal conformance remain open.
 Post-content event-idle/meaningful-progress timeouts are also not implemented;
 they are distinct from the repetition guard and transport-idle limits.
+
+## Safety filtering and refusal routing
+
+Chat `content_filter`, Anthropic `refusal`, Responses
+`incomplete_details.reason: content_filter`, and Gemini safety finishes preserve
+a distinct content-filter stop rather than a normal stop or token limit. Responses
+filter/length streams finish with `response.incomplete`. Gemini prompt-feedback
+blocks can omit model/candidates; feedback with candidate content preserves it.
+
+An explicit policy-error envelope or an allowlisted filter with no answer, while
+the response is still held, skips the remaining keys for that route and tries only
+configured fallback/group routes. It does not trigger empty-reply recovery,
+credential retry, or key cooldown. Exhaustion returns HTTP 400 with the sanitized
+message `safety filter: upstream refused the request`; terminal history uses
+`refusal`. Reported usage is retained even if ordinary reply fields are missing.
+Successful fallback retains only the successful attempt's usage, as with ordinary
+fallback. After answer output, a filter preserves the partial answer and filtered
+finish, without replay. If reasoning or released metadata has already committed
+the stream, an answerless refusal becomes one stream error, not another route.
+
+The routing allowlist is `refusal`, `content_filter`,
+`content_policy_violation`, `SAFETY`, `PROHIBITED_CONTENT`, `BLOCKLIST`,
+`SPII`, and `IMAGE_SAFETY`. Other Gemini filter reasons remain filtered codec
+results but do not automatically trigger refusal routing.
+`BLOCK_REASON_UNSPECIFIED` is not a prompt block and does not hide a candidate
+refusal or disable ordinary empty-reply recovery. Explicit policy error codes
+are classified independently; arbitrary messages mentioning safety are not.
+
+Nonstream success bodies are decoded inside routing; malformed replies now
+return HTTP 502 instead of a fabricated empty HTTP 200. Loopback fixtures cover
+all four upstream/client protocols, same-frame content/filter, prompt feedback,
+policy-error envelopes, usage, fallback, and post-commit behavior. This is not
+live-vendor validation. Lite still commits reasoning earlier than the reference;
+longer reasoning holding, broader multimodal rendering and HTTP/2 evidence remain
+open. Usage arriving after a terminal refusal is not guaranteed to be read.

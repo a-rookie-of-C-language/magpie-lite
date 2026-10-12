@@ -210,6 +210,8 @@ pub enum StopReason {
     MaxTokens,
     /// A stop sequence ended it.
     StopSequence,
+    /// The vendor safety/content filter ended the reply.
+    ContentFilter,
     /// Anything else; treated as the turn ending.
     Other,
 }
@@ -221,6 +223,7 @@ impl StopReason {
             StopReason::EndTurn | StopReason::StopSequence | StopReason::Other => "stop",
             StopReason::ToolUse => "tool_calls",
             StopReason::MaxTokens => "length",
+            StopReason::ContentFilter => "content_filter",
         }
     }
 
@@ -228,7 +231,8 @@ impl StopReason {
     pub fn from_chat(s: &str) -> StopReason {
         match s {
             "tool_calls" | "function_call" => StopReason::ToolUse,
-            "length" | "content_filter" => StopReason::MaxTokens,
+            "length" => StopReason::MaxTokens,
+            "content_filter" => StopReason::ContentFilter,
             _ => StopReason::EndTurn,
         }
     }
@@ -240,6 +244,7 @@ impl StopReason {
             StopReason::ToolUse => "tool_use",
             StopReason::MaxTokens => "max_tokens",
             StopReason::StopSequence => "stop_sequence",
+            StopReason::ContentFilter => "refusal",
         }
     }
 
@@ -249,6 +254,7 @@ impl StopReason {
             "tool_use" => StopReason::ToolUse,
             "max_tokens" => StopReason::MaxTokens,
             "stop_sequence" => StopReason::StopSequence,
+            "refusal" => StopReason::ContentFilter,
             _ => StopReason::EndTurn,
         }
     }

@@ -127,7 +127,12 @@ pub async fn error_detail(resp: reqwest::Response) -> UpstreamError {
 
 /// An error body in the Chat Completions shape.
 pub fn chat_error(status: reqwest::StatusCode, message: &str) -> Value {
-    json!({"error": {"message": message, "type": "upstream_error", "code": status.as_u16()}})
+    let kind = if status == reqwest::StatusCode::BAD_REQUEST {
+        "invalid_request_error"
+    } else {
+        "upstream_error"
+    };
+    json!({"error": {"message": message, "type": kind, "code": status.as_u16()}})
 }
 
 /// An error body in the Gemini generateContent shape.
@@ -146,6 +151,7 @@ pub fn gemini_error(status: reqwest::StatusCode, message: &str) -> Value {
 /// An error body in the Anthropic Messages shape.
 pub fn anthropic_error(status: reqwest::StatusCode, message: &str) -> Value {
     let kind = match status.as_u16() {
+        400 => "invalid_request_error",
         401 | 403 => "authentication_error",
         429 => "rate_limit_error",
         404 => "not_found_error",
@@ -168,5 +174,10 @@ fn path_escape(s: &str) -> String {
 
 /// An error body in the OpenAI Responses shape.
 pub fn responses_error(status: reqwest::StatusCode, message: &str) -> Value {
-    json!({"error": {"message": message, "type": "upstream_error", "code": status.as_u16()}})
+    let kind = if status == reqwest::StatusCode::BAD_REQUEST {
+        "invalid_request_error"
+    } else {
+        "upstream_error"
+    };
+    json!({"error": {"message": message, "type": kind, "code": status.as_u16()}})
 }

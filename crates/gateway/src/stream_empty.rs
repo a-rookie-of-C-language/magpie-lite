@@ -16,7 +16,7 @@ impl GeminiReply {
             .pointer("/promptFeedback/blockReason")
             .or_else(|| body.pointer("/prompt_feedback/block_reason"))
             .and_then(Value::as_str)
-            .is_some_and(|reason| !reason.is_empty())
+            .is_some_and(|reason| !matches!(reason, "" | "BLOCK_REASON_UNSPECIFIED"))
         {
             self.exempt = true;
         }

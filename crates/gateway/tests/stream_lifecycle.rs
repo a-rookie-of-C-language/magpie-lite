@@ -4884,9 +4884,24 @@ async fn gemini_empty_reply_length_filter_tool_image_search_and_other_protocols_
                 "data: {\"usageMetadata\":{\"promptTokenCount\":7,\"candidatesTokenCount\":3}}\n\n"
                     .to_owned()
                     + script;
+            let refused = script.contains("SAFETY");
+            let filtered = script.contains("NEW_FILTER");
+            let length = script.contains("MAX_TOKENS");
             let f = Fixture::new(Protocol::Gemini, script, Ending::Hold).await;
-            let body = f.request(client).await.text().await.unwrap();
-            assert_completed(&body, client);
+            let response = f.request_model_raw(client, "mock/up-model").await;
+            assert_eq!(response.status().as_u16(), if refused { 400 } else { 200 });
+            let body = response.text().await.unwrap();
+            if refused {
+                assert!(body.contains("safety filter"), "{body}");
+            } else if filtered {
+                assert_filtered(&body, client);
+            } else if length && client == Protocol::Responses {
+                assert!(body.contains("response.incomplete"), "{body}");
+                assert!(body.contains("max_output_tokens"), "{body}");
+                assert!(!body.contains("response.completed"), "{body}");
+            } else {
+                assert_completed(&body, client);
+            }
             assert_eq!(*f.attempts.lock().unwrap(), [0]);
             f.assert_released().await;
         }
@@ -4909,8 +4924,11 @@ async fn gemini_empty_reply_length_filter_tool_image_search_and_other_protocols_
             Ending::Eof,
         )
         .await;
-        let body = f.request(client).await.text().await.unwrap();
-        assert_one_stream_error(&body, client, "upstream stream ended");
+        let response = f.request_model_raw(client, "mock/up-model").await;
+        assert_eq!(response.status().as_u16(), 400);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("safety filter"), "{body}");
+        f.assert_released().await;
         assert_eq!(*f.attempts.lock().unwrap(), [0]);
     }
 }
@@ -5367,5 +5385,538 @@ async fn gemini_empty_finish_reason_waits_for_answer_and_real_completion() {
         assert_completed(&body, client);
         assert_eq!(*f.attempts.lock().unwrap(), [0]);
         f.assert_released().await;
+    }
+}
+
+fn filtered_completion(protocol: Protocol) -> String {
+    match protocol {
+        Protocol::Chat => completion(protocol).replace("stop", "content_filter"),
+        Protocol::Anthropic => completion(protocol).replace("end_turn", "refusal"),
+        Protocol::Responses => completion(protocol)
+            .replace("response.completed", "response.incomplete")
+            .replace(
+                "\"status\":\"completed\"",
+                "\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"content_filter\"}",
+            ),
+        Protocol::Gemini => completion(protocol).replace("STOP", "SAFETY"),
+    }
+}
+
+fn filtered_json(protocol: Protocol, answer: bool) -> String {
+    let ir = magpie_core::ir::CompletionResponse {
+        model: "up-model".into(),
+        message: magpie_core::ir::Message {
+            role: magpie_core::ir::Role::Assistant,
+            parts: if answer {
+                vec![magpie_core::ir::Part::text("partial answer")]
+            } else {
+                vec![]
+            },
+        },
+        stop: magpie_core::ir::StopReason::ContentFilter,
+        usage: magpie_core::ir::Usage {
+            input: Some(7),
+            output: Some(3),
+            ..Default::default()
+        },
+    };
+    match protocol {
+        Protocol::Chat => magpie_core::chat::encode_response(&ir),
+        Protocol::Anthropic => magpie_core::anthropic::encode_response(&ir),
+        Protocol::Responses => magpie_core::responses::encode_response(&ir),
+        Protocol::Gemini => magpie_core::gemini::encode_response(&ir),
+    }
+    .to_string()
+}
+
+fn assert_filtered(body: &str, protocol: Protocol) {
+    assert!(!body.contains("upstream refused"), "{body}");
+    assert!(
+        body.contains(match protocol {
+            Protocol::Chat => "content_filter",
+            Protocol::Anthropic => "refusal",
+            Protocol::Responses => "content_filter",
+            Protocol::Gemini => "SAFETY",
+        }),
+        "{body}"
+    );
+    if protocol == Protocol::Responses {
+        assert!(body.contains("content_filter"), "{body}");
+        assert!(!body.contains("response.completed"), "{body}");
+    }
+}
+
+#[tokio::test]
+async fn safety_held_refusals_return_400_without_key_retry_or_cooldown() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            let script = opening(upstream).replace("99", "7") + &filtered_completion(upstream);
+            let f = Fixture::with_keys(upstream, vec![script.clone(), script], Ending::Hold).await;
+            let response = f.request_model_raw(client, "mock/up-model").await;
+            assert_eq!(
+                response.status().as_u16(),
+                400,
+                "{upstream:?} -> {client:?}"
+            );
+            let body: Value = response.json().await.unwrap();
+            assert!(body.to_string().contains("safety filter"), "{body}");
+            let record = f.record().await;
+            assert_eq!(record["usage"]["input"], 7, "{record}");
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            assert!(
+                f.state
+                    .key_rotation
+                    .cooldown_snapshot(&f.state.config.current())
+                    .is_empty()
+            );
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn safety_held_refusals_skip_keys_and_use_only_configured_routes() {
+    for grouped in [false, true] {
+        for upstream in PROTOCOLS {
+            for client in PROTOCOLS {
+                let f = Fixture::with_config(
+                    upstream,
+                    vec![
+                        opening(upstream).replace("99", "7") + &filtered_completion(upstream),
+                        prefix(upstream) + completion(upstream),
+                    ],
+                    Ending::Hold,
+                    |config| configure_timeout_fallback(config, grouped),
+                )
+                .await;
+                let body = f
+                    .request_model(
+                        client,
+                        if grouped {
+                            "group/daily"
+                        } else {
+                            "mock/up-model"
+                        },
+                    )
+                    .await
+                    .text()
+                    .await
+                    .unwrap();
+                assert_completed(&body, client);
+                assert!(!body.contains("safety filter"), "{body}");
+                assert_eq!(*f.attempts.lock().unwrap(), [0, 1]);
+                assert_eq!(*f.sent_models.lock().unwrap(), ["up-model", "backup-model"]);
+                let record = f.record().await;
+                assert_eq!(record["provider"], "spare", "{record}");
+                assert_eq!(record["usage"]["input"], 7, "{record}");
+                f.assert_released().await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn safety_after_answer_preserves_filter_and_never_replays() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            let f = Fixture::with_config(
+                upstream,
+                vec![
+                    prefix(upstream) + &filtered_completion(upstream),
+                    prefix(upstream) + completion(upstream),
+                ],
+                Ending::Hold,
+                |config| configure_timeout_fallback(config, false),
+            )
+            .await;
+            let body = f.request(client).await.text().await.unwrap();
+            assert_filtered(&body, client);
+            assert!(body.contains("partial"), "{body}");
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            let record = f.record().await;
+            assert_eq!(record["status"], "ok", "{record}");
+            assert_eq!(record["usage"]["input"], 7, "{record}");
+            assert_eq!(record["usage"]["output"], 3, "{record}");
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn safety_nonstream_empty_refusal_and_partial_answer_remain_distinct() {
+    for answer in [false, true] {
+        for upstream in PROTOCOLS {
+            for client in PROTOCOLS {
+                let f = Fixture::with_keys(
+                    upstream,
+                    vec![filtered_json(upstream, answer); 2],
+                    Ending::Eof,
+                )
+                .await;
+                let (path, body) = client_request(client, "mock/up-model", false);
+                let response = reqwest::Client::new()
+                    .post(format!("{}{path}", f.gateway.url))
+                    .bearer_auth("secret-local-token")
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status().as_u16(),
+                    if answer { 200 } else { 400 },
+                    "{upstream:?} -> {client:?}"
+                );
+                let body = response.text().await.unwrap();
+                if answer {
+                    assert_filtered(&body, client);
+                } else {
+                    assert!(body.contains("safety filter"), "{body}");
+                }
+                assert_eq!(*f.attempts.lock().unwrap(), [0]);
+                let record = f.record().await;
+                assert_eq!(record["usage"]["input"], 7, "{record}");
+                f.assert_released().await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn safety_reasoning_or_released_metadata_never_switches_routes() {
+    for metadata in [false, true] {
+        for upstream in PROTOCOLS {
+            for client in PROTOCOLS {
+                let committed = if metadata {
+                    opening(upstream).repeat(70)
+                } else {
+                    opening(upstream).to_owned()
+                        + &loop_delta(upstream, true, "reasoning already sent")
+                };
+                let f = Fixture::with_config(
+                    upstream,
+                    vec![
+                        committed + &filtered_completion(upstream),
+                        prefix(upstream) + completion(upstream),
+                    ],
+                    Ending::Hold,
+                    |config| configure_timeout_fallback(config, false),
+                )
+                .await;
+                let body = f.request(client).await.text().await.unwrap();
+                assert_one_stream_error(&body, client, "safety filter");
+                if !metadata {
+                    assert!(body.contains("reasoning already sent"), "{body}");
+                }
+                assert_eq!(*f.attempts.lock().unwrap(), [0]);
+                let record = f.record().await;
+                assert_eq!(record["status"], "refusal", "{record}");
+                assert!(
+                    f.state
+                        .key_rotation
+                        .cooldown_snapshot(&f.state.config.current())
+                        .is_empty()
+                );
+                f.assert_released().await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn safety_same_frame_answer_and_filter_are_not_empty_refusals() {
+    for upstream in [Protocol::Chat, Protocol::Gemini] {
+        for client in PROTOCOLS {
+            let frame = match upstream {
+                Protocol::Chat => {
+                    json!({"model":"up-model","choices":[{"delta":{"content":"same frame answer"},"finish_reason":"content_filter"}], "usage":{"prompt_tokens":7,"completion_tokens":3}})
+                }
+                _ => {
+                    json!({"modelVersion":"up-model", "promptFeedback":{"blockReason":"SAFETY"}, "candidates":[{"content":{"parts":[{"text":"same frame answer"}]},"finishReason":"SAFETY"}], "usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}})
+                }
+            };
+            let script = format!(
+                "data: {frame}\n\n{}",
+                if upstream == Protocol::Chat {
+                    "data: [DONE]\n\n"
+                } else {
+                    ""
+                }
+            );
+            let f = Fixture::new(upstream, script, Ending::Hold).await;
+            let body = f.request(client).await.text().await.unwrap();
+            assert!(body.contains("same frame answer"), "{body}");
+            assert_filtered(&body, client);
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn safety_policy_error_envelopes_fall_back_without_leaking_vendor_messages() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            for http in [false, true] {
+                let policy = json!({"code":"content_policy_violation", "message":"PRIVATE PROMPT secret-upstream-key-0"});
+                let value = if upstream == Protocol::Responses && !http {
+                    json!({"type":"response.failed", "response":{"error":policy}})
+                } else {
+                    json!({"type":"error", "error":policy})
+                };
+                let script = if http {
+                    value.to_string()
+                } else {
+                    format!("data: {value}\n\n")
+                };
+                let f = Fixture::with_transport(
+                    upstream,
+                    vec![script, prefix(upstream) + completion(upstream)],
+                    Ending::PerSlot(vec![Ending::Eof, Ending::Hold]),
+                    Transport {
+                        status: if http {
+                            axum::http::StatusCode::TOO_MANY_REQUESTS
+                        } else {
+                            axum::http::StatusCode::OK
+                        },
+                        ..Default::default()
+                    },
+                    |config| configure_timeout_fallback(config, false),
+                )
+                .await;
+                let body = f.request(client).await.text().await.unwrap();
+                assert_completed(&body, client);
+                assert!(!body.contains("PRIVATE PROMPT"), "{body}");
+                assert_eq!(*f.attempts.lock().unwrap(), [0, 1]);
+                assert!(
+                    f.state
+                        .key_rotation
+                        .cooldown_snapshot(&f.state.config.current())
+                        .is_empty()
+                );
+                let record = f.record().await;
+                assert!(!record.to_string().contains("PRIVATE PROMPT"));
+                let stats = f.log.lock().unwrap().snapshot();
+                assert_eq!(stats.providers["mock"].keys["0"].errors, 1);
+                f.assert_released().await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn safety_policy_error_exhaustion_is_sanitized_400_even_with_quota_status() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            let script = json!({"error":{"code":"bio_policy","message":"PRIVATE PROMPT secret-upstream-key-0"}}).to_string();
+            let f = Fixture::with_transport(
+                upstream,
+                vec![script.clone(), script],
+                Ending::Eof,
+                Transport {
+                    status: axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await;
+            let response = f.request_model_raw(client, "mock/up-model").await;
+            assert_eq!(response.status().as_u16(), 400);
+            let body: Value = response.json().await.unwrap();
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("safety filter")
+            );
+            assert!(!body.to_string().contains("PRIVATE PROMPT"));
+            if client != Protocol::Gemini {
+                assert_eq!(body["error"]["type"], "invalid_request_error");
+            }
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            assert!(
+                f.state
+                    .key_rotation
+                    .cooldown_snapshot(&f.state.config.current())
+                    .is_empty()
+            );
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn safety_nonstream_refusals_use_configured_fallback_and_reset_usage() {
+    for grouped in [false, true] {
+        for upstream in PROTOCOLS {
+            for client in PROTOCOLS {
+                let mut success: Value =
+                    serde_json::from_str(&filtered_json(upstream, true)).unwrap();
+                match upstream {
+                    Protocol::Chat => success["choices"][0]["finish_reason"] = json!("stop"),
+                    Protocol::Anthropic => success["stop_reason"] = json!("end_turn"),
+                    Protocol::Responses => {
+                        success["status"] = json!("completed");
+                        success
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("incomplete_details");
+                    }
+                    Protocol::Gemini => success["candidates"][0]["finishReason"] = json!("STOP"),
+                }
+                let success = success.to_string();
+                let f = Fixture::with_config(
+                    upstream,
+                    vec![filtered_json(upstream, false), success],
+                    Ending::Eof,
+                    |config| configure_timeout_fallback(config, grouped),
+                )
+                .await;
+                let (path, body) = client_request(
+                    client,
+                    if grouped {
+                        "group/daily"
+                    } else {
+                        "mock/up-model"
+                    },
+                    false,
+                );
+                let response = reqwest::Client::new()
+                    .post(format!("{}{path}", f.gateway.url))
+                    .bearer_auth("secret-local-token")
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status().as_u16(), 200);
+                let body: Value = response.json().await.unwrap();
+                assert!(body.to_string().contains("partial answer"));
+                assert_eq!(*f.attempts.lock().unwrap(), [0, 1]);
+                let record = f.record().await;
+                assert_eq!(record["provider"], "spare", "{record}");
+                assert_eq!(record["usage"]["input"], 7, "{record}");
+                assert_eq!(record["usage"]["output"], 3, "{record}");
+                f.assert_released().await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn safety_gemini_prompt_feedback_is_terminal_in_both_modes() {
+    for stream in [false, true] {
+        for client in PROTOCOLS {
+            let value = json!({"prompt_feedback":{"block_reason":"PROHIBITED_CONTENT"},"usage_metadata":{"prompt_token_count":7}});
+            let script = if stream {
+                format!("data: {value}\n\n")
+            } else {
+                value.to_string()
+            };
+            let f = Fixture::new(
+                Protocol::Gemini,
+                script,
+                if stream { Ending::Hold } else { Ending::Eof },
+            )
+            .await;
+            let (path, body) = client_request(client, "mock/up-model", stream);
+            let response = reqwest::Client::new()
+                .post(format!("{}{path}", f.gateway.url))
+                .bearer_auth("secret-local-token")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 400);
+            assert!(response.text().await.unwrap().contains("safety filter"));
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            assert_eq!(f.record().await["usage"]["input"], 7);
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn safety_nonstream_missing_model_refusals_preserve_reported_usage() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            let mut value: Value = serde_json::from_str(&filtered_json(upstream, false)).unwrap();
+            value.as_object_mut().unwrap().remove("model");
+            value.as_object_mut().unwrap().remove("modelVersion");
+            let f = Fixture::new(upstream, value.to_string(), Ending::Eof).await;
+            let (path, body) = client_request(client, "mock/up-model", false);
+            let response = reqwest::Client::new()
+                .post(format!("{}{path}", f.gateway.url))
+                .bearer_auth("secret-local-token")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 400);
+            let record = f.record().await;
+            assert_eq!(record["status"], "refusal", "{record}");
+            assert_eq!(record["usage"]["input"], 7, "{record}");
+            assert_eq!(record["usage"]["output"], 3, "{record}");
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn safety_malformed_nonstream_success_is_a_502_not_a_fabricated_answer() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            let f = Fixture::new(
+                upstream,
+                json!({"candidates":[{"finishReason":"MAX_TOKENS"}]}).to_string(),
+                Ending::Eof,
+            )
+            .await;
+            let (path, body) = client_request(client, "mock/up-model", false);
+            let response = reqwest::Client::new()
+                .post(format!("{}{path}", f.gateway.url))
+                .bearer_auth("secret-local-token")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            // Missing required model fields are malformed, not fabricated empty answers.
+            // The length stop excludes Gemini empty-reply recovery.
+            assert_eq!(response.status().as_u16(), 502);
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn safety_unspecified_gemini_feedback_does_not_mask_refusal_or_empty_recovery() {
+    for filtered in [false, true] {
+        for client in PROTOCOLS {
+            let value = json!({"modelVersion":"up-model", "promptFeedback":{"blockReason":"BLOCK_REASON_UNSPECIFIED"}, "candidates":[{"content":{"parts":[]},"finishReason":if filtered { "SAFETY" } else { "STOP" }}], "usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}});
+            let first = format!("data: {value}\n\n");
+            let f = Fixture::new(
+                Protocol::Gemini,
+                first.clone(),
+                Ending::PerRequest(
+                    vec![
+                        first,
+                        prefix(Protocol::Gemini) + completion(Protocol::Gemini),
+                    ],
+                    Box::new(Ending::Hold),
+                ),
+            )
+            .await;
+            let response = f.request_model_raw(client, "mock/up-model").await;
+            assert_eq!(response.status().as_u16(), if filtered { 400 } else { 200 });
+            let body = response.text().await.unwrap();
+            if filtered {
+                assert!(body.contains("safety filter"), "{body}");
+                assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            } else {
+                assert_completed_usage(&body, client, 14, 6);
+                assert_eq!(*f.attempts.lock().unwrap(), [0, 0]);
+            }
+            f.assert_released().await;
+        }
     }
 }

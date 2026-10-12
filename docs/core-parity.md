@@ -153,3 +153,12 @@ EOF/JSON distinctions, pinned edits and cancellation. Image/search classificatio
 prevents retries without implementing their stream IR; prompt-feedback refusal
 rendering, subscription adapters and provider-specific prefill remain gaps. See
 `docs/stream-lifecycle.md` for the contract and remaining queue/HTTP2/Agent gaps.
+
+## Safety-refusal increment (2026-10-12)
+
+Distinct content-filter stops, held refusal routing without key retry/cooldown,
+sanitized HTTP 400 exhaustion and post-commit stream errors are now covered by
+four-protocol loopback tests. Malformed nonstream success decoding returns 502.
+See `docs/stream-lifecycle.md` for the routing allowlist, usage rules and limits.
+This closes the prompt-feedback refusal-routing gap, not broader Gemini
+image/search stream rendering or reference-length reasoning holding.

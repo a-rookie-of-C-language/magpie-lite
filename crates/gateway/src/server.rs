@@ -28,6 +28,7 @@ use crate::cooldown::quota_cooldown;
 use crate::stream_empty::{EMPTY_REPLY, GeminiReply};
 use crate::stream_keepalive::{self, Keepalive, UpstreamActivity};
 use crate::stream_loop::LoopGuard;
+use crate::stream_refusal::{self, REFUSAL};
 use crate::stream_timeout::{GroupFirstToken, ResponsesHold, StreamClock, StreamTimeout};
 use crate::upstream;
 use crate::usage::{RequestLog, RequestTracker};
@@ -666,6 +667,7 @@ struct UpstreamDecoders {
     gemini: gemini::GeminiStreamDecoder,
     gemini_reply: GeminiReply,
     gemini_pending_usage: Option<Usage>,
+    answered: bool,
 }
 
 impl UpstreamDecoders {
@@ -892,7 +894,6 @@ struct StreamLiveness {
 }
 
 enum UpstreamReply {
-    Json(reqwest::Response),
     Decoded(magpie_core::ir::CompletionResponse),
     Stream {
         events: UpstreamEvents,
@@ -902,9 +903,16 @@ enum UpstreamReply {
     },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FailureKind {
+    Upstream,
+    EmptyReply,
+    Refusal,
+}
+
 #[derive(Clone)]
 struct StreamFailure {
-    empty_reply: bool,
+    kind: FailureKind,
     status: reqwest::StatusCode,
     body: Value,
 }
@@ -924,7 +932,7 @@ struct UpstreamEvent {
 impl From<StreamEvent> for UpstreamEvent {
     fn from(event: StreamEvent) -> Self {
         let failure = matches!(event, StreamEvent::Error { .. }).then(|| StreamFailure {
-            empty_reply: false,
+            kind: FailureKind::Upstream,
             status: reqwest::StatusCode::BAD_GATEWAY,
             body: Value::Null,
         });
@@ -1060,10 +1068,6 @@ async fn send_with_fallback(
                 liveness.activity.headers(status.is_success());
                 if status.is_success() {
                     if !creq.stream {
-                        if route.provider.protocol != Protocol::Gemini {
-                            tracker.record_attempt(&route.provider.id, *key_slot, "ok");
-                            return Ok((UpstreamReply::Json(resp), candidate));
-                        }
                         let value: Value = match resp.json().await {
                             Ok(value) => value,
                             Err(error) => {
@@ -1081,43 +1085,61 @@ async fn send_with_fallback(
                                 ));
                             }
                         };
+                        let protocol = route.provider.protocol;
+                        tracker.observe_usage(&decode_upstream_response_usage(protocol, &value));
+                        if stream_refusal::policy_error(&value)
+                            || (stream_refusal::filtered(protocol, &value)
+                                && !stream_refusal::has_answer(protocol, &value, true))
+                        {
+                            tracker.record_attempt(&route.provider.id, *key_slot, "refusal");
+                            if route_index != last_route {
+                                break 'keys;
+                            }
+                            return Err((ProxyFailure::refusal(), candidate));
+                        }
                         if value.get("error").is_some() {
                             tracker.record_attempt(&route.provider.id, *key_slot, "upstream_error");
                             return Err((
                                 ProxyFailure::new(
                                     StatusCode::BAD_GATEWAY,
-                                    "Gemini returned an error instead of a reply",
+                                    "upstream returned an error instead of a reply",
                                 ),
                                 candidate,
                             ));
                         }
-                        for event in gemini::GeminiStreamDecoder::new().decode(&value) {
-                            if let StreamEvent::Usage(usage) = event {
-                                tracker.observe_usage(&usage);
+                        if protocol == Protocol::Gemini {
+                            for event in gemini::GeminiStreamDecoder::new().decode(&value) {
+                                if let StreamEvent::Usage(usage) = event {
+                                    tracker.observe_usage(&usage);
+                                }
+                            }
+                            let mut reply = GeminiReply::default();
+                            reply.observe(&value);
+                            if reply.is_empty() {
+                                tracker.record_attempt(
+                                    &route.provider.id,
+                                    *key_slot,
+                                    "empty_reply",
+                                );
+                                if empty_retries == 0 {
+                                    empty_retries += 1;
+                                    tracker.begin_reask();
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                    continue 'candidate;
+                                }
+                                if attempt + 1 < route.api_keys.len() {
+                                    continue 'keys;
+                                }
+                                if route_index != last_route {
+                                    break 'keys;
+                                }
+                                return Err((
+                                    ProxyFailure::new(StatusCode::BAD_GATEWAY, EMPTY_REPLY),
+                                    candidate,
+                                ));
                             }
                         }
-                        let mut reply = GeminiReply::default();
-                        reply.observe(&value);
-                        if reply.is_empty() {
-                            tracker.record_attempt(&route.provider.id, *key_slot, "empty_reply");
-                            if empty_retries == 0 {
-                                empty_retries += 1;
-                                tracker.begin_reask();
-                                tokio::time::sleep(Duration::from_secs(1)).await;
-                                continue 'candidate;
-                            }
-                            if attempt + 1 < route.api_keys.len() {
-                                continue 'keys;
-                            }
-                            if route_index != last_route {
-                                break 'keys;
-                            }
-                            return Err((
-                                ProxyFailure::new(StatusCode::BAD_GATEWAY, EMPTY_REPLY),
-                                candidate,
-                            ));
-                        }
-                        let ir = match gemini::decode_response(&value) {
+                        let ir = match decode_upstream_response(protocol, &value) {
                             Ok(ir) => ir,
                             Err(error) => {
                                 tracker.record_attempt(
@@ -1163,13 +1185,20 @@ async fn send_with_fallback(
                         tracker.record_attempt(
                             &route.provider.id,
                             *key_slot,
-                            if failure.empty_reply {
-                                "empty_reply"
-                            } else {
-                                "upstream_stream_error"
+                            match failure.kind {
+                                FailureKind::EmptyReply => "empty_reply",
+                                FailureKind::Refusal => "refusal",
+                                FailureKind::Upstream => "upstream_stream_error",
                             },
                         );
-                        if failure.empty_reply && empty_retries == 0 {
+                        if failure.kind == FailureKind::Refusal {
+                            drop(events);
+                            if route_index != last_route {
+                                break 'keys;
+                            }
+                            return Err((ProxyFailure::refusal(), candidate));
+                        }
+                        if failure.kind == FailureKind::EmptyReply && empty_retries == 0 {
                             drop(events);
                             empty_retries += 1;
                             tracker.begin_reask();
@@ -1190,7 +1219,8 @@ async fn send_with_fallback(
                             );
                         }
                         if attempt + 1 < route.api_keys.len()
-                            && (failure.empty_reply || key_retryable_status(failure.status))
+                            && (failure.kind == FailureKind::EmptyReply
+                                || key_retryable_status(failure.status))
                         {
                             drop(events);
                             continue 'keys;
@@ -1225,6 +1255,13 @@ async fn send_with_fallback(
                         break 'keys;
                     }
                 };
+                if stream_refusal::policy_error(&error.body) {
+                    tracker.record_attempt(&route.provider.id, *key_slot, "refusal");
+                    if route_index != last_route {
+                        break 'keys;
+                    }
+                    return Err((ProxyFailure::refusal(), candidate));
+                }
                 tracker.record_attempt(&route.provider.id, *key_slot, &status.as_u16().to_string());
                 if quota_limited_status(status) {
                     let cooldown = quota_cooldown(
@@ -1332,6 +1369,10 @@ async fn reask_stream(
                 return Err(timeout.message().to_owned());
             }
         };
+        if stream_refusal::policy_error(&detail.body) {
+            tracker.record_attempt(&candidate.provider.id, candidate.key_slot, "refusal");
+            return Err(REFUSAL.to_owned());
+        }
         tracker.record_attempt(
             &candidate.provider.id,
             candidate.key_slot,
@@ -1352,16 +1393,17 @@ async fn reask_stream(
     tracker.record_attempt(
         &candidate.provider.id,
         candidate.key_slot,
-        if failure.is_some() {
-            "upstream_stream_error"
-        } else {
-            "ok"
+        match failure.as_ref().map(|f| f.kind) {
+            Some(FailureKind::Refusal) => "refusal",
+            Some(_) => "upstream_stream_error",
+            None => "ok",
         },
     );
     Ok(events)
 }
 
 struct ProxyFailure {
+    kind: FailureKind,
     status: StatusCode,
     message: String,
 }
@@ -1369,8 +1411,25 @@ struct ProxyFailure {
 impl ProxyFailure {
     fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
+            kind: FailureKind::Upstream,
             status,
             message: message.into(),
+        }
+    }
+
+    fn refusal() -> Self {
+        Self {
+            kind: FailureKind::Refusal,
+            status: StatusCode::BAD_REQUEST,
+            message: REFUSAL.into(),
+        }
+    }
+
+    fn history_status(&self) -> &'static str {
+        if self.kind == FailureKind::Refusal {
+            "refusal"
+        } else {
+            "upstream_error"
         }
     }
 
@@ -1485,31 +1544,11 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
             }
             Err((response, candidate)) => {
                 tracker.set_route(&candidate.provider.id, &candidate.model, candidate.key_slot);
-                tracker.finish("upstream_error", &Usage::default());
+                tracker.finish(response.history_status(), &Usage::default());
                 return Err(response);
             }
         };
-        let protocol = candidate.provider.protocol;
-
         let (mut events, mut empty_retries, reask_allowed) = match reply {
-            UpstreamReply::Json(resp) => {
-                let upstream_body: Value = match resp.json().await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let message = format!("bad upstream body: {e}");
-                        tracker.finish("bad_upstream_body", &Usage::default());
-                        return Err(ProxyFailure::new(StatusCode::BAD_GATEWAY, message));
-                    }
-                };
-                let mut status = "ok";
-                let ir = decode_upstream_response(protocol, &upstream_body).unwrap_or_else(|e| {
-                    tracing::warn!("decoding upstream reply: {e}");
-                    status = "upstream_decode_error";
-                    magpie_core::ir::CompletionResponse::default()
-                });
-                tracker.finish(status, &ir.usage);
-                return Ok(ok_json(wire.encode_response(&ir)));
-            }
             UpstreamReply::Decoded(mut ir) => {
                 tracker.observe_usage(&ir.usage);
                 ir.usage = tracker.total_usage();
@@ -1562,7 +1601,7 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
                     emitted_text_or_tool |= text_or_tool || item.answer_observed;
 
                     let retry_reasoning = item.loop_reasoning && !reasoning_reasked && !emitted_text_or_tool;
-                    let retry_empty = reask_allowed && item.failure.as_ref().is_some_and(|f| f.empty_reply)
+                    let retry_empty = reask_allowed && item.failure.as_ref().is_some_and(|f| f.kind == FailureKind::EmptyReply)
                         && empty_retries < empty_limit && !emitted_text_or_tool;
                     if retry_reasoning || retry_empty {
                         // Preserve any reasoning already sent; replace only the
@@ -1602,7 +1641,7 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
 
                     let terminal_status = match &event {
                         StreamEvent::Done => Some("ok"),
-                        StreamEvent::Error { .. } => Some("upstream_stream_error"),
+                        StreamEvent::Error { .. } => Some(if item.failure.as_ref().is_some_and(|f| f.kind == FailureKind::Refusal) { "refusal" } else { "upstream_stream_error" }),
                         _ => None,
                     };
                     if let Some(status) = terminal_status {
@@ -1707,6 +1746,15 @@ async fn keepalive_response(
     sse_response(Body::from_stream(out))
 }
 
+fn decode_upstream_response_usage(protocol: Protocol, value: &Value) -> Usage {
+    match protocol {
+        Protocol::Chat => chat::response_usage(value),
+        Protocol::Anthropic => anthropic::response_usage(value),
+        Protocol::Responses => responses::response_usage(value.get("response").unwrap_or(value)),
+        Protocol::Gemini => gemini::response_usage(value),
+    }
+}
+
 /// Decode one SSE payload, including Chat's non-JSON completion sentinel.
 fn decode_upstream_data(
     protocol: Protocol,
@@ -1731,14 +1779,40 @@ fn decode_upstream_data(
     if protocol == Protocol::Gemini {
         decoders.gemini_reply.observe(&value);
     }
+    let decoded = decode_upstream_chunk(protocol, &value, decoders);
+    decoders.answered |= stream_refusal::has_answer(protocol, &value, false)
+        || decoded.iter().any(stream_refusal::event_answers);
+    let refused = stream_refusal::policy_error(&value)
+        || (stream_refusal::filtered(protocol, &value) && !decoders.answered);
     let mut out = Vec::new();
     if protocol == Protocol::Gemini
-        && !decoders.gemini_reply.is_empty()
+        && (refused || !decoders.gemini_reply.is_empty())
         && let Some(usage) = decoders.gemini_pending_usage.take()
     {
         out.push(StreamEvent::Usage(usage).into());
     }
-    for event in decode_upstream_chunk(protocol, &value, decoders) {
+    if refused {
+        out.push(StreamEvent::Usage(decode_upstream_response_usage(protocol, &value)).into());
+        // Usage can follow Stop in the decoded frame. Account it before the
+        // refusal; neither Stop nor Done may finish a refused logical turn.
+        out.extend(
+            decoded
+                .into_iter()
+                .filter(|event| matches!(event, StreamEvent::Usage(_)))
+                .map(UpstreamEvent::from),
+        );
+        let mut error = UpstreamEvent::from(StreamEvent::Error {
+            message: REFUSAL.into(),
+        });
+        error.failure = Some(StreamFailure {
+            kind: FailureKind::Refusal,
+            status: StatusCode::BAD_REQUEST,
+            body: Value::Null,
+        });
+        out.push(error);
+        return out;
+    }
+    for event in decoded {
         let empty = protocol == Protocol::Gemini && decoders.gemini_reply.is_empty();
         if empty && matches!(event, StreamEvent::Stop(_)) {
             // Do not let any client encoder finish a turn that will be reasked.
@@ -1756,7 +1830,7 @@ fn decode_upstream_data(
                 .merge(usage);
         }
         let failure = matches!(event, StreamEvent::Error { .. }).then(|| StreamFailure {
-            empty_reply: false,
+            kind: FailureKind::Upstream,
             status: crate::stream_status::error_status(&value),
             body: value.clone(),
         });
@@ -1845,7 +1919,7 @@ fn empty_reply_event() -> UpstreamEvent {
             message: EMPTY_REPLY.into(),
         },
         failure: Some(StreamFailure {
-            empty_reply: true,
+            kind: FailureKind::EmptyReply,
             status: StatusCode::BAD_GATEWAY,
             body: Value::Null,
         }),
@@ -1862,7 +1936,7 @@ fn stream_timeout_event(timeout: StreamTimeout) -> UpstreamEvent {
             message: timeout.message().into(),
         },
         failure: Some(StreamFailure {
-            empty_reply: false,
+            kind: FailureKind::Upstream,
             status: StatusCode::GATEWAY_TIMEOUT,
             body: Value::Null,
         }),
@@ -1943,7 +2017,7 @@ fn upstream_events(
                         yield UpstreamEvent {
                             event: StreamEvent::Error { message: trip.message().into() },
                             failure: Some(StreamFailure {
-                                empty_reply: false,
+                                kind: FailureKind::Upstream,
                                 status: StatusCode::BAD_GATEWAY,
                                 body: Value::Null,
                             }),
@@ -1968,7 +2042,7 @@ fn upstream_events(
                         yield UpstreamEvent {
                             event: StreamEvent::Error { message: trip.message().into() },
                             failure: Some(StreamFailure {
-                                empty_reply: false,
+                                kind: FailureKind::Upstream,
                                 status: StatusCode::BAD_GATEWAY,
                                 body: Value::Null,
                             }),
