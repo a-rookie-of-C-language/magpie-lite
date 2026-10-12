@@ -456,6 +456,16 @@ pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
     {
         out.push(StreamEvent::Usage(decode_usage(u)));
     }
+    if let Some(error) = v.get("error") {
+        out.push(StreamEvent::Error {
+            message: error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("chat upstream error")
+                .to_owned(),
+        });
+        return out;
+    }
     let Some(choice) = v
         .get("choices")
         .and_then(Value::as_array)

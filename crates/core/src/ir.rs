@@ -180,18 +180,19 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// Merge the fields another usage report fills in.
+    /// Merge cumulative reports: later known counters replace earlier ones,
+    /// while absent fields retain their last reported value.
     pub fn merge(&mut self, other: &Usage) {
-        if self.input.is_none() {
+        if other.input.is_some() {
             self.input = other.input;
         }
-        if self.output.is_none() {
+        if other.output.is_some() {
             self.output = other.output;
         }
-        if self.cache_read.is_none() {
+        if other.cache_read.is_some() {
             self.cache_read = other.cache_read;
         }
-        if self.cache_write.is_none() {
+        if other.cache_write.is_some() {
             self.cache_write = other.cache_write;
         }
     }

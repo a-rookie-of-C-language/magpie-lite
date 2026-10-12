@@ -341,6 +341,7 @@ pub struct RequestTracker {
     log: Arc<Mutex<RequestLog>>,
     started_at: Instant,
     record: RequestRecord,
+    usage: Usage,
     finished: bool,
 }
 
@@ -369,6 +370,7 @@ impl RequestTracker {
                 latency_ms: 0,
                 usage: UsageSnapshot::default(),
             },
+            usage: Usage::default(),
             finished: false,
         }
     }
@@ -385,6 +387,11 @@ impl RequestTracker {
         self.record.key_slot = key_slot;
     }
 
+    /// Keep observed usage even if the response body is dropped mid-stream.
+    pub fn observe_usage(&mut self, usage: &Usage) {
+        self.usage.merge(usage);
+    }
+
     /// Record the final status. Later calls (including Drop) are no-ops.
     pub fn finish(&mut self, status: &str, usage: &Usage) {
         if self.finished {
@@ -393,7 +400,8 @@ impl RequestTracker {
         self.finished = true;
         self.record.status = status.to_owned();
         self.record.latency_ms = elapsed_ms(self.started_at.elapsed());
-        self.record.usage = UsageSnapshot::from(usage);
+        self.usage.merge(usage);
+        self.record.usage = UsageSnapshot::from(&self.usage);
         let mut log = lock(&self.log);
         log.record(self.record.clone());
     }

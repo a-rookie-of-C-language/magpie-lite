@@ -482,6 +482,16 @@ pub fn encode_response(resp: &CompletionResponse) -> Value {
 /// `[DONE]` never appears: the terminal `response.completed` event is it.
 pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
     let mut out = Vec::new();
+    if let Some(error) = v.get("error") {
+        out.push(StreamEvent::Error {
+            message: error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("responses upstream error")
+                .to_owned(),
+        });
+        return out;
+    }
     match v.get("type").and_then(Value::as_str).unwrap_or_default() {
         "response.created" => {
             if let Some(model) = v.pointer("/response/model").and_then(Value::as_str) {
@@ -562,9 +572,13 @@ pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
             out.push(StreamEvent::Stop(stop));
             out.push(StreamEvent::Done);
         }
-        "response.failed" => {
+        "response.failed" | "error" => {
+            if let Some(usage) = v.pointer("/response/usage") {
+                out.push(StreamEvent::Usage(decode_usage(usage)));
+            }
             let detail = v
                 .pointer("/response/error/message")
+                .or_else(|| v.get("message"))
                 .and_then(Value::as_str)
                 .unwrap_or("responses upstream error");
             out.push(StreamEvent::Error {

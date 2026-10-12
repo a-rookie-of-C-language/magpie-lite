@@ -1104,73 +1104,94 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
     }
 
     let client_model = creq.model.clone();
-    let byte_stream = resp.bytes_stream();
     let out = async_stream::stream! {
-        let mut parser = SseParser::new();
-        let mut decoders = UpstreamDecoders::new();
+        let mut events = Box::pin(upstream_events(resp, protocol));
         let mut encoder = ClientStreamEncoder::new(wire, &client_model);
-        let mut byte_stream = byte_stream;
-        let mut usage = Usage::default();
-
-        while let Some(chunk) = byte_stream.next().await {
-            let chunk = match chunk {
-                Ok(c) => c,
-                Err(e) => {
-                    let event = StreamEvent::Error {
-                        message: format!("upstream read: {e}"),
-                    };
-                    if let Some(frame) = encoder.encode(&event) {
-                        yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
-                    }
-                    tracker.finish("upstream_stream_error", &usage);
-                    break;
-                }
+        while let Some(event) = events.next().await {
+            if let StreamEvent::Usage(usage) = &event {
+                tracker.observe_usage(usage);
+            }
+            let terminal_status = match &event {
+                StreamEvent::Done => Some("ok"),
+                StreamEvent::Error { .. } => Some("upstream_stream_error"),
+                _ => None,
             };
-            parser.extend(&chunk);
-
-            while let Some(data) = parser.next_data() {
-                if data == "[DONE]" {
-                    continue;
-                }
-                let value: Value = match serde_json::from_str(&data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                for event in decode_upstream_chunk(protocol, &value, &mut decoders) {
-                    if let StreamEvent::Usage(reported) = &event {
-                        usage.merge(reported);
-                    }
-                    if matches!(event, StreamEvent::Error { .. }) {
-                        tracker.finish("upstream_stream_error", &usage);
-                    }
-                    if let Some(frame) = encoder.encode(&event) {
-                        yield Ok(Bytes::from(frame));
-                    }
-                }
-            }
-        }
-
-        if let Some(data) = parser.flush()
-            && let Ok(value) = serde_json::from_str::<Value>(&data)
-        {
-            for event in decode_upstream_chunk(protocol, &value, &mut decoders) {
-                if let StreamEvent::Usage(reported) = &event {
-                    usage.merge(reported);
-                }
-                if matches!(event, StreamEvent::Error { .. }) {
-                    tracker.finish("upstream_stream_error", &usage);
-                }
+            if let Some(status) = terminal_status {
+                // Release the HTTP response before yielding the final frame,
+                // even if the downstream is backpressured or stops polling.
+                drop(events);
+                tracker.finish(status, &Usage::default());
                 if let Some(frame) = encoder.encode(&event) {
-                    yield Ok(Bytes::from(frame));
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                 }
+                return;
+            }
+            if let Some(frame) = encoder.encode(&event) {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
             }
         }
-        if let Some(frame) = encoder.encode(&StreamEvent::Done) {
-            yield Ok(Bytes::from(frame));
-        }
-        tracker.finish("ok", &usage);
     };
     sse_response(Body::from_stream(out))
+}
+
+/// Decode one SSE payload, including Chat's non-JSON completion sentinel.
+fn decode_upstream_data(
+    protocol: Protocol,
+    data: &str,
+    decoders: &mut UpstreamDecoders,
+) -> Vec<StreamEvent> {
+    if protocol == Protocol::Chat && data.trim() == "[DONE]" {
+        return vec![StreamEvent::Done];
+    }
+    serde_json::from_str(data)
+        .map(|value| decode_upstream_chunk(protocol, &value, decoders))
+        .unwrap_or_default()
+}
+
+/// A dropped event stream owns and cancels its upstream response. Errors and
+/// protocol completion markers are terminal, not dependent on a TCP EOF.
+fn upstream_events(
+    response: reqwest::Response,
+    protocol: Protocol,
+) -> impl futures::Stream<Item = StreamEvent> {
+    async_stream::stream! {
+        let mut bytes = response.bytes_stream();
+        let mut parser = SseParser::new();
+        let mut decoders = UpstreamDecoders::new();
+        let mut chat_stopped = false;
+        while let Some(chunk) = bytes.next().await {
+            match chunk {
+                Ok(chunk) => parser.extend(&chunk),
+                Err(error) => {
+                    tracing::warn!("upstream stream read failed: {error}");
+                    yield StreamEvent::Error { message: "upstream stream read failed".into() };
+                    return;
+                }
+            }
+            while let Some(data) = parser.next_data() {
+                for event in decode_upstream_data(protocol, &data, &mut decoders) {
+                    chat_stopped |= protocol == Protocol::Chat && matches!(event, StreamEvent::Stop(_));
+                    yield event;
+                }
+            }
+        }
+        // Tolerate a complete final data frame lacking its blank separator.
+        if let Some(data) = parser.flush() {
+            for event in decode_upstream_data(protocol, &data, &mut decoders) {
+                chat_stopped |= protocol == Protocol::Chat && matches!(event, StreamEvent::Stop(_));
+                yield event;
+            }
+        }
+        // Some Chat-compatible endpoints close cleanly after finish_reason,
+        // omitting [DONE]. Do not end at Stop: a later usage frame is valid.
+        if chat_stopped {
+            yield StreamEvent::Done;
+        } else {
+            yield StreamEvent::Error {
+                message: "upstream stream ended before a completion marker".into(),
+            };
+        }
+    }
 }
 
 /// POST /v1/chat/completions — the OpenAI Chat dialect.
