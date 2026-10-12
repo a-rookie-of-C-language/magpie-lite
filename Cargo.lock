@@ -867,6 +867,7 @@ dependencies = [
  "async-stream",
  "axum",
  "dirs",
+ "fs2",
  "futures",
  "httpdate",
  "magpie-agents",

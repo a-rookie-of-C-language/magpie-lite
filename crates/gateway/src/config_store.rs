@@ -1,9 +1,13 @@
 //! Serialized, persistent configuration updates shared by request handlers.
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
+use fs2::FileExt;
 
 use crate::config::{Config, ConfigSnapshot};
 
@@ -19,6 +23,71 @@ struct Inner {
 }
 
 pub type ConfigError = (StatusCode, String);
+
+fn lock_is_contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || cfg!(windows) && error.raw_os_error() == Some(33)
+}
+
+const CONFIG_LOCK_TIMEOUT: Duration = Duration::from_millis(500);
+const CONFIG_LOCK_RETRY: Duration = Duration::from_millis(10);
+
+fn config_lock_path(path: &Path) -> PathBuf {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    PathBuf::from(lock_path)
+}
+
+fn acquire_config_lock(path: &Path) -> Result<File, ConfigError> {
+    let lock_path = config_lock_path(path);
+    let parent = lock_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|error| {
+        tracing::error!(%error, path = %lock_path.display(), "could not prepare configuration lock");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not prepare configuration lock; no changes applied".to_owned(),
+        )
+    })?;
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| {
+            tracing::error!(%error, path = %lock_path.display(), "could not open configuration lock");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not open configuration lock; no changes applied".to_owned(),
+            )
+        })?;
+
+    let deadline = Instant::now() + CONFIG_LOCK_TIMEOUT;
+    loop {
+        match lock_file.try_lock_exclusive() {
+            Ok(()) => return Ok(lock_file),
+            Err(error) if lock_is_contended(&error) => {
+                if Instant::now() >= deadline {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        "configuration is locked by another gateway process; retry".to_owned(),
+                    ));
+                }
+                thread::sleep(CONFIG_LOCK_RETRY);
+            }
+            Err(error) => {
+                tracing::error!(%error, path = %lock_path.display(), "could not lock configuration");
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not lock configuration; no changes applied".to_owned(),
+                ));
+            }
+        }
+    }
+}
 
 impl ConfigStore {
     pub fn new(mut config: Config, path: Option<PathBuf>) -> Self {
@@ -78,6 +147,10 @@ impl ConfigStore {
                     "configuration editing requires a config file path".to_owned(),
                 )
             })?;
+            // Serialize writers across gateway processes as well as within this
+            // process. Keep the lock until disk persistence and publication are
+            // complete so another process cannot observe a partial update.
+            let _config_lock = acquire_config_lock(path)?;
             let current = store.current();
             let current_revision = store.0.revision.load(Ordering::Acquire);
             if let Some(expected) = expected_revision
@@ -147,6 +220,7 @@ impl ConfigStore {
 mod tests {
     use super::*;
     use crate::config::{GroupConfig, RoutingPolicy};
+    use std::sync::atomic::AtomicBool;
 
     #[tokio::test]
     async fn stale_revision_never_changes_memory_or_disk() {
@@ -240,5 +314,73 @@ mod tests {
         let store = ConfigStore::new(Config::default(), None);
         let error = store.update(|_| Ok(())).await.unwrap_err();
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn a_held_config_lock_rejects_updates_without_running_the_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        Config::default().save(&path).unwrap();
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(config_lock_path(&path))
+            .unwrap();
+        lock.lock_exclusive().unwrap();
+
+        let store = ConfigStore::new(Config::default(), Some(path.clone()));
+        let ran = Arc::new(AtomicBool::new(false));
+        let marker = Arc::clone(&ran);
+        let result = store
+            .update(move |config| {
+                marker.store(true, Ordering::Release);
+                config.key_cooldown_ms = 123;
+                Ok(())
+            })
+            .await;
+
+        assert_eq!(result.unwrap_err().0, StatusCode::CONFLICT);
+        assert!(!ran.load(Ordering::Acquire));
+        assert_eq!(
+            store.current().key_cooldown_ms,
+            Config::default().key_cooldown_ms
+        );
+        assert_eq!(
+            Config::load(&path).unwrap().key_cooldown_ms,
+            Config::default().key_cooldown_ms
+        );
+        lock.unlock().unwrap();
+    }
+
+    #[tokio::test]
+    async fn another_store_cannot_overwrite_a_change_after_the_lock_is_released() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        Config::default().save(&path).unwrap();
+        let first = ConfigStore::new(Config::load(&path).unwrap(), Some(path.clone()));
+        let second = ConfigStore::new(Config::load(&path).unwrap(), Some(path.clone()));
+
+        first
+            .update(|config| {
+                config.key_cooldown_ms = 123;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let result = second
+            .update(|config| {
+                config.key_cooldown_ms = 456;
+                Ok(())
+            })
+            .await;
+
+        assert_eq!(result.unwrap_err().0, StatusCode::CONFLICT);
+        assert_eq!(
+            second.current().key_cooldown_ms,
+            Config::default().key_cooldown_ms
+        );
+        assert_eq!(Config::load(&path).unwrap().key_cooldown_ms, 123);
     }
 }

@@ -25,5 +25,6 @@ toml = "0.8"
 toml_edit = "0.22"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
+fs2 = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
