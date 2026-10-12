@@ -343,6 +343,7 @@ pub struct RequestTracker {
     started_at: Instant,
     record: RequestRecord,
     usage: Usage,
+    reask_usage: Usage,
     finished: bool,
 }
 
@@ -372,6 +373,7 @@ impl RequestTracker {
                 usage: UsageSnapshot::default(),
             },
             usage: Usage::default(),
+            reask_usage: Usage::default(),
             finished: false,
         }
     }
@@ -393,6 +395,18 @@ impl RequestTracker {
     pub fn begin_attempt(&mut self, provider: &str, upstream_model: &str, key_slot: usize) {
         self.set_route(provider, upstream_model, key_slot);
         self.usage = Usage::default();
+        self.reask_usage = Usage::default();
+    }
+
+    /// Begin the one allowed reasoning-only reask without mixing attempts.
+    pub fn begin_reask(&mut self) {
+        self.reask_usage = add_usage(&self.reask_usage, &self.usage);
+        self.usage = Usage::default();
+    }
+
+    /// Usage across the initial attempt and any reasoning-only reask.
+    pub fn total_usage(&self) -> Usage {
+        add_usage(&self.reask_usage, &self.usage)
     }
 
     /// Keep observed usage even if the response body is dropped mid-stream.
@@ -409,7 +423,8 @@ impl RequestTracker {
         self.record.status = status.to_owned();
         self.record.latency_ms = elapsed_ms(self.started_at.elapsed());
         self.usage.merge(usage);
-        self.record.usage = UsageSnapshot::from(&self.usage);
+        let total = self.total_usage();
+        self.record.usage = UsageSnapshot::from(&total);
         let mut log = lock(&self.log);
         log.record(self.record.clone());
     }
@@ -418,6 +433,23 @@ impl RequestTracker {
 impl Drop for RequestTracker {
     fn drop(&mut self) {
         self.finish("client_disconnected", &Usage::default());
+    }
+}
+
+fn add_counter(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn add_usage(left: &Usage, right: &Usage) -> Usage {
+    Usage {
+        input: add_counter(left.input, right.input),
+        output: add_counter(left.output, right.output),
+        cache_read: add_counter(left.cache_read, right.cache_read),
+        cache_write: add_counter(left.cache_write, right.cache_write),
     }
 }
 
@@ -600,5 +632,133 @@ mod tests {
         assert_eq!(snapshot.recent_usage.totals.errors, 1);
         assert_eq!(snapshot.recent_usage.totals.input_tokens, 30);
         assert_eq!(snapshot.recent_usage.totals.output_tokens, 32);
+    }
+    fn tracker(log: Arc<Mutex<RequestLog>>) -> RequestTracker {
+        RequestTracker::new(
+            log,
+            "chat",
+            &CompletionRequest {
+                model: "mock/requested".into(),
+                stream: true,
+                ..CompletionRequest::default()
+            },
+            "mock",
+            "model",
+            0,
+        )
+    }
+
+    #[test]
+    fn usage_merge_keeps_known_fields_and_does_not_add_cumulative_frames() {
+        let log = Arc::new(Mutex::new(RequestLog::default()));
+        let mut tracker = tracker(log.clone());
+        tracker.observe_usage(&Usage {
+            input: Some(10),
+            output: Some(3),
+            cache_read: None,
+            cache_write: None,
+        });
+        tracker.observe_usage(&Usage {
+            input: None,
+            output: Some(7),
+            cache_read: Some(2),
+            cache_write: None,
+        });
+        tracker.finish("ok", &Usage::default());
+
+        let record = &log.lock().unwrap().snapshot().recent_requests[0];
+        assert_eq!(record.usage.input, Some(10));
+        assert_eq!(record.usage.output, Some(7));
+        assert_eq!(record.usage.cache_read, Some(2));
+    }
+
+    #[test]
+    fn reask_usage_adds_attempts_but_preserves_unknown_fields() {
+        let log = Arc::new(Mutex::new(RequestLog::default()));
+        let mut tracker = tracker(log.clone());
+        tracker.observe_usage(&Usage {
+            input: Some(10),
+            output: Some(3),
+            cache_read: Some(4),
+            cache_write: None,
+        });
+        tracker.begin_reask();
+        tracker.observe_usage(&Usage {
+            input: None,
+            output: Some(7),
+            cache_read: None,
+            cache_write: Some(5),
+        });
+        tracker.finish("ok", &Usage::default());
+
+        let record = &log.lock().unwrap().snapshot().recent_requests[0];
+        assert_eq!(record.usage.input, Some(10));
+        assert_eq!(record.usage.output, Some(10));
+        assert_eq!(record.usage.cache_read, Some(4));
+        assert_eq!(record.usage.cache_write, Some(5));
+    }
+
+    #[test]
+    fn fallback_attempt_reset_discards_previous_attempt_usage() {
+        let log = Arc::new(Mutex::new(RequestLog::default()));
+        let mut tracker = tracker(log.clone());
+        tracker.observe_usage(&Usage {
+            input: Some(10),
+            output: Some(3),
+            cache_read: Some(4),
+            cache_write: Some(5),
+        });
+        tracker.begin_attempt("backup", "backup-model", 1);
+        tracker.observe_usage(&Usage {
+            input: Some(20),
+            output: Some(6),
+            cache_read: None,
+            cache_write: None,
+        });
+        tracker.finish("ok", &Usage::default());
+
+        let record = &log.lock().unwrap().snapshot().recent_requests[0];
+        assert_eq!(record.provider, "backup");
+        assert_eq!(record.usage.input, Some(20));
+        assert_eq!(record.usage.output, Some(6));
+        assert_eq!(record.usage.cache_read, None);
+        assert_eq!(record.usage.cache_write, None);
+    }
+
+    #[test]
+    fn usage_addition_saturates_and_drop_records_once() {
+        let max = u64::MAX;
+        assert_eq!(add_counter(Some(max), Some(1)), Some(max));
+        assert_eq!(
+            add_usage(
+                &Usage {
+                    input: Some(max),
+                    ..Usage::default()
+                },
+                &Usage {
+                    input: Some(1),
+                    ..Usage::default()
+                }
+            )
+            .input,
+            Some(max)
+        );
+
+        let log = Arc::new(Mutex::new(RequestLog::default()));
+        {
+            let mut tracker = tracker(log.clone());
+            tracker.observe_usage(&Usage {
+                input: Some(1),
+                output: None,
+                cache_read: None,
+                cache_write: None,
+            });
+            tracker.finish("ok", &Usage::default());
+            tracker.finish("upstream_error", &Usage::default());
+        }
+        let snapshot = log.lock().unwrap().snapshot();
+        assert_eq!(snapshot.total_requests, 1);
+        assert_eq!(snapshot.recent_requests[0].status, "ok");
+        assert_eq!(snapshot.recent_requests[0].usage.input, Some(1));
     }
 }

@@ -27,6 +27,10 @@ pub(crate) struct LoopTrip {
 }
 
 impl LoopTrip {
+    pub(crate) fn is_reasoning(&self) -> bool {
+        self.reasoning
+    }
+
     pub(crate) fn message(&self) -> &'static str {
         // Unlike the reference, do not quote repeated reply text: the same
         // error may travel to an agent log or a proxy's diagnostics.

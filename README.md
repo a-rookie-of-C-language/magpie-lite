@@ -162,12 +162,15 @@ It is a bounded heuristic, not a semantic judge; unusually repetitive valid
 prose can trip it. Tool arguments, metadata and nonstreaming replies are excluded.
 
 Already received content, including the triggering delta, is preserved. The
-selected stream ends with one client-protocol error, not a successful completion
-or a fallback/replay. The upstream is released and observed selected-attempt
-usage is retained. Errors do not quote the repeated reply; sanitized JSONL
-history stores neither prompt nor reply content. There is no automatic
-reasoning-only continuation/reask yet. See `docs/stream-lifecycle.md` for exact
-limits and reproducible fixture evidence.
+selected stream normally ends with one client-protocol error, not a successful
+completion or a fallback/replay. When the first trip contains reasoning only
+(no answer text and no tool call), Lite waits about one second and re-asks the
+same provider/model/key slot at most once. Earlier reasoning is preserved, the
+second upstream opening event is suppressed, and usage is combined across both
+attempts. A second loop, a re-ask failure, or any already-emitted answer/tool
+output ends with one client-protocol error. Errors do not quote the repeated
+reply; sanitized JSONL history stores neither prompt nor reply content. See
+`docs/stream-lifecycle.md` for exact limits and reproducible fixture evidence.
 
 ## Editing providers
 

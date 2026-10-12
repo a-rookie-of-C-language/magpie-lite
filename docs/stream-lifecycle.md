@@ -170,9 +170,9 @@ with persisted last-attempt accounting. Paused-clock tests check absolute and
 per-attempt budgets, zero/extreme values and ready-result precedence. API and
 child-CLI tests cover persistence, editing, defaults and invalid input; the
 browser fixture exercises save/reopen/reset and native field validation.
-This does not implement the reference's queue, slow-final-route waiting UI,
-reasoning-only continuation/reask or HTTP/2 cancellation conformance, and does
-not establish live-vendor or installed-Agent compatibility.
+This does not implement the reference's queue or slow-final-route waiting UI,
+and does not establish live-vendor, installed-Agent, or HTTP/2 cancellation
+compatibility.
 
 ## Downstream keepalive
 
@@ -323,8 +323,13 @@ observed selected-attempt usage, and sanitized JSONL history survives reload.
 
 This is a repetition heuristic, not a no-progress timeout, total-answer limit
 or guarantee against false positives. It does not end a heartbeats-only stall
-after content, and it does not implement the reference's optional translated
-reasoning-only continuation/reask. The latter remains a separate parity gap.
+after content. If the first trip is reasoning-only—no answer text and no tool
+call—the gateway waits about one second and re-asks the same provider/model/key
+slot once, without fallback or rotation. Previously emitted reasoning is kept,
+the re-ask's duplicate opening event is hidden from the client, and usage is
+combined across both attempts. If the re-ask loops again or fails, the client
+receives one protocol error; answer text or tool output emitted before the loop
+disables the re-ask path.
 
 Seven unit tests cover chunk boundaries, text/reasoning independence, exact
 window/distinct thresholds, eviction, run-on cycles and short-break reset,
@@ -440,7 +445,7 @@ The policy was compared to local reference `internal/gateway/fallback.go`
 This evidence is local HTTP/1.1 and synthetic SSE, not a live vendor, TLS/proxy,
 HTTP/2 or real-Agent validation.
 
-Queue/slow-final-route behavior, reasoning-only continuation/reask, HTTP/2
-cancellation conformance and broader tool/multimodal conformance remain open.
+Queue/slow-final-route behavior, HTTP/2 cancellation conformance and broader
+tool/multimodal conformance remain open.
 Post-content event-idle/meaningful-progress timeouts are also not implemented;
 they are distinct from the repetition guard and transport-idle limits.

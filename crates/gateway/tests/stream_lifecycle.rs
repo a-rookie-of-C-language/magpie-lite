@@ -113,6 +113,9 @@ enum Ending {
     Paced(Vec<(Duration, String)>),
     PacedEof(Vec<(Duration, String)>),
     PerSlot(Vec<Ending>),
+    /// Select a response script by request number, allowing one key to be
+    /// exercised across the initial attempt and a reasoning-only reask.
+    PerRequest(Vec<String>, Box<Ending>),
 }
 
 struct Transport {
@@ -199,6 +202,8 @@ impl Fixture {
         let observed = attempts.clone();
         let dropped = Arc::new(AtomicUsize::new(0));
         let flag = dropped.clone();
+        let request_counter = Arc::new(AtomicUsize::new(0));
+        let requests = request_counter.clone();
         let upstream =
             serve(Router::new().route(
                 "/{*path}",
@@ -218,9 +223,18 @@ impl Fixture {
                     observed.lock().unwrap().push(slot);
                     let model = body.get("model").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| uri.path().split("/models/").nth(1).unwrap().split(':').next().unwrap().to_owned());
                     captured_models.lock().unwrap().push(model);
-                    let script = scripts[slot].clone();
+                    let request_number = requests.fetch_add(1, Ordering::SeqCst);
+                    let script = match &ending {
+                        Ending::PerRequest(queue, _) => queue
+                            .get(request_number)
+                            .or_else(|| queue.last())
+                            .cloned()
+                            .expect("non-empty per-request fixture queue"),
+                        _ => scripts[slot].clone(),
+                    };
                     let ending = match &ending {
                         Ending::PerSlot(slots) => slots[slot].clone(),
+                        Ending::PerRequest(_, ending) => ending.as_ref().clone(),
                         ending => ending.clone(),
                     };
                     let guard = Dropped(flag.clone());
@@ -234,7 +248,7 @@ impl Fixture {
                             yield Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(bytes));
                         }
                         match ending {
-                            Ending::PerSlot(_) => unreachable!("selected before response"),
+                            Ending::PerSlot(_) | Ending::PerRequest(_, _) => unreachable!("selected before response"),
                             Ending::Eof => {},
                             Ending::Hold => std::future::pending::<()>().await,
                             Ending::Heartbeats => loop {
@@ -3781,6 +3795,58 @@ async fn loop_guard_ends_text_and_reasoning_without_retry_for_every_protocol_pai
                     f.assert_released().await;
                 }
             }
+        }
+    }
+}
+
+#[tokio::test]
+async fn reasoning_only_loop_reasks_same_candidate_once_and_preserves_one_client_response() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            let mut first = opening(upstream).replace(":99", ":7");
+            first += &loop_delta(upstream, true, &"mcp ".repeat(4096));
+            let second = prefix(upstream) + completion(upstream);
+            let f = Fixture::with_config(
+                upstream,
+                vec![String::new()],
+                Ending::PerRequest(vec![first, second], Box::new(Ending::Hold)),
+                |config| {
+                    disable_stream_deadlines(config);
+                    config.stream_loop_guard = true;
+                },
+            )
+            .await;
+            let body = tokio::time::timeout(LIMIT, f.request(client).await.text())
+                .await
+                .expect("reasoning-only loop reask timed out")
+                .unwrap();
+
+            assert_completed(&body, client);
+            assert!(body.contains("mcp"), "first reasoning was lost: {body}");
+            assert!(body.contains("partial"), "reask text was lost: {body}");
+            assert_eq!(*f.attempts.lock().unwrap(), [0, 0]);
+            assert_eq!(
+                f.sent_models.lock().unwrap().as_slice(),
+                ["up-model", "up-model"]
+            );
+            if client == Protocol::Anthropic {
+                assert_eq!(body.matches("event: message_start").count(), 1, "{body}");
+            }
+            if client == Protocol::Responses {
+                assert_eq!(body.matches("event: response.created").count(), 1, "{body}");
+            }
+
+            let record = f.record().await;
+            assert_eq!(record["status"], "ok");
+            assert_eq!(record["provider"], "mock");
+            assert_eq!(record["key_slot"], 0);
+            assert_eq!(record["usage"]["output"], 3);
+            if upstream == Protocol::Responses {
+                assert_eq!(record["usage"]["input"], 7);
+            } else {
+                assert_eq!(record["usage"]["input"], 14);
+            }
+            f.assert_released().await;
         }
     }
 }

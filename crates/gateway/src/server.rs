@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, Request, State};
@@ -902,6 +903,9 @@ struct UpstreamEvent {
     event: StreamEvent,
     failure: Option<StreamFailure>,
     usage_observed: bool,
+    /// True only for the loop guard's reasoning terminal. This is an internal
+    /// control signal; ordinary vendor errors must never trigger a reask.
+    loop_reasoning: bool,
 }
 impl From<StreamEvent> for UpstreamEvent {
     fn from(event: StreamEvent) -> Self {
@@ -913,6 +917,7 @@ impl From<StreamEvent> for UpstreamEvent {
             event,
             failure,
             usage_observed: false,
+            loop_reasoning: false,
         }
     }
 }
@@ -1138,6 +1143,63 @@ async fn send_with_fallback(
     ))
 }
 
+/// Re-ask a reasoning-only loop on the exact candidate that already
+/// committed the response. This deliberately bypasses fallback and key
+/// rotation: it is a continuation of the same upstream attempt, not a new
+/// routing decision.
+async fn reask_reasoning_stream(
+    state: &AppState,
+    config: &Config,
+    creq: &CompletionRequest,
+    candidate: &UpstreamCandidate,
+    tracker: &mut RequestTracker,
+    liveness: &StreamLiveness,
+) -> Result<UpstreamEvents, String> {
+    tracker.begin_reask();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let api_key = candidate
+        .provider
+        .api_key_pool()
+        .into_iter()
+        .nth(candidate.key_slot)
+        .ok_or_else(|| "reask key is no longer available".to_owned())?;
+    let body = upstream::build_request(&candidate.provider, creq, &candidate.model);
+    let clock = StreamClock::new(
+        config.stream_first_content_timeout_ms,
+        config.stream_idle_timeout_ms,
+    );
+    let response = upstream::send(
+        &state.http,
+        &candidate.provider,
+        &api_key,
+        &body,
+        &candidate.model,
+        true,
+    )
+    .await
+    .map_err(|error| format!("reasoning reask could not reach upstream: {error}"))?;
+
+    if !response.status().is_success() {
+        let detail = clock
+            .headers(upstream::error_detail(response))
+            .await
+            .map_err(|timeout| timeout.message().to_owned())?;
+        return Err(detail.message);
+    }
+
+    let (events, _failure) = prefetch_stream(
+        response,
+        candidate.provider.protocol,
+        tracker,
+        clock,
+        liveness,
+        config.stream_loop_guard,
+    )
+    .await;
+    Ok(events)
+}
+
 struct ProxyFailure {
     status: StatusCode,
     message: String,
@@ -1291,31 +1353,85 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
         };
 
         let client_model = creq.model.clone();
+        let reask_candidate = candidate.clone();
         let out = async_stream::stream! {
             let mut encoder = ClientStreamEncoder::new(wire, &client_model);
-            while let Some(item) = events.next().await {
-                let event = item.event;
-                if !item.usage_observed && let StreamEvent::Usage(usage) = &event {
-                    tracker.observe_usage(usage);
-                }
-                let terminal_status = match &event {
-                    StreamEvent::Done => Some("ok"),
-                    StreamEvent::Error { .. } => Some("upstream_stream_error"),
-                    _ => None,
-                };
-                if let Some(status) = terminal_status {
-                    // Release the HTTP response before yielding the final frame,
-                    // even if the downstream is backpressured or stops polling.
-                    drop(events);
-                    tracker.finish(status, &Usage::default());
-                    if let Some(frame) = encoder.encode(&event) {
+            let mut reasked = false;
+            let mut emitted_text_or_tool = false;
+            'attempt: loop {
+                while let Some(item) = events.next().await {
+                    let event = item.event;
+                    if !item.usage_observed && let StreamEvent::Usage(usage) = &event {
+                        tracker.observe_usage(usage);
+                    }
+
+                    // The second upstream sends its own Start frame, but the
+                    // client sees one logical response and must not receive a
+                    // second response.created/message_start/chunk opening.
+                    let suppress_start = reasked && matches!(event, StreamEvent::Start { .. });
+
+                    let text_or_tool = match &event {
+                        StreamEvent::TextDelta { text } => !text.is_empty(),
+                        StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallEnd { .. } => true,
+                        StreamEvent::ToolCallDelta { args, .. } => !args.is_empty(),
+                        _ => false,
+                    };
+                    emitted_text_or_tool |= text_or_tool;
+
+                    if item.loop_reasoning && !reasked && !emitted_text_or_tool {
+                        // The triggering reasoning delta has already been sent;
+                        // replace only the synthetic terminal error with one
+                        // same-candidate reask. Dropping the old stream first
+                        // is what cancels its response body.
+                        drop(events);
+                        reasked = true;
+                        match reask_reasoning_stream(
+                            &state,
+                            &config,
+                            &creq,
+                            &reask_candidate,
+                            &mut tracker,
+                            &liveness,
+                        ).await {
+                            Ok(next_events) => {
+                                events = next_events;
+                                continue 'attempt;
+                            }
+                            Err(message) => {
+                                tracker.finish("upstream_stream_error", &Usage::default());
+                                let error = StreamEvent::Error { message };
+                                if let Some(frame) = encoder.encode(&error) {
+                                    yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                                }
+                                return;
+                            }
+                        }
+                    }
+
+                    let terminal_status = match &event {
+                        StreamEvent::Done => Some("ok"),
+                        StreamEvent::Error { .. } => Some("upstream_stream_error"),
+                        _ => None,
+                    };
+                    if let Some(status) = terminal_status {
+                        // Release the HTTP response before yielding the final frame,
+                        // even if the downstream is backpressured or stops polling.
+                        drop(events);
+                        tracker.finish(status, &Usage::default());
+                        if !suppress_start && let Some(frame) = encoder.encode(&event) {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                        }
+                        return;
+                    }
+                    if !suppress_start && let Some(frame) = encoder.encode(&event) {
                         yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                     }
-                    return;
                 }
-                if let Some(frame) = encoder.encode(&event) {
-                    yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
-                }
+                // A well-formed upstream stream always emits Done or Error;
+                // keep the existing cancellation/accounting behavior if it
+                // closes unexpectedly.
+                tracker.finish("upstream_stream_error", &Usage::default());
+                return;
             }
         };
         Ok(sse_response(Body::from_stream(out)))
@@ -1416,6 +1532,7 @@ fn decode_upstream_data(
                 event,
                 failure,
                 usage_observed: false,
+                loop_reasoning: false,
             }
         })
         .collect()
@@ -1498,6 +1615,7 @@ fn stream_timeout_event(timeout: StreamTimeout) -> UpstreamEvent {
             body: Value::Null,
         }),
         usage_observed: false,
+        loop_reasoning: false,
     }
 }
 
@@ -1568,7 +1686,15 @@ fn upstream_events(
                     let trip = loop_guard.as_mut().and_then(|guard| guard.observe(&event.event));
                     yield event.into();
                     if let Some(trip) = trip {
-                        yield StreamEvent::Error { message: trip.message().into() }.into();
+                        yield UpstreamEvent {
+                            event: StreamEvent::Error { message: trip.message().into() },
+                            failure: Some(StreamFailure {
+                                status: StatusCode::BAD_GATEWAY,
+                                body: Value::Null,
+                            }),
+                            usage_observed: false,
+                            loop_reasoning: trip.is_reasoning(),
+                        }.into();
                         return;
                     }
                 }
@@ -1582,7 +1708,15 @@ fn upstream_events(
                     let trip = loop_guard.as_mut().and_then(|guard| guard.observe(&event.event));
                     yield event.into();
                     if let Some(trip) = trip {
-                        yield StreamEvent::Error { message: trip.message().into() }.into();
+                        yield UpstreamEvent {
+                            event: StreamEvent::Error { message: trip.message().into() },
+                            failure: Some(StreamFailure {
+                                status: StatusCode::BAD_GATEWAY,
+                                body: Value::Null,
+                            }),
+                            usage_observed: false,
+                            loop_reasoning: trip.is_reasoning(),
+                        }.into();
                         return;
                     }
                 }
