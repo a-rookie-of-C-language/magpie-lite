@@ -739,6 +739,73 @@ fn search_metadata(search: &WebSearch) -> Value {
     }))
 }
 
+// Combining distinct completed searches must not discard later results. A
+// native single-search metadata object is returned unchanged; merging rebases
+// support indices onto the combined chunk list rather than mixing citations.
+fn combined_search_metadata<'a>(searches: impl Iterator<Item = &'a WebSearch>) -> Option<Value> {
+    let mut metadata: Option<Value> = None;
+    for search in searches.filter(|s| s.is_public_result()) {
+        let next = search_metadata(search);
+        let Some(current) = metadata.as_mut() else {
+            metadata = Some(next);
+            continue;
+        };
+        let offset = get_either(current, "groundingChunks", "grounding_chunks")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len) as u64;
+        for (key, alias) in [
+            ("webSearchQueries", "web_search_queries"),
+            ("groundingChunks", "grounding_chunks"),
+            ("groundingSupports", "grounding_supports"),
+        ] {
+            let Some(items) = get_either(&next, key, alias).and_then(Value::as_array) else {
+                continue;
+            };
+            let Some(object) = current.as_object_mut() else {
+                continue;
+            };
+            let mut joined = match object.remove(key).or_else(|| object.remove(alias)) {
+                Some(Value::Array(items)) => items,
+                _ => Vec::new(),
+            };
+            object.remove(alias);
+            joined.extend(items.iter().cloned().map(|mut item| {
+                if key == "groundingSupports" {
+                    for indices_key in ["groundingChunkIndices", "grounding_chunk_indices"] {
+                        if let Some(indices) =
+                            item.get_mut(indices_key).and_then(Value::as_array_mut)
+                        {
+                            for index in indices {
+                                if let Some(value) = index.as_u64() {
+                                    *index = json!(value.saturating_add(offset));
+                                }
+                            }
+                        }
+                    }
+                }
+                item
+            }));
+            object.insert(key.into(), Value::Array(joined));
+        }
+        if let (Some(current), Some(next)) = (current.as_object_mut(), next.as_object()) {
+            for (key, value) in next {
+                if !matches!(
+                    key.as_str(),
+                    "webSearchQueries"
+                        | "web_search_queries"
+                        | "groundingChunks"
+                        | "grounding_chunks"
+                        | "groundingSupports"
+                        | "grounding_supports"
+                ) {
+                    current.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+            }
+        }
+    }
+    metadata
+}
+
 /// Decode a Gemini generateContent reply.
 pub fn decode_response(v: &Value) -> Result<CompletionResponse> {
     if let Some(error) = v.get("error") {
@@ -827,14 +894,13 @@ pub fn encode_response(resp: &CompletionResponse) -> Value {
         "modelVersion": resp.model,
         "responseId": response_id(),
     });
-    if let Some(search) = resp
-        .message
-        .parts
-        .iter()
-        .filter_map(|p| p.search.as_deref())
-        .find(|s| s.is_public_result())
-    {
-        body["candidates"][0]["groundingMetadata"] = search_metadata(search);
+    if let Some(metadata) = combined_search_metadata(
+        resp.message
+            .parts
+            .iter()
+            .filter_map(|p| p.search.as_deref()),
+    ) {
+        body["candidates"][0]["groundingMetadata"] = metadata;
     }
     body
 }

@@ -100,7 +100,7 @@ async fn text(response: reqwest::Response) -> String {
 
 #[tokio::test]
 async fn search_requests_enable_real_upstream_search_and_return_results_in_json_and_sse() {
-    for upstream in [Protocol::Gemini, Protocol::Responses] {
+    for upstream in [Protocol::Gemini, Protocol::Responses, Protocol::Anthropic] {
         for client in PROTOCOLS {
             for stream in [false, true] {
                 let script = if stream {

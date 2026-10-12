@@ -471,6 +471,8 @@ pub fn encode_response(resp: &CompletionResponse) -> Value {
     })
 }
 
+const MAX_PENDING_SEARCH_CALLS: usize = 128;
+
 /// Stateful Anthropic decoder. Function arguments and hosted search inputs
 /// are kept separate; search starts commit replay safety before results arrive.
 #[derive(Debug)]
@@ -523,6 +525,7 @@ impl AnthropicStreamDecoder {
     fn search_error(&mut self, message: &'static str) -> Vec<StreamEvent> {
         self.search_blocks.clear();
         self.search_queries.clear();
+        self.tool_blocks.clear();
         self.search_failed = true;
         vec![StreamEvent::Error {
             message: message.into(),
@@ -555,6 +558,9 @@ impl AnthropicStreamDecoder {
             "content_block_start" => {
                 let index = v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
                 let block = v.get("content_block").cloned().unwrap_or(Value::Null);
+                if self.search_blocks.contains_key(&index) {
+                    return self.search_error("upstream web search block was not closed");
+                }
                 self.tool_blocks.remove(&index);
                 if block.get("type").is_some_and(|ty| ty == "server_tool_use")
                     && block.get("name").is_some_and(|name| name == "web_search")
@@ -564,8 +570,17 @@ impl AnthropicStreamDecoder {
                         .is_some_and(|id| !id.is_empty())
                 {
                     let bytes = block.to_string().len();
-                    if self.search_blocks.contains_key(&index)
-                        || self.search_blocks.len() + self.search_queries.len() >= 128
+                    let id = block["id"].as_str().expect("validated search id");
+                    if self.search_queries.contains_key(id)
+                        || self
+                            .search_blocks
+                            .values()
+                            .any(|input| input.block["id"] == id)
+                    {
+                        return self.search_error("upstream web search id is already pending");
+                    }
+                    if self.search_blocks.len() + self.search_queries.len()
+                        >= MAX_PENDING_SEARCH_CALLS
                         || self.search_bytes().saturating_add(bytes) > self.search_limit
                     {
                         return self.search_error("upstream web search state exceeds its budget");
@@ -588,6 +603,14 @@ impl AnthropicStreamDecoder {
                     .get("type")
                     .is_some_and(|ty| ty == "web_search_tool_result")
                 {
+                    if self
+                        .search_blocks
+                        .values()
+                        .any(|input| input.block["id"] == block["tool_use_id"])
+                    {
+                        return self
+                            .search_error("upstream web search result precedes its closed call");
+                    }
                     if let Some(mut search) = decode_block(&block).and_then(|p| p.search) {
                         remember_search_query(&mut search, &mut self.search_queries);
                         out.push(StreamEvent::Search { search });
@@ -674,6 +697,9 @@ impl AnthropicStreamDecoder {
                         }
                         input.block["input"] = args;
                     }
+                    if !input.block.get("input").is_some_and(Value::is_object) {
+                        return self.search_error("upstream web search input must be an object");
+                    }
                     if let Some(mut search) = decode_block(&input.block).and_then(|p| p.search) {
                         let id = input.block["id"].as_str().expect("validated search id");
                         if self.search_queries.contains_key(id)
@@ -702,6 +728,10 @@ impl AnthropicStreamDecoder {
                 }
             }
             "message_stop" => {
+                if !self.search_blocks.is_empty() {
+                    return self.search_error("upstream web search block was not closed");
+                }
+                self.tool_blocks.clear();
                 self.search_blocks.clear();
                 self.search_queries.clear();
                 out.push(StreamEvent::Done);
@@ -994,5 +1024,109 @@ impl AnthropicStreamEncoder {
                 &json!({"type": "error", "error": {"type": "api_error", "message": message}}),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod search_state_tests {
+    use super::*;
+
+    fn call(index: usize, id: &str) -> Value {
+        json!({"type":"content_block_start","index":index,
+            "content_block":{"type":"server_tool_use","id":id,"name":"web_search","input":{}}})
+    }
+    fn stop(index: usize) -> Value {
+        json!({"type":"content_block_stop","index":index})
+    }
+    fn assert_failed(dec: &mut AnthropicStreamDecoder, events: &[StreamEvent]) {
+        assert!(matches!(events, [StreamEvent::Error { .. }]), "{events:?}");
+        assert!(dec.search_failed);
+        assert!(dec.search_blocks.is_empty());
+        assert!(dec.search_queries.is_empty());
+        assert!(dec.tool_blocks.is_empty());
+        assert!(dec.decode(&json!({"type":"message_stop"})).is_empty());
+        dec.decode(&json!({"type":"message_start","message":{"model":"next"}}));
+        assert!(!dec.search_failed);
+    }
+
+    #[test]
+    fn accumulated_search_bytes_are_bounded_and_errors_drop_all_retained_state() {
+        let start = call(0, "srv");
+        let bytes = start["content_block"].to_string().len();
+        let args = r#"{"query":"private"}"#;
+        let mut dec = AnthropicStreamDecoder {
+            search_limit: bytes + args.len(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            dec.decode(&start).as_slice(),
+            [StreamEvent::SearchStarted]
+        ));
+        assert!(
+            dec.decode(&json!({"type":"content_block_delta","index":0,
+            "delta":{"type":"input_json_delta","partial_json":args}}))
+                .is_empty()
+        );
+        assert_eq!(dec.search_bytes(), dec.search_limit);
+        let events = dec.decode(&json!({"type":"content_block_delta","index":0,
+            "delta":{"type":"input_json_delta","partial_json":" "}}));
+        assert_failed(&mut dec, &events);
+        dec.search_limit = bytes - 1;
+        let events = dec.decode(&start);
+        assert_failed(&mut dec, &events);
+    }
+
+    #[test]
+    fn pending_count_includes_both_open_calls_and_unanswered_queries() {
+        let mut dec = AnthropicStreamDecoder::new();
+        for index in 0..128 {
+            assert!(matches!(
+                dec.decode(&call(index, &format!("srv_{index}"))).as_slice(),
+                [StreamEvent::SearchStarted]
+            ));
+            if index % 2 == 0 {
+                dec.decode(&stop(index));
+            }
+        }
+        assert_eq!(dec.search_blocks.len(), 64);
+        assert_eq!(dec.search_queries.len(), 64);
+        let events = dec.decode(&call(128, "overflow"));
+        assert_failed(&mut dec, &events);
+        assert!(matches!(
+            dec.decode(&call(0, "again")).as_slice(),
+            [StreamEvent::SearchStarted]
+        ));
+    }
+
+    #[test]
+    fn consumed_queries_release_count_and_byte_budget() {
+        let mut dec = AnthropicStreamDecoder::new();
+        for index in 0..256 {
+            dec.decode(&call(index * 2, "reusable"));
+            dec.decode(&stop(index * 2));
+            let events = dec.decode(&json!({"type":"content_block_start","index":index * 2 + 1,
+                "content_block":{"type":"web_search_tool_result","tool_use_id":"reusable","content":[]}}));
+            assert!(matches!(events.as_slice(), [StreamEvent::Search { .. }]));
+            assert_eq!(dec.search_bytes(), 0);
+            assert!(!dec.search_failed);
+        }
+    }
+
+    #[test]
+    fn duplicate_pending_ids_and_results_before_call_stop_are_protocol_errors() {
+        for closed in [false, true] {
+            let mut dec = AnthropicStreamDecoder::new();
+            dec.decode(&call(0, "duplicate"));
+            if closed {
+                dec.decode(&stop(0));
+            }
+            let events = dec.decode(&call(1, "duplicate"));
+            assert_failed(&mut dec, &events);
+        }
+        let mut dec = AnthropicStreamDecoder::new();
+        dec.decode(&call(0, "open"));
+        let events = dec.decode(&json!({"type":"content_block_start","index":1,
+            "content_block":{"type":"web_search_tool_result","tool_use_id":"open","content":[]}}));
+        assert_failed(&mut dec, &events);
     }
 }

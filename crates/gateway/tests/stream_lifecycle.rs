@@ -6143,6 +6143,11 @@ const SEARCH_QUERY: &str = "private search fixture query";
 const SEARCH_URL: &str = "https://example.invalid/private-search-source";
 fn search_reply(upstream: Protocol) -> Value {
     match upstream {
+        Protocol::Anthropic => json!({"model":"up-model","content":[
+            {"type":"server_tool_use","id":"srv_fixture","name":"web_search","input":{"query":SEARCH_QUERY}},
+            {"type":"web_search_tool_result","tool_use_id":"srv_fixture","content":[
+                {"type":"web_search_result","url":SEARCH_URL,"title":"Fixture page","encrypted_content":"native-secret"}]}],
+            "stop_reason":"end_turn","usage":{"input_tokens":7,"output_tokens":3}}),
         Protocol::Gemini => json!({"modelVersion":"up-model","candidates":[{"content":{"parts":[]},
             "groundingMetadata":{"webSearchQueries":[SEARCH_QUERY],"groundingChunks":[{"web":{"uri":SEARCH_URL,"title":"Fixture page"}}]},
             "finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}),
@@ -6157,6 +6162,20 @@ fn search_reply(upstream: Protocol) -> Value {
 fn search_frame(upstream: Protocol) -> String {
     let mut reply = search_reply(upstream);
     match upstream {
+        Protocol::Anthropic => {
+            let mut wire = format!(
+                "data: {}\n\n",
+                json!({"type":"message_start","message":{"model":"up-model","usage":{"input_tokens":7,"output_tokens":3}}})
+            );
+            for (index, block) in reply["content"].as_array().unwrap().iter().enumerate() {
+                wire += &format!(
+                    "data: {}\n\ndata: {}\n\n",
+                    json!({"type":"content_block_start","index":index,"content_block":block}),
+                    json!({"type":"content_block_stop","index":index})
+                );
+            }
+            wire
+        }
         Protocol::Gemini => {
             reply["candidates"][0]
                 .as_object_mut()
@@ -6391,3 +6410,6 @@ async fn web_search_socket_disconnect_retains_usage_without_query_or_sources_in_
 
 #[path = "support/search_requests.rs"]
 mod search_requests;
+
+#[path = "support/anthropic_search.rs"]
+mod anthropic_search;

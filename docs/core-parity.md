@@ -197,11 +197,12 @@ usage and query/source-free history on disconnect. Optional opening usage from
 Responses-compatible upstreams is retained when reported; missing usage is not
 invented. These are synthetic fixtures, not paid-provider or real-Agent evidence.
 
-Remaining: enabling/translating built-in search tools in requests, Anthropic
-upstream search decoding, Responses open_page/find actions, cross-provider
-citation annotations and Chat search presentation. Gemini emits the first valid
-grounding result only. Search results are not replayable tool requests in chat
-history, and vendor-encrypted search content is not copied across providers.
+The later increments below add built-in search requests and Anthropic result
+ingress. Responses open_page/find actions, cross-provider citation annotations
+and Chat search presentation remain gaps. Gemini's upstream stream decoder still
+emits only the first valid grounding metadata event. Search results do not become
+agent-executed function calls, and vendor-encrypted search content is not copied
+across providers; native Anthropic history is the exception described below.
 
 
 ## Built-in web-search requests (2026-10-12)
@@ -235,6 +236,54 @@ exhausted routing plan returns HTTP 400 with a configuration-free error message.
 
 Evidence is local core fixtures, host-specific gateway unit tests and real
 loopback HTTP/SSE fixtures, not paid/live-provider or real-agent conformance.
-Remaining work includes configured cross-protocol option conversion, Anthropic
-search-result ingress, Responses open_page/find, cross-provider citations and
-Chat search-result presentation.
+Remaining work includes configured cross-protocol option conversion, Responses
+open_page/find, cross-provider citations and Chat search-result presentation.
+Anthropic search-result ingress is described below.
+
+
+## Anthropic hosted-search ingress and lifecycle (2026-10-12)
+
+Anthropic server_tool_use named web_search and web_search_tool_result now enter
+IR as distinct search parts, never ordinary function calls. Keeping each native
+block separate preserves call IDs, tool_use_id links, interleaved text, encrypted
+results, result order and native tool errors in replies and Anthropic history.
+Result queries are associated by ID, not by the most recent call. Only completed
+array-valued result blocks produce public Responses search actions or Gemini
+grounding. Call-only and native tool-error blocks do not fabricate successful
+foreign search results. Other server tools and unopened input_json_delta indices
+are not exposed as client functions; a real function named web_search is unchanged.
+Native text citation annotations and pause_turn semantics are not yet preserved.
+
+Streaming search start immediately counts as answer/content activity, before
+input fragments or results arrive. Search fragments accumulate separately from
+client function arguments; a nonempty whole input object takes precedence over
+subsequent fragments. Retained serialized search blocks, argument bytes, pending
+IDs and queries share a 32 MiB budget and at most 128 pending calls/queries.
+Consumed results release retained query state. Invalid argument JSON/non-object
+inputs, reused open search indices, duplicate pending IDs, results preceding
+call closure, budget exhaustion and message termination with an unclosed search
+produce one static error without exposing argument fragments. Error state drops
+retained search/function state and ignores later frames until a new message_start.
+
+Gemini JSON encoding aggregates all completed search parts instead of selecting
+the first. Queries/chunks retain result order; merged native support chunk indices
+are rebased. A single native grounding object remains unchanged. Non-array native
+metadata conflicts keep the first value; this is not a general merger of arbitrary
+provider attribution documents. Gemini SSE emits a grounding chunk for each
+completed search; its upstream decoder still only consumes the first valid
+metadata event, so repeated/cumulative native grounding updates remain a gap.
+
+Evidence: core tests first reproduced dropped second-search results, accepted
+non-object inputs and fabricated completion for unclosed searches. Core fixtures
+cover native JSON/history and SSE round trips, interleaving, query-to-ID association,
+malformed fragments, whole-input precedence, error/reset behavior, exact-byte and
+pending-count budgets, budget release, and Gemini support-index rebasing.
+Eight local HTTP/socket tests exercise all four clients, JSON/SSE native/cross
+output, search-start deadlines including groups, key retry before search only,
+after-start idle/error/refusal/reasoning-loop no-replay, invalid fragments,
+usage/history privacy and client cancellation. The existing search-request HTTP
+test now also enables Anthropic search end to end. These fixtures do not establish
+paid/live Anthropic or actual-agent conformance. The original reference decoder
+ignores hosted-search argument fragments; preserving complete inbound search
+results through IR extends that behavior rather than copying a completed reference
+implementation.

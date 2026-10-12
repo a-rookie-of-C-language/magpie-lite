@@ -150,3 +150,178 @@ fn unknown_server_tools_and_unopened_argument_indices_are_not_function_calls() {
         [StreamEvent::ToolCallEnd { .. }]
     ));
 }
+
+#[test]
+fn multiple_searches_keep_id_association_and_all_gemini_json_results() {
+    let mut second = result("srv_2");
+    second["content"][0]["url"] = json!("https://example.invalid/second");
+    let content = json!([call("srv_1", "first query"), call("srv_2", "second query"),
+        second, {"type":"text","text":"between"}, result("srv_1")]);
+    let ir = anthropic::decode_response(&reply(content.clone())).unwrap();
+    assert_eq!(anthropic::encode_response(&ir)["content"], content);
+    let out = responses::encode_response(&ir);
+    let searches: Vec<_> = out["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|v| v["type"] == "web_search_call")
+        .collect();
+    assert_eq!(searches.len(), 2);
+    assert_eq!(searches[0]["action"]["query"], "second query");
+    assert_eq!(searches[1]["action"]["query"], "first query");
+    let out = gemini::encode_response(&ir);
+    let metadata = &out["candidates"][0]["groundingMetadata"];
+    assert_eq!(
+        metadata["webSearchQueries"],
+        json!(["second query", "first query"])
+    );
+    assert_eq!(metadata["groundingChunks"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        metadata["groundingChunks"][0]["web"]["uri"],
+        "https://example.invalid/second"
+    );
+}
+
+#[test]
+fn calls_and_native_errors_do_not_fabricate_successful_public_searches() {
+    let content = json!([call("srv_1", "first query"),
+        {"type":"web_search_tool_result","tool_use_id":"srv_1",
+         "content":{"type":"web_search_tool_result_error","error_code":"unavailable"}}]);
+    let ir = anthropic::decode_response(&reply(content.clone())).unwrap();
+    assert_eq!(anthropic::encode_response(&ir)["content"], content);
+    assert!(
+        responses::encode_response(&ir)["output"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        gemini::encode_response(&ir)["candidates"][0]
+            .get("groundingMetadata")
+            .is_none()
+    );
+    let mut dec = anthropic::AnthropicStreamDecoder::new();
+    let mut events = dec.decode(&block_start(0, call("srv_1", "first query")));
+    events.extend(dec.decode(&stop(0)));
+    events.extend(dec.decode(&block_start(1, content[1].clone())));
+    for event in events {
+        assert!(
+            responses::ResponsesStreamEncoder::new("client")
+                .encode(&event)
+                .is_none()
+        );
+        assert!(
+            gemini::GeminiStreamEncoder::new("client")
+                .encode(&event)
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn whole_input_ignores_fragments_and_stream_roundtrip_keeps_interleaving() {
+    let mut dec = anthropic::AnthropicStreamDecoder::new();
+    let mut events = dec.decode(&block_start(0, call("srv_1", "whole query")));
+    events.extend(dec.decode(&json!({"type":"content_block_delta","index":0,
+        "delta":{"type":"input_json_delta","partial_json":"THIS_IS_NOT_JSON"}})));
+    events.extend(dec.decode(&stop(0)));
+    events.extend(dec.decode(&block_start(1, json!({"type":"text","text":""}))));
+    events.extend(dec.decode(&json!({"type":"content_block_delta","index":1,
+        "delta":{"type":"text_delta","text":"between"}})));
+    events.extend(dec.decode(&stop(1)));
+    events.extend(dec.decode(&block_start(2, result("srv_1"))));
+    events.extend(dec.decode(&stop(2)));
+    events.push(StreamEvent::Done);
+    let mut enc = anthropic::AnthropicStreamEncoder::new("client");
+    let wire: String = events
+        .iter()
+        .filter_map(|event| enc.encode(event))
+        .collect();
+    let mut decoded = anthropic::AnthropicStreamDecoder::new();
+    let parts: Vec<_> = frames(&wire)
+        .iter()
+        .flat_map(|v| decoded.decode(v))
+        .filter_map(|event| match event {
+            StreamEvent::Search { search } => Some(search.anthropic_block.unwrap()),
+            StreamEvent::TextDelta { text } => Some(json!({"type":"text","text":text})),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        parts,
+        vec![
+            call("srv_1", "whole query"),
+            json!({"type":"text","text":"between"}),
+            result("srv_1")
+        ]
+    );
+    assert!(!wire.contains("THIS_IS_NOT_JSON"));
+}
+
+#[test]
+fn malformed_input_and_reused_search_indices_fail_without_secrets_and_reset() {
+    for input in [Value::Null, json!([]), json!("PRIVATE_INPUT")] {
+        let mut dec = anthropic::AnthropicStreamDecoder::new();
+        let mut block = call("srv_1", "unused");
+        block["input"] = input;
+        dec.decode(&block_start(0, block));
+        let events = dec.decode(&stop(0));
+        assert!(
+            matches!(events.as_slice(), [StreamEvent::Error { .. }]),
+            "{events:?}"
+        );
+        assert!(!format!("{events:?}").contains("PRIVATE_INPUT"));
+        assert!(
+            dec.decode(&block_start(1, call("srv_2", "ignored")))
+                .is_empty()
+        );
+        dec.decode(&json!({"type":"message_start","message":{"model":"next"}}));
+        assert!(matches!(
+            dec.decode(&block_start(0, call("srv_1", "next")))
+                .as_slice(),
+            [StreamEvent::SearchStarted]
+        ));
+        assert!(matches!(
+            dec.decode(&stop(0)).as_slice(),
+            [StreamEvent::Search { .. }]
+        ));
+    }
+    for replacement in [
+        call("srv_2", "duplicate"),
+        json!({"type":"tool_use","id":"fn","name":"shell","input":{}}),
+        json!({"type":"text","text":""}),
+    ] {
+        let mut dec = anthropic::AnthropicStreamDecoder::new();
+        dec.decode(&block_start(0, call("srv_1", "first")));
+        let events = dec.decode(&block_start(0, replacement));
+        assert!(
+            matches!(events.as_slice(), [StreamEvent::Error { .. }]),
+            "{events:?}"
+        );
+    }
+}
+
+#[test]
+fn malformed_argument_fragments_and_unclosed_search_fail_once() {
+    for args in ["{PRIVATE", "[]", "null"] {
+        let mut dec = anthropic::AnthropicStreamDecoder::new();
+        let mut block = call("srv_1", "");
+        block["input"] = json!({});
+        dec.decode(&block_start(0, block));
+        dec.decode(&json!({"type":"content_block_delta","index":0,
+            "delta":{"type":"input_json_delta","partial_json":args}}));
+        let events = dec.decode(&stop(0));
+        assert!(
+            matches!(events.as_slice(), [StreamEvent::Error { .. }]),
+            "{events:?}"
+        );
+        assert!(!format!("{events:?}").contains("PRIVATE"));
+        assert!(dec.decode(&json!({"type":"message_stop"})).is_empty());
+    }
+    let mut dec = anthropic::AnthropicStreamDecoder::new();
+    dec.decode(&block_start(0, call("srv_1", "open")));
+    assert!(matches!(
+        dec.decode(&json!({"type":"message_stop"})).as_slice(),
+        [StreamEvent::Error { .. }]
+    ));
+}

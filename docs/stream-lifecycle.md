@@ -612,8 +612,8 @@ Fixtures cover both upstreams and all three supported output protocols in JSON
 and SSE, plus deadlines, refusal/loop no-replay and socket cancellation. The
 Responses disconnect fixture includes optional opening usage from a compatible
 upstream; ordinary missing/null opening usage produces no fabricated counters.
-Cross-protocol configured search-option translation, Anthropic search ingress, Responses
-open_page/find, cross-provider citations, Chat presentation, subscription
+Cross-protocol configured search-option translation, Responses open_page/find,
+cross-provider citations, Chat presentation, subscription
 wrappers and live-provider/real-Agent conformance remain outside this increment.
 
 
@@ -635,3 +635,26 @@ are exact-host checks; their behavior and native/cross-protocol choices are
 covered by local tests. Request history excludes private search policy values.
 These fixtures do not establish paid/live search or real-agent compatibility;
 see docs/core-parity.md for option-conversion and result-ingress limitations.
+
+
+## Anthropic search starts commit replay safety (2026-10-12)
+
+An Anthropic hosted-search content_block_start produces SearchStarted immediately.
+It is answer/content for the shared stream clock, group first-content commitment,
+refusal policy and reasoning-only reask guards. Encoders do not manufacture an
+empty completed search for this signal: native call output waits for its closed
+input block, and foreign result output waits for a successful public result block.
+Thus a paid search already started cannot be replayed through another key,
+provider, group route or reasoning-only reask merely because no result has arrived.
+It satisfies first-content limits but not future read-idle activity: an upstream
+stall after start ends with one idle error, not a new attempt.
+
+Search arguments are bounded independently of ordinary function fragments;
+malformed/incomplete lifecycle or retained-state overflow emits one static error
+and suppresses later success. Native search errors remain native data, not fabricated
+successful foreign grounding. All observed token usage remains on the selected
+attempt. Client disconnect releases the owned upstream and persists one sanitized
+record without query, URL or encrypted result content. Local fixtures prove these
+properties for the four client dialects and ordinary/group routes, not live vendors,
+HTTP/2, TLS/proxies or real Agents. See docs/core-parity.md for budgets, block
+preservation and remaining citation, pause_turn and repeated-grounding limitations.

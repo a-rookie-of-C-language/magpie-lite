@@ -236,3 +236,47 @@ fn responses_opening_usage_is_optional_and_retained_when_reported() {
         assert!(!events.iter().any(|e| matches!(e, StreamEvent::Usage(_))));
     }
 }
+
+#[test]
+fn multiple_grounding_parts_merge_queries_and_rebase_native_support_indices() {
+    let first = gemini::decode_response(&gemini_reply()).unwrap();
+    let mut combined = first.clone();
+    let mut second = gemini_reply();
+    second["candidates"][0]["groundingMetadata"] = json!({
+        "web_search_queries":["second search"],
+        "grounding_chunks":[{"web":{"uri":"https://example.invalid/second","title":"Second"}}],
+        "grounding_supports":[{"segment":{"startIndex":7,"endIndex":13,"text":"Second"},
+            "grounding_chunk_indices":[0]}]});
+    let second = gemini::decode_response(&second).unwrap();
+    combined.message.parts.extend(
+        second
+            .message
+            .parts
+            .into_iter()
+            .filter(|p| p.search.is_some()),
+    );
+    let out = gemini::encode_response(&combined);
+    let metadata = &out["candidates"][0]["groundingMetadata"];
+    assert_eq!(
+        metadata["webSearchQueries"],
+        json!(["latest go release", "go release notes", "second search"])
+    );
+    assert_eq!(metadata["groundingChunks"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        metadata["groundingSupports"][0]["groundingChunkIndices"],
+        json!([0])
+    );
+    assert_eq!(
+        metadata["groundingSupports"][1]["grounding_chunk_indices"],
+        json!([3])
+    );
+    assert_eq!(
+        metadata["searchEntryPoint"],
+        grounding()["searchEntryPoint"]
+    );
+    assert!(metadata.get("grounding_chunks").is_none());
+    assert_eq!(
+        gemini::encode_response(&first)["candidates"][0]["groundingMetadata"],
+        grounding()
+    );
+}
