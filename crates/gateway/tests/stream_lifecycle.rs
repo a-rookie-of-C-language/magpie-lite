@@ -2006,3 +2006,737 @@ async fn socket_disconnect_after_fallback_keeps_only_last_attempt_and_persists()
         }
     }
 }
+
+fn enable_fast_keepalive(config: &mut Config) {
+    disable_stream_deadlines(config);
+    config.stream_keepalive_interval_ms = 30;
+    config.stream_keepalive_max_silence_ms = 2_000;
+}
+
+const COMMENT_CLIENTS: [Protocol; 3] = [Protocol::Chat, Protocol::Anthropic, Protocol::Responses];
+const KEEPALIVE: &str = ": keepalive\n";
+
+async fn first_comment(response: &mut reqwest::Response) {
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let first = tokio::time::timeout(LIMIT, response.chunk())
+        .await
+        .expect("no comment while upstream is pending")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, KEEPALIVE);
+}
+
+async fn read_through(response: &mut reqwest::Response, needle: &str) -> String {
+    tokio::time::timeout(LIMIT, async {
+        let mut received = String::new();
+        while !received.contains(needle) {
+            let chunk = response.chunk().await.unwrap().expect("stream ended early");
+            received.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        received
+    })
+    .await
+    .expect("stream did not produce expected output")
+}
+
+fn assert_one_stream_error(body: &str, client: Protocol, message: &str) {
+    assert_no_success(body);
+    let mut parser = magpie_core::stream::SseParser::new();
+    let mut remaining = body.as_bytes();
+    let mut errors = 0;
+    while let Some(data) = parser.feed(&mut remaining).unwrap() {
+        let value: Value = serde_json::from_str(&data).unwrap();
+        let error = match client {
+            Protocol::Chat | Protocol::Gemini => value.get("error"),
+            Protocol::Anthropic => (value["type"] == "error").then(|| &value["error"]),
+            Protocol::Responses => {
+                (value["type"] == "response.failed").then(|| &value["response"]["error"])
+            }
+        };
+        if let Some(error) = error {
+            assert!(
+                error["message"].as_str().unwrap().contains(message),
+                "{body}"
+            );
+            errors += 1;
+        }
+    }
+    assert_eq!(errors, 1, "exactly one terminal stream error: {body}");
+}
+
+#[tokio::test]
+async fn keepalive_precedes_delayed_upstream_headers_without_opening_metadata() {
+    for upstream in PROTOCOLS {
+        for client in COMMENT_CLIENTS {
+            let f = Fixture::with_transport(
+                upstream,
+                vec![prefix(upstream) + completion(upstream)],
+                Ending::Hold,
+                Transport {
+                    header_delay: Duration::from_millis(180),
+                    ..Transport::default()
+                },
+                enable_fast_keepalive,
+            )
+            .await;
+            let mut response = f.request(client).await;
+            first_comment(&mut response).await;
+            assert!(f.log.lock().unwrap().snapshot().recent_requests.is_empty());
+            let body = response.text().await.unwrap();
+            assert!(body.contains("partial"));
+            assert_completed(&body, client);
+            assert_eq!(f.record().await["status"], "ok");
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn keepalive_holds_opening_metadata_until_content_without_changing_usage() {
+    for upstream in PROTOCOLS {
+        for client in COMMENT_CLIENTS {
+            let f = Fixture::with_config(
+                upstream,
+                vec![opening(upstream).into()],
+                Ending::Paced(vec![(
+                    Duration::from_millis(180),
+                    prefix(upstream) + completion(upstream),
+                )]),
+                enable_fast_keepalive,
+            )
+            .await;
+            let mut response = f.request(client).await;
+            first_comment(&mut response).await;
+            assert!(f.log.lock().unwrap().snapshot().recent_requests.is_empty());
+            let body = response.text().await.unwrap();
+            assert!(body.contains("partial"));
+            assert_completed(&body, client);
+            let record = f.record().await;
+            assert_eq!(record["status"], "ok");
+            assert_eq!(record["usage"]["input"], 7);
+            assert_eq!(record["usage"]["output"], 3);
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn keepalive_does_not_commit_candidates_before_key_provider_or_group_retry() {
+    // Same-key-pool retry and every protocol pair through provider/group retry.
+    for mode in 0..3 {
+        for upstream in PROTOCOLS {
+            for spare in PROTOCOLS {
+                if mode == 0 && upstream != spare {
+                    continue;
+                }
+                for client in COMMENT_CLIENTS {
+                    let f = Fixture::with_transport(
+                        upstream,
+                        vec![
+                            opening(upstream).to_owned() + limited(upstream),
+                            prefix(spare) + completion(spare),
+                        ],
+                        Ending::Hold,
+                        Transport {
+                            header_delay: Duration::from_millis(180),
+                            ..Transport::default()
+                        },
+                        |config| {
+                            enable_fast_keepalive(config);
+                            if mode != 0 {
+                                configure_timeout_fallback(config, mode == 2);
+                                config.provider[0].api_keys.truncate(1);
+                                config.provider[1].protocol = spare;
+                            }
+                        },
+                    )
+                    .await;
+                    let model = if mode == 2 {
+                        "group/daily"
+                    } else {
+                        "mock/up-model"
+                    };
+                    let mut response = f.request_model(client, model).await;
+                    first_comment(&mut response).await;
+                    let body = response.text().await.unwrap();
+                    assert!(
+                        !body.contains("abandoned-model") && !body.contains("fixture rate limit"),
+                        "{body}"
+                    );
+                    assert_completed(&body, client);
+                    assert_eq!(*f.attempts.lock().unwrap(), vec![0, 1]);
+                    let record = f.record().await;
+                    assert_eq!(record["status"], "ok");
+                    assert_eq!(record["provider"], if mode == 0 { "mock" } else { "spare" });
+                    assert_eq!(
+                        record["upstream_model"],
+                        if mode == 0 {
+                            "up-model"
+                        } else {
+                            "backup-model"
+                        }
+                    );
+                    assert_eq!(record["key_slot"], if mode == 0 { 1 } else { 0 });
+                    assert_eq!(record["usage"]["input"], 7);
+                    assert_eq!(record["usage"]["output"], 3);
+                    f.assert_released().await;
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn keepalive_turns_late_http_failures_into_one_protocol_error() {
+    for client in COMMENT_CLIENTS {
+        for status in [400, 429, 503] {
+            let f = Fixture::with_transport(
+                Protocol::Chat,
+                vec![json!({"error":{"message":"late fixture failure"}}).to_string()],
+                Ending::Eof,
+                Transport {
+                    header_delay: Duration::from_millis(180),
+                    status: axum::http::StatusCode::from_u16(status).unwrap(),
+                    ..Transport::default()
+                },
+                enable_fast_keepalive,
+            )
+            .await;
+            let mut response = f.request(client).await;
+            first_comment(&mut response).await;
+            let body = response.text().await.unwrap();
+            assert_one_stream_error(&body, client, "late fixture failure");
+            assert_eq!(f.record().await["status"], "upstream_error");
+            assert_eq!(*f.attempts.lock().unwrap(), vec![0]);
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn keepalive_preserves_fast_http_errors_and_known_error_body_waits() {
+    for client in PROTOCOLS {
+        let f = Fixture::with_transport(
+            Protocol::Chat,
+            vec![json!({"error":{"message":"fast fixture failure"}}).to_string()],
+            Ending::Eof,
+            Transport {
+                status: axum::http::StatusCode::BAD_REQUEST,
+                ..Transport::default()
+            },
+            |config| {
+                enable_fast_keepalive(config);
+                config.stream_keepalive_interval_ms = 250;
+            },
+        )
+        .await;
+        let response = f.request_model_raw(client, "mock/up-model").await;
+        assert_eq!(response.status(), 400);
+        assert!(
+            response.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("application/json")
+        );
+        let body = response.text().await.unwrap();
+        assert!(body.contains("fast fixture failure") && !body.contains(KEEPALIVE));
+        assert_eq!(f.record().await["status"], "upstream_error");
+        f.assert_released().await;
+
+        // Known non-2xx bodies must not become 200 merely because their EOF is late.
+        let f = Fixture::with_transport(
+            Protocol::Chat,
+            vec![json!({"error":{"message":"pending failure"}}).to_string()],
+            Ending::Hold,
+            Transport {
+                status: axum::http::StatusCode::BAD_REQUEST,
+                ..Transport::default()
+            },
+            enable_fast_keepalive,
+        )
+        .await;
+        let history = f.persistent_history();
+        let socket = f.socket_request(client, "mock/up-model", true).await;
+        f.wait_for_attempts(&[0]).await;
+        // This helper asserts no headers/comments arrive before dropping TCP.
+        let record = f.disconnect_before_headers(socket, history.path()).await;
+        assert_eq!(record["status"], "client_disconnected");
+        assert_eq!(*f.attempts.lock().unwrap(), vec![0]);
+    }
+}
+
+#[tokio::test]
+async fn keepalive_never_extends_first_content_or_read_idle_deadlines() {
+    for upstream in PROTOCOLS {
+        for client in COMMENT_CLIENTS {
+            for mode in 0..4 {
+                let f = Fixture::with_transport(
+                    upstream,
+                    if mode == 1 {
+                        vec![prefix(upstream), prefix(upstream) + completion(upstream)]
+                    } else {
+                        vec![opening(upstream).into()]
+                    },
+                    if mode == 2 {
+                        Ending::Heartbeats
+                    } else {
+                        Ending::Hold
+                    },
+                    Transport {
+                        header_delay: if mode == 3 {
+                            Duration::from_secs(60)
+                        } else {
+                            Duration::ZERO
+                        },
+                        ..Transport::default()
+                    },
+                    |config| {
+                        enable_fast_keepalive(config);
+                        config.stream_first_content_timeout_ms = if mode == 1 { 0 } else { 180 };
+                        config.stream_idle_timeout_ms = if mode == 1 { 180 } else { 0 };
+                        if mode == 1 {
+                            configure_timeout_fallback(config, false);
+                        }
+                    },
+                )
+                .await;
+                let start = std::time::Instant::now();
+                let response = f.request(client).await;
+                assert_eq!(response.status(), 200);
+                let body = tokio::time::timeout(LIMIT, response.text())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(body.contains(KEEPALIVE), "no downstream liveness: {body}");
+                assert_one_stream_error(
+                    &body,
+                    client,
+                    if mode == 1 {
+                        "upstream stream idle timeout"
+                    } else {
+                        "upstream first-content timeout"
+                    },
+                );
+                assert!(
+                    start.elapsed() < Duration::from_secs(2),
+                    "comments restarted deadline"
+                );
+                let record = f.record().await;
+                assert_eq!(
+                    record["status"],
+                    if mode == 3 {
+                        "upstream_error"
+                    } else {
+                        "upstream_stream_error"
+                    }
+                );
+                assert_eq!(*f.attempts.lock().unwrap(), vec![0]);
+                f.assert_released().await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn keepalive_after_content_stops_at_upstream_silence_cap_without_finishing_request() {
+    for upstream in PROTOCOLS {
+        for client in COMMENT_CLIENTS {
+            let f =
+                Fixture::with_config(upstream, vec![prefix(upstream)], Ending::Hold, |config| {
+                    enable_fast_keepalive(config);
+                    config.stream_keepalive_max_silence_ms = 160;
+                })
+                .await;
+            let mut response = f.request(client).await;
+            let initial = read_through(&mut response, "partial").await;
+            assert!(!initial.contains(KEEPALIVE));
+            let mut comments = 0;
+            loop {
+                match tokio::time::timeout(Duration::from_millis(250), response.chunk()).await {
+                    Err(_) => break,
+                    Ok(Ok(Some(chunk))) => {
+                        assert_eq!(chunk, KEEPALIVE);
+                        comments += 1;
+                    }
+                    other => panic!("silence cap incorrectly ended stream: {other:?}"),
+                }
+                assert!(comments < 10, "comments outlived upstream silence cap");
+            }
+            assert!(comments > 0, "no post-content keepalive");
+            assert!(f.log.lock().unwrap().snapshot().recent_requests.is_empty());
+            drop(response);
+            let record = f.record().await;
+            assert_eq!(record["status"], "client_disconnected");
+            assert_partial_usage(&record, upstream);
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn keepalive_observes_ignored_upstream_heartbeats_not_only_decoded_events() {
+    for upstream in PROTOCOLS {
+        for client in COMMENT_CLIENTS {
+            let f = Fixture::with_config(
+                upstream,
+                vec![prefix(upstream)],
+                Ending::Heartbeats,
+                |config| {
+                    enable_fast_keepalive(config);
+                    config.stream_keepalive_max_silence_ms = 90;
+                },
+            )
+            .await;
+            let mut response = f.request(client).await;
+            read_through(&mut response, "partial").await;
+            let start = std::time::Instant::now();
+            for _ in 0..7 {
+                let chunk = tokio::time::timeout(LIMIT, response.chunk())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(chunk, KEEPALIVE);
+            }
+            assert!(start.elapsed() >= Duration::from_millis(150));
+            drop(response);
+            assert_eq!(f.record().await["status"], "client_disconnected");
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn keepalive_is_disabled_for_gemini_nonstream_and_either_zero_setting() {
+    for client in PROTOCOLS {
+        for mode in 0..4 {
+            if mode == 0 && client != Protocol::Gemini {
+                continue;
+            }
+            let f = Fixture::with_transport(
+                Protocol::Chat,
+                vec![prefix(Protocol::Chat)],
+                Ending::Hold,
+                Transport {
+                    header_delay: Duration::from_secs(60),
+                    ..Transport::default()
+                },
+                |config| {
+                    enable_fast_keepalive(config);
+                    if mode == 2 {
+                        config.stream_keepalive_interval_ms = 0;
+                    }
+                    if mode == 3 {
+                        config.stream_keepalive_max_silence_ms = 0;
+                    }
+                },
+            )
+            .await;
+            let history = f.persistent_history();
+            let socket = f.socket_request(client, "mock/up-model", mode != 1).await;
+            f.wait_for_attempts(&[0]).await;
+            let record = f.disconnect_before_headers(socket, history.path()).await;
+            assert_pending_record(&record, client, mode != 1);
+        }
+    }
+    // Gemini remains comment-free after content too, even with ignored upstream traffic.
+    for upstream in PROTOCOLS {
+        let f = Fixture::with_config(
+            upstream,
+            vec![prefix(upstream)],
+            Ending::Heartbeats,
+            enable_fast_keepalive,
+        )
+        .await;
+        let mut response = f.request(Protocol::Gemini).await;
+        read_through(&mut response, "partial").await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), response.chunk())
+                .await
+                .is_err()
+        );
+        drop(response);
+        assert_eq!(f.record().await["status"], "client_disconnected");
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn keepalive_socket_disconnect_cancels_owned_work_and_persists_last_attempt() {
+    use tokio::io::AsyncReadExt;
+    for upstream in PROTOCOLS {
+        for client in COMMENT_CLIENTS {
+            // Pending headers, opening metadata, ordinary/group fallback headers.
+            for mode in 0..4 {
+                let fallback = mode >= 2;
+                let f = Fixture::with_transport(
+                    upstream,
+                    if fallback {
+                        vec![
+                            opening(upstream).to_owned() + error(upstream),
+                            prefix(upstream),
+                        ]
+                    } else {
+                        vec![opening(upstream).into()]
+                    },
+                    Ending::Hold,
+                    Transport {
+                        header_delay: if mode == 1 {
+                            Duration::ZERO
+                        } else {
+                            Duration::from_secs(60)
+                        },
+                        header_delay_slot: usize::from(fallback),
+                        ..Transport::default()
+                    },
+                    |config| {
+                        enable_fast_keepalive(config);
+                        if fallback {
+                            configure_timeout_fallback(config, mode == 3);
+                            config.provider[0].api_keys.truncate(1);
+                        }
+                    },
+                )
+                .await;
+                let history = f.persistent_history();
+                let model = if mode == 3 {
+                    "group/daily"
+                } else {
+                    "mock/up-model"
+                };
+                let mut socket = f.socket_request(client, model, true).await;
+                f.wait_for_attempts(if fallback { &[0, 1] } else { &[0] })
+                    .await;
+                let received = tokio::time::timeout(LIMIT, async {
+                    let mut received = Vec::new();
+                    while !String::from_utf8_lossy(&received).contains(KEEPALIVE) {
+                        received.push(socket.read_u8().await.unwrap());
+                    }
+                    String::from_utf8(received).unwrap()
+                })
+                .await
+                .unwrap();
+                assert!(received.starts_with("HTTP/1.1 200 OK\r\n"), "{received}");
+                assert!(!received.contains("abandoned-model") && !received.contains("data:"));
+                assert!(f.log.lock().unwrap().snapshot().recent_requests.is_empty());
+                drop(socket);
+                let record = f.record().await;
+                assert_eq!(record["status"], "client_disconnected");
+                assert_eq!(record["requested_model"], model);
+                assert_eq!(record["provider"], if fallback { "spare" } else { "mock" });
+                assert_eq!(
+                    record["upstream_model"],
+                    if fallback { "backup-model" } else { "up-model" }
+                );
+                assert_eq!(record["key_slot"], 0);
+                if mode == 1 && upstream != Protocol::Responses {
+                    assert_eq!(record["usage"]["input"], 99);
+                    assert_eq!(record["usage"]["output"], 0);
+                } else {
+                    assert!(
+                        record["usage"]["input"].is_null() && record["usage"]["output"].is_null()
+                    );
+                }
+                f.assert_released().await;
+                let persisted =
+                    std::fs::read_to_string(history.path().join("requests.jsonl")).unwrap();
+                assert_eq!(persisted.lines().count(), 1);
+                assert!(
+                    !persisted.contains("secret-")
+                        && !persisted.contains("private cancellation prompt")
+                        && !persisted.contains("abandoned-model")
+                );
+                assert_eq!(serde_json::from_str::<Value>(&persisted).unwrap(), record);
+                let restored = RequestLog::open(&history.path().join("requests.jsonl"))
+                    .unwrap()
+                    .snapshot()
+                    .recent_requests;
+                assert_eq!(restored.len(), 1);
+                assert_eq!(serde_json::to_value(&restored[0]).unwrap(), record);
+                assert_eq!(
+                    *f.attempts.lock().unwrap(),
+                    if fallback { vec![0, 1] } else { vec![0] }
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn keepalive_preserves_http_error_and_header_timeout_fallback_after_comments() {
+    for timeout in [false, true] {
+        for grouped in [false, true] {
+            for spare in PROTOCOLS {
+                for client in COMMENT_CLIENTS {
+                    let f = Fixture::with_transport(
+                        Protocol::Chat,
+                        vec![
+                            json!({"error":{"message":"abandoned HTTP failure"}}).to_string(),
+                            prefix(spare) + completion(spare),
+                        ],
+                        Ending::Eof,
+                        Transport {
+                            header_delay: if timeout {
+                                Duration::from_secs(60)
+                            } else {
+                                Duration::from_millis(180)
+                            },
+                            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            ..Transport::default()
+                        },
+                        |config| {
+                            enable_fast_keepalive(config);
+                            configure_timeout_fallback(config, grouped);
+                            config.provider[1].protocol = spare;
+                            if timeout {
+                                config.stream_first_content_timeout_ms = 180;
+                            }
+                        },
+                    )
+                    .await;
+                    let model = if grouped {
+                        "group/daily"
+                    } else {
+                        "mock/up-model"
+                    };
+                    let mut response = f.request_model(client, model).await;
+                    first_comment(&mut response).await;
+                    let body = response.text().await.unwrap();
+                    assert!(!body.contains("abandoned HTTP failure"), "{body}");
+                    assert_completed(&body, client);
+                    assert_eq!(*f.attempts.lock().unwrap(), vec![0, 1]);
+                    let record = f.record().await;
+                    assert_eq!(record["status"], "ok");
+                    assert_eq!(record["provider"], "spare");
+                    assert_eq!(record["upstream_model"], "backup-model");
+                    assert_eq!(record["key_slot"], 0);
+                    assert_eq!(record["usage"]["input"], 7);
+                    assert_eq!(record["usage"]["output"], 3);
+                    f.assert_released().await;
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn keepalive_uses_fast_gap_for_translated_activity_and_resumes_after_silence_cap() {
+    for client in COMMENT_CLIENTS {
+        let f = Fixture::with_config(
+            Protocol::Responses,
+            vec![prefix(Protocol::Responses)],
+            Ending::Heartbeats,
+            |config| {
+                enable_fast_keepalive(config);
+                config.stream_keepalive_interval_ms = 1_500;
+                config.stream_keepalive_max_silence_ms = 2_000;
+            },
+        )
+        .await;
+        let mut response = f.request(client).await;
+        read_through(&mut response, "partial").await;
+        let start = std::time::Instant::now();
+        let chunk = tokio::time::timeout(Duration::from_millis(1_400), response.chunk())
+            .await
+            .expect("ignored transport did not trigger the one-second gap")
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk, KEEPALIVE);
+        assert!(start.elapsed() >= Duration::from_millis(800));
+        drop(response);
+        assert_eq!(f.record().await["status"], "client_disconnected");
+        f.assert_released().await;
+
+        let f = Fixture::with_config(
+            Protocol::Responses,
+            vec![prefix(Protocol::Responses)],
+            Ending::Paced(vec![
+                (
+                    Duration::from_millis(400),
+                    ": upstream transport resumed\n\n".into(),
+                ),
+                (
+                    Duration::from_millis(100),
+                    completion(Protocol::Responses).into(),
+                ),
+            ]),
+            |config| {
+                enable_fast_keepalive(config);
+                config.stream_keepalive_max_silence_ms = 120;
+            },
+        )
+        .await;
+        let mut response = f.request(client).await;
+        let mut body = read_through(&mut response, "partial").await;
+        let mut comments = 0;
+        // Transport falls silent, the comments stop, but the request remains live.
+        loop {
+            match tokio::time::timeout(Duration::from_millis(150), response.chunk()).await {
+                Err(_) => break,
+                Ok(Ok(Some(chunk))) => {
+                    assert_eq!(chunk, KEEPALIVE);
+                    body.push_str(KEEPALIVE);
+                    comments += 1;
+                }
+                other => panic!("stream ended during recoverable silence: {other:?}"),
+            }
+            assert!(comments < 8);
+        }
+        assert!(comments > 0);
+        // A transport comment, not a decoded event, reopens the liveness window.
+        let chunk = tokio::time::timeout(LIMIT, response.chunk())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk, KEEPALIVE);
+        body.push_str(KEEPALIVE);
+        body.push_str(&response.text().await.unwrap());
+        assert_completed(&body, client);
+        assert_eq!(f.record().await["status"], "ok");
+        f.assert_released().await;
+    }
+}
+
+#[tokio::test]
+async fn keepalive_stops_during_late_known_http_error_body_without_background_work() {
+    for client in COMMENT_CLIENTS {
+        let f = Fixture::with_transport(
+            Protocol::Chat,
+            vec![json!({"error":{"message":"held late HTTP failure"}}).to_string()],
+            Ending::Hold,
+            Transport {
+                header_delay: Duration::from_millis(180),
+                status: axum::http::StatusCode::BAD_REQUEST,
+                ..Transport::default()
+            },
+            enable_fast_keepalive,
+        )
+        .await;
+        let mut response = f.request(client).await;
+        first_comment(&mut response).await;
+        let mut comments = 1;
+        loop {
+            match tokio::time::timeout(Duration::from_millis(120), response.chunk()).await {
+                Err(_) => break,
+                Ok(Ok(Some(chunk))) => {
+                    assert_eq!(chunk, KEEPALIVE);
+                    comments += 1;
+                }
+                other => panic!("incomplete error body ended unexpectedly: {other:?}"),
+            }
+            assert!(comments < 10, "keepalive ignored known HTTP failure");
+        }
+        assert!(f.log.lock().unwrap().snapshot().recent_requests.is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), response.chunk())
+                .await
+                .is_err()
+        );
+        drop(response);
+        assert_eq!(f.record().await["status"], "client_disconnected");
+        assert_eq!(*f.attempts.lock().unwrap(), vec![0]);
+        f.assert_released().await;
+    }
+}

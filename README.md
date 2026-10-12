@@ -91,12 +91,44 @@ upstream transport bytes, not downstream backpressure. Before committing a
 stream, timeouts can try a configured fallback/group route (not another key on
 the same endpoint); after commitment they end with one protocol error and keep
 observed partial usage. Header/error-body timeouts return HTTP 504 when no route
-remains. Each attempt gets a fresh budget. Nonstreaming requests are unchanged.
+remains and no keepalive has sent HTTP headers; otherwise they become a stream
+error. Each attempt gets a fresh budget. Nonstreaming requests are unchanged.
 
 Both settings appear in protected GET `/config`; edit the TOML and restart to
-change them (no timeout-edit API yet). They are not a total-duration limit, a
-keepalive facility, or proof of pre-header socket-disconnect cancellation.
+change them (no timeout-edit API yet). They are not a total-duration limit.
 See `docs/stream-lifecycle.md` for exact policies and remaining reference gaps.
+
+## Streaming keepalive
+
+Streaming Chat, Anthropic and Responses clients receive SSE comments while
+waiting for upstream headers, opening metadata, or a quiet mid-answer stream:
+
+```toml
+stream_keepalive_interval_ms = 15000     # normal downstream comment interval
+stream_keepalive_max_silence_ms = 300000 # stop after this much upstream silence
+```
+
+These defaults apply to old configuration files. Either value set to `0` disables
+keepalive. Both appear in protected GET `/config`; edit the TOML and restart to
+change them. Requests pin all four streaming settings when they begin.
+
+Only `: keepalive\n` is sent (no extra blank line), not opening model/usage from
+an attempt that may still fail over. Key, provider and group fallback remain
+available before actual content or the existing buffering safety bounds commit
+an attempt. Fast HTTP failures retain their status; once a comment has sent
+HTTP 200/SSE headers, a later HTTP failure becomes one protocol stream error,
+never a JSON body or a success marker. Known non-2xx body reads do not send
+comments. Gemini and all nonstreaming requests never get these comments.
+
+Transport bytes, including ignored comments and partial frames, renew the
+silence window. After a stream is handed off, upstream activity with no client
+output can trigger a comment after a one-second gap (or the configured interval,
+whichever is shorter). Reaching the silence cap stops comments, not the request;
+new upstream activity resumes them. A fresh fallback attempt starts a fresh
+window. Downstream comments never count as upstream progress or reset the
+first-content/read-idle deadlines, and they cannot satisfy clients that require
+actual protocol events. No background worker is spawned: closing the client
+connection drops pending work and preserves one final accounting record.
 
 ## Editing providers
 

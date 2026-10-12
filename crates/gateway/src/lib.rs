@@ -7,6 +7,7 @@ pub mod cooldown;
 mod provider_tools;
 mod providers;
 pub mod server;
+mod stream_keepalive;
 mod stream_status;
 mod stream_timeout;
 pub mod upstream;

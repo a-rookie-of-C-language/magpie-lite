@@ -76,11 +76,13 @@ for the selected attempt. An answer is never assembled from two upstreams. In
 particular reasoning/tool activity counts as committed even if a particular
 client dialect buffers or hides that activity.
 
-The prefetch runs in the handler before downstream response headers. The
-streaming deadlines below bound a below-budget stall when enabled. Real HTTP/1.1
-fixtures additionally verify that closing the downstream socket cancels pending
-handlers even with both deadlines disabled (see Accounting and cancellation).
-The gateway still emits no downstream keepalive frames.
+Prefetch withholds candidate metadata until handoff. Normally it runs before
+downstream headers; a slow streaming request may send only headers/comments and
+move the still-pending prefetch into the response body. HTTP commitment does not
+commit a candidate. The deadlines below bound a below-budget stall when enabled.
+Real HTTP/1.1 fixtures verify socket-close cancellation both before headers and
+after a comment, even with both deadlines disabled (see Accounting and
+cancellation).
 
 ## Streaming deadlines
 
@@ -105,7 +107,8 @@ upstream may hold a handler indefinitely while its client stays connected. Nonst
 previous behavior; these settings are not a total request-duration limit.
 Configuration is pinned for the request, and each fallback attempt gets a fresh
 clock. The first-content deadline remains active after a metadata safety budget
-commits headers, but a later timeout can no longer retry that committed response.
+commits a candidate, but a later timeout can no longer retry that response.
+Sending only keepalive headers/comments does not commit a candidate.
 
 Timeouts are endpoint failures, internally classified as 504. They skip any
 remaining credentials on that endpoint and never apply quota cooldown. Before
@@ -113,16 +116,61 @@ commit they may try an ordinary fallback or next group route; after commit they
 produce one terminal protocol error, retain observed partial usage, release the
 upstream and never synthesize a success marker or splice another answer. A
 header/error-body timeout on the last route returns HTTP 504 in the client's
-error envelope; a timeout of an HTTP-200 SSE response uses the existing client
-stream-error encoder (the transport status is already 200).
+error envelope if no comment has committed HTTP headers. After a comment it
+becomes one protocol stream error. A timeout of an HTTP-200 SSE response uses
+the existing client stream-error encoder (the transport status is already 200).
 
 Timers are cooperative and enforced when the handler/event stream is polled;
 they are not a background cancellation service and cannot interrupt blocking
 CPU work or a downstream that never polls again. Idle time is transport silence,
 not a post-content meaningful-progress or loop-detection policy: an endless
 heartbeat stream after content can remain live. The reference group-specific
-FirstToken policy, keepalives and slow-final-route exceptions are not replicated
-by these gateway-wide safety settings.
+FirstToken policy and slow-final-route exceptions are not replicated by these
+gateway-wide safety settings.
+
+## Downstream keepalive
+
+Two more root TOML settings, also pinned per request and exposed in protected
+GET `/config`, control SSE comments:
+
+- `stream_keepalive_interval_ms = 15000`: normal comment interval.
+- `stream_keepalive_max_silence_ms = 300000`: stop comments after this much
+  upstream transport silence. Either setting at zero disables keepalive.
+
+Only Chat, Anthropic and Responses clients receive `: keepalive\n`, with no
+extra blank separator. Gemini clients and nonstreaming requests bypass comments.
+The reference excludes Gemini because some clients reject SSE comments. The
+first comment can send HTTP 200/SSE headers while awaiting vendor headers or
+opening metadata. It contains no candidate model, usage or answer. Key/provider/
+group fallback can still choose another attempt in that same downstream stream.
+A fast failure before any comment preserves the original HTTP error status and
+JSON envelope. A later HTTP failure must instead use the client stream encoder,
+with exactly one error and no fabricated success. Known non-2xx body reads
+suppress comments, even if an earlier header-wait comment has already been sent.
+
+An attempt starts a fresh silence window; response headers and each nonempty
+transport chunk renew it, even when the bytes are ignored comments or incomplete
+frames. Downstream writes do not renew upstream activity. After handoff,
+upstream activity with no downstream output can send a comment after a one-second
+gap (capped by the configured interval). Completely quiet streams use the normal
+interval. The cap stops comments without closing the request or consuming extra
+credentials. New transport activity can resume comments. Configured upstream
+deadlines still independently decide whether to fail over or end the stream.
+
+The handler owns one pinned execution future. After a comment the response body
+owns that same future, including tracker, HTTP send and opening prefetch; it is
+not restarted or spawned elsewhere. A watch channel reports transport activity
+without retaining payloads. Once handoff completes, comments are inserted only
+between complete encoder output chunks, never inside SSE lines. Biased polling
+prioritizes ready reply/body output over a timer so terminal output is not delayed
+by a scheduled comment. Dropping either handler or body cancels the owned work.
+A heartbeat tick must not recreate an upstream header/read timeout.
+
+These are comments, not protocol events: they do not satisfy first-content,
+meaningful-progress or an Agent's event-only idle policy. Reference held-Responses
+quiet-agent metadata flushing, group timing/queue policies, and slow-final-route
+exceptions remain separate, unimplemented policies; this is not a claim of full
+reference keepalive or real-Agent conformance.
 
 ### Retry classification
 
@@ -145,7 +193,7 @@ transport failures and truncated streams use 502.
   free-form errors, firewall responses or retired models remain unimplemented.
 
 If all applicable candidates fail, the last attempt's error is delivered once
-in the client protocol. No new public configuration or management API is added.
+in the client protocol. Retry classification adds no management mutation API.
 
 ## Accounting and cancellation
 
@@ -233,6 +281,21 @@ limits, and HTTP header/error-body stalls. Drop guards verify release of every
 attempt, and assertions verify one error/record, selected-route usage and no extra
 same-endpoint key/cooldown spending.
 
-Group-specific timeout overrides, downstream keepalives, HTTP/2 cancellation
-conformance, post-content progress/loop detection and broader tool/multimodal
-conformance remain open.
+Thirteen `keepalive_*` real-HTTP tests add cross-dialect delayed headers and
+opening metadata, finite key/provider/group retries after comments, fast/late
+HTTP failures, header-timeout fallback, known-error suppression before/after
+comments, unchanged first-content/read-idle deadlines, post-content silence caps,
+ignored upstream heartbeats, one-second active gap, resumption after the cap,
+Gemini/nonstream/zero-setting exclusions, and 48 raw-socket disconnect cases
+after comments with selected-attempt JSONL persistence/reload. Existing terminal
+and fallback tests also run with the default keepalive wrapper. Three paused-clock
+unit tests exercise cadence, silence cap, activity resumption, error suppression,
+per-attempt reset, independent disable settings and extreme numeric settings.
+The policy was compared to local reference `internal/gateway/fallback.go`
+(held/quiet keepalive) and `internal/gateway/gateway.go` (translated relay gap).
+This evidence is local HTTP/1.1 and synthetic SSE, not a live vendor, TLS/proxy,
+HTTP/2 or real-Agent validation.
+
+Group-specific timeout overrides, held-Responses quiet-agent flushing, HTTP/2
+cancellation conformance, post-content progress/loop detection and broader
+tool/multimodal conformance remain open.

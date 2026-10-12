@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 use crate::config::{Config, GroupConfig, Protocol, ProviderConfig};
 use crate::config_store::{ConfigStore, IdempotencyRequest};
 use crate::cooldown::quota_cooldown;
+use crate::stream_keepalive::{self, Keepalive, UpstreamActivity};
 use crate::stream_timeout::{StreamClock, StreamTimeout};
 use crate::upstream;
 use crate::usage::{RequestLog, RequestTracker};
@@ -900,8 +901,8 @@ async fn send_with_fallback(
     initial: UpstreamRoute,
     group_plan: Option<&GroupRoutePlan>,
     tracker: &mut RequestTracker,
-    wire: ClientWire,
-) -> Result<(UpstreamReply, UpstreamCandidate), (Box<Response>, UpstreamCandidate)> {
+    activity: &UpstreamActivity,
+) -> Result<(UpstreamReply, UpstreamCandidate), (ProxyFailure, UpstreamCandidate)> {
     let routes = upstream_routes(
         config,
         &state.key_rotation,
@@ -933,6 +934,7 @@ async fn send_with_fallback(
         for (attempt, (key_slot, api_key)) in route.api_keys.iter().enumerate() {
             let candidate = UpstreamCandidate::new(&route, *key_slot);
             tracker.begin_attempt(&route.provider.id, &route.model, *key_slot);
+            activity.attempt();
             let body = upstream::build_request(&route.provider, creq, &route.model);
             tracing::debug!(
                 provider = %route.provider.id,
@@ -966,10 +968,7 @@ async fn send_with_fallback(
                     tracker.record_attempt(&route.provider.id, *key_slot, "504");
                     if route_index == last_route {
                         return Err((
-                            Box::new(err_response(
-                                StatusCode::GATEWAY_TIMEOUT,
-                                wire.error_body(StatusCode::GATEWAY_TIMEOUT, timeout.message()),
-                            )),
+                            ProxyFailure::new(StatusCode::GATEWAY_TIMEOUT, timeout.message()),
                             candidate,
                         ));
                     }
@@ -982,10 +981,7 @@ async fn send_with_fallback(
                     tracing::warn!("{message}");
                     if route_index == last_route {
                         return Err((
-                            Box::new(err_response(
-                                StatusCode::BAD_GATEWAY,
-                                wire.error_body(StatusCode::BAD_GATEWAY, &message),
-                            )),
+                            ProxyFailure::new(StatusCode::BAD_GATEWAY, message),
                             candidate,
                         ));
                     }
@@ -996,14 +992,21 @@ async fn send_with_fallback(
             };
 
             let status = resp.status();
+            activity.headers(status.is_success());
             if status.is_success() {
                 if !creq.stream {
                     tracker.record_attempt(&route.provider.id, *key_slot, "ok");
                     return Ok((UpstreamReply::Json(resp), candidate));
                 }
                 let headers = resp.headers().clone();
-                let (events, failure) =
-                    prefetch_stream(resp, route.provider.protocol, tracker, clock).await;
+                let (events, failure) = prefetch_stream(
+                    resp,
+                    route.provider.protocol,
+                    tracker,
+                    clock,
+                    activity.clone(),
+                )
+                .await;
                 if let Some(failure) = failure {
                     tracker.record_attempt(&route.provider.id, *key_slot, "upstream_stream_error");
                     if quota_limited_status(failure.status) {
@@ -1039,10 +1042,7 @@ async fn send_with_fallback(
                     tracker.record_attempt(&route.provider.id, *key_slot, "504");
                     if route_index == last_route {
                         return Err((
-                            Box::new(err_response(
-                                StatusCode::GATEWAY_TIMEOUT,
-                                wire.error_body(StatusCode::GATEWAY_TIMEOUT, timeout.message()),
-                            )),
+                            ProxyFailure::new(StatusCode::GATEWAY_TIMEOUT, timeout.message()),
                             candidate,
                         ));
                     }
@@ -1076,20 +1076,32 @@ async fn send_with_fallback(
                 break;
             }
             let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            return Err((
-                Box::new(err_response(status, wire.error_body(status, &detail))),
-                candidate,
-            ));
+            return Err((ProxyFailure::new(status, detail), candidate));
         }
     }
 
     Err((
-        Box::new(err_response(
-            StatusCode::BAD_GATEWAY,
-            wire.error_body(StatusCode::BAD_GATEWAY, "no upstream route"),
-        )),
+        ProxyFailure::new(StatusCode::BAD_GATEWAY, "no upstream route"),
         no_route,
     ))
+}
+
+struct ProxyFailure {
+    status: StatusCode,
+    message: String,
+}
+
+impl ProxyFailure {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
+    fn response(self, wire: ClientWire) -> Response {
+        err_response(self.status, wire.error_body(self.status, &self.message))
+    }
 }
 
 fn err_response(status: StatusCode, body: Value) -> Response {
@@ -1151,87 +1163,168 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
         Err((status, body)) => return err_response(status, body),
     };
 
-    let mut tracker = RequestTracker::new(
-        state.requests.clone(),
-        wire.name(),
-        &creq,
-        &initial.provider.id,
-        &initial.model,
-        0,
-    );
-    let (reply, candidate) = match send_with_fallback(
-        &state,
-        &config,
-        &creq,
-        initial,
-        group_plan.as_ref(),
-        &mut tracker,
-        wire,
-    )
-    .await
-    {
-        Ok((resp, candidate)) => {
-            tracker.set_route(&candidate.provider.id, &candidate.model, candidate.key_slot);
-            (resp, candidate)
-        }
-        Err((response, candidate)) => {
-            tracker.set_route(&candidate.provider.id, &candidate.model, candidate.key_slot);
-            tracker.finish("upstream_error", &Usage::default());
-            return *response;
-        }
+    let (activity, keepalive) = if creq.stream && !matches!(wire, ClientWire::Gemini) {
+        Keepalive::new(
+            config.stream_keepalive_interval_ms,
+            config.stream_keepalive_max_silence_ms,
+        )
+    } else {
+        (UpstreamActivity::default(), None)
     };
-    let protocol = candidate.provider.protocol;
-
-    let mut events = match reply {
-        UpstreamReply::Json(resp) => {
-            let upstream_body: Value = match resp.json().await {
-                Ok(v) => v,
-                Err(e) => {
-                    let message = format!("bad upstream body: {e}");
-                    tracker.finish("bad_upstream_body", &Usage::default());
-                    return err_response(
-                        StatusCode::BAD_GATEWAY,
-                        wire.error_body(StatusCode::BAD_GATEWAY, &message),
-                    );
-                }
-            };
-            let mut status = "ok";
-            let ir = decode_upstream_response(protocol, &upstream_body).unwrap_or_else(|e| {
-                tracing::warn!("decoding upstream reply: {e}");
-                status = "upstream_decode_error";
-                magpie_core::ir::CompletionResponse::default()
-            });
-            tracker.finish(status, &ir.usage);
-            return ok_json(wire.encode_response(&ir));
-        }
-        UpstreamReply::Stream(events) => events,
-    };
-
-    let client_model = creq.model.clone();
-    let out = async_stream::stream! {
-        let mut encoder = ClientStreamEncoder::new(wire, &client_model);
-        while let Some(item) = events.next().await {
-            let event = item.event;
-            if !item.usage_observed && let StreamEvent::Usage(usage) = &event {
-                tracker.observe_usage(usage);
+    let model = creq.model.clone();
+    // Keep ownership through both header waiting and body polling. Dropping
+    // either stage cancels the same work and finalizes the same tracker.
+    let execute = async move {
+        let mut tracker = RequestTracker::new(
+            state.requests.clone(),
+            wire.name(),
+            &creq,
+            &initial.provider.id,
+            &initial.model,
+            0,
+        );
+        let (reply, candidate) = match send_with_fallback(
+            &state,
+            &config,
+            &creq,
+            initial,
+            group_plan.as_ref(),
+            &mut tracker,
+            &activity,
+        )
+        .await
+        {
+            Ok((resp, candidate)) => {
+                tracker.set_route(&candidate.provider.id, &candidate.model, candidate.key_slot);
+                (resp, candidate)
             }
-            let terminal_status = match &event {
-                StreamEvent::Done => Some("ok"),
-                StreamEvent::Error { .. } => Some("upstream_stream_error"),
-                _ => None,
-            };
-            if let Some(status) = terminal_status {
-                // Release the HTTP response before yielding the final frame,
-                // even if the downstream is backpressured or stops polling.
-                drop(events);
-                tracker.finish(status, &Usage::default());
+            Err((response, candidate)) => {
+                tracker.set_route(&candidate.provider.id, &candidate.model, candidate.key_slot);
+                tracker.finish("upstream_error", &Usage::default());
+                return Err(response);
+            }
+        };
+        let protocol = candidate.provider.protocol;
+
+        let mut events = match reply {
+            UpstreamReply::Json(resp) => {
+                let upstream_body: Value = match resp.json().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let message = format!("bad upstream body: {e}");
+                        tracker.finish("bad_upstream_body", &Usage::default());
+                        return Err(ProxyFailure::new(StatusCode::BAD_GATEWAY, message));
+                    }
+                };
+                let mut status = "ok";
+                let ir = decode_upstream_response(protocol, &upstream_body).unwrap_or_else(|e| {
+                    tracing::warn!("decoding upstream reply: {e}");
+                    status = "upstream_decode_error";
+                    magpie_core::ir::CompletionResponse::default()
+                });
+                tracker.finish(status, &ir.usage);
+                return Ok(ok_json(wire.encode_response(&ir)));
+            }
+            UpstreamReply::Stream(events) => events,
+        };
+
+        let client_model = creq.model.clone();
+        let out = async_stream::stream! {
+            let mut encoder = ClientStreamEncoder::new(wire, &client_model);
+            while let Some(item) = events.next().await {
+                let event = item.event;
+                if !item.usage_observed && let StreamEvent::Usage(usage) = &event {
+                    tracker.observe_usage(usage);
+                }
+                let terminal_status = match &event {
+                    StreamEvent::Done => Some("ok"),
+                    StreamEvent::Error { .. } => Some("upstream_stream_error"),
+                    _ => None,
+                };
+                if let Some(status) = terminal_status {
+                    // Release the HTTP response before yielding the final frame,
+                    // even if the downstream is backpressured or stops polling.
+                    drop(events);
+                    tracker.finish(status, &Usage::default());
+                    if let Some(frame) = encoder.encode(&event) {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                    }
+                    return;
+                }
                 if let Some(frame) = encoder.encode(&event) {
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                 }
+            }
+        };
+        Ok(sse_response(Body::from_stream(out)))
+    };
+    match keepalive {
+        Some(keepalive) => keepalive_response(execute, keepalive, wire, model).await,
+        None => execute.await.unwrap_or_else(|error| error.response(wire)),
+    }
+}
+
+/// Delay HTTP commitment until a reply or the first comment. A comment exposes
+/// no candidate metadata and must never prevent safe pre-content fallback.
+async fn keepalive_response(
+    execute: impl std::future::Future<Output = Result<Response, ProxyFailure>> + Send + 'static,
+    mut keepalive: Keepalive,
+    wire: ClientWire,
+    model: String,
+) -> Response {
+    let mut execute = Box::pin(execute);
+    let mut wrote = tokio::time::Instant::now();
+    let first = tokio::select! {
+        biased;
+        reply = &mut execute => Some(reply),
+        _ = keepalive.wait(wrote, false) => None,
+    };
+    if let Some(Err(error)) = first {
+        return error.response(wire);
+    }
+    let out = async_stream::stream! {
+        let reply = match first {
+            Some(reply) => reply,
+            None => loop {
+                wrote = tokio::time::Instant::now();
+                yield Ok::<Bytes, axum::Error>(Bytes::from_static(stream_keepalive::COMMENT));
+                tokio::select! {
+                    biased;
+                    reply = &mut execute => break reply,
+                    _ = keepalive.wait(wrote, false) => {},
+                }
+            },
+        };
+        drop(execute);
+        let response = match reply {
+            Ok(response) => response,
+            Err(error) => {
+                // Headers already say 200/SSE. Report exactly one stream error,
+                // not a JSON HTTP error or a fabricated completion marker.
+                let event = StreamEvent::Error { message: error.message };
+                if let Some(frame) = ClientStreamEncoder::new(wire, &model).encode(&event) {
+                    yield Ok(Bytes::from(frame));
+                }
                 return;
             }
-            if let Some(frame) = encoder.encode(&event) {
-                yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+        };
+        let mut bytes = response.into_body().into_data_stream();
+        loop {
+            tokio::select! {
+                biased;
+                chunk = bytes.next() => match chunk {
+                    Some(chunk) => {
+                        if chunk.as_ref().is_ok_and(|chunk| !chunk.is_empty()) {
+                            wrote = tokio::time::Instant::now();
+                        }
+                        yield chunk;
+                    }
+                    None => return,
+                },
+                _ = keepalive.wait(wrote, true) => {
+                    wrote = tokio::time::Instant::now();
+                    yield Ok(Bytes::from_static(stream_keepalive::COMMENT));
+                },
             }
         }
     };
@@ -1274,11 +1367,12 @@ async fn prefetch_stream(
     protocol: Protocol,
     tracker: &mut RequestTracker,
     clock: StreamClock,
+    activity: UpstreamActivity,
 ) -> (UpstreamEvents, Option<StreamFailure>) {
     const MAX_OPENING_EVENTS: usize = 64;
     const MAX_OPENING_METADATA_BYTES: usize = 64 * 1024;
     let mut metadata_bytes = 0;
-    let mut events: UpstreamEvents = Box::pin(upstream_events(response, protocol, clock));
+    let mut events: UpstreamEvents = Box::pin(upstream_events(response, protocol, clock, activity));
     let mut prefix = Vec::new();
     while let Some(mut item) = events.next().await {
         if let StreamEvent::Usage(usage) = &item.event {
@@ -1334,6 +1428,7 @@ fn upstream_events(
     response: reqwest::Response,
     protocol: Protocol,
     mut clock: StreamClock,
+    activity: UpstreamActivity,
 ) -> impl futures::Stream<Item = UpstreamEvent> {
     async_stream::stream! {
         let mut bytes = response.bytes_stream();
@@ -1357,6 +1452,7 @@ fn upstream_events(
                     return;
                 }
             };
+            activity.chunk(&chunk);
             let mut remaining = chunk.as_ref();
             loop {
                 let data = match parser.feed(&mut remaining) {
