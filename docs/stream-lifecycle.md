@@ -123,7 +123,7 @@ the existing client stream-error encoder (the transport status is already 200).
 Timers are cooperative and enforced when the handler/event stream is polled;
 they are not a background cancellation service and cannot interrupt blocking
 CPU work or a downstream that never polls again. Idle time is transport silence,
-not a post-content meaningful-progress or loop-detection policy: an endless
+not a post-content meaningful-progress policy: an endless
 heartbeat stream after content can remain live. Group first-content switching
 is a separate policy described below; disabling its cap on the final route does
 not disable these gateway-wide safety settings.
@@ -171,7 +171,7 @@ per-attempt budgets, zero/extreme values and ready-result precedence. API and
 child-CLI tests cover persistence, editing, defaults and invalid input; the
 browser fixture exercises save/reopen/reset and native field validation.
 This does not implement the reference's queue, slow-final-route waiting UI,
-post-content progress/loop policies or HTTP/2 cancellation conformance, and does
+reasoning-only continuation/reask or HTTP/2 cancellation conformance, and does
 not establish live-vendor or installed-Agent compatibility.
 
 ## Downstream keepalive
@@ -274,6 +274,71 @@ transport failures and truncated streams use 502.
 If all applicable candidates fail, the last attempt's error is delivered once
 in the client protocol. Retry classification adds no management mutation API.
 
+## Repetition-loop protection
+
+Root TOML `stream_loop_guard` defaults to `true` for new and legacy files; an
+explicit `false` disables it. It is exposed in protected GET `/config` and pinned
+for the request. Editing the TOML and restarting is currently the user-facing
+way to change it; there is no root-settings edit endpoint or console toggle.
+Each upstream attempt owns a fresh guard. No background task is spawned.
+
+The guard consumes decoded canonical `TextDelta` and `ThinkingDelta` events,
+with independent state for each channel. All four upstream/client protocols use
+this path, including both Responses `response.reasoning_summary_text.delta` and
+`response.reasoning_text.delta` (and both Chat reasoning aliases). Start, usage,
+empty deltas, SSE comments, signatures, tool starts/arguments/ends and other
+metadata do not add prose units. Nonstreaming JSON replies never enter the guard.
+
+The reference is `internal/gateway/loop_guard.go` and `loop_guard_test.go`:
+
+- A newline, a space after a letter-bearing sentence ending in `.!?`, or a CJK
+  `。！？` ends a unit. Trimmed, lowercased units lose trailing sentence punctuation.
+  A unit counts only if it has a word token with a letter and no numeric
+  character; standalone braces, digit/hex/version-only lines do not count.
+- The rolling channel window holds **256** word-bearing units. If at most
+  **24** distinct normalized keys remain, it trips. Keys retain at most the first
+  **256 UTF-8 bytes**, without splitting a character. Distinct text beyond this
+  prefix is intentionally not distinguished, so this is not exact semantic
+  repetition detection.
+- An unbroken unit is processed after **4096 bytes** (a final multibyte character
+  may cross the bound). A repeated byte period of 1–64 bytes, or at most **8**
+  distinct word tokens at sufficient density (`words * 32 >= bytes`), marks a
+  run-on unit. **Two consecutive** marked units trip. A short natural break
+  clears this run; sufficiently long repetitive line tails preserve it.
+- Unit storage, keys and counts are bounded. Lite stores full bounded keys, not
+  reference FNV hashes, avoiding hash-collision classification. Character
+  classification uses Rust's alphabetic/numeric predicates; Unicode edge cases
+  and safe UTF-8 truncation are not claimed bit-identical to Go's letter/digit
+  categories and byte truncation. The thresholds and common-text behavior match.
+
+The triggering decoded delta is forwarded **whole**, then one terminal protocol
+error ends the selected stream and releases the upstream, including on a final
+unterminated SSE frame at EOF. Text later inside that same delta may therefore
+be visible; later decoded events are not. No successful completion marker is
+fabricated. Content/reasoning has committed the candidate: the guard cannot spend
+another key, switch provider/group, or splice/replay an answer. Unlike the
+reference's diagnostic quote, Lite's fixed error message includes no generated
+text or credentials. The final record uses `upstream_stream_error`, retains only
+observed selected-attempt usage, and sanitized JSONL history survives reload.
+
+This is a repetition heuristic, not a no-progress timeout, total-answer limit
+or guarantee against false positives. It does not end a heartbeats-only stall
+after content, and it does not implement the reference's optional translated
+reasoning-only continuation/reask. The latter remains a separate parity gap.
+
+Seven unit tests cover chunk boundaries, text/reasoning independence, exact
+window/distinct thresholds, eviction, run-on cycles and short-break reset,
+Unicode, real source/document negatives and bounded storage. Configuration tests
+cover legacy defaults, explicit disable, snapshots and invalid types. Eight
+`loop_guard_*` local HTTP tests cover four-by-four protocol combinations,
+reasoning aliases, enable/disable, no replay after content, EOF flush, tools/code
+and nonstream exclusions, pinned edits and fresh request windows. Interaction
+fixtures exercise key/provider/group fallback followed by comments then a loop,
+selected-attempt usage and JSONL reload without secrets/reply quotes, and actual
+socket cancellation below the loop threshold without a late duplicate record.
+These are synthetic local HTTP/1.1 fixtures, not paid/live-vendor, real-Agent or
+HTTP/2 conformance evidence.
+
 ## Accounting and cancellation
 
 Usage reports are cumulative: later known fields replace earlier values,
@@ -375,6 +440,7 @@ The policy was compared to local reference `internal/gateway/fallback.go`
 This evidence is local HTTP/1.1 and synthetic SSE, not a live vendor, TLS/proxy,
 HTTP/2 or real-Agent validation.
 
-Group-specific timeout overrides, post-content event-idle policies, HTTP/2
-cancellation conformance, post-content progress/loop detection and broader
-tool/multimodal conformance remain open.
+Queue/slow-final-route behavior, reasoning-only continuation/reask, HTTP/2
+cancellation conformance and broader tool/multimodal conformance remain open.
+Post-content event-idle/meaningful-progress timeouts are also not implemented;
+they are distinct from the repetition guard and transport-idle limits.

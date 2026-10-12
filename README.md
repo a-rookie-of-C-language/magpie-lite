@@ -148,6 +148,27 @@ opening commits that attempt: later failures become stream errors, not retries.
 It does not reset first-content or upstream read-idle deadlines. This is not a
 post-content progress policy or a claim of real-Agent compatibility.
 
+## Repetition-loop protection
+
+`stream_loop_guard = true` is the root TOML default, including for older config
+files. Set it to `false` and restart to disable it; protected GET `/config`
+reports the setting. Requests pin it when they begin.
+
+The guard observes streamed text and reasoning separately after all four
+upstream dialects are decoded. A channel trips when its last **256 word-bearing
+lines/sentences contain at most 24 different normalized units**, or when two
+successive **4096-byte run-on units** repeat the same short pattern/few words.
+It is a bounded heuristic, not a semantic judge; unusually repetitive valid
+prose can trip it. Tool arguments, metadata and nonstreaming replies are excluded.
+
+Already received content, including the triggering delta, is preserved. The
+selected stream ends with one client-protocol error, not a successful completion
+or a fallback/replay. The upstream is released and observed selected-attempt
+usage is retained. Errors do not quote the repeated reply; sanitized JSONL
+history stores neither prompt nor reply content. There is no automatic
+reasoning-only continuation/reask yet. See `docs/stream-lifecycle.md` for exact
+limits and reproducible fixture evidence.
+
 ## Editing providers
 
 The protected web console can create, edit, and delete providers without restarting the gateway. Provider metadata and route lists are editable directly; API keys are never returned. When editing an existing provider, choose **Keep existing keys**, **Replace key pool**, or **No upstream authentication** explicitly. New requests use a saved provider immediately, while in-flight requests keep their original endpoint and credential snapshot.

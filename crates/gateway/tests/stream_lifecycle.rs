@@ -3985,3 +3985,263 @@ async fn loop_guard_is_pinned_per_request_and_fresh_for_following_requests() {
     }
     f.assert_released().await;
 }
+
+fn assert_loop_history(history: &std::path::Path, record: &Value) {
+    let path = history.join("requests.jsonl");
+    let persisted = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(persisted.lines().count(), 1);
+    assert_eq!(serde_json::from_str::<Value>(&persisted).unwrap(), *record);
+    for private in [
+        "secret-",
+        "private cancellation prompt",
+        "private repeated reply",
+        "abandoned-model",
+        "SHOULD-NOT-LEAK",
+    ] {
+        assert!(
+            !persisted.contains(private),
+            "private content in history: {private}"
+        );
+    }
+    let restored = RequestLog::open(&path).unwrap().snapshot().recent_requests;
+    assert_eq!(restored.len(), 1);
+    assert_eq!(serde_json::to_value(&restored[0]).unwrap(), *record);
+}
+
+#[tokio::test]
+async fn loop_guard_after_fallback_and_keepalive_persists_only_selected_partial_usage() {
+    use magpie_gateway::{GroupConfig, RoutingPolicy};
+    for grouped in [false, true] {
+        for upstream in PROTOCOLS {
+            for client in PROTOCOLS {
+                let f = Fixture::with_chunk_size(
+                    Protocol::Chat,
+                    vec![
+                        opening(Protocol::Chat).to_owned() + limited(Protocol::Chat),
+                        prefix(upstream),
+                        prefix(upstream) + completion(upstream),
+                    ],
+                    Ending::PerSlot(vec![
+                        Ending::Hold,
+                        Ending::Paced(vec![(
+                            Duration::from_millis(160),
+                            loop_delta(upstream, true, &"private repeated reply.\n".repeat(300))
+                                + &loop_delta(upstream, false, "SHOULD-NOT-LEAK")
+                                + completion(upstream),
+                        )]),
+                        Ending::Hold,
+                    ]),
+                    4096,
+                    |config| {
+                        enable_fast_keepalive(config);
+                        config.provider[0].api_keys = vec!["secret-upstream-key-0".into()];
+                        let mut spare = config.provider[0].clone();
+                        spare.id = "spare".into();
+                        spare.protocol = upstream;
+                        spare.models = vec!["backup-model".into()];
+                        spare.api_keys = vec![
+                            "secret-upstream-key-1".into(),
+                            "secret-upstream-key-2".into(),
+                        ];
+                        if grouped {
+                            config.group.push(GroupConfig {
+                                id: "daily".into(),
+                                name: "Daily".into(),
+                                routes: vec!["mock/up-model".into(), "spare/backup-model".into()],
+                                routing: RoutingPolicy::Order,
+                                first_token_timeout_ms: 0,
+                            });
+                        } else {
+                            config.provider[0].fallback = vec!["spare/backup-model".into()];
+                        }
+                        config.provider.push(spare);
+                    },
+                )
+                .await;
+                let history = f.persistent_history();
+                let requested = if grouped {
+                    "group/daily"
+                } else {
+                    "mock/up-model"
+                };
+                let (path, mut request) = client_request(client, requested, true);
+                match client {
+                    Protocol::Responses => request["input"] = json!("private cancellation prompt"),
+                    Protocol::Gemini => {
+                        request["contents"][0]["parts"][0]["text"] =
+                            json!("private cancellation prompt")
+                    }
+                    _ => request["messages"][0]["content"] = json!("private cancellation prompt"),
+                }
+                let mut response = tokio::time::timeout(
+                    LIMIT,
+                    reqwest::Client::new()
+                        .post(format!("{}{path}", f.gateway.url))
+                        .bearer_auth("secret-local-token")
+                        .json(&request)
+                        .send(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(response.status(), 200);
+                let mut body = read_through(&mut response, "partial").await;
+                if client != Protocol::Gemini {
+                    body += &read_through(&mut response, KEEPALIVE).await;
+                }
+                body += &tokio::time::timeout(LIMIT, response.text())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_one_stream_error(&body, client, "model's reasoning was stuck in a loop");
+                assert!(!body.contains("SHOULD-NOT-LEAK"));
+                assert!(!body.contains("abandoned-model"));
+                assert_eq!(
+                    *f.attempts.lock().unwrap(),
+                    [0, 1],
+                    "loop cannot spend the spare key or replay the group"
+                );
+                assert_eq!(*f.sent_models.lock().unwrap(), ["up-model", "backup-model"]);
+                let record = f.record().await;
+                assert_eq!(record["requested_model"], requested);
+                assert_eq!(record["provider"], "spare");
+                assert_eq!(record["upstream_model"], "backup-model");
+                assert_eq!(record["key_slot"], 0);
+                assert_eq!(record["status"], "upstream_stream_error");
+                assert_partial_usage(&record, upstream);
+                assert_loop_history(history.path(), &record);
+                f.assert_released().await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn loop_guard_does_not_change_repetitive_nonstreaming_replies() {
+    let repeated = "private repeated reply.\n".repeat(300);
+    for upstream in PROTOCOLS {
+        let reply = match upstream {
+            Protocol::Chat => {
+                json!({"model":"up-model", "choices":[{"message":{"role":"assistant", "content":repeated, "reasoning_content":repeated},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3}})
+            }
+            Protocol::Anthropic => {
+                json!({"type":"message","role":"assistant","model":"up-model","content":[{"type":"text","text":repeated},{"type":"thinking","thinking":repeated}],"stop_reason":"end_turn","usage":{"input_tokens":7,"output_tokens":3}})
+            }
+            Protocol::Responses => {
+                json!({"model":"up-model","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":repeated}]}],"usage":{"input_tokens":7,"output_tokens":3}})
+            }
+            Protocol::Gemini => {
+                json!({"modelVersion":"up-model","candidates":[{"content":{"role":"model","parts":[{"text":repeated},{"thought":true,"text":repeated}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}})
+            }
+        };
+        for client in PROTOCOLS {
+            let f = Fixture::with_config(
+                upstream,
+                vec![reply.to_string()],
+                Ending::Eof,
+                enable_fast_keepalive,
+            )
+            .await;
+            let history = f.persistent_history();
+            let (path, request) = client_request(client, "mock/up-model", false);
+            let response = tokio::time::timeout(
+                LIMIT,
+                reqwest::Client::new()
+                    .post(format!("{}{path}", f.gateway.url))
+                    .bearer_auth("secret-local-token")
+                    .json(&request)
+                    .send(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.headers()["content-type"], "application/json");
+            let reply = tokio::time::timeout(LIMIT, response.json::<Value>())
+                .await
+                .unwrap()
+                .unwrap();
+            let text = match client {
+                Protocol::Chat => reply["choices"][0]["message"]["content"].as_str().unwrap(),
+                Protocol::Anthropic => reply["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|v| v["type"] == "text")
+                    .unwrap()["text"]
+                    .as_str()
+                    .unwrap(),
+                Protocol::Responses => reply["output"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|v| v["type"] == "message")
+                    .unwrap()["content"][0]["text"]
+                    .as_str()
+                    .unwrap(),
+                Protocol::Gemini => reply["candidates"][0]["content"]["parts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|v| v["thought"] != true)
+                    .unwrap()["text"]
+                    .as_str()
+                    .unwrap(),
+            };
+            assert_eq!(text, repeated);
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            let record = f.record().await;
+            assert_eq!(record["status"], "ok");
+            assert_eq!(record["stream"], false);
+            assert_eq!(record["usage"]["input"], 7);
+            assert_eq!(record["usage"]["output"], 3);
+            assert_loop_history(history.path(), &record);
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn loop_guard_pending_window_is_dropped_on_client_disconnect_without_late_record() {
+    use tokio::io::AsyncReadExt;
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            let script = prefix(upstream)
+                + &loop_delta(upstream, true, &"private repeated reply.\n".repeat(200))
+                + &loop_delta(upstream, false, "window-ready");
+            let f = Fixture::with_chunk_size(
+                upstream,
+                vec![script],
+                Ending::Hold,
+                4096,
+                enable_fast_keepalive,
+            )
+            .await;
+            let history = f.persistent_history();
+            let mut socket = f.socket_request(client, "mock/up-model", true).await;
+            tokio::time::timeout(LIMIT, async {
+                let mut body = Vec::new();
+                loop {
+                    let mut buf = [0; 4096];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0, "guard ended below its window threshold");
+                    body.extend_from_slice(&buf[..n]);
+                    if String::from_utf8_lossy(&body).contains("window-ready") {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            drop(socket);
+            let record = f.record().await;
+            assert_eq!(record["status"], "client_disconnected");
+            assert_partial_usage(&record, upstream);
+            f.assert_released().await;
+            // No detached loop detector or keepalive can produce another record.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(f.log.lock().unwrap().snapshot().recent_requests.len(), 1);
+            assert_loop_history(history.path(), &record);
+        }
+    }
+}
