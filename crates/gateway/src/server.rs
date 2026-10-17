@@ -636,7 +636,7 @@ impl ClientWire {
 enum ClientStreamEncoder {
     Chat(chat::ChatChunkEncoder),
     Anthropic(anthropic::AnthropicStreamEncoder),
-    Responses(responses::ResponsesStreamEncoder),
+    Responses(Box<responses::ResponsesStreamEncoder>),
     Gemini(gemini::GeminiStreamEncoder),
 }
 
@@ -647,16 +647,18 @@ impl ClientStreamEncoder {
                 Self::Chat(chat::ChatChunkEncoder::new(model, include_usage))
             }
             ClientWire::Anthropic => Self::Anthropic(anthropic::AnthropicStreamEncoder::new(model)),
-            ClientWire::Responses => Self::Responses(responses::ResponsesStreamEncoder::new(model)),
+            ClientWire::Responses => {
+                Self::Responses(Box::new(responses::ResponsesStreamEncoder::new(model)))
+            }
             ClientWire::Gemini => Self::Gemini(gemini::GeminiStreamEncoder::new(model)),
         }
     }
 
     fn for_request(wire: ClientWire, req: &CompletionRequest) -> Self {
         match wire {
-            ClientWire::Responses => Self::Responses(
+            ClientWire::Responses => Self::Responses(Box::new(
                 responses::ResponsesStreamEncoder::for_request(&req.model, req),
-            ),
+            )),
             _ => Self::new(wire, &req.model),
         }
     }

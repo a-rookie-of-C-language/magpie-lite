@@ -34,6 +34,17 @@ name. Namespace and function names cannot contain `__`; nested namespaces and
 namespace-scoped custom tools are rejected. Invalid namespaced streaming items
 fail closed without emitting a tool call.
 
+Responses custom (free-form) tools are supported flat and inside one namespace
+level. A `custom` declaration is decoded as an input function: its description
+documents the required `input` string (plus a declared grammar), and its
+constant schema keeps foreign dialects on ordinary JSON arguments. A model call
+to that function is restored to `custom_tool_call` (with `input` and, when
+declared in a namespace, the `namespace` field) in JSON replies, history
+round-trips and `custom_tool_call_input.delta` streams. Restoration is based on
+the request's current declarations, so history replay keeps the tool
+declarations. Custom formats other than a grammar definition, duplicate custom
+names, and nested namespaces over custom tools fail closed at decode time.
+
 Hosted-search requests other than Responses `allowed_tools` continue to use the
 existing search translator's native-option and global/function-choice contract.
 Gemini function configurations are validated before that delegation: search

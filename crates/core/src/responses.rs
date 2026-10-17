@@ -14,6 +14,50 @@ use crate::ir::{
 use crate::stream::StreamEvent;
 use serde_json::{Map, Value, json};
 
+/// The schema a custom tool is offered as taking when translated to a
+/// function dialect: one required string argument, nothing else.
+const CUSTOM_SCHEMA: &str = r#"{"type":"object","properties":{"input":{"type":"string","description":"The tool's free-form input, the whole of it, exactly as it is to be run."}},"required":["input"],"additionalProperties":false}"#;
+
+/// A custom tool's description as a function's: its own, plus what its
+/// input is and the grammar that input follows, when one was declared.
+fn custom_description(description: &str, format: Option<&Value>) -> String {
+    let mut d = description.trim().to_owned();
+    if !d.is_empty() {
+        d.push_str("\n\n");
+    }
+    d.push_str("Put the tool's whole free-form input, as it is to be run, in the `input` string; it is passed on as written, so it is not itself JSON.");
+    if let Some(f) = format
+        && f.get("type").and_then(Value::as_str) == Some("grammar")
+        && let Some(definition) = f
+            .get("definition")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    {
+        let syntax = f
+            .get("syntax")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("the");
+        d.push_str(&format!(
+            "\n\nThe input follows this {syntax} grammar:\n{definition}"
+        ));
+    }
+    d
+}
+
+/// The free-form input of a model's call to a custom tool offered as a
+/// function: its `input` argument, else the string it gave, else the raw text.
+fn custom_input(args: &Value) -> String {
+    if let Some(s) = args.get("input").and_then(Value::as_str) {
+        return s.to_owned();
+    }
+    if let Some(s) = args.as_str() {
+        return s.to_owned();
+    }
+    args.to_string()
+}
+
 fn missing(field: &'static str) -> CoreError {
     CoreError::MissingField(field)
 }
@@ -134,6 +178,12 @@ fn set_call_namespace(item: &mut Value, namespace: &str) {
     item["encrypted_function_args"] = json!([]);
 }
 
+/// Whether a call in the IR answers a custom tool declared on the current
+/// request. History alone never marks a tool custom; declarations do.
+fn is_custom_call(tools: &[Tool], name: &str) -> bool {
+    tools.iter().any(|tool| tool.name == name && tool.custom)
+}
+
 /// Decode a streamed Responses function-call identity into the shared IR.
 /// Responses carries the namespace separately; other dialects only see the
 /// flattened name, so the namespace is retained only as source metadata.
@@ -173,23 +223,47 @@ fn decode_tools(tools: Option<&Vec<Value>>) -> Result<Vec<Tool>> {
             .and_then(Value::as_str)
             .unwrap_or("function")
         {
-            "function" => {
+            "function" | "custom" => {
+                let custom = tool.get("type").and_then(Value::as_str) == Some("custom");
                 let name = component(tool.get("name"), "name")?;
+                if custom
+                    && let Some(format) = tool.get("format")
+                    && !format.is_null()
+                    && !format.is_object()
+                {
+                    return Err(CoreError::Invalid {
+                        field: "tools",
+                        detail: "custom tool format must be an object".into(),
+                    });
+                }
                 if !seen.insert(name.clone()) {
                     return Err(CoreError::Invalid {
                         field: "tools",
-                        detail: "duplicate function name".into(),
+                        detail: "duplicate tool name".into(),
                     });
                 }
                 out.push(Tool {
                     name,
                     namespace: None,
-                    description: tool
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    parameters: tool.get("parameters").cloned().unwrap_or_else(|| json!({})),
+                    description: if custom {
+                        custom_description(
+                            tool.get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or(""),
+                            tool.get("format"),
+                        )
+                    } else {
+                        tool.get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned()
+                    },
+                    parameters: if custom {
+                        serde_json::from_str(CUSTOM_SCHEMA).expect("constant schema")
+                    } else {
+                        tool.get("parameters").cloned().unwrap_or_else(|| json!({}))
+                    },
+                    custom,
                 });
             }
             "namespace" => {
@@ -199,7 +273,8 @@ fn decode_tools(tools: Option<&Vec<Value>>) -> Result<Vec<Tool>> {
                     .and_then(Value::as_array)
                     .ok_or(missing("tools"))?;
                 for child in nested {
-                    if child.get("type").and_then(Value::as_str) != Some("function") {
+                    let child_type = child.get("type").and_then(Value::as_str);
+                    if !matches!(child_type, Some("function") | Some("custom")) {
                         return Err(CoreError::Invalid {
                             field: "tools",
                             detail: "nested namespaces and custom tools are unsupported".into(),
@@ -213,19 +288,46 @@ fn decode_tools(tools: Option<&Vec<Value>>) -> Result<Vec<Tool>> {
                             detail: "duplicate flattened function name".into(),
                         });
                     }
-                    out.push(Tool {
-                        name,
-                        namespace: Some(namespace.clone()),
-                        description: child
-                            .get("description")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                        parameters: child
-                            .get("parameters")
-                            .cloned()
-                            .unwrap_or_else(|| json!({})),
-                    });
+                    if child_type == Some("custom") {
+                        if let Some(format) = child.get("format")
+                            && !format.is_null()
+                            && !format.is_object()
+                        {
+                            return Err(CoreError::Invalid {
+                                field: "tools",
+                                detail: "custom tool format must be an object".into(),
+                            });
+                        }
+                        out.push(Tool {
+                            name,
+                            namespace: Some(namespace.clone()),
+                            description: custom_description(
+                                child
+                                    .get("description")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or(""),
+                                child.get("format"),
+                            ),
+                            parameters: serde_json::from_str(CUSTOM_SCHEMA)
+                                .expect("constant schema"),
+                            custom: true,
+                        });
+                    } else {
+                        out.push(Tool {
+                            name,
+                            namespace: Some(namespace.clone()),
+                            description: child
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                            parameters: child
+                                .get("parameters")
+                                .cloned()
+                                .unwrap_or_else(|| json!({})),
+                            custom: false,
+                        });
+                    }
                 }
             }
             _ => {}
@@ -308,7 +410,8 @@ fn decode_input_item(item: &Value, messages: &mut Vec<Message>) -> Result<()> {
                 messages.push(Message { role, parts });
             }
         }
-        "function_call" => {
+        "function_call" | "custom_tool_call" => {
+            let custom = ty == "custom_tool_call";
             let namespace = item.get("namespace");
             if namespace.is_some()
                 && (namespace
@@ -324,12 +427,15 @@ fn decode_input_item(item: &Value, messages: &mut Vec<Message>) -> Result<()> {
                     detail: "invalid namespaced function call".into(),
                 });
             }
-            let args_raw = item
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or("{}");
-            let args: Value =
-                serde_json::from_str(args_raw).unwrap_or(Value::String(args_raw.to_owned()));
+            let args: Value = if custom {
+                json!({"input": item.get("input").and_then(Value::as_str).unwrap_or_default()})
+            } else {
+                let args_raw = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}");
+                serde_json::from_str(args_raw).unwrap_or(Value::String(args_raw.to_owned()))
+            };
             let namespace = item
                 .get("namespace")
                 .and_then(Value::as_str)
@@ -350,7 +456,7 @@ fn decode_input_item(item: &Value, messages: &mut Vec<Message>) -> Result<()> {
                 parts: vec![call],
             });
         }
-        "function_call_output" => {
+        "function_call_output" | "custom_tool_call_output" => {
             let output = item.get("output").cloned().unwrap_or(Value::Null);
             let structured = output.as_array().is_some_and(|blocks| {
                 blocks.iter().any(|block| {
@@ -452,10 +558,20 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
                     if let Some((role, content)) = open_message.take() {
                         input.push(json!({"type": "message", "role": role, "content": content}));
                     }
-                    let mut call = json!({"type":"function_call","call_id":p.id,"name":wire_name(&p.name, p.namespace.as_deref()),"arguments":p.args.to_string()});
-                    if let Some(namespace) = &p.namespace {
-                        call["namespace"] = json!(namespace);
-                    }
+                    let name = wire_name(&p.name, p.namespace.as_deref());
+                    let call = if is_custom_call(&req.tools, &p.name) {
+                        let mut call = json!({"type":"custom_tool_call","call_id":p.id,"name":name,"input":custom_input(&p.args)});
+                        if let Some(namespace) = &p.namespace {
+                            call["namespace"] = json!(namespace);
+                        }
+                        call
+                    } else {
+                        let mut call = json!({"type":"function_call","call_id":p.id,"name":name,"arguments":p.args.to_string()});
+                        if let Some(namespace) = &p.namespace {
+                            call["namespace"] = json!(namespace);
+                        }
+                        call
+                    };
                     input.push(call);
                 }
                 PartKind::ToolResult => {
@@ -503,7 +619,11 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
                 .as_ref()
                 .and_then(|n| t.name.strip_prefix(&format!("{n}__")))
                 .unwrap_or(&t.name);
-            let function = json!({"type":"function","name":name,"description":t.description,"parameters":t.parameters,"strict":false});
+            let function = if t.custom {
+                json!({"type":"custom","name":name,"description":t.description})
+            } else {
+                json!({"type":"function","name":name,"description":t.description,"parameters":t.parameters,"strict":false})
+            };
             if let Some(namespace) = &t.namespace {
                 let index = *namespaces.entry(namespace.clone()).or_insert_with(|| {
                     tools.push(json!({"type":"namespace","name":namespace,"tools":[]}));
@@ -725,17 +845,21 @@ fn incomplete_reason(reason: StopReason) -> Option<&'static str> {
 
 /// Encode an IR reply as an OpenAI Responses body.
 pub fn encode_response(resp: &CompletionResponse) -> Value {
-    encode_response_with_bindings(resp, &NamespaceBindings::default())
+    encode_response_with_bindings(resp, &NamespaceBindings::default(), &[])
 }
 
 /// Encode a reply for the original client request, restoring only declared
 /// namespaces when a foreign (or flat-name Responses) upstream omits them.
 /// Neither the response nor the request is mutated.
 pub fn encode_response_for_request(resp: &CompletionResponse, req: &CompletionRequest) -> Value {
-    encode_response_with_bindings(resp, &NamespaceBindings::from_request(req))
+    encode_response_with_bindings(resp, &NamespaceBindings::from_request(req), &req.tools)
 }
 
-fn encode_response_with_bindings(resp: &CompletionResponse, bindings: &NamespaceBindings) -> Value {
+fn encode_response_with_bindings(
+    resp: &CompletionResponse,
+    bindings: &NamespaceBindings,
+    tools: &[Tool],
+) -> Value {
     let mut output: Vec<Value> = Vec::new();
     for p in &resp.message.parts {
         match p.kind() {
@@ -759,11 +883,20 @@ fn encode_response_with_bindings(resp: &CompletionResponse, bindings: &Namespace
             })),
             PartKind::ToolCall => {
                 let namespace = bindings.resolve(&p.name, p.namespace.as_deref());
-                let mut call = json!({"type":"function_call","id":format!("fc_{}", response_id()),"call_id":p.id,"name":wire_name(&p.name, namespace),"arguments":p.args.to_string(),"status":"completed"});
-                if let Some(namespace) = namespace {
-                    set_call_namespace(&mut call, namespace);
+                let name = wire_name(&p.name, namespace);
+                if is_custom_call(tools, &p.name) {
+                    let mut call = json!({"type":"custom_tool_call","id":format!("ctc_{}", response_id()),"call_id":p.id,"name":name,"input":custom_input(&p.args),"status":"completed"});
+                    if let Some(namespace) = namespace {
+                        set_call_namespace(&mut call, namespace);
+                    }
+                    output.push(call);
+                } else {
+                    let mut call = json!({"type":"function_call","id":format!("fc_{}", response_id()),"call_id":p.id,"name":name,"arguments":p.args.to_string(),"status":"completed"});
+                    if let Some(namespace) = namespace {
+                        set_call_namespace(&mut call, namespace);
+                    }
+                    output.push(call);
                 }
-                output.push(call);
             }
             PartKind::Thinking => output.push(native_reasoning(p).unwrap_or_else(|| {
                 json!({
@@ -974,6 +1107,8 @@ struct ToolItem {
     /// Responses wire name (without the namespace prefix).
     name: String,
     namespace: Option<String>,
+    /// Whether this call belongs to a declared custom (free-form) tool.
+    custom: bool,
     args: String,
     output_index: usize,
 }
@@ -993,6 +1128,7 @@ pub struct ResponsesStreamEncoder {
     pending_reasoning: Option<String>,
     tools: HashMap<usize, ToolItem>,
     namespaces: NamespaceBindings,
+    customs: HashSet<String>,
     output: Vec<Value>,
     usage: Usage,
     stop_reason: Option<StopReason>,
@@ -1014,6 +1150,7 @@ impl ResponsesStreamEncoder {
             pending_reasoning: None,
             tools: HashMap::new(),
             namespaces: NamespaceBindings::default(),
+            customs: HashSet::new(),
             output: Vec::new(),
             usage: Usage::default(),
             stop_reason: None,
@@ -1026,6 +1163,12 @@ impl ResponsesStreamEncoder {
     pub fn for_request(model: impl Into<String>, req: &CompletionRequest) -> Self {
         let mut encoder = Self::new(model);
         encoder.namespaces = NamespaceBindings::from_request(req);
+        encoder.customs = req
+            .tools
+            .iter()
+            .filter(|tool| tool.custom)
+            .map(|tool| tool.name.clone())
+            .collect();
         encoder
     }
 
@@ -1285,7 +1428,8 @@ impl ResponsesStreamEncoder {
                 let mut out = self.ensure_created();
                 out.push_str(&self.close_message());
                 out.push_str(&self.close_reasoning());
-                let item_id = self.next_id("fc");
+                let custom = self.customs.contains(name);
+                let item_id = self.next_id(if custom { "ctc" } else { "fc" });
                 let output_index = self.next_index;
                 self.next_index += 1;
                 let valid_namespace = self
@@ -1300,17 +1444,26 @@ impl ResponsesStreamEncoder {
                         call_id: id.clone(),
                         name: wire.clone(),
                         namespace: valid_namespace.clone(),
+                        custom,
                         args: String::new(),
                         output_index,
                     },
                 );
-                let mut item = json!({
-                    "id": item_id, "type": "function_call", "call_id": id,
-                    "name": wire, "arguments": "", "status": "in_progress"
-                });
-                if let Some(namespace) = valid_namespace {
-                    set_call_namespace(&mut item, &namespace);
-                }
+                let item = if custom {
+                    json!({
+                        "id": item_id, "type": "custom_tool_call", "call_id": id,
+                        "name": wire, "input": "", "status": "in_progress"
+                    })
+                } else {
+                    let mut item = json!({
+                        "id": item_id, "type": "function_call", "call_id": id,
+                        "name": wire, "arguments": "", "status": "in_progress"
+                    });
+                    if let Some(namespace) = valid_namespace {
+                        set_call_namespace(&mut item, &namespace);
+                    }
+                    item
+                };
                 out.push_str(&event(
                     "response.output_item.added",
                     json!({"output_index": output_index, "item": item}),
@@ -1320,6 +1473,12 @@ impl ResponsesStreamEncoder {
             StreamEvent::ToolCallDelta { index, args } => {
                 let tool = self.tools.get_mut(index)?;
                 tool.args.push_str(args);
+                if tool.custom {
+                    return Some(event(
+                        "response.custom_tool_call_input.delta",
+                        json!({"item_id": tool.id, "output_index": tool.output_index, "delta": args}),
+                    ));
+                }
                 Some(event(
                     "response.function_call_arguments.delta",
                     json!({"item_id": tool.id, "output_index": tool.output_index, "delta": args}),
@@ -1327,13 +1486,21 @@ impl ResponsesStreamEncoder {
             }
             StreamEvent::ToolCallEnd { index } => {
                 let tool = self.tools.remove(index)?;
-                let mut done = json!({
-                    "id": tool.id, "type": "function_call", "call_id": tool.call_id,
-                    "name": tool.name, "arguments": tool.args, "status": "completed",
-                });
-                if let Some(namespace) = tool.namespace {
-                    set_call_namespace(&mut done, &namespace);
-                }
+                let done = if tool.custom {
+                    json!({
+                        "id": tool.id, "type": "custom_tool_call", "call_id": tool.call_id,
+                        "name": tool.name, "input": tool.args, "status": "completed",
+                    })
+                } else {
+                    let mut done = json!({
+                        "id": tool.id, "type": "function_call", "call_id": tool.call_id,
+                        "name": tool.name, "arguments": tool.args, "status": "completed",
+                    });
+                    if let Some(namespace) = tool.namespace {
+                        set_call_namespace(&mut done, &namespace);
+                    }
+                    done
+                };
                 self.output.push(done.clone());
                 Some(event(
                     "response.output_item.done",

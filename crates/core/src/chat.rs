@@ -144,6 +144,7 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
                             .to_owned(),
                         namespace: None,
                         parameters: f.get("parameters").cloned().unwrap_or_else(|| json!({})),
+                        custom: false,
                     })
                 })
                 .collect()

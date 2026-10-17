@@ -303,6 +303,10 @@ pub struct Tool {
     pub description: String,
     /// JSON Schema for its arguments.
     pub parameters: Value,
+    /// A Responses free-form (custom) tool. Foreign dialects offer it as a
+    /// function with one string `input` argument; its call is restored to
+    /// `custom_tool_call` only for Responses clients.
+    pub custom: bool,
 }
 
 /// Token accounting, as far as the protocols agree.

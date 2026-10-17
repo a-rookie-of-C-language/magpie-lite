@@ -291,6 +291,7 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
                     .or_else(|| declaration.get("parameters_json_schema"))
                     .cloned()
                     .unwrap_or_else(|| json!({})),
+                custom: false,
             });
         }
     }

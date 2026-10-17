@@ -150,6 +150,86 @@ fn namespaced_input_calls_are_flattened_without_a_current_declaration() {
         }
     }
 }
+
+#[test]
+fn custom_tools_are_offered_as_input_functions_and_restored_on_responses() {
+    let mut v = body();
+    v["tools"] = json!([
+        {"type":"custom","name":"apply_patch","description":"Patch files","format":{"type":"grammar","syntax":"lark","definition":"start: \"***\""}},
+        {"type":"namespace","name":"team","tools":[{"type":"custom","name":"note","description":"A note"}]}
+    ]);
+    let req = responses::decode_request(&v).unwrap();
+    for p in 0..4 {
+        let wire = encode(p, &req).unwrap();
+        let text = wire.to_string();
+        if p == 1 {
+            assert!(text.contains(r#""type":"custom""#), "{wire}");
+            assert!(text.contains("lark"), "{wire}");
+            assert!(text.contains("start: "), "{wire}");
+        } else {
+            assert!(text.contains("apply_patch"), "{wire}");
+            assert!(text.contains("team__note"), "{wire}");
+            assert!(text.contains("free-form input"), "{wire}");
+        }
+    }
+    // A model calling the translated function restores to custom_tool_call
+    // for the Responses client, with its free-form input preserved.
+    let reply = responses::encode_response_for_request(
+        &magpie_core::ir::CompletionResponse {
+            message: magpie_core::ir::Message {
+                role: magpie_core::ir::Role::Assistant,
+                parts: vec![
+                    magpie_core::ir::Part::tool_call(
+                        "call1",
+                        "apply_patch",
+                        json!({"input":"*** Begin Patch"}),
+                    ),
+                    magpie_core::ir::Part::tool_call(
+                        "call2",
+                        "team__note",
+                        json!({"input":"hello"}),
+                    ),
+                ],
+            },
+            ..Default::default()
+        },
+        &req,
+    );
+    let output = reply["output"].as_array().unwrap();
+    assert_eq!(output[0]["type"], "custom_tool_call");
+    assert_eq!(output[0]["name"], "apply_patch");
+    assert_eq!(output[0]["input"], "*** Begin Patch");
+    assert_eq!(output[1]["type"], "custom_tool_call");
+    assert_eq!(output[1]["name"], "note");
+    assert_eq!(output[1]["namespace"], "team");
+    assert_eq!(output[1]["input"], "hello");
+    // History round-trips: a custom_tool_call is offered back as the
+    // translated function with an input argument, both flat and namespaced.
+    let mut history = v.clone();
+    history["input"] = json!([
+        {"type":"custom_tool_call","call_id":"call1","name":"apply_patch","input":"*** Begin Patch"},
+        {"type":"custom_tool_call","call_id":"call2","name":"note","namespace":"team","input":"hello"},
+        {"type":"custom_tool_call_output","call_id":"call1","output":"done"}
+    ]);
+    let req = responses::decode_request(&history).unwrap();
+    let calls: Vec<_> = req
+        .messages
+        .iter()
+        .flat_map(|m| &m.parts)
+        .filter(|p| p.kind() == magpie_core::ir::PartKind::ToolCall)
+        .collect();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].name, "apply_patch");
+    assert_eq!(calls[0].args, json!({"input":"*** Begin Patch"}));
+    assert_eq!(calls[1].name, "team__note");
+    let wire = responses::encode_request(&req, "up-model").unwrap();
+    let items = wire["input"].as_array().unwrap();
+    assert_eq!(items[0]["type"], "custom_tool_call");
+    assert_eq!(items[0]["input"], "*** Begin Patch");
+    assert_eq!(items[1]["type"], "custom_tool_call");
+    assert_eq!(items[1]["name"], "note");
+    assert_eq!(items[1]["namespace"], "team");
+}
 #[test]
 fn ambiguous_flat_names_and_namespace_selectors_are_rejected() {
     for duplicate in [
@@ -172,7 +252,6 @@ fn malformed_namespace_declarations_calls_and_selectors_fail_closed() {
         json!({"type":"namespace","name":"n","tools":{}}),
         json!({"type":"namespace","name":"n","tools":[{"type":"function","name":""}]}),
         json!({"type":"namespace","name":"n","tools":[{"type":"namespace","name":"nested","tools":[]}]}),
-        json!({"type":"namespace","name":"n","tools":[{"type":"custom","name":"freeform"}]}),
     ] {
         let mut v = body();
         v["tools"] = json!([declaration]);
