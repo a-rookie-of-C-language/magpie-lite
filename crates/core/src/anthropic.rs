@@ -276,6 +276,7 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
             })
             .unwrap_or_default(),
         stream: v.get("stream").and_then(Value::as_bool).unwrap_or(false),
+        effort: crate::effort::decode(crate::ir::ToolChoiceProtocol::Anthropic, v),
     })
 }
 
@@ -388,6 +389,20 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
     }
     if !req.stop.is_empty() {
         out.insert("stop_sequences".into(), json!(req.stop));
+    }
+    if let Some(effort) = req.effort {
+        let mut body = Value::Object(out.clone());
+        crate::effort::encode(
+            crate::ir::ToolChoiceProtocol::Anthropic,
+            &mut body,
+            effort,
+            Some(req.max_tokens.unwrap_or(16384)),
+        );
+        for key in ["thinking", "max_tokens"] {
+            if let Some(v) = body.get(key) {
+                out.insert(key.into(), v.clone());
+            }
+        }
     }
     out.insert("stream".into(), json!(req.stream));
     crate::search::encode(req, crate::search::SearchProtocol::Anthropic, &mut out)?;

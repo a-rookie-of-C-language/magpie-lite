@@ -8,6 +8,7 @@
 
 pub mod anthropic;
 pub mod chat;
+pub mod effort;
 pub mod error;
 pub mod ir;
 pub mod responses;

@@ -53,6 +53,21 @@ back natively; on Chat/Responses upstreams it becomes `parallel_tool_calls`
 :`false`. Gemini has no equivalent field, so a route carrying the constraint is
 rejected without an HTTP call instead of letting the model make parallel calls.
 
+Reasoning-effort asks follow the reference's `effortOf`/`effortOfBudget`/
+`budgetOf` conversions. Chat `reasoning_effort` and Responses
+`reasoning.effort` parse to one canonical level (`none` is off, `minimal`
+reads as low, Codex's `ultra` as max); Anthropic's thinking budget maps back
+at 4096/12000/24000 breaks, with `output_config.effort` taking precedence,
+and Gemini's `thinkingLevel`/`thinkingBudget` decode to the same levels
+(-1 lets the model decide). Encoding goes the other way per target: Chat and
+Responses get their level fields (Responses with `summary: "auto"`),
+Anthropic an `enabled` thinking budget fitted under the client's
+`max_tokens` cap (raised when absent, dropped to `disabled` when no budget
+fits), and Gemini a `thinkingConfig` with `includeThoughts` and the level,
+or a 2.5-style budget where levels do not exist. An effort the client never
+named sends no reasoning field at all; unknown level strings decode as
+absent rather than guessed.
+
 Hosted-search requests other than Responses `allowed_tools` continue to use the
 existing search translator's native-option and global/function-choice contract.
 Gemini function configurations are validated before that delegation: search

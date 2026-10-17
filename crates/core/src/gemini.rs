@@ -335,6 +335,7 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
             })
             .unwrap_or_default(),
         stream: v.get("stream").and_then(Value::as_bool).unwrap_or(false),
+        effort: crate::effort::decode(crate::ir::ToolChoiceProtocol::Gemini, v),
     })
 }
 
@@ -541,6 +542,21 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
     }
     if !req.stop.is_empty() {
         generation.insert("stopSequences".into(), json!(req.stop));
+    }
+    if let Some(effort) = req.effort {
+        let mut body = Value::Object(out.clone());
+        crate::effort::encode(
+            crate::ir::ToolChoiceProtocol::Gemini,
+            &mut body,
+            effort,
+            req.max_tokens,
+        );
+        if let Some(gc) = body
+            .get("generationConfig")
+            .and_then(|g| g.get("thinkingConfig"))
+        {
+            generation.insert("thinkingConfig".into(), gc.clone());
+        }
     }
     if !generation.is_empty() {
         out.insert("generationConfig".into(), Value::Object(generation));

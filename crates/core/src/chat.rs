@@ -177,6 +177,7 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
             })
             .unwrap_or_default(),
         stream: v.get("stream").and_then(Value::as_bool).unwrap_or(false),
+        effort: crate::effort::decode(crate::ir::ToolChoiceProtocol::Chat, v),
     })
 }
 
@@ -317,6 +318,17 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
     }
     if let Some(p) = req.top_p {
         out.insert("top_p".into(), json!(p));
+    }
+    if let Some(effort) = req.effort {
+        crate::effort::encode(
+            crate::ir::ToolChoiceProtocol::Chat,
+            &mut Value::Object(out.clone()),
+            effort,
+            req.max_tokens,
+        );
+        if let Some(level) = effort.wire_level() {
+            out.insert("reasoning_effort".into(), json!(level));
+        }
     }
     if !req.stop.is_empty() {
         out.insert("stop".into(), json!(req.stop));

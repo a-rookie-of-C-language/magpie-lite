@@ -442,6 +442,9 @@ pub struct CompletionRequest {
     pub stop: Vec<String>,
     /// Whether the caller wants a stream.
     pub stream: bool,
+    /// The reasoning effort the client asked for, canonicalized; `None`
+    /// means the request named no reasoning ask at all.
+    pub effort: Option<crate::effort::Effort>,
 }
 
 /// A complete assistant reply.

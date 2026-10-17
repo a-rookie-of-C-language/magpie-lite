@@ -123,6 +123,7 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
         top_p: v.get("top_p").and_then(Value::as_f64),
         stop: Vec::new(),
         stream: v.get("stream").and_then(Value::as_bool).unwrap_or(false),
+        effort: crate::effort::decode(crate::ir::ToolChoiceProtocol::Responses, v),
     })
 }
 
@@ -652,6 +653,18 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
     }
     if let Some(p) = req.top_p {
         out.insert("top_p".into(), json!(p));
+    }
+    if let Some(effort) = req.effort {
+        let mut body = Value::Object(out.clone());
+        crate::effort::encode(
+            crate::ir::ToolChoiceProtocol::Responses,
+            &mut body,
+            effort,
+            req.max_tokens,
+        );
+        if let Some(reasoning) = body.get("reasoning") {
+            out.insert("reasoning".into(), reasoning.clone());
+        }
     }
     out.insert("stream".into(), json!(req.stream));
     out.insert("store".into(), json!(false));
