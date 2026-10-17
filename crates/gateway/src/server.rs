@@ -617,11 +617,15 @@ impl ClientWire {
         }
     }
 
-    fn encode_response(self, ir: &magpie_core::ir::CompletionResponse) -> Value {
+    fn encode_response(
+        self,
+        ir: &magpie_core::ir::CompletionResponse,
+        req: &CompletionRequest,
+    ) -> Value {
         match self {
             Self::Chat { .. } => chat::encode_response(ir),
             Self::Anthropic => anthropic::encode_response(ir),
-            Self::Responses => responses::encode_response(ir),
+            Self::Responses => responses::encode_response_for_request(ir, req),
             Self::Gemini => gemini::encode_response(ir),
         }
     }
@@ -645,6 +649,15 @@ impl ClientStreamEncoder {
             ClientWire::Anthropic => Self::Anthropic(anthropic::AnthropicStreamEncoder::new(model)),
             ClientWire::Responses => Self::Responses(responses::ResponsesStreamEncoder::new(model)),
             ClientWire::Gemini => Self::Gemini(gemini::GeminiStreamEncoder::new(model)),
+        }
+    }
+
+    fn for_request(wire: ClientWire, req: &CompletionRequest) -> Self {
+        match wire {
+            ClientWire::Responses => Self::Responses(
+                responses::ResponsesStreamEncoder::for_request(&req.model, req),
+            ),
+            _ => Self::new(wire, &req.model),
         }
     }
 
@@ -1569,7 +1582,7 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
                 tracker.observe_usage(&ir.usage);
                 ir.usage = tracker.total_usage();
                 tracker.finish("ok", &Usage::default());
-                return Ok(ok_json(wire.encode_response(&ir)));
+                return Ok(ok_json(wire.encode_response(&ir, &creq)));
             }
             UpstreamReply::Stream {
                 events,
@@ -1578,10 +1591,9 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
             } => (events, empty_retries, reask_allowed),
         };
 
-        let client_model = creq.model.clone();
         let reask_candidate = candidate.clone();
         let out = async_stream::stream! {
-            let mut encoder = ClientStreamEncoder::new(wire, &client_model);
+            let mut encoder = ClientStreamEncoder::for_request(wire, &creq);
             let mut reasked = false;
             let mut reasoning_reasked = false;
             let mut continued = empty_retries > 0;

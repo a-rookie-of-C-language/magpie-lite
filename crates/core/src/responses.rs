@@ -93,6 +93,47 @@ fn wire_name(name: &str, namespace: Option<&str>) -> String {
         .to_owned()
 }
 
+/// Only current declarations may restore a foreign provider's flat call name.
+/// Do not split arbitrary names containing __ or infer bindings from history.
+#[derive(Debug, Default)]
+struct NamespaceBindings(HashMap<String, String>);
+
+impl NamespaceBindings {
+    fn from_request(req: &CompletionRequest) -> Self {
+        Self(
+            req.tools
+                .iter()
+                .filter_map(|tool| {
+                    let namespace = tool.namespace.as_ref()?;
+                    tool.name
+                        .strip_prefix(&format!("{namespace}__"))
+                        .filter(|local| !local.is_empty())?;
+                    Some((tool.name.clone(), namespace.clone()))
+                })
+                .collect(),
+        )
+    }
+
+    fn resolve<'a>(&'a self, name: &str, source: Option<&'a str>) -> Option<&'a str> {
+        // Explicit upstream identity takes precedence over request-derived metadata.
+        source
+            .or_else(|| self.0.get(name).map(String::as_str))
+            .filter(|namespace| {
+                !namespace.is_empty()
+                    && name
+                        .strip_prefix(&format!("{namespace}__"))
+                        .is_some_and(|local| !local.is_empty())
+            })
+    }
+}
+
+fn set_call_namespace(item: &mut Value, namespace: &str) {
+    item["namespace"] = json!(namespace);
+    // These arguments were decoded/generated as plaintext, not vendor-sealed.
+    // Codex otherwise interprets a namespaced call as encrypted arguments.
+    item["encrypted_function_args"] = json!([]);
+}
+
 /// Decode a streamed Responses function-call identity into the shared IR.
 /// Responses carries the namespace separately; other dialects only see the
 /// flattened name, so the namespace is retained only as source metadata.
@@ -684,6 +725,17 @@ fn incomplete_reason(reason: StopReason) -> Option<&'static str> {
 
 /// Encode an IR reply as an OpenAI Responses body.
 pub fn encode_response(resp: &CompletionResponse) -> Value {
+    encode_response_with_bindings(resp, &NamespaceBindings::default())
+}
+
+/// Encode a reply for the original client request, restoring only declared
+/// namespaces when a foreign (or flat-name Responses) upstream omits them.
+/// Neither the response nor the request is mutated.
+pub fn encode_response_for_request(resp: &CompletionResponse, req: &CompletionRequest) -> Value {
+    encode_response_with_bindings(resp, &NamespaceBindings::from_request(req))
+}
+
+fn encode_response_with_bindings(resp: &CompletionResponse, bindings: &NamespaceBindings) -> Value {
     let mut output: Vec<Value> = Vec::new();
     for p in &resp.message.parts {
         match p.kind() {
@@ -706,9 +758,10 @@ pub fn encode_response(resp: &CompletionResponse) -> Value {
                 "content": [{"type": "output_text", "text": p.text, "annotations": []}],
             })),
             PartKind::ToolCall => {
-                let mut call = json!({"type":"function_call","id":format!("fc_{}", response_id()),"call_id":p.id,"name":wire_name(&p.name, p.namespace.as_deref()),"arguments":p.args.to_string(),"status":"completed"});
-                if let Some(namespace) = &p.namespace {
-                    call["namespace"] = json!(namespace);
+                let namespace = bindings.resolve(&p.name, p.namespace.as_deref());
+                let mut call = json!({"type":"function_call","id":format!("fc_{}", response_id()),"call_id":p.id,"name":wire_name(&p.name, namespace),"arguments":p.args.to_string(),"status":"completed"});
+                if let Some(namespace) = namespace {
+                    set_call_namespace(&mut call, namespace);
                 }
                 output.push(call);
             }
@@ -939,6 +992,7 @@ pub struct ResponsesStreamEncoder {
     open_reasoning: Option<OpenItem>,
     pending_reasoning: Option<String>,
     tools: HashMap<usize, ToolItem>,
+    namespaces: NamespaceBindings,
     output: Vec<Value>,
     usage: Usage,
     stop_reason: Option<StopReason>,
@@ -959,12 +1013,20 @@ impl ResponsesStreamEncoder {
             open_reasoning: None,
             pending_reasoning: None,
             tools: HashMap::new(),
+            namespaces: NamespaceBindings::default(),
             output: Vec::new(),
             usage: Usage::default(),
             stop_reason: None,
             started: false,
             completed: false,
         }
+    }
+
+    /// Request-scoped namespace restoration for cross-provider tool calls.
+    pub fn for_request(model: impl Into<String>, req: &CompletionRequest) -> Self {
+        let mut encoder = Self::new(model);
+        encoder.namespaces = NamespaceBindings::from_request(req);
+        encoder
     }
 
     fn next_id(&mut self, prefix: &str) -> String {
@@ -1226,18 +1288,18 @@ impl ResponsesStreamEncoder {
                 let item_id = self.next_id("fc");
                 let output_index = self.next_index;
                 self.next_index += 1;
-                let valid_namespace = namespace.as_deref().filter(|ns| {
-                    name.strip_prefix(&format!("{ns}__"))
-                        .is_some_and(|wire| !wire.is_empty())
-                });
-                let wire = wire_name(name, valid_namespace);
+                let valid_namespace = self
+                    .namespaces
+                    .resolve(name, namespace.as_deref())
+                    .map(str::to_owned);
+                let wire = wire_name(name, valid_namespace.as_deref());
                 self.tools.insert(
                     *index,
                     ToolItem {
                         id: item_id.clone(),
                         call_id: id.clone(),
                         name: wire.clone(),
-                        namespace: valid_namespace.map(str::to_owned),
+                        namespace: valid_namespace.clone(),
                         args: String::new(),
                         output_index,
                     },
@@ -1247,7 +1309,7 @@ impl ResponsesStreamEncoder {
                     "name": wire, "arguments": "", "status": "in_progress"
                 });
                 if let Some(namespace) = valid_namespace {
-                    item["namespace"] = json!(namespace);
+                    set_call_namespace(&mut item, &namespace);
                 }
                 out.push_str(&event(
                     "response.output_item.added",
@@ -1270,7 +1332,7 @@ impl ResponsesStreamEncoder {
                     "name": tool.name, "arguments": tool.args, "status": "completed",
                 });
                 if let Some(namespace) = tool.namespace {
-                    done["namespace"] = json!(namespace);
+                    set_call_namespace(&mut done, &namespace);
                 }
                 self.output.push(done.clone());
                 Some(event(
