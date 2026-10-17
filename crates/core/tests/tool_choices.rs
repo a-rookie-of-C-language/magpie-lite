@@ -173,13 +173,10 @@ fn forced_unknown_or_empty_required_allowlists_never_widen_to_all_functions() {
 }
 #[test]
 fn gemini_validated_and_native_extra_options_are_not_silently_widened() {
-    for (source, c) in [
-        (
-            3,
-            json!({"functionCallingConfig":{"mode":"VALIDATED","allowedFunctionNames":["safeA","safeB"]}}),
-        ),
-        (2, json!({"type":"any","disable_parallel_tool_use":true})),
-    ] {
+    for (source, c) in [(
+        3,
+        json!({"functionCallingConfig":{"mode":"VALIDATED","allowedFunctionNames":["safeA","safeB"]}}),
+    )] {
         let r = decode(source, c.clone(), false);
         assert_eq!(
             encode(source, &r).unwrap()[if source == 3 {
@@ -198,6 +195,59 @@ fn gemini_validated_and_native_extra_options_are_not_silently_widened() {
             }
         }
     }
+}
+
+#[test]
+fn parallel_tool_calls_translate_between_openai_shapes_and_anthropic() {
+    // Anthropic's disable_parallel_tool_use becomes parallel_tool_calls:false
+    // for Chat and Responses and survives its native round trip.
+    let r = decode(
+        2,
+        json!({"type":"any","disable_parallel_tool_use":true}),
+        false,
+    );
+    assert_eq!(r.parallel_tool_calls, Some(false));
+    let out = encode(0, &r).unwrap();
+    assert_eq!(out["parallel_tool_calls"], json!(false));
+    assert_eq!(out["tool_choice"], json!("required"));
+    let out = encode(1, &r).unwrap();
+    assert_eq!(out["parallel_tool_calls"], json!(false));
+    let out = encode(2, &r).unwrap();
+    assert_eq!(
+        out["tool_choice"],
+        json!({"type":"any","disable_parallel_tool_use":true})
+    );
+    // Gemini has no parallel flag and silently dropping the constraint would
+    // widen the model's freedom, so the route is rejected.
+    assert!(encode(3, &r).is_err());
+
+    // A Chat request's parallel flag is forwarded verbatim and restored natively.
+    let body = json!({"model":"m","messages":[],"tools":[{"type":"function","function":{"name":"safeA","parameters":{"type":"object"}}}],"tool_choice":"auto","parallel_tool_calls":false});
+    let r = chat::decode_request(&body).unwrap();
+    assert_eq!(r.parallel_tool_calls, Some(false));
+    let out = chat::encode_request(&r, "up").unwrap();
+    assert_eq!(out["parallel_tool_calls"], json!(false));
+    let body = json!({"model":"m","input":"hi","tools":[{"type":"function","name":"safeA","parameters":{"type":"object"}}],"parallel_tool_calls":false});
+    let r = responses::decode_request(&body).unwrap();
+    assert_eq!(r.parallel_tool_calls, Some(false));
+    let out = responses::encode_request(&r, "up").unwrap();
+    assert_eq!(out["parallel_tool_calls"], json!(false));
+
+    // Anthropic parallel_tool_calls:false in tool_choice stays native there.
+    let body = json!({"model":"m","messages":[],"tools":[{"name":"safeA","input_schema":{"type":"object"}}],"tool_choice":{"type":"auto","disable_parallel_tool_use":true}});
+    let r = anthropic::decode_request(&body).unwrap();
+    assert_eq!(r.parallel_tool_calls, Some(false));
+    let out = anthropic::encode_request(&r, "up").unwrap();
+    assert_eq!(
+        out["tool_choice"],
+        json!({"type":"auto","disable_parallel_tool_use":true})
+    );
+    // Without the disable flag no parallel key is emitted.
+    let body = json!({"model":"m","messages":[],"tools":[{"name":"safeA","input_schema":{"type":"object"}}]});
+    let r = anthropic::decode_request(&body).unwrap();
+    assert_eq!(r.parallel_tool_calls, None);
+    let out = anthropic::encode_request(&r, "up").unwrap();
+    assert_eq!(out["tool_choice"], json!({"type":"auto"}));
 }
 
 #[test]

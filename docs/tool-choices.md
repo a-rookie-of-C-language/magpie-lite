@@ -45,6 +45,14 @@ the request's current declarations, so history replay keeps the tool
 declarations. Custom formats other than a grammar definition, duplicate custom
 names, and nested namespaces over custom tools fail closed at decode time.
 
+Parallel-calls constraints follow the same no-silent-widening contract. Chat
+`parallel_tool_calls` and Responses `parallel_tool_calls` are forwarded
+verbatim between their native shapes. Anthropic's tool_choice
+`disable_parallel_tool_use` decodes to a parallel-calls constraint and encodes
+back natively; on Chat/Responses upstreams it becomes `parallel_tool_calls`
+:`false`. Gemini has no equivalent field, so a route carrying the constraint is
+rejected without an HTTP call instead of letting the model make parallel calls.
+
 Hosted-search requests other than Responses `allowed_tools` continue to use the
 existing search translator's native-option and global/function-choice contract.
 Gemini function configurations are validated before that delegation: search

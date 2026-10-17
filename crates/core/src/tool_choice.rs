@@ -21,6 +21,9 @@ struct Selection {
     mode: Mode,
     allowed: Option<Vec<String>>,
     search_allowed: Option<bool>,
+    /// Anthropic's `disable_parallel_tool_use`, translatable as a parallel-calls
+    /// constraint rather than a native-only restriction.
+    parallel_disable: bool,
     native: Option<Protocol>,
     native_only: bool,
 }
@@ -75,6 +78,7 @@ fn parse(v: &Value) -> Result<Selection> {
         mode: Mode::Auto,
         allowed: None,
         search_allowed: None,
+        parallel_disable: false,
         native: None,
         native_only: false,
     };
@@ -192,6 +196,10 @@ fn parse(v: &Value) -> Result<Selection> {
         }
         "function" | "tool" => {
             s.mode = Mode::Function(selected_name(v)?);
+            s.parallel_disable = v
+                .get("disable_parallel_tool_use")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             s.native = Some(if ty == "tool" {
                 Protocol::Anthropic
             } else if v.get("function").is_some() {
@@ -199,13 +207,25 @@ fn parse(v: &Value) -> Result<Selection> {
             } else {
                 Protocol::Responses
             });
-            s.native_only = extra(v, &["type", "name", "namespace", "function"])
-                || v.get("function").is_some_and(|f| extra(f, &["name"]));
+            s.native_only = extra(
+                v,
+                &[
+                    "type",
+                    "name",
+                    "namespace",
+                    "function",
+                    "disable_parallel_tool_use",
+                ],
+            ) || v.get("function").is_some_and(|f| extra(f, &["name"]));
         }
         "auto" | "none" | "any" => {
             s.mode = mode(ty)?;
             s.native = Some(Protocol::Anthropic);
-            s.native_only = extra(v, &["type"]);
+            s.parallel_disable = v
+                .get("disable_parallel_tool_use")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            s.native_only = extra(v, &["type", "disable_parallel_tool_use"]);
         }
         _ => return Err(invalid("unsupported tool selection type")),
     }
@@ -251,6 +271,13 @@ pub(crate) fn prepare(
         return Ok(Cow::Borrowed(req));
     }
     let selection = parse(raw)?;
+    if selection.parallel_disable && target == Protocol::Gemini {
+        // Gemini has no way to express the parallel-calls constraint; dropping
+        // it would silently widen what the model may do.
+        return Err(invalid(
+            "native tool selection restrictions cannot be translated to this provider protocol",
+        ));
+    }
     if selection.native_only && selection.native != Some(target) {
         return Err(invalid(
             "native tool selection restrictions cannot be translated to this provider protocol",
@@ -262,6 +289,9 @@ pub(crate) fn prepare(
         return Ok(Cow::Borrowed(req));
     }
     let mut prepared = req.clone();
+    if selection.parallel_disable && prepared.parallel_tool_calls.is_none() {
+        prepared.parallel_tool_calls = Some(false);
+    }
     if let Some(allowed) = &selection.allowed {
         prepared.tools.retain(|t| allowed.contains(&t.name));
     }

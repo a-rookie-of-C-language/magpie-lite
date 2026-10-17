@@ -181,6 +181,11 @@ struct Capture {
     stream: bool,
     key: String,
 }
+impl std::fmt::Display for Capture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "provider={} body={}", self.provider, self.body)
+    }
+}
 #[derive(Clone)]
 struct Mock {
     protocol: Protocol,
@@ -543,6 +548,18 @@ fn assert_sent(
         search,
         "{body}"
     );
+    if selector.get("disable_parallel_tool_use") == Some(&json!(true)) {
+        // The parallel constraint is translated, not dropped, on OpenAI shapes.
+        let expected = match protocol {
+            Protocol::Chat | Protocol::Responses => Some(json!(false)),
+            Protocol::Anthropic | Protocol::Gemini => None,
+        };
+        assert_eq!(
+            capture.body.get("parallel_tool_calls"),
+            expected.as_ref(),
+            "{capture}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -709,11 +726,6 @@ async fn impossible_or_malformed_choices_do_not_use_any_upstream_key() {
 async fn native_only_choices_skip_foreign_key_pools_and_preserve_native_fallback() {
     for (client, selector, search) in [
         (
-            Protocol::Anthropic,
-            json!({"type":"any","disable_parallel_tool_use":true}),
-            false,
-        ),
-        (
             Protocol::Gemini,
             json!({"functionCallingConfig":{"mode":"VALIDATED","allowedFunctionNames":["safeA"]}}),
             false,
@@ -807,11 +819,6 @@ async fn native_only_selectors_fail_locally_without_a_compatible_fallback() {
     let mut total = 0;
     for (client, selector, search) in [
         (
-            Protocol::Anthropic,
-            json!({"type":"any","disable_parallel_tool_use":true}),
-            false,
-        ),
-        (
             Protocol::Gemini,
             json!({"functionCallingConfig":{"mode":"VALIDATED","allowedFunctionNames":["safeA"]}}),
             false,
@@ -859,7 +866,50 @@ async fn native_only_selectors_fail_locally_without_a_compatible_fallback() {
             total += completed;
         }
     }
-    assert_eq!(total, 48);
+    assert_eq!(total, 32);
+}
+
+#[tokio::test]
+async fn anthropic_parallel_disable_translates_to_openai_shapes() {
+    let selector = json!({"type":"any","disable_parallel_tool_use":true});
+    // The upstream selector is the translated wire form, not the raw client's.
+    let upstream = |protocol| match protocol {
+        Protocol::Chat | Protocol::Responses => json!("required"),
+        Protocol::Anthropic => json!({"type":"any","disable_parallel_tool_use":true}),
+        Protocol::Gemini => unreachable!(),
+    };
+    // A compatible single route serves the request with the constraint intact;
+    // Gemini has no parallel flag and is rejected without touching any key.
+    for provider in PROTOCOLS {
+        let f = Fixture::new(&[provider], false).await;
+        let mut completed = 0;
+        for model in ["p0/up-model", "group/daily"] {
+            for stream in [false, true] {
+                let (status, wire) = f
+                    .send(Protocol::Anthropic, model, stream, &selector, false)
+                    .await;
+                completed += 1;
+                if provider == Protocol::Gemini {
+                    assert_eq!(status, StatusCode::BAD_REQUEST, "{wire}");
+                    assert!(wire.contains("cannot be translated"));
+                    assert!(!wire.contains("disable_parallel_tool_use"));
+                    f.assert_no_credentials_used();
+                } else {
+                    assert_reply(Protocol::Anthropic, stream, status, &wire);
+                    assert_sent(
+                        f.seen.lock().unwrap().last().unwrap(),
+                        provider,
+                        &upstream(provider),
+                        NAMES.as_ref(),
+                        stream,
+                        false,
+                    );
+                }
+                f.record(completed, provider != Protocol::Gemini, "p0")
+                    .await;
+            }
+        }
+    }
 }
 
 #[tokio::test]

@@ -242,6 +242,13 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
                 .collect()
         })
         .unwrap_or_default();
+    // Anthropic has no standalone parallel flag: only a tool_choice that
+    // disables parallel tool use carries the constraint.
+    let parallel_tool_calls = v
+        .get("tool_choice")
+        .and_then(|tc| tc.get("disable_parallel_tool_use"))
+        .and_then(Value::as_bool)
+        .map(|disable| !disable);
 
     Ok(CompletionRequest {
         model,
@@ -253,6 +260,7 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
             v,
         )?,
         tool_choice: v.get("tool_choice").filter(|t| !t.is_null()).cloned(),
+        parallel_tool_calls,
         tool_choice_protocol: Some(crate::ir::ToolChoiceProtocol::Anthropic),
         max_tokens: v.get("max_tokens").and_then(Value::as_u64),
         temperature: v.get("temperature").and_then(Value::as_f64),
@@ -366,6 +374,11 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
             "tool_choice".into(),
             req.tool_choice.clone().unwrap_or(json!({"type": "auto"})),
         );
+        if req.parallel_tool_calls == Some(false)
+            && out["tool_choice"].get("type").and_then(Value::as_str) != Some("none")
+        {
+            out["tool_choice"]["disable_parallel_tool_use"] = json!(true);
+        }
     }
     if let Some(t) = req.temperature {
         out.insert("temperature".into(), json!(t));

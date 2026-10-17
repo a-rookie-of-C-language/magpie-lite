@@ -427,6 +427,9 @@ pub struct CompletionRequest {
     pub web_search: Option<crate::search::WebSearchRequest>,
     /// Tool selection in the asking dialect; encoders normalize it and enforce allowlists.
     pub tool_choice: Option<Value>,
+    /// Whether parallel tool calls are allowed; `None` is the protocol default
+    /// and `false` asks the model to emit one call per turn.
+    pub parallel_tool_calls: Option<bool>,
     /// Provenance for native selector preservation; None permits manually constructed IR.
     pub tool_choice_protocol: Option<ToolChoiceProtocol>,
     /// A token limit.

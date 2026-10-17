@@ -161,6 +161,7 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
             v,
         )?,
         tool_choice: v.get("tool_choice").filter(|t| !t.is_null()).cloned(),
+        parallel_tool_calls: v.get("parallel_tool_calls").and_then(Value::as_bool),
         tool_choice_protocol: Some(crate::ir::ToolChoiceProtocol::Chat),
         max_tokens: v.get("max_tokens").and_then(Value::as_u64),
         temperature: v.get("temperature").and_then(Value::as_f64),
@@ -304,6 +305,9 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
             "tool_choice".into(),
             req.tool_choice.clone().unwrap_or(json!("auto")),
         );
+        if let Some(parallel) = req.parallel_tool_calls {
+            out.insert("parallel_tool_calls".into(), json!(parallel));
+        }
     }
     if let Some(max) = req.max_tokens {
         out.insert("max_tokens".into(), json!(max));

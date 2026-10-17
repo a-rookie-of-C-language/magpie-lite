@@ -313,6 +313,7 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
             v,
         )?,
         tool_choice,
+        parallel_tool_calls: None,
         tool_choice_protocol: Some(crate::ir::ToolChoiceProtocol::Gemini),
         max_tokens: generation
             .and_then(|g| get_either(g, "maxOutputTokens", "max_output_tokens"))
