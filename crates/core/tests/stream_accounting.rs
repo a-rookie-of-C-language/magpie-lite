@@ -1,4 +1,4 @@
-use magpie_core::{chat, ir::Usage, responses, stream::StreamEvent};
+use magpie_core::{chat, chat::usage_to_chat_json, ir::Usage, responses, stream::StreamEvent};
 use serde_json::json;
 
 #[test]
@@ -37,6 +37,29 @@ fn cumulative_usage_replaces_reported_counters_without_erasing_absent_fields() {
     });
     assert_eq!(usage.output, Some(0));
     assert_eq!(usage.cache_read, Some(2));
+}
+
+#[test]
+fn chat_and_responses_round_trip_cache_write_and_reasoning_usage() {
+    let chat = json!({"usage": {
+        "prompt_tokens": 12, "completion_tokens": 5,
+        "prompt_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 4},
+        "completion_tokens_details": {"reasoning_tokens": 2}}});
+    let usage = chat::response_usage(&chat);
+    assert_eq!(usage.cache_read, Some(3));
+    assert_eq!(usage.cache_write, Some(4));
+    assert_eq!(usage.reasoning, Some(2));
+    let encoded = chat::response_usage(&json!({"usage": usage_to_chat_json(&usage)}));
+    assert_eq!(encoded.cache_write, Some(4));
+
+    let responses_usage = json!({"usage": {
+        "input_tokens": 12, "output_tokens": 5,
+        "input_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 4},
+        "output_tokens_details": {"reasoning_tokens": 2}}});
+    let usage = responses::response_usage(&responses_usage);
+    assert_eq!(usage.cache_read, Some(3));
+    assert_eq!(usage.cache_write, Some(4));
+    assert_eq!(usage.reasoning, Some(2));
 }
 
 #[test]

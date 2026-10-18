@@ -360,16 +360,19 @@ fn decode_usage(v: &Value) -> Usage {
 fn usage_to_json(u: &Usage) -> Value {
     let input = u.input.unwrap_or(0);
     let output = u.output.unwrap_or(0);
-    let mut cached = Map::new();
+    let mut details = Map::new();
     if let Some(read) = u.cache_read {
-        cached.insert("cached_tokens".into(), json!(read));
+        details.insert("cached_tokens".into(), json!(read));
+    }
+    if let Some(write) = u.cache_write {
+        details.insert("cache_write_tokens".into(), json!(write));
     }
     let mut usage = Map::new();
     usage.insert("prompt_tokens".into(), json!(input));
     usage.insert("completion_tokens".into(), json!(output));
     usage.insert("total_tokens".into(), json!(input + output));
-    if !cached.is_empty() {
-        usage.insert("prompt_tokens_details".into(), Value::Object(cached));
+    if !details.is_empty() {
+        usage.insert("prompt_tokens_details".into(), Value::Object(details));
     }
     if let Some(reasoning) = u.reasoning {
         usage.insert(
@@ -383,6 +386,12 @@ fn usage_to_json(u: &Usage) -> Value {
 /// Read reported usage even when a refusal omits the ordinary reply fields.
 pub fn response_usage(v: &Value) -> Usage {
     v.get("usage").map(decode_usage).unwrap_or_default()
+}
+
+/// Re-encode IR usage into Chat's usage object (test and internal helper).
+#[doc(hidden)]
+pub fn usage_to_chat_json(u: &Usage) -> Value {
+    usage_to_json(u)
 }
 
 /// Decode an OpenAI Chat Completions reply body.
