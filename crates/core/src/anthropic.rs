@@ -414,7 +414,17 @@ fn decode_usage(v: &Value) -> Usage {
         input: v.get("input_tokens").and_then(Value::as_u64),
         output: v.get("output_tokens").and_then(Value::as_u64),
         cache_read: v.get("cache_read_input_tokens").and_then(Value::as_u64),
-        cache_write: v.get("cache_creation_input_tokens").and_then(Value::as_u64),
+        cache_write: v
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                v.get("cache_creation").and_then(|c| {
+                    Some(
+                        c.get("ephemeral_5m_input_tokens")?.as_u64()?
+                            + c.get("ephemeral_1h_input_tokens")?.as_u64()?,
+                    )
+                })
+            }),
     }
 }
 
@@ -1199,6 +1209,20 @@ impl AnthropicStreamEncoder {
 #[cfg(test)]
 mod search_state_tests {
     use super::*;
+
+    #[test]
+    fn cache_write_split_sums_both_ttls_without_inventing_a_total() {
+        let split = json!({"cache_creation_input_tokens": 3000,
+            "cache_creation":{"ephemeral_5m_input_tokens":1000,
+            "ephemeral_1h_input_tokens":2000}});
+        assert_eq!(decode_usage(&split).cache_write, Some(3000));
+        let creation_only = json!({"cache_creation":{"ephemeral_5m_input_tokens":100,
+            "ephemeral_1h_input_tokens":200}});
+        assert_eq!(decode_usage(&creation_only).cache_write, Some(300));
+        let partial = json!({"cache_creation":{"ephemeral_5m_input_tokens":100}});
+        assert_eq!(decode_usage(&partial).cache_write, None);
+        assert_eq!(decode_usage(&json!({})).cache_write, None);
+    }
 
     fn call(index: usize, id: &str) -> Value {
         json!({"type":"content_block_start","index":index,
