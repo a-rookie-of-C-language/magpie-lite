@@ -209,10 +209,7 @@ async fn spawn_gateway(upstream_base: String) -> String {
 }
 
 fn init_retired_for_test(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "magpie-lite-retired-e2e-{}-{name}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("magpie-lite-retired-e2e-{name}"));
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("retired.json");
     let _ = std::fs::remove_file(&path);
@@ -576,18 +573,139 @@ async fn spawn_retired_model() -> String {
     format!("http://{addr}")
 }
 
+/// A scripted upstream: the Nth request gets the Nth scripted reply, or
+/// a plain OK chat answer once the script runs out. It counts requests.
+#[derive(Clone)]
+struct ScriptedUpstream {
+    replies: Arc<Mutex<Vec<(u16, Value)>>>,
+    requests: Arc<Mutex<usize>>,
+}
+
+async fn scripted_chat_completions(
+    State(mock): State<ScriptedUpstream>,
+    body: axum::body::Bytes,
+) -> Response {
+    let _ = serde_json::from_slice::<Value>(&body).expect("upstream body is JSON");
+    let count = {
+        let mut requests = mock.requests.lock().unwrap();
+        let count = *requests;
+        *requests += 1;
+        count
+    };
+    // The last scripted reply repeats once the script runs out; no
+    // script at all, an OK chat answer.
+    let replies = mock.replies.lock().unwrap();
+    let index = count.min(replies.len().saturating_sub(1));
+    if let Some((status, reply)) = replies.get(index).cloned() {
+        drop(replies);
+        let status = StatusCode::from_u16(status).unwrap();
+        return (status, Json(reply)).into_response();
+    }
+    drop(replies);
+    Json(json!({
+        "id": "chatcmpl-scripted", "object": "chat.completion", "model": "m",
+        "choices": [{"index": 0,
+            "message": {"role": "assistant", "content": "hello"},
+            "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    }))
+    .into_response()
+}
+
+async fn spawn_scripted(replies: Vec<(u16, Value)>) -> (String, Arc<Mutex<usize>>) {
+    let mock = ScriptedUpstream {
+        replies: Arc::new(Mutex::new(replies)),
+        requests: Arc::new(Mutex::new(0)),
+    };
+    let requests = mock.requests.clone();
+    let app = Router::new()
+        .route("/v1/chat/completions", post(scripted_chat_completions))
+        .with_state(mock);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), requests)
+}
+
+/// A member whose API can't read the request's shape hands it to the
+/// next one, asked once, and doesn't rest for it: the next request asks
+/// it first again (#350). Nobody left, the agent gets its error.
+#[tokio::test]
+async fn group_fails_over_a_request_shape() {
+    let grok_shape_422 = json!({
+        "error": "Failed to deserialize the JSON body into the target type: input[0]: unknown item type \"additional_tools\"; expected one of: message, reasoning, function_call"
+    });
+    let (a, a_requests) = spawn_scripted(vec![(422, grok_shape_422)]).await;
+    let (b, b_requests) = spawn_scripted(vec![]).await;
+    let gw = spawn_gateway_with_group(a.clone(), b.clone(), RoutingPolicy::Order).await;
+    let client = reqwest::Client::new();
+
+    for expected_a in 1..=2 {
+        let resp = client
+            .post(format!("{gw}/v1/chat/completions"))
+            .bearer_auth("magpie-lite")
+            .json(&json!({
+                "model": "group/daily-coding",
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "hello");
+        assert_eq!(*a_requests.lock().unwrap(), expected_a);
+        assert_eq!(*b_requests.lock().unwrap(), expected_a);
+    }
+
+    // Alone, the shape error is the agent's, and a retry asks it again:
+    // the shape failure never rests the member.
+    let solo = spawn_gateway_with_group(a, b, RoutingPolicy::Order).await;
+    // Replace b's base with a's by building a one-member config: reuse
+    // the fallback helper's shape through a provider fallback chain.
+    let resp = client
+        .post(format!("{solo}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "primary/mock-model",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(resp.text().await.unwrap().contains("unknown item type"));
+    assert_eq!(*a_requests.lock().unwrap(), 3);
+
+    // The next request to the group asks a first again.
+    let resp = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "group/daily-coding",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(*a_requests.lock().unwrap(), 4);
+}
+
 #[tokio::test]
 async fn retired_model_falls_back_to_another_provider() {
     let primary = spawn_retired_model().await;
     let (backup, last) = spawn_mock().await;
-    let gw = spawn_gateway_with_fallback(primary.clone(), backup).await;
+    let gw = spawn_gateway_with_fallback_named(primary, backup, "gone", "spare").await;
     let client = reqwest::Client::new();
 
     let resp = client
         .post(format!("{gw}/v1/chat/completions"))
         .bearer_auth("magpie-lite")
         .json(&json!({
-            "model": "primary/mock-model",
+            "model": "gone/mock-model",
             "stream": true,
             "messages": [{"role": "user", "content": "Weather?"}]
         }))
@@ -605,7 +723,8 @@ async fn retired_model_leaves_the_catalog_until_it_answers() {
     let path = init_retired_for_test("catalog");
     let primary = spawn_retired_model().await;
     let (backup, _) = spawn_mock().await;
-    let gw = spawn_gateway_with_fallback(primary, backup).await;
+    let gw =
+        spawn_gateway_with_fallback_named(primary, backup, "catalog-gone", "catalog-spare").await;
     let client = reqwest::Client::new();
 
     // Before anything: mock-model is listed, and nothing is retired.
@@ -623,10 +742,10 @@ async fn retired_model_leaves_the_catalog_until_it_answers() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|m| m["id"] == "primary/mock-model")
+            .any(|m| m["id"] == "catalog-gone/mock-model")
     );
     assert!(!model_is_retired(
-        "primary",
+        "catalog-gone",
         "mock-model",
         std::time::SystemTime::now()
     ));
@@ -636,7 +755,7 @@ async fn retired_model_leaves_the_catalog_until_it_answers() {
         .post(format!("{gw}/v1/chat/completions"))
         .bearer_auth("magpie-lite")
         .json(&json!({
-            "model": "primary/mock-model",
+            "model": "catalog-gone/mock-model",
             "messages": [{"role": "user", "content": "Weather?"}]
         }))
         .send()
@@ -645,7 +764,7 @@ async fn retired_model_leaves_the_catalog_until_it_answers() {
     assert_eq!(resp.status(), StatusCode::OK);
     drop(resp);
     assert!(model_is_retired(
-        "primary",
+        "catalog-gone",
         "mock-model",
         std::time::SystemTime::now()
     ));
@@ -665,7 +784,7 @@ async fn retired_model_leaves_the_catalog_until_it_answers() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|m| m["id"] == "primary/mock-model")
+            .any(|m| m["id"] == "catalog-gone/mock-model")
     );
 
     // A vendor answer takes the retirement back, and the model is listed.
@@ -685,7 +804,7 @@ async fn retired_model_leaves_the_catalog_until_it_answers() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|m| m["id"] == "primary/mock-model")
+            .any(|m| m["id"] == "catalog-gone/mock-model")
     );
     let _ = std::fs::remove_file(&path);
 }
@@ -1005,6 +1124,15 @@ async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) ->
     format!("http://{addr}")
 }
 async fn spawn_gateway_with_fallback(primary: String, backup: String) -> String {
+    spawn_gateway_with_fallback_named(primary, backup, "primary", "backup").await
+}
+
+async fn spawn_gateway_with_fallback_named(
+    primary: String,
+    backup: String,
+    primary_id: &str,
+    backup_id: &str,
+) -> String {
     let config = Config {
         port: 0,
         token: "magpie-lite".into(),
@@ -1019,20 +1147,20 @@ async fn spawn_gateway_with_fallback(primary: String, backup: String) -> String 
         default_provider: "primary".into(),
         provider: vec![
             ProviderConfig {
-                id: "primary".into(),
+                id: primary_id.into(),
                 name: "Primary".into(),
                 protocol: Protocol::Chat,
                 base_url: format!("{primary}/v1"),
                 api_key: "primary-key".into(),
                 api_keys: Vec::new(),
                 models: vec!["mock-model".into()],
-                fallback: vec!["backup/mock-model".into()],
+                fallback: vec![format!("{backup_id}/mock-model")],
                 key_cooldown_ms: None,
                 capabilities: Default::default(),
                 key_generation: 0,
             },
             ProviderConfig {
-                id: "backup".into(),
+                id: backup_id.into(),
                 name: "Backup".into(),
                 protocol: Protocol::Chat,
                 base_url: format!("{backup}/v1"),

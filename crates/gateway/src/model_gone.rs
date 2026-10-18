@@ -80,6 +80,35 @@ pub(crate) fn model_refused(status: u16, body: &Value) -> bool {
         && !refused_words().is_match(&text)
 }
 
+/// How a vendor says it can't read the request's shape — an item, field
+/// or parameter it doesn't know, which another vendor's API may take:
+/// xAI's 422 "Failed to deserialize the JSON body …: unknown item type"
+/// (#350), OpenAI's "Unknown parameter".
+fn shape_words() -> &'static Regex {
+    static SHAPE: OnceLock<Regex> = OnceLock::new();
+    SHAPE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)failed to deserialize|unknown (item |content |input )?(type|variant|field|parameter)|unknown_parameter|unrecognized (request argument|field|parameter)|extra (inputs|fields) are not permitted|additional properties are not allowed"#,
+        )
+        .expect("shape words regex")
+    })
+}
+
+/// A request failed over its shape alone: the next member is asked, and
+/// this one doesn't rest, as nothing is wrong with it. A request missing
+/// what every API requires ("field required") or too long for the model
+/// isn't one.
+pub(crate) fn shape_refused(status: u16, body: &Value) -> bool {
+    if !matches!(status, 400 | 422) {
+        return false;
+    }
+    let text = error_text(body);
+    shape_words().is_match(&text)
+        && !quota_words().is_match(&text)
+        && !unserved_words().is_match(&text)
+        && !refused_words().is_match(&text)
+}
+
 fn quota_words() -> &'static Regex {
     static QUOTA: OnceLock<Regex> = OnceLock::new();
     QUOTA.get_or_init(|| {
@@ -175,5 +204,36 @@ mod tests {
             "response": {"error": {"message": "model not_found: no such model"}}
         });
         assert!(model_refused(404, &body));
+    }
+
+    #[test]
+    fn shape_refusal_matches_unknown_items_only() {
+        // xAI's 422 over an input item its API doesn't know (#350).
+        assert!(shape_refused(
+            422,
+            &json!({"error": "Failed to deserialize the JSON body into the target type: input[0]: unknown item type \"additional_tools\"; expected one of: message, reasoning, function_call"})
+        ));
+        // OpenAI's unknown parameter.
+        assert!(shape_refused(
+            400,
+            &json!({"error": {"message": "Unknown parameter: 'reasoning.summary'.", "code": "unknown_parameter"}})
+        ));
+        // A request missing what every API requires is not a shape the
+        // next vendor reads better.
+        assert!(!shape_refused(
+            400,
+            &json!({"error": {"message": "messages: field required"}})
+        ));
+        // Too long for the model is not a shape failure.
+        assert!(!shape_refused(
+            400,
+            &json!({"error": {"message": "This model's maximum context length is 128000 tokens"}})
+        ));
+        // The next member is asked only once, from the status itself:
+        // 5xx never claims a shape.
+        assert!(!shape_refused(
+            500,
+            &json!({"error": "Failed to deserialize the JSON body into the target type: input[0]: unknown item type \"additional_tools\""})
+        ));
     }
 }

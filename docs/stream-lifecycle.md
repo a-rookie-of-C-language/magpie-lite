@@ -287,6 +287,12 @@ transport failures and truncated streams use 502.
   catalog for a week (`crates/gateway/src/retired.rs`): it leaves
   `/v1/models` and bare-name routing until the vendor answers it again or
   the week passes; an explicit `provider/model` request is still sent.
+- A request a vendor's API cannot read — xAI's 422 "unknown item type",
+  OpenAI's "Unknown parameter" — is worth handing to the next route once
+  (`shapeRefused` in `crates/gateway/src/model_gone.rs`): the shape, not
+  the vendor, is at fault, so the member doesn't rest and the next
+  request asks it first again. Missing-required-field and context-length
+  errors stay non-retryable.
 
 If all applicable candidates fail, the last attempt's error is delivered once
 in the client protocol. Retry classification adds no management mutation API.
