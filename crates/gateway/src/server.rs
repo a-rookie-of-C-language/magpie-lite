@@ -800,10 +800,12 @@ fn upstream_routes(
         .map(|(_, key)| key.clone())
         .collect::<Vec<_>>();
     let initial = UpstreamRoute {
-        api_keys: key_rotation.rotate(
+        api_keys: key_rotation.rotate_routed(
             &initial.provider.id,
             initial.provider.key_generation,
+            initial.provider.routing,
             &initial_keys,
+            &initial.provider.key_weights(),
         ),
         ..initial
     };
@@ -841,10 +843,12 @@ fn upstream_routes(
             if !seen_group_routes.insert((provider.id.clone(), model.clone())) {
                 continue;
             }
-            let api_keys = key_rotation.rotate(
+            let api_keys = key_rotation.rotate_routed(
                 &provider.id,
                 provider.key_generation,
+                provider.routing,
                 &provider.api_key_pool(),
+                &provider.key_weights(),
             );
             out.push(UpstreamRoute {
                 provider: Arc::new(provider.clone()),
@@ -857,10 +861,12 @@ fn upstream_routes(
             if !seen_providers.insert(provider.id.clone()) {
                 continue;
             }
-            let api_keys = key_rotation.rotate(
+            let api_keys = key_rotation.rotate_routed(
                 &provider.id,
                 provider.key_generation,
+                provider.routing,
                 &provider.api_key_pool(),
+                &provider.key_weights(),
             );
             out.push(UpstreamRoute {
                 provider: Arc::new(provider.clone()),
@@ -877,6 +883,31 @@ fn upstream_routes(
 /// Statuses that make the next key in the same provider worth one attempt.
 fn key_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 401 | 402 | 403 | 429)
+}
+
+/// Count what a key just answered against it for the provider's `usage`
+/// policy, and wake it from any cooldown. Providers report cumulative counters
+/// for each attempt, so `tracker.total_usage()` is the whole logical reply; a
+/// reply that named no amount still counts as one request served.
+fn record_key_served(
+    state: &AppState,
+    provider: &ProviderConfig,
+    key_slot: usize,
+    tracker: &RequestTracker,
+) {
+    let usage = tracker.total_usage();
+    let tokens = usage
+        .input
+        .unwrap_or(0)
+        .saturating_add(usage.output.unwrap_or(0))
+        .saturating_add(usage.cache_read.unwrap_or(0))
+        .saturating_add(usage.cache_write.unwrap_or(0));
+    state.key_rotation.record_served(
+        &provider.id,
+        provider.key_generation,
+        key_slot,
+        tokens,
+    );
 }
 
 /// Quota and rate-limit responses should influence later key selection.
@@ -1855,6 +1886,10 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
             } => {
                 tracker.observe_usage(&ir.usage);
                 ir.usage = tracker.total_usage();
+                // The key that answered is credited with the reply's tokens,
+                // whether the client gets JSON or the answer is replayed as a
+                // stream below.
+                record_key_served(&state, &candidate.provider, candidate.key_slot, &tracker);
                 tracker.finish("ok", &Usage::default());
                 if !whole_as_stream {
                     return Ok(ok_json(wire.encode_response(&ir, &creq)));
@@ -1964,6 +1999,18 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
                         // Release the HTTP response before yielding the final frame,
                         // even if the downstream is backpressured or stops polling.
                         drop(events);
+                        // A stream that reached its own Done is the reply the key
+                        // served; credit it the whole logical reply. A reply
+                        // replayed from a whole upstream answer already finished
+                        // above and must not be counted a second time.
+                        if status == "ok" && !tracker.is_finished() {
+                            record_key_served(
+                                &state,
+                                &reask_candidate.provider,
+                                reask_candidate.key_slot,
+                                &tracker,
+                            );
+                        }
                         tracker.finish(status, &Usage::default());
                         if !suppress_start && let Some(frame) = encoder.encode(&event) {
                             yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
@@ -2516,6 +2563,8 @@ mod tests {
             fallback: vec![],
             key_cooldown_ms: None,
             capabilities: Default::default(),
+            routing: RoutingPolicy::Rotate,
+            weights: Vec::new(),
             key_generation: 0,
         }
     }

@@ -653,6 +653,8 @@
                 <div class="field"><label for="provider-models">Model IDs</label><textarea id="provider-models" class="token-input" placeholder="deepseek-chat&#10;deepseek-reasoner" aria-describedby="provider-models-help"></textarea><p id="provider-models-help" class="group-help">One upstream model ID per line. Listed models appear in the agent catalog; explicit provider/model routes also work for unlisted models.</p></div>
                 <div class="field"><label for="provider-key-mode">API keys</label><select id="provider-key-mode" class="token-input" aria-describedby="provider-key-help"><option value="keep">Keep existing keys</option><option value="replace">Replace key pool</option><option value="clear">No upstream authentication</option></select><p id="provider-key-help" class="group-help">Saved keys are never displayed. Choose Replace to rotate credentials, or No upstream authentication for a local service.</p></div>
                 <div id="provider-keys-field" class="field" hidden><label for="provider-keys">New key pool</label><textarea id="provider-keys" class="token-input" autocomplete="off" spellcheck="false" aria-describedby="provider-keys-help"></textarea><p id="provider-keys-help" class="group-help">One API key per line, in rotation order. These values are sent when you save, discover models or test a connection.</p></div>
+                <div class="field"><label for="provider-routing">Key routing</label><select id="provider-routing" class="token-input" aria-describedby="provider-routing-help"><option value="rotate">Rotate</option><option value="order">Ordered</option><option value="usage">Least used</option><option value="weight">Weighted</option></select><p id="provider-routing-help" class="group-help">Rotate spreads requests across the key pool, the default. Ordered always starts at the first key. Least used prefers the key that served the fewest tokens lately. Weighted spreads by each key's weight.</p></div>
+                <div id="provider-weights-field" class="field" hidden><label for="provider-weights">Key weights</label><textarea id="provider-weights" class="token-input" placeholder="3&#10;1&#10;4" aria-describedby="provider-weights-help"></textarea><p id="provider-weights-help" class="group-help">One weight per key slot, in pool order, each a whole number from 0 to 1000. A missing or zero weight counts as 1.</p></div>
                 <div class="editor-grid">
                   <div class="field"><label for="provider-cap-streaming">Streaming support</label><select id="provider-cap-streaming" class="token-input"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></div>
                   <div class="field"><label for="provider-cap-tools">Tools/function calling</label><select id="provider-cap-tools" class="token-input"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></div>
@@ -675,6 +677,7 @@
                       <th scope="col">Base URL</th>
                       <th scope="col">Models</th>
                       <th scope="col">Keys</th>
+                      <th scope="col">Routing</th>
                       <th scope="col">Fallback</th>
                       <th scope="col">Cooldown</th>
                       <th scope="col">Actions</th>
@@ -777,6 +780,9 @@
       providerKeyMode: document.getElementById("provider-key-mode"),
       providerKeysField: document.getElementById("provider-keys-field"),
       providerKeys: document.getElementById("provider-keys"),
+      providerRouting: document.getElementById("provider-routing"),
+      providerWeightsField: document.getElementById("provider-weights-field"),
+      providerWeights: document.getElementById("provider-weights"),
       providerFallback: document.getElementById("provider-fallback"),
       providerCooldown: document.getElementById("provider-cooldown"),
       providerDefault: document.getElementById("provider-default"),
@@ -1276,6 +1282,7 @@
           text("td", provider.base_url),
           text("td", listSummary(provider.models || [])),
           text("td", provider.credential_count === 0 ? "No auth" : `${fmt(provider.key_count)} slots`),
+          text("td", routingSummary(provider)),
           text("td", listSummary(provider.fallback || [])),
           text("td", formatDuration(provider.key_cooldown_ms)),
           actions
@@ -1330,6 +1337,14 @@
       return protocols + " · " + flags.join(" ");
     }
 
+    // A provider's key policy, with its weights shown only when it uses them.
+    function routingSummary(provider) {
+      const policy = provider.routing || "rotate";
+      if (policy !== "weight") return policy;
+      const weights = provider.weights || [];
+      return weights.length ? `weight: ${weights.join(", ")}` : "weight";
+    }
+
     function renderModels(models) {
       clear(elements.modelList);
       const values = Array.isArray(models) ? models : [];
@@ -1366,6 +1381,13 @@
       if (!replace) elements.providerKeys.value = "";
     }
 
+    // Weights only apply to the weighted policy, so hide them otherwise.
+    function routingChanged() {
+      const weighted = elements.providerRouting.value === "weight";
+      elements.providerWeightsField.hidden = !weighted;
+      if (!weighted) elements.providerWeights.value = "";
+    }
+
     function openProviderEditor(provider = null) {
       if (managementBusy) return;
       if (!elements.agentEditor.hidden) closeAgentEditor(false);
@@ -1390,6 +1412,9 @@
       elements.providerUrl.value = provider?.base_url || "";
       elements.providerModels.value = (provider?.models || []).join("\n");
       elements.providerFallback.value = (provider?.fallback || []).join("\n");
+      elements.providerRouting.value = provider?.routing || "rotate";
+      elements.providerWeights.value = (provider?.weights || []).join("\n");
+      routingChanged();
       elements.providerCooldown.value = provider?.key_cooldown_override_ms ?? "";
       elements.providerDefault.checked = provider ? routingSnapshot.default_provider === provider.id : !(routingSnapshot?.providers || []).length;
       elements.providerDefault.disabled = managementBusy;
@@ -1478,6 +1503,7 @@
     elements.providerNew.addEventListener("click", () => openProviderEditor());
     elements.providerCancel.addEventListener("click", closeProviderEditor);
     elements.providerKeyMode.addEventListener("change", keyModeChanged);
+    elements.providerRouting.addEventListener("change", routingChanged);
     elements.providerEditor.addEventListener("keydown", event => {
       if (event.key === "Escape" && !managementBusy) { event.preventDefault(); closeProviderEditor(); }
     });
@@ -1504,6 +1530,19 @@
         key_cooldown_ms: cooldown === "" ? null : Number(cooldown),
         make_default: elements.providerDefault.checked
       };
+      const routing = elements.providerRouting.value;
+      body.routing = routing;
+      // Only the weighted policy reads weights; an empty list clears them.
+      if (routing === "weight") {
+        const raw = lines(elements.providerWeights.value);
+        const weights = raw.map(Number);
+        if (weights.some(weight => !Number.isSafeInteger(weight) || weight < 0 || weight > 1000)) {
+          elements.providerMessage.textContent = "Key weights must be whole numbers from 0 to 1000, one per line.";
+          elements.providerWeights.focus();
+          return;
+        }
+        body.weights = weights;
+      } else body.weights = [];
       if (elements.providerKeyMode.value === "replace") {
         body.api_keys = lines(elements.providerKeys.value);
         if (!body.api_keys.length) {

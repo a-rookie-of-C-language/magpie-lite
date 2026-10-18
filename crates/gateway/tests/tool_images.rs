@@ -559,6 +559,8 @@ async fn fixture(protocol: Protocol) -> Fixture {
             models: vec!["mock-model".into()],
             fallback: vec![],
             key_cooldown_ms: None,
+            routing: RoutingPolicy::Rotate,
+            weights: Vec::new(),
             key_generation: 0,
         }],
         group: vec![GroupConfig {

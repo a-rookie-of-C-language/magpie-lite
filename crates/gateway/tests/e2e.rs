@@ -276,6 +276,8 @@ async fn spawn_gateway_with_protocol_and_history(
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),
+            routing: RoutingPolicy::Rotate,
+            weights: Vec::new(),
             key_generation: 0,
         }],
         group: Vec::new(),
@@ -1466,6 +1468,8 @@ async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) ->
         fallback: Vec::new(),
         key_cooldown_ms: None,
         capabilities: Default::default(),
+        routing: RoutingPolicy::Rotate,
+        weights: Vec::new(),
         key_generation: 0,
     }];
     if let Some(backup) = backup {
@@ -1481,6 +1485,8 @@ async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) ->
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),
+            routing: RoutingPolicy::Rotate,
+            weights: Vec::new(),
             key_generation: 0,
         });
     }
@@ -1551,6 +1557,8 @@ async fn spawn_gateway_with_fallback_named(
                 fallback: vec![format!("{backup_id}/mock-model")],
                 key_cooldown_ms: None,
                 capabilities: Default::default(),
+                routing: RoutingPolicy::Rotate,
+                weights: Vec::new(),
                 key_generation: 0,
             },
             ProviderConfig {
@@ -1564,6 +1572,8 @@ async fn spawn_gateway_with_fallback_named(
                 fallback: Vec::new(),
                 key_cooldown_ms: None,
                 capabilities: Default::default(),
+                routing: RoutingPolicy::Rotate,
+                weights: Vec::new(),
                 key_generation: 0,
             },
         ],
@@ -1610,6 +1620,8 @@ async fn spawn_gateway_with_same_provider_group(upstream: String) -> String {
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),
+            routing: RoutingPolicy::Rotate,
+            weights: Vec::new(),
             key_generation: 0,
         }],
         group: vec![GroupConfig {
@@ -1665,6 +1677,8 @@ async fn spawn_gateway_with_group(
                 fallback: Vec::new(),
                 key_cooldown_ms: None,
                 capabilities: Default::default(),
+                routing: RoutingPolicy::Rotate,
+                weights: Vec::new(),
                 key_generation: 0,
             },
             ProviderConfig {
@@ -1678,6 +1692,8 @@ async fn spawn_gateway_with_group(
                 fallback: Vec::new(),
                 key_cooldown_ms: None,
                 capabilities: Default::default(),
+                routing: RoutingPolicy::Rotate,
+                weights: Vec::new(),
                 key_generation: 0,
             },
         ],

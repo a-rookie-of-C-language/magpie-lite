@@ -42,6 +42,8 @@ async fn server(enabled: bool) -> Server {
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),
+            routing: RoutingPolicy::Rotate,
+            weights: Vec::new(),
             key_generation: 0,
         }],
         group: vec![GroupConfig {

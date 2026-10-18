@@ -9,7 +9,10 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
-use crate::config::{Config, ConfigSnapshot, Protocol, ProviderCapabilities, ProviderConfig};
+use crate::config::{
+    Config, ConfigSnapshot, Protocol, ProviderCapabilities, ProviderConfig, RoutingPolicy,
+    default_provider_routing,
+};
 use crate::config_store::ConfigError;
 use crate::server::{AppState, config_response, expected_config_revision, idempotency_request};
 use crate::upstream;
@@ -32,6 +35,10 @@ pub(crate) struct ProviderEdit {
     #[serde(default)]
     fallback: Vec<String>,
     key_cooldown_ms: Option<u64>,
+    /// Omitted on update to preserve the existing policy.
+    routing: Option<RoutingPolicy>,
+    /// Omitted on update to preserve the existing weights; `[]` clears them.
+    weights: Option<Vec<u32>>,
     #[serde(default)]
     make_default: bool,
 }
@@ -48,6 +55,12 @@ impl ProviderEdit {
                 .map(|p| (p.api_key.clone(), p.api_keys.clone()))
                 .unwrap_or_default(),
         };
+        let routing = self
+            .routing
+            .unwrap_or_else(|| existing.map(|p| p.routing).unwrap_or_else(default_provider_routing));
+        let weights = self
+            .weights
+            .unwrap_or_else(|| existing.map(|p| p.weights.clone()).unwrap_or_default());
         ProviderConfig {
             id: self.id,
             name: self.name,
@@ -59,6 +72,8 @@ impl ProviderEdit {
             models: self.models,
             fallback: self.fallback,
             key_cooldown_ms: self.key_cooldown_ms,
+            routing,
+            weights,
             key_generation: 0,
         }
     }

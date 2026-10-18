@@ -365,6 +365,79 @@ async fn provider_capabilities_round_trip_preserve_and_clear_without_secrets() {
     }
 }
 
+/// A provider's routing policy and per-key weights survive a create, an
+/// update that omits them, and an update that clears them -- without any key
+/// ever appearing in a response.
+#[tokio::test]
+async fn provider_routing_and_key_weights_round_trip_and_preserve_on_update() {
+    let gw = gateway().await;
+    let mut body = provider(&gw, "weighted");
+    body["routing"] = json!("weight");
+    body["weights"] = json!([3, 1, 4]);
+    let created = edit(&gw, Method::POST, "/config/providers", body.clone()).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let text = created.text().await.unwrap();
+    for secret in ["private-one", "private-two", "private-three"] {
+        assert!(!text.contains(secret));
+    }
+    let snapshot = snapshot(&gw, "/config").await;
+    let shown = snapshot["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["id"] == "weighted")
+        .unwrap()
+        .clone();
+    assert_eq!(shown["routing"], json!("weight"));
+    assert_eq!(shown["weights"], json!([3, 1, 4]));
+    assert_eq!(
+        Config::load(&gw.path).unwrap().provider[0].routing,
+        magpie_gateway::RoutingPolicy::Weighted
+    );
+
+    // An update that omits them keeps the policy and the weights.
+    let mut preserve = body.clone();
+    preserve.as_object_mut().unwrap().remove("routing");
+    preserve.as_object_mut().unwrap().remove("weights");
+    assert_eq!(
+        edit(&gw, Method::PUT, "/config/providers/weighted", preserve)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let kept = Config::load(&gw.path).unwrap();
+    assert_eq!(kept.provider[0].routing, magpie_gateway::RoutingPolicy::Weighted);
+    assert_eq!(kept.provider[0].weights, vec![3, 1, 4]);
+
+    // An explicit empty list clears the weights without dropping the policy.
+    let mut clear = body.clone();
+    clear["weights"] = json!([]);
+    clear["routing"] = json!("rotate");
+    assert_eq!(
+        edit(&gw, Method::PUT, "/config/providers/weighted", clear)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let cleared = Config::load(&gw.path).unwrap();
+    assert_eq!(cleared.provider[0].routing, magpie_gateway::RoutingPolicy::Rotate);
+    assert!(cleared.provider[0].weights.is_empty());
+
+    // Unknown policies and out-of-range weights are refused, and no key leaks.
+    let mut bad_policy = provider(&gw, "bad");
+    bad_policy["routing"] = json!("pace");
+    let response = edit(&gw, Method::POST, "/config/providers", bad_policy).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(!response.text().await.unwrap().contains("private-one"));
+
+    let mut too_heavy = provider(&gw, "heavy");
+    too_heavy["routing"] = json!("weight");
+    too_heavy["weights"] = json!([0, 1, 1001]);
+    let response = edit(&gw, Method::POST, "/config/providers", too_heavy).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(!response.text().await.unwrap().contains("private-one"));
+}
+
 #[tokio::test]
 async fn metadata_edit_preserves_legacy_keys_and_cooldown_then_explicit_clear_removes_auth() {
     let gw = gateway().await;

@@ -24,7 +24,7 @@ Zed ─────────┘   Chat + Responses +
 - **Built-in web-search requests**: four client dialects can enable provider-executed search alongside function tools. Native options are retained; bare search intent translates across protocols. Incompatible configured policies fail safely or use a compatible fallback rather than silently dropping restrictions. OpenRouter Chat uses its web plugin; xAI Responses omits the OpenAI sources include.
 - **Providers** from one TOML file: Chat-compatible, Responses-compatible, Anthropic, or Gemini upstreams; console CRUD, bounded model discovery and connection checks, credential rotation and cooldown editing with immediate runtime updates
 - **Model routing**: `deepseek/deepseek-chat` by provider id, `group/daily-coding` route chains with process-local `order`, `rotate`, or `usage` scheduling, bare names by provider model lists, default provider fallback
-- **Multi-key pools**: repeat `--api-key`; requests rotate across keys, rejected/rate-limited keys are retried before route fallback, and `402`/`429` starts a cooldown from `Retry-After`, common duration/reset headers, absolute reset timestamps, or JSON error-body retry delays (60s fallback, per-provider `key_cooldown_ms` / `--key-cooldown-ms` override; `0` disables it)
+- **Multi-key pools**: repeat `--api-key`; rejected/rate-limited keys are retried before route fallback, and `402`/`429` starts a cooldown from `Retry-After`, common duration/reset headers, absolute reset timestamps, or JSON error-body retry delays (60s fallback, per-provider `key_cooldown_ms` / `--key-cooldown-ms` override; `0` disables it). A per-provider `routing` policy spreads a pool by `order`, `rotate` (default), `usage` (least-recently-served token load), or `weight` (smooth weighted round-robin over per-key `--key-weight` shares of `0`-`1000`, cooling keys skipped)
 - **Failover**: ordered provider fallbacks and routing-group routes, tried before any reply bytes are streamed when the active provider is rate limited, out of quota, overloaded, or unreachable
 - **Local authentication**: every non-health route requires the configured token as Bearer, Anthropic `x-api-key`, or Gemini `x-goog-api-key`; `/health` stays public
 - **Web console**: open `http://127.0.0.1:3426/`, enter the local token, and manage Agent connections, providers and routing groups, discover upstream models, test draft connections, or inspect provider totals, routing providers and groups, key-slot totals and active cooldowns, available models, recent requests, and recent usage; prompts, replies, and saved keys are never returned to the page or persisted in request history
@@ -55,6 +55,7 @@ magpie-lite provider add kimi \
 magpie-lite provider add deepseek \
   --base-url https://api.deepseek.com/v1 \
   --api-key sk-one... --api-key sk-two... \
+  --routing weight --key-weight 3 --key-weight 1 \
   --models deepseek-chat deepseek-reasoner --default \
   --fallback kimi/moonshot-v1-128k
 

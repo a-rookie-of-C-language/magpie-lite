@@ -194,6 +194,8 @@ async fn fixture(protocol: Protocol, fail: bool) -> Fixture {
         models: vec!["native-model".into()],
         fallback: vec!["backup/native-model".into()],
         key_cooldown_ms: None,
+        routing: RoutingPolicy::Rotate,
+        weights: Vec::new(),
         key_generation: 0,
     };
     let backup = ProviderConfig {

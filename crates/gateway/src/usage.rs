@@ -414,6 +414,13 @@ impl RequestTracker {
         self.usage.merge(usage);
     }
 
+    /// Whether the request already recorded its final status. A reply replayed
+    /// from a whole upstream answer finishes before its stream is drained, so
+    /// its terminal frame must not account for the same reply twice.
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
     /// Record the final status. Later calls (including Drop) are no-ops.
     pub fn finish(&mut self, status: &str, usage: &Usage) {
         if self.finished {

@@ -140,9 +140,26 @@ pub struct ProviderConfig {
     /// a key out of quota or rate limited.
     #[serde(default)]
     pub key_cooldown_ms: Option<u64>,
+    /// How requests spread over this provider's key pool. `rotate`, the
+    /// default, is the round-robin the pool has always used.
+    #[serde(default = "default_provider_routing")]
+    pub routing: RoutingPolicy,
+    /// Per-key weights for the `weight` policy, parallel to
+    /// `api_key_pool()`: the slot at index `i` weighs `weights[i]`. A
+    /// missing or zero entry weighs 1.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub weights: Vec<u32>,
     /// Process-local credential/endpoint version; never saved or disclosed.
     #[serde(skip)]
     pub key_generation: u64,
+}
+
+/// The largest weight a key may carry; zero is taken as the default 1.
+pub const MAX_KEY_WEIGHT: u32 = 1000;
+
+/// A provider rotates its key pool unless it says otherwise.
+pub(crate) fn default_provider_routing() -> RoutingPolicy {
+    RoutingPolicy::Rotate
 }
 
 impl ProviderConfig {
@@ -194,6 +211,12 @@ impl ProviderConfig {
         {
             anyhow::bail!("model ids must be non-empty and contain no whitespace");
         }
+        if self.weights.iter().any(|weight| *weight > MAX_KEY_WEIGHT) {
+            anyhow::bail!("key weights cannot be above {MAX_KEY_WEIGHT}");
+        }
+        if self.weights.len() > self.api_key_pool().len() {
+            anyhow::bail!("there are more key weights than keys in the pool");
+        }
         Ok(())
     }
     /// Display name: the given one, or the id.
@@ -224,6 +247,15 @@ impl ProviderConfig {
         }
         keys
     }
+
+    /// One weight per effective key slot, in pool order. Absent and zero
+    /// entries weigh 1 so an unweighted pool keeps the rotation it had.
+    pub fn key_weights(&self) -> Vec<u32> {
+        let slots = self.api_key_pool().len();
+        (0..slots)
+            .map(|slot| self.weights.get(slot).copied().unwrap_or(0))
+            .collect()
+    }
 }
 
 /// Round-robin and cooldown selection for one gateway process.
@@ -236,6 +268,31 @@ struct KeyRotationState {
     generation: u64,
     cursor: usize,
     cooldowns: BTreeMap<usize, Instant>,
+    /// Smooth weighted round robin: each key slot's current weight, and the
+    /// total the last pick charged. Kept between requests so the ratio holds
+    /// over every few requests rather than only on average.
+    current: BTreeMap<usize, i64>,
+    /// What each key slot answered lately, for the `usage` policy.
+    served: BTreeMap<usize, TokenUse>,
+}
+
+/// Tokens a key served, decaying so a key that has rested catches up.
+#[derive(Debug, Clone, Copy)]
+struct TokenUse {
+    tokens: f64,
+    at: Instant,
+}
+
+/// How fast served tokens stop counting against a key: half of them after an
+/// hour, as the reference `usageHalfLife` does.
+const USAGE_HALF_LIFE: Duration = Duration::from_secs(60 * 60);
+
+impl TokenUse {
+    /// The tokens still counted against the key now.
+    fn now(&self, now: Instant) -> f64 {
+        let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
+        self.tokens * 2f64.powf(-elapsed / USAGE_HALF_LIFE.as_secs_f64())
+    }
 }
 
 #[derive(Debug)]
@@ -276,8 +333,27 @@ impl KeyRotator {
         generation: u64,
         keys: &[String],
     ) -> Vec<(usize, String)> {
+        self.rotate_routed(provider_id, generation, RoutingPolicy::Rotate, keys, &[])
+    }
+
+    /// Return `(configured slot, key)` pairs in the order the provider's
+    /// routing policy picks, so the first pair is tried first and the rest are
+    /// its failover. `weights` is parallel to `keys`; a missing or zero entry
+    /// weighs 1. A cooling key is left out while another key is healthy, and
+    /// kept as a last resort when every key is cooling.
+    ///
+    /// Slots always stay the configured ones: a policy only decides the order,
+    /// so a request can still re-ask the exact key that answered it.
+    pub fn rotate_routed(
+        &self,
+        provider_id: &str,
+        generation: u64,
+        routing: RoutingPolicy,
+        keys: &[String],
+        weights: &[u32],
+    ) -> Vec<(usize, String)> {
         if keys.is_empty() {
-            return keys.iter().cloned().map(|key| (0, key)).collect();
+            return Vec::new();
         }
         let now = Instant::now();
         let mut states = self
@@ -296,26 +372,127 @@ impl KeyRotator {
             };
         }
         state.cooldowns.retain(|_, until| *until > now);
+        // A pool that shrank inside one generation must not keep the weights
+        // and usage counts of the slots it no longer has.
+        state.current.retain(|slot, _| *slot < keys.len());
+        state.served.retain(|slot, _| *slot < keys.len());
 
-        let start = state.cursor % keys.len();
-        let rotated = keys[start..]
-            .iter()
-            .chain(keys[..start].iter())
-            .enumerate()
-            .map(|(rotated_slot, key)| ((start + rotated_slot) % keys.len(), key.clone()))
-            .collect::<Vec<_>>();
-        state.cursor = (start + 1) % keys.len();
+        let ordered = match routing {
+            RoutingPolicy::Order => (0..keys.len()).collect::<Vec<_>>(),
+            RoutingPolicy::Rotate => {
+                let start = state.cursor % keys.len();
+                state.cursor = (start + 1) % keys.len();
+                (0..keys.len())
+                    .map(|offset| (start + offset) % keys.len())
+                    .collect()
+            }
+            RoutingPolicy::Usage => {
+                // Least used first, by the tokens still counted against each
+                // key after an hour's half-life; ties keep their slot order.
+                let served = |slot: &usize| {
+                    state
+                        .served
+                        .get(slot)
+                        .map(|use_| use_.now(now))
+                        .unwrap_or(0.0)
+                };
+                let mut slots = (0..keys.len()).collect::<Vec<_>>();
+                slots.sort_by(|a, b| {
+                    served(a)
+                        .partial_cmp(&served(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.cmp(b))
+                });
+                slots
+            }
+            RoutingPolicy::Weighted => {
+                // Smooth weighted round robin: every key that isn't cooling
+                // gains its weight, and the heaviest takes the request and is
+                // charged the total, which holds the ratio over every few
+                // requests. A cooling key neither gains nor is charged, so it
+                // takes up its share where it left off once it is back.
+                let mut best: Option<usize> = None;
+                let mut total: i64 = 0;
+                for slot in 0..keys.len() {
+                    if state.cooldowns.contains_key(&slot) {
+                        continue;
+                    }
+                    let weight = i64::from(weights.get(slot).copied().unwrap_or(0).max(1));
+                    *state.current.entry(slot).or_insert(0) += weight;
+                    total += weight;
+                    let current = *state.current.get(&slot).unwrap_or(&0);
+                    if best.is_none_or(|best| current > *state.current.get(&best).unwrap_or(&0)) {
+                        best = Some(slot);
+                    }
+                }
+                match best {
+                    Some(best) => {
+                        *state.current.entry(best).or_insert(0) -= total;
+                        let mut slots = Vec::with_capacity(keys.len());
+                        slots.push(best);
+                        slots.extend((0..keys.len()).filter(|slot| *slot != best));
+                        slots
+                    }
+                    // Every key is cooling: leave them in their order, as the
+                    // reference's weighted round does.
+                    None => (0..keys.len()).collect(),
+                }
+            }
+        };
 
-        let available = rotated
+        let available = ordered
             .iter()
-            .filter(|(slot, _)| !state.cooldowns.contains_key(slot))
-            .cloned()
+            .copied()
+            .filter(|slot| !state.cooldowns.contains_key(slot))
             .collect::<Vec<_>>();
-        if available.is_empty() {
-            rotated
-        } else {
-            available
+        let ordered = if available.is_empty() { ordered } else { available };
+        ordered
+            .into_iter()
+            .map(|slot| (slot, keys[slot].clone()))
+            .collect()
+    }
+
+    /// Count what a key just answered against it for the `usage` policy, and
+    /// wake it: a key that answers is not resting any more. `tokens` of zero
+    /// still counts as one request served.
+    pub fn record_served(
+        &self,
+        provider_id: &str,
+        generation: u64,
+        key_slot: usize,
+        tokens: u64,
+    ) {
+        let now = Instant::now();
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = states.entry(provider_id.to_owned()).or_default();
+        if generation < state.generation {
+            return;
         }
+        if generation > state.generation {
+            *state = KeyRotationState {
+                generation,
+                ..Default::default()
+            };
+        }
+        let served = state
+            .served
+            .get(&key_slot)
+            .copied()
+            .unwrap_or(TokenUse {
+                tokens: 0.0,
+                at: now,
+            });
+        state.served.insert(
+            key_slot,
+            TokenUse {
+                tokens: served.now(now) + tokens.max(1) as f64,
+                at: now,
+            },
+        );
+        state.cooldowns.remove(&key_slot);
     }
 
     /// Return a group route order and reset its process-local schedule when its
@@ -351,7 +528,11 @@ impl KeyRotator {
         }
 
         let indices = match state.policy {
-            RoutingPolicy::Order => (0..routes.len()).collect::<Vec<_>>(),
+            // A group has no per-route weights, so a weighted provider
+            // policy takes its configured order here.
+            RoutingPolicy::Order | RoutingPolicy::Weighted => {
+                (0..routes.len()).collect::<Vec<_>>()
+            }
             RoutingPolicy::Rotate => {
                 let start = state.cursor % routes.len();
                 state.cursor = (start + 1) % routes.len();
@@ -490,6 +671,13 @@ pub enum RoutingPolicy {
     Rotate,
     /// Prefer routes with fewer attempts in this gateway process.
     Usage,
+    /// Spread a provider's requests over its keys by each key's weight,
+    /// smoothly, as NGINX's smooth weighted round robin does: keys weighing
+    /// 3 and 1 take three requests to one, holding the ratio over every few
+    /// requests rather than only on average. A routing group has no weights,
+    /// so it takes this for `order`.
+    #[serde(rename = "weight")]
+    Weighted,
 }
 
 impl RoutingPolicy {
@@ -499,6 +687,7 @@ impl RoutingPolicy {
             Self::Order => "order",
             Self::Rotate => "rotate",
             Self::Usage => "usage",
+            Self::Weighted => "weight",
         }
     }
 }
@@ -511,8 +700,9 @@ impl std::str::FromStr for RoutingPolicy {
             "order" => Ok(Self::Order),
             "rotate" | "round_robin" => Ok(Self::Rotate),
             "usage" | "least_used" => Ok(Self::Usage),
+            "weight" | "weighted" => Ok(Self::Weighted),
             _ => Err(format!(
-                "unknown routing policy `{value}`; expected order, rotate or usage"
+                "unknown routing policy `{value}`; expected order, rotate, usage or weight"
             )),
         }
     }
@@ -602,6 +792,11 @@ pub struct ProviderConfigSnapshot {
     pub fallback: Vec<String>,
     /// Effective cooldown after quota or rate-limit rejection.
     pub key_cooldown_ms: u64,
+    /// How requests spread over this provider's key pool.
+    pub routing: RoutingPolicy,
+    /// Per-key weights, parallel to the key pool, for the `weight` policy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub weights: Vec<u32>,
 }
 
 /// Capability metadata exposed by the secret-free configuration snapshot.
@@ -943,6 +1138,8 @@ impl Config {
                     fallback: p.fallback.clone(),
                     key_cooldown_ms: self.key_cooldown_for(p).as_millis().min(u64::MAX as u128)
                         as u64,
+                    routing: p.routing,
+                    weights: p.key_weights(),
                 })
                 .collect(),
             groups: self
@@ -1091,6 +1288,8 @@ mod tests {
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),
+            routing: RoutingPolicy::Rotate,
+            weights: Vec::new(),
             key_generation: 0,
         };
 
@@ -1125,6 +1324,8 @@ base_url = "http://127.0.0.1:1/v1"
             models: Vec::new(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
+            routing: RoutingPolicy::Rotate,
+            weights: Vec::new(),
             key_generation: 0,
         };
         let encoded = toml::to_string(&provider).unwrap();
@@ -1153,6 +1354,8 @@ base_url = "http://127.0.0.1:1/v1"
             models: Vec::new(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
+            routing: RoutingPolicy::Rotate,
+            weights: Vec::new(),
             key_generation: 0,
         };
         assert!(provider.validate().is_err());
@@ -1176,6 +1379,8 @@ base_url = "http://127.0.0.1:1/v1"
             models: Vec::new(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
+            routing: RoutingPolicy::Rotate,
+            weights: Vec::new(),
             key_generation: 0,
         });
         let snapshot = config.snapshot();
@@ -1266,6 +1471,110 @@ base_url = "http://127.0.0.1:1/v1"
         assert!(rotator.cooldown_snapshot(&cooldown_config()).is_empty());
     }
 
+    #[test]
+    fn weighting_spreads_a_provider_pool_by_each_keys_share() {
+        let rotator = KeyRotator::default();
+        let keys = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let weights = [3u32, 1, 4];
+        let picks = || {
+            rotator
+                .rotate_routed("mock", 0, RoutingPolicy::Weighted, &keys, &weights)
+                .into_iter()
+                .map(|(slot, _)| slot)
+                .collect::<Vec<_>>()
+        };
+
+        let mut firsts = Vec::new();
+        for _ in 0..8 {
+            firsts.push(picks()[0]);
+        }
+        // Every round of 8 keeps the 3 : 1 : 4 ratio exactly, not just on
+        // average, and the heaviest key never takes three in a row while a
+        // lighter one is ready.
+        assert_eq!(firsts.iter().filter(|slot| **slot == 0).count(), 3);
+        assert_eq!(firsts.iter().filter(|slot| **slot == 1).count(), 1);
+        assert_eq!(firsts.iter().filter(|slot| **slot == 2).count(), 4);
+        assert!(
+            !firsts.windows(3).any(|window| window == [2, 2, 2]),
+            "the heavy key ran three times: {firsts:?}"
+        );
+    }
+
+    #[test]
+    fn a_cooling_key_is_hidden_and_the_rest_share_its_weight() {
+        let rotator = KeyRotator::default();
+        let keys = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let weights = [3u32, 1, 4];
+        rotator.cool_down("mock", 0, 2, Duration::from_secs(60));
+
+        let mut firsts = Vec::new();
+        for _ in 0..4 {
+            let order =
+                rotator.rotate_routed("mock", 0, RoutingPolicy::Weighted, &keys, &weights);
+            // The cooling key is left out entirely while others are healthy,
+            // matching how the pool already hides a key in cooldown.
+            assert!(order.iter().all(|(slot, _)| *slot != 2));
+            firsts.push(order[0].0);
+        }
+        assert_eq!(firsts.iter().filter(|slot| **slot == 0).count(), 3);
+        assert_eq!(firsts.iter().filter(|slot| **slot == 1).count(), 1);
+    }
+
+    #[test]
+    fn least_used_puts_the_lightest_key_first_and_a_wake_clears_its_rest() {
+        let rotator = KeyRotator::default();
+        let keys = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let order = || {
+            rotator
+                .rotate_routed("mock", 0, RoutingPolicy::Usage, &keys, &[])
+                .into_iter()
+                .map(|(slot, _)| slot)
+                .collect::<Vec<_>>()
+        };
+
+        rotator.record_served("mock", 0, 0, 5000);
+        rotator.record_served("mock", 0, 2, 10);
+        assert_eq!(order(), vec![1, 2, 0]);
+
+        // A key that answered with no reported usage still counts as serving
+        // one request, so it keeps its place ahead of a key that never ran.
+        rotator.cool_down("mock", 0, 1, Duration::from_secs(60));
+        rotator.record_served("mock", 0, 1, 0);
+        assert_eq!(order(), vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn provider_routing_policy_parses_weight_and_roundtrips_serde() {
+        assert_eq!("weight".parse(), Ok(RoutingPolicy::Weighted));
+        assert_eq!("weighted".parse(), Ok(RoutingPolicy::Weighted));
+        assert_eq!(RoutingPolicy::Weighted.as_str(), "weight");
+        assert_eq!(
+            serde_json::to_string(&RoutingPolicy::Weighted).unwrap(),
+            "\"weight\""
+        );
+        assert_eq!(
+            serde_json::from_str::<RoutingPolicy>("\"weight\"").unwrap(),
+            RoutingPolicy::Weighted
+        );
+        assert!("pace".parse::<RoutingPolicy>().is_err());
+    }
+
+    #[test]
+    fn provider_weights_are_bounded_and_parallel_to_the_pool() {
+        let mut provider = cooldown_config().provider.remove(0);
+        provider.api_keys = vec!["one".to_owned(), "two".to_owned()];
+        // A missing tail weighs nothing here and is treated as 1 by callers.
+        provider.weights = vec![3];
+        assert!(provider.validate().is_ok());
+        assert_eq!(provider.key_weights(), vec![3, 0]);
+
+        provider.weights = vec![0, MAX_KEY_WEIGHT + 1];
+        assert!(provider.validate().is_err());
+
+        provider.weights = vec![1, 1, 1];
+        assert!(provider.validate().is_err());
+    }
+
     fn cooldown_config() -> Config {
         Config {
             provider: vec![ProviderConfig {
@@ -1279,6 +1588,8 @@ base_url = "http://127.0.0.1:1/v1"
                 fallback: vec![],
                 key_cooldown_ms: None,
                 capabilities: Default::default(),
+                routing: RoutingPolicy::Rotate,
+                weights: Vec::new(),
                 key_generation: 0,
             }],
             ..Default::default()
@@ -1310,6 +1621,8 @@ base_url = "http://127.0.0.1:1/v1"
             fallback: vec!["backup/other".into()],
             key_cooldown_ms: Some(1_200),
             capabilities: Default::default(),
+            routing: RoutingPolicy::Rotate,
+            weights: Vec::new(),
             key_generation: 0,
         });
         config.group.push(GroupConfig {
@@ -1429,6 +1742,8 @@ routes = ["mock/model"]
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),
+            routing: RoutingPolicy::Rotate,
+            weights: Vec::new(),
             key_generation: 0,
         };
 

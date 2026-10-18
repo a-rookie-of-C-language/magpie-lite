@@ -176,6 +176,12 @@ enum ProviderCommand {
         /// Cooldown in milliseconds after a key is quota-limited or rate limited.
         #[arg(long)]
         key_cooldown_ms: Option<u64>,
+        /// How requests spread over the key pool: rotate (the default), order, usage, or weight.
+        #[arg(long, default_value = "rotate")]
+        routing: RoutingPolicy,
+        /// Per-key weight for `--routing weight`, in pool order; repeat for each key.
+        #[arg(long = "key-weight", num_args = 1)]
+        key_weights: Vec<u32>,
         /// Make this the provider for models that name none.
         #[arg(long)]
         default: bool,
@@ -273,6 +279,8 @@ async fn main() -> Result<()> {
                 models,
                 fallback,
                 key_cooldown_ms,
+                routing,
+                key_weights,
                 default,
             } => {
                 if id == "group" {
@@ -290,6 +298,8 @@ async fn main() -> Result<()> {
                     models,
                     fallback,
                     key_cooldown_ms,
+                    routing,
+                    weights: key_weights,
                     capabilities: Default::default(),
                     key_generation: 0,
                 };

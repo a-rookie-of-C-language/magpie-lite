@@ -630,6 +630,8 @@ mod tests {
                     fallback: vec![],
                     key_cooldown_ms: None,
                     capabilities: Default::default(),
+                    routing: RoutingPolicy::Rotate,
+                    weights: Vec::new(),
                     key_generation: 0,
                 };
                 config.set_provider(provider, true).unwrap();
@@ -748,6 +750,8 @@ mod tests {
                             fallback: vec![],
                             key_cooldown_ms: None,
                             capabilities: Default::default(),
+                            routing: RoutingPolicy::Rotate,
+                            weights: Vec::new(),
                             key_generation: 0,
                         },
                         true,

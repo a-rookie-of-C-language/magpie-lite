@@ -308,6 +308,8 @@ impl Fixture {
             fallback: vec![],
             key_cooldown_ms: None,
             capabilities: Default::default(),
+            routing: magpie_gateway::RoutingPolicy::Rotate,
+            weights: Vec::new(),
             key_generation: 0,
         };
         let mut config = Config {

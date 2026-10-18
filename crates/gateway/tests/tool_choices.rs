@@ -294,6 +294,8 @@ impl Fixture {
                     vec![]
                 },
                 key_cooldown_ms: None,
+                routing: RoutingPolicy::Rotate,
+                weights: Vec::new(),
                 key_generation: 0,
             });
             upstreams.push(server);
