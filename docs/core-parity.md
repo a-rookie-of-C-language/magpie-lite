@@ -396,3 +396,19 @@ through Anthropic streams unchanged. Chat and Gemini have no per-text citation
 carrier and deliberately ignore the events, as they do for native search
 presentation. Citations are not answer prose for loop-guard or reask
 accounting. Whole-reply stream replay re-emits decoded citations.
+
+## Context-overflow recognition and mid-reply refusal parity (2026-10-18)
+
+The reference gateway recognizes a conversation too long for the model by
+wording (`tooLongRe` / `overflowed`) and keeps it with its route: no other
+member fits it either, and the agent should compact. Lite's routing had no
+overflow notion — such a 400 could still be read as an unserved model or
+unknown shape. `contextOverflowed` now ports the wording table (400/413/422,
+never 429, never `max_tokens` allowances or paced traffic) and short-circuits
+route retry before every other classifier. The token-estimate half of
+`tooLongUnsaid` stays unimplemented, as before.
+
+Mid-reply failures — a 200 stream that then emits an error event — already
+carry the vendor's raw error body beside its derived status, so refusal
+wording falls over and overflow wording stays after headers commit; this
+semantic is now proven by tests rather than only by reading the code.

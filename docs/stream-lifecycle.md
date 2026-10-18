@@ -277,8 +277,17 @@ transport failures and truncated streams use 502.
 - 402/429 apply the existing hint-aware key cooldown, including `Retry-After`
   and supported body/reset hints; provider cooldown zero still disables it.
 - Recognized invalid-request, refusal and context-length errors do not retry or
-  cool down keys. Specialized reference heuristics based on prompt length,
-  free-form errors remain unimplemented; retired-model detection and edge-
+  cool down keys. Context-length errors are recognized by wording alone
+  (`contextOverflowed` in `crates/gateway/src/model_gone.rs`, the
+  reference `tooLongRe` table): a 400/413/422 whose words say the
+  conversation no longer fits — never 429, a `max_tokens` allowance, or
+  paced traffic ("Too many tokens, please wait") — stays with the route
+  it started on. No other member fits the conversation either, so the
+  backup is not asked, the agent gets the vendor's wording at its
+  original status, and the member is not retired or cooled down; the
+  agent should compact the conversation itself. Reference heuristics
+  based on prompt-length estimation remain unimplemented; retired-model
+  detection and edge-
   firewall block pages are implemented (`crates/gateway/src/model_gone.rs`,
   `crates/gateway/src/edge_block.rs`): 410/retired-wording and model-refusal
   errors let the next route try, and a firewall block page falls back at any
@@ -292,7 +301,7 @@ transport failures and truncated streams use 502.
   (`shapeRefused` in `crates/gateway/src/model_gone.rs`): the shape, not
   the vendor, is at fault, so the member doesn't rest and the next
   request asks it first again. Missing-required-field and context-length
-  errors stay non-retryable.
+  errors stay non-retryable (context-length wording above).
 - A vendor that refuses the conversation outright — WorkBuddy's 400
   "Illegal API invocation from an unapproved channel" — or whose
   response-protection layer is unavailable — the ChatGPT backend's 502
@@ -303,6 +312,11 @@ transport failures and truncated streams use 502.
   request asks it first again, and a 502 protection refusal is
   explicitly not a key-cooldown busy outage. Solo, the vendor's error
   reaches the agent at its original status.
+- A refusal discovered mid-reply — the route committed HTTP 200 and
+  started its stream, then its error event carries the vendor's error —
+  keeps the full classification: the raw error body is retained beside
+  the derived status, so prompt and protection wording still falls over
+  to the next route at any status, and overflow wording still stays.
 
 If all applicable candidates fail, the last attempt's error is delivered once
 in the client protocol. Retry classification adds no management mutation API.

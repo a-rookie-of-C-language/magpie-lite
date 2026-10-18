@@ -28,7 +28,8 @@ use crate::config_store::{ConfigStore, IdempotencyRequest};
 use crate::cooldown::quota_cooldown;
 use crate::edge_block::{BLOCKED_HINT, edge_blocked, edge_blocked_text};
 use crate::model_gone::{
-    model_refused, model_retired, prompt_refused, protection_refused, shape_refused,
+    context_overflowed, model_refused, model_retired, prompt_refused, protection_refused,
+    shape_refused,
 };
 use crate::retired as retired_store;
 use crate::stream_empty::{EMPTY_REPLY, GeminiReply};
@@ -886,6 +887,13 @@ fn quota_limited_status(status: reqwest::StatusCode) -> bool {
 /// parse into `body`, so the blocked-page wording arrives here instead.
 fn route_retryable_status(status: reqwest::StatusCode, body: &Value, text: &str) -> bool {
     let code = status.as_u16();
+    // A conversation too long for the model stays with the route it
+    // started on: no other member fits it either, and the agent should
+    // compact it itself. Short-circuit first, so a long overflow message
+    // never reads as an unknown shape or unserved model.
+    if context_overflowed(code, body) {
+        return false;
+    }
     if matches!(code, 401 | 402 | 403 | 404 | 408 | 429 | 500..=599) {
         return true;
     }

@@ -133,6 +133,46 @@ fn protection_words() -> &'static Regex {
     })
 }
 
+/// How a vendor says the conversation no longer fits in the model's
+/// context (the reference gateway's `tooLongRe`). Matches wording alone:
+/// Lite has no token estimator, and needs none to keep a too-long
+/// conversation with the route it started on.
+fn too_long_words() -> &'static Regex {
+    static TOO_LONG: OnceLock<Regex> = OnceLock::new();
+    TOO_LONG.get_or_init(|| {
+        Regex::new(r#"(?i)context_length_exceeded|prompt is too long|input is too long|(exceeds?|exceeded|over|beyond)( the)?( model'?s?)?( maximum)? context|context (length|limit|window) (exceeded|is exceeded)|maximum context length|too many (input |prompt )?tokens|上下文(长度)?(超|过长)|超(过|出)(了)?(模型)?(的)?(最大)?上下文|input token count.*exceeds the maximum|maximum prompt length is \d|reduce the length of the messages|maximum allowed input length|longer than the model'?s context length|available context size|greater than the context length|prompt token count of [\d,]+ exceeds the limit|context window exceeds limit|exceeded model token limit|configured context size|prompt too long|prompt exceeds max length|context_window_exceeded|exceeded (max |maximum )?context length|range of input length should be|token limit exceeded"#)
+            .expect("too long words regex")
+    })
+}
+
+/// How a vendor paces traffic — a rate limit in disguise, not a
+/// conversation that doesn't fit (the reference gateway's `paceWords`).
+fn pace_words() -> &'static Regex {
+    static PACE: OnceLock<Regex> = OnceLock::new();
+    PACE.get_or_init(|| {
+        Regex::new(r#"(?i)rate.?limit|per (minute|hour|day)|\bTP[MD]\b|please wait|try again later|throttl"#)
+            .expect("pace words regex")
+    })
+}
+
+/// A 4xx (but never 429) error whose words say the conversation is too
+/// long for the model. One about `max_tokens` is about the reply's
+/// allowance, not the conversation, and a paced one ("Too many tokens,
+/// please wait") is a rate limit; neither is overflow. The reference
+/// gateway's `overflowed`/`tooLong` pair, without its token-estimate
+/// half: whether every vendor's phrasing of the same refusal.
+pub(crate) fn context_overflowed(status: u16, body: &Value) -> bool {
+    if !matches!(status, 400 | 413 | 422) {
+        return false;
+    }
+    let text = error_text(body);
+    too_long_words().is_match(&text)
+        && !pace_words().is_match(&text)
+        && ["max_tokens", "max_output_tokens", "max_completion_tokens"]
+            .iter()
+            .all(|word| !text.to_lowercase().contains(word))
+}
+
 /// The vendor refused this conversation outright (an unapproved channel
 /// or illegal API invocation): another provider may accept it, and the
 /// refusing one is not broken, so it doesn't rest.
@@ -196,6 +236,64 @@ mod tests {
             &json!({"error": {"message": "unknown error"}})
         ));
         assert!(!model_retired(403, &json!({"error": {"message": "no"}})));
+    }
+
+    #[test]
+    fn context_overflow_matches_every_vendor_shape() {
+        // A full cross-vendor table of the reference gateway's
+        // `TestEveryVendorsOverflow` phrasings.
+        for message in [
+            "This model's maximum context length is 131072 tokens. However, you requested 207000 tokens.",
+            "prompt is too long: 210000 tokens > 131072 maximum",
+            "input is too long for the requested model",
+            "The request exceeds the maximum context length",
+            "context_length_exceeded",
+            "exceeded the model's context",
+            "This model supports up to 131072 tokens, but the request's context length exceeded it",
+            "too many prompt tokens",
+            "prompt token count of 250,000 exceeds the limit of 131072",
+            "context window exceeds limit: 200000 tokens requested",
+            "exceeded model token limit",
+            "configured context size is smaller than the prompt",
+            "prompt too long",
+            "prompt exceeds max length",
+            "context_window_exceeded",
+            "exceeded maximum context length",
+            "range of input length should be between 1 and 131072",
+            "token limit exceeded",
+            "上下文过长",
+            "超出模型最大上下文",
+        ] {
+            for status in [400, 413, 422] {
+                assert!(
+                    context_overflowed(status, &json!({"error": {"message": message}})),
+                    "status {status} should overflow: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_overflow_errors_do_not_short_circuit_routing() {
+        // A reply allowance, a rate limit in disguise, a quota, and a
+        // status outside the overflow trio all stay with ordinary
+        // routing.
+        for (status, message) in [
+            (400, "max_tokens is too large"),
+            (400, "max_output_tokens: 16384 > 8192"),
+            (400, "max_completion_tokens too high for this model"),
+            (413, "Too many tokens, please wait before trying again"),
+            (413, "You have hit your usage limit"),
+            (413, "Request Entity Too Large"),
+            (422, "invalid value: integer, expected max_tokens"),
+            (429, "maximum context length exceeded, please slow down"),
+            (400, "Your balance is exhausted"),
+        ] {
+            assert!(
+                !context_overflowed(status, &json!({"error": {"message": message}})),
+                "status {status} should not overflow: {message}"
+            );
+        }
     }
 
     #[test]

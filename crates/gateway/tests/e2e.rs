@@ -629,6 +629,69 @@ async fn spawn_scripted(replies: Vec<(u16, Value)>) -> (String, Arc<Mutex<usize>
     (format!("http://{addr}"), requests)
 }
 
+/// A scripted upstream whose Nth reply may be an SSE error event sent
+/// after 200 headers — a mid-reply failure. It counts requests.
+#[derive(Clone)]
+struct StreamScriptedUpstream {
+    replies: Arc<Mutex<Vec<Value>>>,
+    requests: Arc<Mutex<usize>>,
+}
+
+async fn stream_scripted_chat_completions(
+    State(mock): State<StreamScriptedUpstream>,
+    body: axum::body::Bytes,
+) -> Response {
+    let _ = serde_json::from_slice::<Value>(&body).expect("upstream body is JSON");
+    let count = {
+        let mut requests = mock.requests.lock().unwrap();
+        let count = *requests;
+        *requests += 1;
+        count
+    };
+    let error = {
+        let replies = mock.replies.lock().unwrap();
+        replies.get(count).cloned()
+    };
+    let Some(error) = error else {
+        return Json(json!({
+            "id": "chatcmpl-stream-scripted", "object": "chat.completion", "model": "m",
+            "choices": [{"index": 0,
+                "message": {"role": "assistant", "content": "hello"},
+                "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }))
+        .into_response();
+    };
+    let frame = format!(
+        "data: {}\n\n",
+        serde_json::to_string(&json!({"error": error})).unwrap()
+    );
+    Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(Body::from(frame))
+        .unwrap()
+}
+
+async fn spawn_stream_scripted(replies: Vec<Value>) -> (String, Arc<Mutex<usize>>) {
+    let mock = StreamScriptedUpstream {
+        replies: Arc::new(Mutex::new(replies)),
+        requests: Arc::new(Mutex::new(0)),
+    };
+    let requests = mock.requests.clone();
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(stream_scripted_chat_completions),
+        )
+        .with_state(mock);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), requests)
+}
+
 /// A member whose API can't read the request's shape hands it to the
 /// next one, asked once, and doesn't rest for it: the next request asks
 /// it first again (#350). Nobody left, the agent gets its error.
@@ -835,6 +898,135 @@ async fn protection_refusal_falls_over_at_any_status() {
             .contains("response protection is unavailable")
     );
     assert_eq!(*a_requests.lock().unwrap(), 3);
+}
+
+#[tokio::test]
+async fn mid_reply_refusal_falls_over_after_headers_commit() {
+    // The route answers 200 and starts its stream, then its error event
+    // says the conversation is refused — a mid-reply failure carries the
+    // vendor's raw error body, so the refusal wording is still seen and
+    // the next route is asked, without resting the refusing one.
+    let refusal = json!({
+        "message": "Illegal API invocation from an unapproved channel",
+        "type": "invalid_request_error"
+    });
+    let (a, a_requests) = spawn_stream_scripted(vec![refusal]).await;
+    let (b, b_requests) = spawn_scripted(vec![]).await;
+    let gw = spawn_gateway_with_group(a.clone(), b.clone(), RoutingPolicy::Order).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "group/daily-coding",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("hello"), "{text}");
+    assert_eq!(*a_requests.lock().unwrap(), 1);
+    assert_eq!(*b_requests.lock().unwrap(), 1);
+
+    // The refusal never rests the member: the next request asks it first.
+    let resp = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "group/daily-coding",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("hello"), "{text}");
+    assert_eq!(*a_requests.lock().unwrap(), 2);
+    // The script is spent, so a answers for itself this time.
+    assert_eq!(*b_requests.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn context_overflow_stays_with_its_route() {
+    // A conversation too long for the model is too long for every
+    // member: the overflow refusal goes back to the agent with the
+    // vendor's wording and status, the backup is not asked, and the
+    // primary is not retired or cooled down.
+    let overflow = json!({
+        "error": {
+            "message": "This model's maximum context length is 131072 tokens. However, you requested 207000 tokens.",
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded"
+        }
+    });
+    let (a, a_requests) = spawn_scripted(vec![(400, overflow)]).await;
+    let (b, b_requests) = spawn_scripted(vec![]).await;
+    let gw = spawn_gateway_with_group(a.clone(), b.clone(), RoutingPolicy::Order).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "group/daily-coding",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("maximum context length")
+    );
+    assert_eq!(*a_requests.lock().unwrap(), 1);
+    assert_eq!(*b_requests.lock().unwrap(), 0);
+
+    // The overflow never rests the member: the next request asks it first.
+    let resp = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "group/daily-coding",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(*a_requests.lock().unwrap(), 2);
+    assert_eq!(*b_requests.lock().unwrap(), 0);
+
+    // A worded model refusal at the same status is different: worth the
+    // next member.
+    let refused = json!({
+        "error": {"message": "model mini is not supported in the current token plan"}
+    });
+    let (c, c_requests) = spawn_scripted(vec![(400, refused)]).await;
+    let (d, d_requests) = spawn_scripted(vec![]).await;
+    let gw = spawn_gateway_with_group(c, d, RoutingPolicy::Order).await;
+    let resp = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "group/daily-coding",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(*c_requests.lock().unwrap(), 1);
+    assert_eq!(*d_requests.lock().unwrap(), 1);
 }
 
 #[tokio::test]
