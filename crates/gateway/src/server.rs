@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 use crate::config::{Config, GroupConfig, Protocol, ProviderConfig};
 use crate::config_store::{ConfigStore, IdempotencyRequest};
 use crate::cooldown::quota_cooldown;
+use crate::edge_block::{BLOCKED_HINT, edge_blocked, edge_blocked_text};
 use crate::model_gone::{model_refused, model_retired};
 use crate::stream_empty::{EMPTY_REPLY, GeminiReply};
 use crate::stream_keepalive::{self, Keepalive, UpstreamActivity};
@@ -877,15 +878,21 @@ fn quota_limited_status(status: reqwest::StatusCode) -> bool {
 }
 
 /// Whether an upstream status is worth spending another route on.
-fn route_retryable_status(status: reqwest::StatusCode, body: &Value) -> bool {
+/// `text` carries the raw human-readable error: HTML block pages never
+/// parse into `body`, so the blocked-page wording arrives here instead.
+fn route_retryable_status(status: reqwest::StatusCode, body: &Value, text: &str) -> bool {
     let code = status.as_u16();
     if matches!(code, 401 | 402 | 403 | 404 | 408 | 429 | 500..=599) {
         return true;
     }
     // Model-retired 410s and model-refusal shapes describe the model,
     // not this key or route: another provider of the same model may
-    // still serve it.
-    model_retired(code, body) || model_refused(code, body)
+    // still serve it. A firewall block page describes this address, so
+    // another provider goes another way at any status.
+    model_retired(code, body)
+        || model_refused(code, body)
+        || edge_blocked(body)
+        || edge_blocked_text(text)
 }
 
 type UpstreamEvents = Pin<Box<dyn futures::Stream<Item = UpstreamEvent> + Send>>;
@@ -1283,7 +1290,7 @@ async fn send_with_fallback(
                             continue 'keys;
                         }
                         if route_index != last_route
-                            && route_retryable_status(failure.status, &failure.body)
+                            && route_retryable_status(failure.status, &failure.body, "")
                         {
                             drop(events);
                             break 'keys;
@@ -1335,7 +1342,7 @@ async fn send_with_fallback(
                         cooldown,
                     );
                 }
-                let detail = error.message;
+                let mut detail = error.message;
                 tracing::warn!(
                     "upstream {} key {}: {detail}",
                     route.provider.id,
@@ -1344,8 +1351,12 @@ async fn send_with_fallback(
                 if attempt + 1 < route.api_keys.len() && key_retryable_status(status) {
                     continue 'keys;
                 }
-                if route_index != last_route && route_retryable_status(status, &error.body) {
+                if route_index != last_route && route_retryable_status(status, &error.body, &detail)
+                {
                     break 'keys;
+                }
+                if edge_blocked(&error.body) || edge_blocked_text(&detail) {
+                    detail = format!("{detail} — {BLOCKED_HINT}");
                 }
                 let status =
                     StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -1438,7 +1449,11 @@ async fn reask_stream(
             candidate.key_slot,
             &status.as_u16().to_string(),
         );
-        return Err(detail.message);
+        let mut message = detail.message;
+        if edge_blocked(&detail.body) || edge_blocked_text(&message) {
+            message = format!("{message} — {BLOCKED_HINT}");
+        }
+        return Err(message);
     }
 
     let (events, failure) = prefetch_stream(

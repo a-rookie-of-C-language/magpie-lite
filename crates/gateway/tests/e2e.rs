@@ -567,7 +567,7 @@ async fn spawn_retired_model() -> String {
 async fn retired_model_falls_back_to_another_provider() {
     let primary = spawn_retired_model().await;
     let (backup, last) = spawn_mock().await;
-    let gw = spawn_gateway_with_fallback(primary, backup).await;
+    let gw = spawn_gateway_with_fallback(primary.clone(), backup).await;
     let client = reqwest::Client::new();
 
     let resp = client
@@ -585,6 +585,73 @@ async fn retired_model_falls_back_to_another_provider() {
     let text = resp.text().await.unwrap();
     assert!(text.contains("\"Rain\"") && text.contains("[DONE]"));
     assert!(last.lock().unwrap().is_some(), "backup was called");
+}
+
+async fn edge_blocked_chat() -> Response {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        )],
+        "<html><body><p>Sorry, your request has been blocked due to unusual activity.</p></body></html>",
+    )
+        .into_response()
+}
+
+async fn spawn_edge_blocked() -> String {
+    let app = Router::new().route("/v1/chat/completions", post(edge_blocked_chat));
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn edge_firewall_block_falls_back_and_says_what_happened() {
+    let primary = spawn_edge_blocked().await;
+    let (backup, last) = spawn_mock().await;
+    let gw = spawn_gateway_with_fallback(primary.clone(), backup).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "primary/mock-model",
+            "messages": [{"role": "user", "content": "Weather?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "Beijing is sunny."
+    );
+    assert!(last.lock().unwrap().is_some(), "backup was called");
+
+    // The same block with no fallback route reports the vendor's error in
+    // plain words, not the block page.
+    let gw = spawn_gateway(primary).await;
+    let failed = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "mock/mock-model",
+            "messages": [{"role": "user", "content": "Weather?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let body: Value = failed.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("request has been blocked"), "{message}");
+    assert!(message.contains("firewall blocked requests from this IP"));
 }
 
 #[derive(Clone)]

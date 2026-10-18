@@ -278,9 +278,11 @@ transport failures and truncated streams use 502.
   and supported body/reset hints; provider cooldown zero still disables it.
 - Recognized invalid-request, refusal and context-length errors do not retry or
   cool down keys. Specialized reference heuristics based on prompt length,
-  free-form errors or firewall responses remain unimplemented; retired-model
-  detection is implemented (`crates/gateway/src/model_gone.rs`): 410/
-  retired-wording and model-refusal errors let the next route try.
+  free-form errors remain unimplemented; retired-model detection and edge-
+  firewall block pages are implemented (`crates/gateway/src/model_gone.rs`,
+  `crates/gateway/src/edge_block.rs`): 410/retired-wording and model-refusal
+  errors let the next route try, and a firewall block page falls back at any
+  status while reporting the block in plain words instead of the page.
 
 If all applicable candidates fail, the last attempt's error is delivered once
 in the client protocol. Retry classification adds no management mutation API.
