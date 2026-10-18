@@ -1535,6 +1535,11 @@ fn whole_as_stream_events(reply: &CompletionResponse) -> Vec<StreamEvent> {
                         text: part.text.clone(),
                     });
                 }
+                for citation in &part.citations {
+                    out.push(StreamEvent::Citation {
+                        citation: citation.clone(),
+                    });
+                }
             }
             PartKind::Thinking => {
                 if !part.text.is_empty() {

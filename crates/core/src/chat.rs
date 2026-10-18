@@ -681,6 +681,8 @@ impl ChatChunkEncoder {
             StreamEvent::Signature { .. }
             | StreamEvent::ThinkingStart { .. }
             | StreamEvent::Sealed { .. } => None,
+            // Chat prose has no citation carrier; citations stay IR-only here.
+            StreamEvent::Citation { .. } => None,
             StreamEvent::SearchStarted => None,
             StreamEvent::Search { .. } | StreamEvent::SearchUpdate { .. } => None,
             // Image output currently has a native mapping only in Gemini.

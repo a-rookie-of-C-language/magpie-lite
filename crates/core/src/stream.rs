@@ -2,6 +2,7 @@
 //! into, and a small server-sent-events frame parser.
 
 use crate::ir::{Part, SealedReasoning, SignatureProtocol, StopReason, Usage, WebSearch};
+use serde_json::Value;
 
 /// The native part to which a streamed signature belongs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +24,12 @@ pub enum StreamEvent {
     TextDelta {
         /// The fragment.
         text: String,
+    },
+    /// A citation attached to the visible answer text. Carried separately so
+    /// foreign dialects can translate it; not itself answer prose.
+    Citation {
+        /// The citation as the source dialect spelled it.
+        citation: Value,
     },
     /// A complete visible image, inline or by URL; never a reasoning draft.
     Image {

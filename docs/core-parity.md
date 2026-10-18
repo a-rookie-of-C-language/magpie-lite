@@ -362,8 +362,6 @@ end-turn, losing the distinction that the reply stopped because the model ran
 out of context before finishing. `StopReason::from_anthropic` now maps it to
 `MaxTokens`, so every client dialect reports a length stop.
 
-Native text `citations` and Responses output-text `annotations` remain
-untranslated: they are not retained in IR or re-emitted to other dialects.
 Anthropic `pause_turn` has no reference mapping and is still not represented.
 
 ## Reasoning-token usage across dialects (2026-10-18)
@@ -380,3 +378,18 @@ usage fields, which do not include a reasoning count.
 
 Anthropic API Messages usage carries no reasoning split, so it is absent
 there; Claude subscription thinking tokens are not part of the API core.
+
+## Cross-protocol citation retention (2026-10-18)
+
+Anthropic text-block citations and Responses output-text annotations were
+decoded as bare text and dropped. IR text parts now carry a citations list,
+and Anthropic citations_delta stream events and Responses
+response.output_text.annotation.added events decode into it. Encoders emit
+them back natively (Anthropic citations_delta beside an open text block;
+Responses annotation events and final annotations), and translate across
+dialects: Anthropic citations become Responses url_citation annotations with
+url, title and offsets mapped when present; Responses annotations pass
+through Anthropic streams unchanged. Chat and Gemini have no per-text citation
+carrier and deliberately ignore the events, as they do for native search
+presentation. Citations are not answer prose for loop-guard or reask
+accounting. Whole-reply stream replay re-emits decoded citations.

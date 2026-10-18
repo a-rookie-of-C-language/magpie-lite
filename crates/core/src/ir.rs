@@ -188,6 +188,9 @@ pub struct Part {
     pub sealed: Option<Box<SealedReasoning>>,
     /// An upstream web search, when the kind is Search.
     pub search: Option<Box<WebSearch>>,
+    /// Citations attached to a text part, kept as the source dialect's JSON
+    /// values and translated to each client dialect's citation shape.
+    pub citations: Vec<Value>,
 }
 
 impl Part {

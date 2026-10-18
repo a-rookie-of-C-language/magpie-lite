@@ -769,6 +769,35 @@ fn search_item(search: &WebSearch, id: &str, status: &str) -> Value {
     json!({"id":id,"type":"web_search_call","status":status,"action":action})
 }
 
+/// Translate a protocol-neutral citation into Responses' `url_citation`
+/// annotation shape. Known Anthropic fields map over; anything else passes
+/// through so unknown dialects still round-trip their own citations.
+fn responses_annotation(citation: &Value) -> Value {
+    if citation.get("type").and_then(Value::as_str) == Some("url_citation") {
+        return citation.clone();
+    }
+    let mut out = Map::new();
+    out.insert("type".into(), json!("url_citation"));
+    out.insert(
+        "url".into(),
+        citation.get("url").cloned().unwrap_or_else(|| json!("")),
+    );
+    if let Some(title) = citation.get("title") {
+        out.insert("title".into(), title.clone());
+    }
+    for (from, to) in [("start_index", "start_index"), ("end_index", "end_index")] {
+        if let Some(v) = citation.get(from) {
+            out.insert(to.into(), v.clone());
+        }
+    }
+    for field in ["cited_text", "document_index", "document_title"] {
+        if let Some(v) = citation.get(field) {
+            out.insert(field.into(), v.clone());
+        }
+    }
+    Value::Object(out)
+}
+
 /// Decode an OpenAI Responses reply body.
 pub fn decode_response(v: &Value) -> Result<CompletionResponse> {
     if v.get("status") == Some(&json!("failed")) {
@@ -799,7 +828,14 @@ pub fn decode_response(v: &Value) -> Result<CompletionResponse> {
                     if b.get("type").and_then(Value::as_str) == Some("output_text")
                         && let Some(t) = b.get("text").and_then(Value::as_str)
                     {
-                        parts.push(Part::text(t));
+                        parts.push(Part {
+                            citations: b
+                                .get("annotations")
+                                .and_then(Value::as_array)
+                                .cloned()
+                                .unwrap_or_default(),
+                            ..Part::text(t)
+                        });
                     }
                 }
             }
@@ -913,13 +949,20 @@ fn encode_response_with_bindings(
                     ));
                 }
             }
-            PartKind::Text => output.push(json!({
-                "type": "message",
-                "id": format!("msg_{}", response_id()),
-                "role": "assistant",
-                "status": "completed",
-                "content": [{"type": "output_text", "text": p.text, "annotations": []}],
-            })),
+            PartKind::Text => {
+                let mut annotations =
+                    Value::Array(p.citations.iter().map(responses_annotation).collect());
+                if annotations.is_null() {
+                    annotations = json!([]);
+                }
+                output.push(json!({
+                    "type": "message",
+                    "id": format!("msg_{}", response_id()),
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": p.text, "annotations": annotations}],
+                }))
+            }
             PartKind::ToolCall => {
                 let namespace = bindings.resolve(&p.name, p.namespace.as_deref());
                 let name = wire_name(&p.name, namespace);
@@ -1054,6 +1097,15 @@ pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
                 out.push(StreamEvent::TextDelta { text: t.to_owned() });
             }
         }
+        "response.output_text.annotation.added" => {
+            if let Some(annotation) = v.get("annotation")
+                && !annotation.is_null()
+            {
+                out.push(StreamEvent::Citation {
+                    citation: annotation.clone(),
+                });
+            }
+        }
         "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
             if let Some(t) = v.get("delta").and_then(Value::as_str)
                 && !t.is_empty()
@@ -1136,6 +1188,7 @@ struct OpenItem {
     id: String,
     output_index: usize,
     text: String,
+    annotations: Vec<Value>,
 }
 
 /// A tool call the encoder is streaming.
@@ -1242,12 +1295,17 @@ impl ResponsesStreamEncoder {
         let Some(item) = self.open_message.take() else {
             return String::new();
         };
+        let annotations = item
+            .annotations
+            .iter()
+            .map(responses_annotation)
+            .collect::<Vec<_>>();
         let done = json!({
             "id": item.id,
             "type": "message",
             "role": "assistant",
             "status": "completed",
-            "content": [{"type": "output_text", "text": item.text, "annotations": []}],
+            "content": [{"type": "output_text", "text": item.text, "annotations": annotations}],
         });
         self.output.push(done.clone());
         event(
@@ -1386,6 +1444,18 @@ impl ResponsesStreamEncoder {
             }
             // Image output currently has a native mapping only in Gemini.
             StreamEvent::Image { .. } => None,
+            StreamEvent::Citation { citation } => {
+                let item = self.open_message.as_mut()?;
+                let annotation = responses_annotation(citation);
+                let index = item.annotations.len();
+                item.annotations.push(annotation.clone());
+                Some(event(
+                    "response.output_text.annotation.added",
+                    json!({"item_id": item.id, "output_index": item.output_index,
+                           "content_index": 0, "annotation_index": index,
+                           "annotation": annotation}),
+                ))
+            }
             StreamEvent::TextDelta { text } => {
                 let mut out = self.ensure_created();
                 if self.open_message.is_none() {
@@ -1409,6 +1479,7 @@ impl ResponsesStreamEncoder {
                         id,
                         output_index: index,
                         text: String::new(),
+                        annotations: Vec::new(),
                     });
                 }
                 let item = self.open_message.as_ref().expect("just opened");
@@ -1443,6 +1514,7 @@ impl ResponsesStreamEncoder {
                         id,
                         output_index: index,
                         text: String::new(),
+                        annotations: Vec::new(),
                     });
                 }
                 let item = self.open_reasoning.as_ref().expect("just opened");

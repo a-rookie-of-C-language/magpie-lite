@@ -1250,6 +1250,9 @@ impl GeminiStreamEncoder {
             | StreamEvent::ThinkingStart { .. }
             | StreamEvent::Sealed { .. } => None,
             StreamEvent::SearchStarted => None,
+            // Gemini has no per-text citation carrier; grounding is the
+            // dialect's native shape and is handled by Search events.
+            StreamEvent::Citation { .. } => None,
             StreamEvent::Search { search } | StreamEvent::SearchUpdate { search } => {
                 if !search.is_public_result() {
                     return None;

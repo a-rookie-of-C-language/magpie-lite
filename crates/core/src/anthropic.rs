@@ -28,7 +28,14 @@ fn str_field(v: &Value, field: &'static str) -> Result<String> {
 /// Decode an Anthropic content block into a part.
 fn decode_block(b: &Value) -> Option<Part> {
     match b.get("type").and_then(Value::as_str) {
-        Some("text") => b.get("text").and_then(Value::as_str).map(Part::text),
+        Some("text") => b.get("text").and_then(Value::as_str).map(|text| Part {
+            citations: b
+                .get("citations")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            ..Part::text(text)
+        }),
         Some("thinking") => Some(Part {
             signature_protocol: Some(SignatureProtocol::Anthropic),
             ..Part::thinking(
@@ -179,7 +186,13 @@ fn part_to_block(p: &Part) -> Option<Value> {
     }
     match p.kind() {
         PartKind::Search => p.search.as_ref()?.anthropic_block.clone(),
-        PartKind::Text => Some(json!({"type": "text", "text": p.text})),
+        PartKind::Text => {
+            let mut block = json!({"type": "text", "text": p.text});
+            if !p.citations.is_empty() {
+                block["citations"] = Value::Array(p.citations.clone());
+            }
+            Some(block)
+        }
         PartKind::Thinking => Some(json!({
             "type": "thinking",
             "thinking": p.text,
@@ -765,6 +778,15 @@ impl AnthropicStreamDecoder {
                             });
                         }
                     }
+                    "citations_delta" => {
+                        if let Some(citation) = delta.get("citation")
+                            && !citation.is_null()
+                        {
+                            out.push(StreamEvent::Citation {
+                                citation: citation.clone(),
+                            });
+                        }
+                    }
                     "input_json_delta" => {
                         if let Some(a) = delta.get("partial_json").and_then(Value::as_str)
                             && !a.is_empty()
@@ -1086,6 +1108,20 @@ impl AnthropicStreamEncoder {
             }
             // Image output currently has a native mapping only in Gemini.
             StreamEvent::Image { .. } => None,
+            StreamEvent::Citation { citation } => {
+                if self.open.as_ref().map(|(_, kind)| *kind) != Some(BlockKind::Text) {
+                    return None;
+                }
+                let index = self.open.as_ref().expect("open text block").0;
+                Some(sse(
+                    "content_block_delta",
+                    &json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "citations_delta", "citation": citation},
+                    }),
+                ))
+            }
             StreamEvent::TextDelta { text } => {
                 self.pending_thinking = false;
                 let mut out = self.start_message();
