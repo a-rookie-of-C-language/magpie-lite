@@ -200,10 +200,11 @@ invented. These are synthetic fixtures, not paid-provider or real-Agent evidence
 
 The later increments below add built-in search requests and Anthropic result
 ingress. Responses open_page/find actions, cross-provider citation annotations
-and Chat search presentation remain gaps. Gemini's upstream stream decoder still
-emits only the first valid grounding metadata event. Search results do not become
-agent-executed function calls, and vendor-encrypted search content is not copied
-across providers; native Anthropic history is the exception described below.
+and Chat search presentation remain gaps; the repeated/cumulative Gemini
+grounding contract below supersedes the earlier single-emission limitation.
+Search results do not become agent-executed function calls, and vendor-encrypted
+search content is not copied across providers; native Anthropic history is the
+exception described below.
 
 
 ## Built-in web-search requests (2026-10-12)
