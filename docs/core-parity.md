@@ -198,10 +198,11 @@ usage and query/source-free history on disconnect. Optional opening usage from
 Responses-compatible upstreams is retained when reported; missing usage is not
 invented. These are synthetic fixtures, not paid-provider or real-Agent evidence.
 
-The later increments below add built-in search requests and Anthropic result
-ingress. Responses open_page/find actions, cross-provider citation annotations
-and Chat search presentation remain gaps; the repeated/cumulative Gemini
-grounding contract below supersedes the earlier single-emission limitation.
+The later increments below add built-in search requests, Anthropic result
+ingress and cross-protocol citation retention. Responses open_page/find
+actions (a shared gap with the reference) and Chat search presentation remain
+gaps; the repeated/cumulative Gemini grounding contract below supersedes the
+earlier single-emission limitation.
 Search results do not become agent-executed function calls, and vendor-encrypted
 search content is not copied across providers; native Anthropic history is the
 exception described below.
@@ -239,7 +240,7 @@ exhausted routing plan returns HTTP 400 with a configuration-free error message.
 Evidence is local core fixtures, host-specific gateway unit tests and real
 loopback HTTP/SSE fixtures, not paid/live-provider or real-agent conformance.
 Remaining work includes configured cross-protocol option conversion, Responses
-open_page/find, cross-provider citations and Chat search-result presentation.
+open_page/find and Chat search-result presentation.
 Anthropic search-result ingress is described below.
 
 
@@ -254,7 +255,9 @@ array-valued result blocks produce public Responses search actions or Gemini
 grounding. Call-only and native tool-error blocks do not fabricate successful
 foreign search results. Other server tools and unopened input_json_delta indices
 are not exposed as client functions; a real function named web_search is unchanged.
-Native text citation annotations and pause_turn semantics are not yet preserved.
+Anthropic pause_turn semantics are not yet preserved (the reference also maps
+it to a plain end-turn); native text citations now are, as described in the
+2026-10-18 cross-protocol citation increment below.
 
 Streaming search start immediately counts as answer/content activity, before
 input fragments or results arrive. Search fragments accumulate separately from

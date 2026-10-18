@@ -610,6 +610,12 @@ close pending content, allocate distinct output indices/IDs and retain completed
 search items in the final response output. Chat encoders omit search events.
 Queries and source URLs are not persisted in sanitized request history.
 
+Cross-protocol citation retention is now implemented: Anthropic
+`citations_delta` events and Responses `response.output_text.annotation.added`
+events enter the IR and translate between the two dialects. See
+docs/core-parity.md for the exact contract; Chat and Gemini remain
+presentation-free for citations as they are for searches.
+
 Fixtures cover both upstreams and all three supported output protocols in JSON
 and SSE, plus deadlines, refusal/loop no-replay and socket cancellation. The
 Responses disconnect fixture includes optional opening usage from a compatible
