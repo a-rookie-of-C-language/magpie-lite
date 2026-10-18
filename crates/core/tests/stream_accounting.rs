@@ -8,12 +8,14 @@ fn cumulative_usage_replaces_reported_counters_without_erasing_absent_fields() {
         output: Some(0),
         cache_read: Some(0),
         cache_write: None,
+        reasoning: None,
     };
     usage.merge(&Usage {
         input: None,
         output: Some(3),
         cache_read: Some(2),
         cache_write: Some(4),
+        reasoning: Some(1),
     });
     assert_eq!(
         usage,
@@ -21,7 +23,8 @@ fn cumulative_usage_replaces_reported_counters_without_erasing_absent_fields() {
             input: Some(7),
             output: Some(3),
             cache_read: Some(2),
-            cache_write: Some(4)
+            cache_write: Some(4),
+            reasoning: Some(1)
         }
     );
     usage.merge(&Usage::default());

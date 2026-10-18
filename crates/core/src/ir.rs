@@ -320,6 +320,8 @@ pub struct Usage {
     pub cache_read: Option<u64>,
     /// Tokens written to a prompt cache.
     pub cache_write: Option<u64>,
+    /// Output tokens spent on reasoning, when a protocol reports them.
+    pub reasoning: Option<u64>,
 }
 
 impl Usage {
@@ -337,6 +339,9 @@ impl Usage {
         }
         if other.cache_write.is_some() {
             self.cache_write = other.cache_write;
+        }
+        if other.reasoning.is_some() {
+            self.reasoning = other.reasoning;
         }
     }
 }

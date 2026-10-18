@@ -346,7 +346,14 @@ fn decode_usage(v: &Value) -> Usage {
             .get("prompt_tokens_details")
             .and_then(|d| d.get("cached_tokens"))
             .and_then(Value::as_u64),
-        cache_write: None,
+        cache_write: v
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cache_write_tokens"))
+            .and_then(Value::as_u64),
+        reasoning: v
+            .get("completion_tokens_details")
+            .and_then(|d| d.get("reasoning_tokens"))
+            .and_then(Value::as_u64),
     }
 }
 
@@ -363,6 +370,12 @@ fn usage_to_json(u: &Usage) -> Value {
     usage.insert("total_tokens".into(), json!(input + output));
     if !cached.is_empty() {
         usage.insert("prompt_tokens_details".into(), Value::Object(cached));
+    }
+    if let Some(reasoning) = u.reasoning {
+        usage.insert(
+            "completion_tokens_details".into(),
+            json!({"reasoning_tokens": reasoning}),
+        );
     }
     Value::Object(usage)
 }

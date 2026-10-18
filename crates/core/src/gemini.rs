@@ -575,6 +575,8 @@ fn decode_usage(v: &Value) -> Usage {
         cache_read: get_either(v, "cachedContentTokenCount", "cached_content_token_count")
             .and_then(Value::as_u64),
         cache_write: None,
+        reasoning: get_either(v, "thoughtsTokenCount", "thoughts_token_count")
+            .and_then(Value::as_u64),
     }
 }
 

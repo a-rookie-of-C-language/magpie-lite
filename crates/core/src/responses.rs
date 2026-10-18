@@ -682,16 +682,38 @@ fn decode_usage(v: &Value) -> Usage {
             .get("input_tokens_details")
             .and_then(|d| d.get("cached_tokens"))
             .and_then(Value::as_u64),
-        cache_write: None,
+        cache_write: v
+            .get("input_tokens_details")
+            .and_then(|d| d.get("cache_write_tokens"))
+            .and_then(Value::as_u64),
+        reasoning: v
+            .get("output_tokens_details")
+            .and_then(|d| d.get("reasoning_tokens"))
+            .and_then(Value::as_u64),
     }
 }
 
 fn usage_to_json(u: &Usage) -> Value {
-    json!({
+    let mut usage = json!({
         "input_tokens": u.input.unwrap_or(0),
         "output_tokens": u.output.unwrap_or(0),
         "total_tokens": u.input.unwrap_or(0) + u.output.unwrap_or(0),
-    })
+    });
+    let input = u.cache_read.is_some() || u.cache_write.is_some();
+    if input {
+        let mut details = serde_json::Map::new();
+        if let Some(read) = u.cache_read {
+            details.insert("cached_tokens".into(), json!(read));
+        }
+        if let Some(write) = u.cache_write {
+            details.insert("cache_write_tokens".into(), json!(write));
+        }
+        usage["input_tokens_details"] = Value::Object(details);
+    }
+    if let Some(reasoning) = u.reasoning {
+        usage["output_tokens_details"] = json!({"reasoning_tokens": reasoning});
+    }
+    usage
 }
 
 /// Read reported usage even when a refusal omits the ordinary reply fields.

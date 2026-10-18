@@ -425,6 +425,7 @@ fn decode_usage(v: &Value) -> Usage {
                     )
                 })
             }),
+        reasoning: None,
     }
 }
 

@@ -365,3 +365,18 @@ out of context before finishing. `StopReason::from_anthropic` now maps it to
 Native text `citations` and Responses output-text `annotations` remain
 untranslated: they are not retained in IR or re-emitted to other dialects.
 Anthropic `pause_turn` has no reference mapping and is still not represented.
+
+## Reasoning-token usage across dialects (2026-10-18)
+
+The reference gateway carries a separate reasoning counter beside output
+tokens: Chat's `completion_tokens_details.reasoning_tokens`, Responses'
+`output_tokens_details.reasoning_tokens`, Gemini's `thoughtsTokenCount`, and
+Claude's subscription `output_tokens_details.thinking_tokens`. Lite's IR usage
+had only input/output/cache counters, so a Gemini upstream's thinking spend
+disappeared for foreign clients. `Usage` now carries `reasoning`; Chat,
+Responses and Gemini decoders read their native fields, and Chat and Responses
+encoders emit them back. Gemini's own encoder still writes only its native
+usage fields, which do not include a reasoning count.
+
+Anthropic API Messages usage carries no reasoning split, so it is absent
+there; Claude subscription thinking tokens are not part of the API core.

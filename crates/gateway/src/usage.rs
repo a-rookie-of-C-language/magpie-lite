@@ -450,6 +450,7 @@ fn add_usage(left: &Usage, right: &Usage) -> Usage {
         output: add_counter(left.output, right.output),
         cache_read: add_counter(left.cache_read, right.cache_read),
         cache_write: add_counter(left.cache_write, right.cache_write),
+        reasoning: add_counter(left.reasoning, right.reasoning),
     }
 }
 
@@ -657,12 +658,14 @@ mod tests {
             output: Some(3),
             cache_read: None,
             cache_write: None,
+            reasoning: None,
         });
         tracker.observe_usage(&Usage {
             input: None,
             output: Some(7),
             cache_read: Some(2),
             cache_write: None,
+            reasoning: None,
         });
         tracker.finish("ok", &Usage::default());
 
@@ -681,6 +684,7 @@ mod tests {
             output: Some(3),
             cache_read: Some(4),
             cache_write: None,
+            reasoning: None,
         });
         tracker.begin_reask();
         tracker.observe_usage(&Usage {
@@ -688,6 +692,7 @@ mod tests {
             output: Some(7),
             cache_read: None,
             cache_write: Some(5),
+            reasoning: None,
         });
         tracker.finish("ok", &Usage::default());
 
@@ -707,6 +712,7 @@ mod tests {
             output: Some(3),
             cache_read: Some(4),
             cache_write: Some(5),
+            reasoning: None,
         });
         tracker.begin_attempt("backup", "backup-model", 1);
         tracker.observe_usage(&Usage {
@@ -714,6 +720,7 @@ mod tests {
             output: Some(6),
             cache_read: None,
             cache_write: None,
+            reasoning: None,
         });
         tracker.finish("ok", &Usage::default());
 
@@ -752,6 +759,7 @@ mod tests {
                 output: None,
                 cache_read: None,
                 cache_write: None,
+                reasoning: None,
             });
             tracker.finish("ok", &Usage::default());
             tracker.finish("upstream_error", &Usage::default());
