@@ -457,3 +457,18 @@ the reference's note in a user turn before what followed, user text beside
 tool results gets a turn of its own, and a history ending with the model's
 turn is closed with a "Continue." user turn. An answered history is built
 as before; Antigravity's Claude tool_result shape has no Lite surface yet.
+
+## Anthropic-safe tool call ids (2026-10-18)
+
+Anthropic Messages accepts `tool_use.id` and `tool_result.tool_use_id` only
+in `[A-Za-z0-9_-]`. A conversation moved from another vendor can contain an
+id such as Devin's `Bash:0#...`, which Claude Code drops as unparsable
+(#1304). Lite now gives every unsafe id a stateless `mp_` + base64url form
+before it crosses into Anthropic and restores the original id on the way
+back. Safe ids pass byte for byte, while ids already beginning with `mp_`
+are encoded to keep the namespace unambiguous. Request history, non-stream
+responses and streamed tool-call starts use the same mapping, so a call and
+its result continue to pair.
+
+This ports the reference gateway's `6c099edd` behavior. Real Anthropic API
+acceptance remains covered by request-shape tests rather than a live call.

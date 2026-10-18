@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
 use crate::error::{CoreError, Result};
 use crate::ir::{
     CompletionRequest, CompletionResponse, Message, Part, PartKind, ReasoningProtocol, Role,
@@ -23,6 +25,44 @@ fn str_field(v: &Value, field: &'static str) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or(missing(field))
+}
+
+// The Messages API accepts tool ids only in this alphabet. Foreign vendors
+// can use characters Claude Code drops, so such ids cross as mark plus
+// base64url. The mapping is stateless and symmetric.
+const TOOL_ID_MARK: &str = "mp_";
+
+fn safe_tool_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn anthropic_out_id(id: &str) -> String {
+    if id.is_empty() {
+        return String::new();
+    }
+    if safe_tool_id(id) && !id.starts_with(TOOL_ID_MARK) {
+        return id.to_owned();
+    }
+    format!("{TOOL_ID_MARK}{}", URL_SAFE_NO_PAD.encode(id.as_bytes()))
+}
+
+fn anthropic_in_id(id: &str) -> String {
+    if !id.starts_with(TOOL_ID_MARK) || !safe_tool_id(id) {
+        return id.to_owned();
+    }
+    let Ok(raw) = URL_SAFE_NO_PAD.decode(&id[TOOL_ID_MARK.len()..]) else {
+        return id.to_owned();
+    };
+    let Ok(raw) = String::from_utf8(raw) else {
+        return id.to_owned();
+    };
+    if raw.is_empty() || anthropic_out_id(&raw) != id {
+        return id.to_owned();
+    }
+    raw
 }
 
 /// Decode an Anthropic content block into a part.
@@ -121,7 +161,7 @@ fn decode_block(b: &Value) -> Option<Part> {
             }))
         }
         Some("tool_use") => Some(Part::tool_call(
-            b.get("id").and_then(Value::as_str).unwrap_or_default(),
+            anthropic_in_id(b.get("id").and_then(Value::as_str).unwrap_or_default()),
             b.get("name").and_then(Value::as_str).unwrap_or_default(),
             b.get("input").cloned().unwrap_or_else(|| json!({})),
         )),
@@ -129,9 +169,11 @@ fn decode_block(b: &Value) -> Option<Part> {
             let content = b.get("content").unwrap_or(&Value::Null);
             let (text, images) = crate::tool_output::decode(content);
             let mut result = Part::tool_result(
-                b.get("tool_use_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
+                anthropic_in_id(
+                    b.get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                ),
                 text,
                 b.get("is_error").and_then(Value::as_bool).unwrap_or(false),
             );
@@ -207,7 +249,7 @@ fn part_to_block(p: &Part) -> Option<Value> {
         }
         PartKind::ToolCall => Some(json!({
             "type": "tool_use",
-            "id": p.id,
+            "id": anthropic_out_id(&p.id),
             "name": p.name,
             "input": p.args,
         })),
@@ -358,7 +400,7 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
                     };
                     blocks.push(json!({
                         "type": "tool_result",
-                        "tool_use_id": p.call_id,
+                        "tool_use_id": anthropic_out_id(&p.call_id),
                         "content": content,
                         "is_error": p.is_error,
                     }));
@@ -369,7 +411,7 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
             match p.kind() {
                 PartKind::ToolCall => blocks.push(json!({
                     "type": "tool_use",
-                    "id": p.id,
+                    "id": anthropic_out_id(&p.id),
                     "name": p.name,
                     "input": p.args,
                 })),
@@ -747,11 +789,9 @@ impl AnthropicStreamDecoder {
                     self.tool_blocks.insert(index, ());
                     out.push(StreamEvent::ToolCallStart {
                         index,
-                        id: block
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
+                        id: anthropic_in_id(
+                            block.get("id").and_then(Value::as_str).unwrap_or_default(),
+                        ),
                         name: block
                             .get("name")
                             .and_then(Value::as_str)
@@ -1188,7 +1228,12 @@ impl AnthropicStreamEncoder {
                     &json!({
                         "type": "content_block_start",
                         "index": block_index,
-                        "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": anthropic_out_id(id),
+                            "name": name,
+                            "input": {}
+                        }
                     }),
                 ));
                 Some(out)
