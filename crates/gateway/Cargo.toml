@@ -13,6 +13,7 @@ axum.workspace = true
 futures.workspace = true
 httpdate.workspace = true
 reqwest.workspace = true
+regex = "1"
 serde.workspace = true
 serde_json.workspace = true
 subtle.workspace = true

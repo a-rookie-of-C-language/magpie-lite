@@ -540,6 +540,53 @@ async fn spawn_rate_limited() -> String {
     format!("http://{addr}")
 }
 
+async fn retired_model_chat() -> Response {
+    (
+        StatusCode::GONE,
+        Json(json!({
+            "error": {
+                "type": "ModelDeprecated",
+                "message": "Model exo-free has been deprecated."
+            }
+        })),
+    )
+        .into_response()
+}
+
+async fn spawn_retired_model() -> String {
+    let app = Router::new().route("/v1/chat/completions", post(retired_model_chat));
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn retired_model_falls_back_to_another_provider() {
+    let primary = spawn_retired_model().await;
+    let (backup, last) = spawn_mock().await;
+    let gw = spawn_gateway_with_fallback(primary, backup).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "primary/mock-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "Weather?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("\"Rain\"") && text.contains("[DONE]"));
+    assert!(last.lock().unwrap().is_some(), "backup was called");
+}
+
 #[derive(Clone)]
 struct SameProviderModelMock {
     seen_models: Arc<Mutex<Vec<String>>>,

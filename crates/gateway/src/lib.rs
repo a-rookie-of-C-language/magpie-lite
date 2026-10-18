@@ -4,6 +4,7 @@ pub mod agents;
 pub mod config;
 pub mod config_store;
 pub mod cooldown;
+mod model_gone;
 mod provider_tools;
 mod providers;
 pub mod server;

@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 use crate::config::{Config, GroupConfig, Protocol, ProviderConfig};
 use crate::config_store::{ConfigStore, IdempotencyRequest};
 use crate::cooldown::quota_cooldown;
+use crate::model_gone::{model_refused, model_retired};
 use crate::stream_empty::{EMPTY_REPLY, GeminiReply};
 use crate::stream_keepalive::{self, Keepalive, UpstreamActivity};
 use crate::stream_loop::LoopGuard;
@@ -876,11 +877,15 @@ fn quota_limited_status(status: reqwest::StatusCode) -> bool {
 }
 
 /// Whether an upstream status is worth spending another route on.
-fn route_retryable_status(status: reqwest::StatusCode) -> bool {
-    matches!(
-        status.as_u16(),
-        401 | 402 | 403 | 404 | 408 | 429 | 500..=599
-    )
+fn route_retryable_status(status: reqwest::StatusCode, body: &Value) -> bool {
+    let code = status.as_u16();
+    if matches!(code, 401 | 402 | 403 | 404 | 408 | 429 | 500..=599) {
+        return true;
+    }
+    // Model-retired 410s and model-refusal shapes describe the model,
+    // not this key or route: another provider of the same model may
+    // still serve it.
+    model_retired(code, body) || model_refused(code, body)
 }
 
 type UpstreamEvents = Pin<Box<dyn futures::Stream<Item = UpstreamEvent> + Send>>;
@@ -1277,7 +1282,9 @@ async fn send_with_fallback(
                             drop(events);
                             continue 'keys;
                         }
-                        if route_index != last_route && route_retryable_status(failure.status) {
+                        if route_index != last_route
+                            && route_retryable_status(failure.status, &failure.body)
+                        {
                             drop(events);
                             break 'keys;
                         }
@@ -1337,7 +1344,7 @@ async fn send_with_fallback(
                 if attempt + 1 < route.api_keys.len() && key_retryable_status(status) {
                     continue 'keys;
                 }
-                if route_index != last_route && route_retryable_status(status) {
+                if route_index != last_route && route_retryable_status(status, &error.body) {
                     break 'keys;
                 }
                 let status =
