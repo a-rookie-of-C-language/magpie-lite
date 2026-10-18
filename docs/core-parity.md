@@ -412,3 +412,15 @@ Mid-reply failures — a 200 stream that then emits an error event — already
 carry the vendor's raw error body beside its derived status, so refusal
 wording falls over and overflow wording stays after headers commit; this
 semantic is now proven by tests rather than only by reading the code.
+
+## Tool strict passthrough (2026-10-18)
+
+The reference gateway carries a tool's `strict` flag from Chat's
+`function.strict` and Responses' tool field into its IR, and a Responses
+upstream says it back verbatim: left out or forced false, the ChatGPT
+backend holds the tool to strict mode's rules anyway and refuses a schema
+with a lookaround pattern (MiniMax Code's path, #383). Lite's tool IR had
+no strict field and its Responses encoder hardcoded `false`. `Tool` now
+carries `strict` (Chat and Responses decode it, Anthropic and Gemini have
+no such field), and the Responses encoder emits what the client asked,
+defaulting to `false` exactly as before.

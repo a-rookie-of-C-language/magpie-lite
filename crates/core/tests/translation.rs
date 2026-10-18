@@ -47,6 +47,55 @@ fn chat_request_decodes_into_ir() {
     assert_eq!(ir.tools[0].name, "weather");
 }
 
+// A tool sent on to a Responses API says strict, as Codex says it. Left
+// out, the ChatGPT backend held MiniMax Code's tools to strict mode and
+// refused a path pattern with a lookaround (#383); a client asking for
+// strict still gets it, at its original true.
+#[test]
+fn responses_tools_say_strict_as_the_client_asked() {
+    let schema = json!({"type":"object","properties":{"path":{"type":"string","pattern":"^(?!.*\\.\\.).+$"}}});
+    let ir = magpie_core::responses::decode_request(&json!({
+        "model": "m",
+        "input": "hi",
+        "tools": [
+            {"type": "function", "name": "loose", "parameters": schema},
+            {"type": "function", "name": "held", "strict": true,
+             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": false}}
+        ]
+    }))
+    .expect("decode");
+    let out = magpie_core::responses::encode_request(&ir, "m").unwrap();
+    let tools = out["tools"].as_array().unwrap();
+    assert_eq!(tools[0]["name"], "loose");
+    assert_eq!(tools[0]["strict"], false);
+    assert_eq!(tools[1]["name"], "held");
+    assert_eq!(tools[1]["strict"], true);
+
+    // Chat tools keep their asked strict across the round trip too;
+    // Anthropic tools have no strict field and decode false.
+    let ir = magpie_core::chat::decode_request(&json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {
+            "name": "held", "strict": true,
+            "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": false}
+        }}]
+    }))
+    .expect("decode");
+    assert!(ir.tools[0].strict);
+    let out = magpie_core::responses::encode_request(&ir, "m").unwrap();
+    assert_eq!(out["tools"][0]["strict"], true);
+
+    let ir = magpie_core::anthropic::decode_request(&json!({
+        "model": "m", "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"name": "read", "description": "Read a file", "input_schema": schema}]
+    }))
+    .expect("decode");
+    let out = magpie_core::responses::encode_request(&ir, "m").unwrap();
+    assert_eq!(out["tools"][0]["strict"], false);
+}
+
 #[test]
 fn chat_request_encodes_to_anthropic() {
     let ir = chat::decode_request(&chat_request()).expect("decode");

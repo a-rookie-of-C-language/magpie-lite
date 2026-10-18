@@ -266,6 +266,11 @@ fn decode_tools(tools: Option<&Vec<Value>>) -> Result<Vec<Tool>> {
                         tool.get("parameters").cloned().unwrap_or_else(|| json!({}))
                     },
                     custom,
+                    strict: if custom {
+                        false
+                    } else {
+                        tool.get("strict").and_then(Value::as_bool).unwrap_or(false)
+                    },
                 });
             }
             "namespace" => {
@@ -313,6 +318,7 @@ fn decode_tools(tools: Option<&Vec<Value>>) -> Result<Vec<Tool>> {
                             parameters: serde_json::from_str(CUSTOM_SCHEMA)
                                 .expect("constant schema"),
                             custom: true,
+                            strict: false,
                         });
                     } else {
                         out.push(Tool {
@@ -328,6 +334,10 @@ fn decode_tools(tools: Option<&Vec<Value>>) -> Result<Vec<Tool>> {
                                 .cloned()
                                 .unwrap_or_else(|| json!({})),
                             custom: false,
+                            strict: child
+                                .get("strict")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
                         });
                     }
                 }
@@ -624,7 +634,7 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
             let function = if t.custom {
                 json!({"type":"custom","name":name,"description":t.description})
             } else {
-                json!({"type":"function","name":name,"description":t.description,"parameters":t.parameters,"strict":false})
+                json!({"type":"function","name":name,"description":t.description,"parameters":t.parameters,"strict":t.strict})
             };
             if let Some(namespace) = &t.namespace {
                 let index = *namespaces.entry(namespace.clone()).or_insert_with(|| {

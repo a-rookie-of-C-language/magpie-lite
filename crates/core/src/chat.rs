@@ -145,6 +145,7 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
                         namespace: None,
                         parameters: f.get("parameters").cloned().unwrap_or_else(|| json!({})),
                         custom: false,
+                        strict: f.get("strict").and_then(Value::as_bool).unwrap_or(false),
                     })
                 })
                 .collect()

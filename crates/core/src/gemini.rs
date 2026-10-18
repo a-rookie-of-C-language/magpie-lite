@@ -292,6 +292,7 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
                     .cloned()
                     .unwrap_or_else(|| json!({})),
                 custom: false,
+                strict: false,
             });
         }
     }

@@ -265,6 +265,7 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
                     namespace: None,
                     parameters: t.get("input_schema").cloned().unwrap_or_else(|| json!({})),
                     custom: false,
+                    strict: false,
                 })
                 .collect()
         })

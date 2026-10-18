@@ -310,6 +310,11 @@ pub struct Tool {
     /// function with one string `input` argument; its call is restored to
     /// `custom_tool_call` only for Responses clients.
     pub custom: bool,
+    /// The client asked the upstream to hold the schema to strict mode's
+    /// rules. Only a Responses upstream says it back: left out or forced
+    /// false, the ChatGPT backend applies strict-mode rules anyway and
+    /// refuses a schema a strict tool needs (#383).
+    pub strict: bool,
 }
 
 /// Token accounting, as far as the protocols agree.
