@@ -27,7 +27,9 @@ use crate::config::{Config, GroupConfig, Protocol, ProviderConfig};
 use crate::config_store::{ConfigStore, IdempotencyRequest};
 use crate::cooldown::quota_cooldown;
 use crate::edge_block::{BLOCKED_HINT, edge_blocked, edge_blocked_text};
-use crate::model_gone::{model_refused, model_retired, shape_refused};
+use crate::model_gone::{
+    model_refused, model_retired, prompt_refused, protection_refused, shape_refused,
+};
 use crate::retired as retired_store;
 use crate::stream_empty::{EMPTY_REPLY, GeminiReply};
 use crate::stream_keepalive::{self, Keepalive, UpstreamActivity};
@@ -892,9 +894,16 @@ fn route_retryable_status(status: reqwest::StatusCode, body: &Value, text: &str)
     // still serve it. A firewall block page describes this address, so
     // another provider goes another way at any status. A shape the
     // vendor's API can't read is worth handing to the next route, too.
+    // A refused conversation ("unapproved channel") or an unavailable
+    // response-protection layer ("response protection is unavailable")
+    // is that vendor's read on the request or its policy backend, not a
+    // broken credential or a busy endpoint: the next route may serve it
+    // at any status, and the refusing one never rests.
     model_retired(code, body)
         || model_refused(code, body)
         || shape_refused(code, body)
+        || prompt_refused(code, body)
+        || protection_refused(code, body)
         || edge_blocked(body)
         || edge_blocked_text(text)
 }

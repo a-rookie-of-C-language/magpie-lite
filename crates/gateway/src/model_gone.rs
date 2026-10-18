@@ -124,6 +124,30 @@ fn refused_words() -> &'static Regex {
     })
 }
 
+/// How a vendor says it refuses to scan the conversation at all — the
+/// "response protection" layer, not this key or this request's shape.
+fn protection_words() -> &'static Regex {
+    static PROTECTION: OnceLock<Regex> = OnceLock::new();
+    PROTECTION.get_or_init(|| {
+        Regex::new(r#"(?i)response protection is unavailable"#).expect("protection words regex")
+    })
+}
+
+/// The vendor refused this conversation outright (an unapproved channel
+/// or illegal API invocation): another provider may accept it, and the
+/// refusing one is not broken, so it doesn't rest.
+pub(crate) fn prompt_refused(status: u16, body: &Value) -> bool {
+    status >= 400 && refused_words().is_match(&body.to_string())
+}
+
+/// The vendor's response-protection layer is unavailable for this
+/// conversation: it answers 4xx/5xx no matter what is asked. Another
+/// provider may still serve it, and the refusing one doesn't rest —
+/// notably a 502 here must not count as a busy outage.
+pub(crate) fn protection_refused(status: u16, body: &Value) -> bool {
+    status >= 400 && protection_words().is_match(&body.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,6 +258,48 @@ mod tests {
         assert!(!shape_refused(
             500,
             &json!({"error": "Failed to deserialize the JSON body into the target type: input[0]: unknown item type \"additional_tools\""})
+        ));
+    }
+
+    #[test]
+    fn prompt_and_protection_refusals_match_at_any_error_status() {
+        // WorkBuddy-style 400: the channel, not the key, is refused.
+        let prompt_refusal =
+            json!({"code": 11128, "msg": "Illegal API invocation from an unapproved channel"});
+        for status in [400, 403, 502] {
+            assert!(prompt_refused(status, &prompt_refusal));
+        }
+        assert!(!prompt_refused(200, &prompt_refusal));
+        assert!(!prompt_refused(
+            400,
+            &json!({"error": {"message": "bad request"}})
+        ));
+
+        // ChatGPT-backend-style 502: the protection layer is unavailable.
+        for body in [
+            json!({"error": {"message": "response protection is unavailable", "type": "server_error"}}),
+            json!({"detail": "response protection is unavailable"}),
+        ] {
+            for status in [400, 502] {
+                assert!(protection_refused(status, &body));
+            }
+        }
+        assert!(!protection_refused(
+            200,
+            &json!({"detail": "response protection is unavailable"})
+        ));
+        assert!(!protection_refused(
+            502,
+            &json!({"error": {"message": "Unable to reach the model provider"}})
+        ));
+        // Quota wording alone is neither refusal.
+        assert!(!prompt_refused(
+            429,
+            &json!({"error": {"message": "rate limit"}})
+        ));
+        assert!(!protection_refused(
+            429,
+            &json!({"error": {"message": "rate limit"}})
         ));
     }
 }

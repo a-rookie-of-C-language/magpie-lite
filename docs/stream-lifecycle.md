@@ -293,6 +293,16 @@ transport failures and truncated streams use 502.
   the vendor, is at fault, so the member doesn't rest and the next
   request asks it first again. Missing-required-field and context-length
   errors stay non-retryable.
+- A vendor that refuses the conversation outright — WorkBuddy's 400
+  "Illegal API invocation from an unapproved channel" — or whose
+  response-protection layer is unavailable — the ChatGPT backend's 502
+  "response protection is unavailable" — is also worth one next-route
+  try at any status (`promptRefused` / `protectionRefused` in
+  `crates/gateway/src/model_gone.rs`). Neither describes a broken
+  credential or a busy endpoint, so the route never rests: the next
+  request asks it first again, and a 502 protection refusal is
+  explicitly not a key-cooldown busy outage. Solo, the vendor's error
+  reaches the agent at its original status.
 
 If all applicable candidates fail, the last attempt's error is delivered once
 in the client protocol. Retry classification adds no management mutation API.

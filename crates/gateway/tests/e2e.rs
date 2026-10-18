@@ -694,6 +694,149 @@ async fn group_fails_over_a_request_shape() {
     assert_eq!(*a_requests.lock().unwrap(), 4);
 }
 
+/// A vendor that refuses the conversation outright ("unapproved channel")
+/// hands it to the next route at any status — including a 400, which
+/// otherwise stays with the route — and doesn't rest for it: the next
+/// request asks it first again. Nobody left, the agent gets its error.
+#[tokio::test]
+async fn prompt_refusal_falls_over_and_rests_nobody() {
+    let refusal = json!({
+        "code": 11128,
+        "msg": "Illegal API invocation from an unapproved channel"
+    });
+    let (a, a_requests) = spawn_scripted(vec![(400, refusal)]).await;
+    let (b, b_requests) = spawn_scripted(vec![]).await;
+    let gw = spawn_gateway_with_group(a.clone(), b.clone(), RoutingPolicy::Order).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "group/daily-coding",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "hello");
+    assert_eq!(*a_requests.lock().unwrap(), 1);
+    assert_eq!(*b_requests.lock().unwrap(), 1);
+
+    // The refusal never rests the member: the next request asks it first.
+    let resp = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "group/daily-coding",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(*a_requests.lock().unwrap(), 2);
+    assert_eq!(*b_requests.lock().unwrap(), 2);
+
+    // Alone (no fallback), the refusal is the agent's, at its original
+    // status.
+    let solo = spawn_gateway_with_group(a, b, RoutingPolicy::Order).await;
+    let resp = client
+        .post(format!("{solo}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "primary/mock-model",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Illegal API invocation from an unapproved channel")
+    );
+    assert_eq!(*a_requests.lock().unwrap(), 3);
+}
+
+/// A vendor whose response-protection layer is unavailable answers 4xx/5xx
+/// — including a 502 — no matter what is asked. That is not a busy outage:
+/// the next route is tried, the refusal doesn't cool the key down, and
+/// the asking member doesn't rest.
+#[tokio::test]
+async fn protection_refusal_falls_over_at_any_status() {
+    let refusal = json!({
+        "error": {
+            "message": "response protection is unavailable",
+            "type": "server_error"
+        }
+    });
+    let (a, a_requests) = spawn_scripted(vec![(502, refusal)]).await;
+    let (b, b_requests) = spawn_scripted(vec![]).await;
+    let gw = spawn_gateway_with_group(a.clone(), b.clone(), RoutingPolicy::Order).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "group/daily-coding",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "hello");
+    assert_eq!(*a_requests.lock().unwrap(), 1);
+    assert_eq!(*b_requests.lock().unwrap(), 1);
+
+    // One provider's refusal doesn't cool its key: the next request asks
+    // the same route first again and falls over once more.
+    let resp = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "group/daily-coding",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(*a_requests.lock().unwrap(), 2);
+    assert_eq!(*b_requests.lock().unwrap(), 2);
+
+    // Solo (no fallback), the 502 reaches the agent with the vendor's
+    // wording.
+    let solo = spawn_gateway_with_group(a, b, RoutingPolicy::Order).await;
+    let resp = client
+        .post(format!("{solo}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "primary/mock-model",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("response protection is unavailable")
+    );
+    assert_eq!(*a_requests.lock().unwrap(), 3);
+}
+
 #[tokio::test]
 async fn retired_model_falls_back_to_another_provider() {
     let primary = spawn_retired_model().await;
