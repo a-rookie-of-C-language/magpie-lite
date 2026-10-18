@@ -215,6 +215,20 @@ fn part_to_block(p: &Part) -> Option<Value> {
     }
 }
 
+/// A history block for a request: citations a reply carried cite documents
+/// the next request does not include, and would be rejected, so they are
+/// stripped before a conversation continues.
+fn part_to_history_block(p: &Part) -> Option<Value> {
+    let mut block = part_to_block(p)?;
+    if block.get("type").and_then(Value::as_str) == Some("text") {
+        block
+            .as_object_mut()
+            .expect("text block is an object")
+            .remove("citations");
+    }
+    Some(block)
+}
+
 /// Decode an Anthropic Messages request body.
 pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
     let model = str_field(v, "model")?;
@@ -309,7 +323,11 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
             .map(|p| p.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        let blocks: Vec<Value> = req.system.iter().filter_map(part_to_block).collect();
+        let blocks: Vec<Value> = req
+            .system
+            .iter()
+            .filter_map(part_to_history_block)
+            .collect();
         if !text.is_empty() {
             out.insert("system".into(), json!(text));
         } else if !blocks.is_empty() {
@@ -325,7 +343,7 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
             for p in &m.parts {
                 if p.kind() == PartKind::ToolResult {
                     let images: Vec<Value> = crate::tool_output::images(p)
-                        .filter_map(part_to_block)
+                        .filter_map(part_to_history_block)
                         .collect();
                     let content = if images.is_empty() {
                         json!(p.text)
@@ -356,7 +374,7 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
                 })),
                 PartKind::ToolResult => {}
                 _ => {
-                    if let Some(b) = part_to_block(p) {
+                    if let Some(b) = part_to_history_block(p) {
                         blocks.push(b);
                     }
                 }

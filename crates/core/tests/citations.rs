@@ -221,3 +221,33 @@ fn citations_are_not_answers_and_without_text_are_dropped() {
     // No open message: the Responses encoder says nothing.
     assert!(encode_r(&[event]).is_empty());
 }
+
+#[test]
+fn request_history_strips_citations_but_replies_keep_them() {
+    use magpie_core::ir::{CompletionRequest, Message, Role};
+    let reply = anthropic::decode_response(&json!({
+        "id": "m", "type": "message", "role": "assistant", "model": "m",
+        "content": [{"type": "text", "text": "answer", "citations": [citation()]}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }))
+    .unwrap();
+    let req = CompletionRequest {
+        model: "m".into(),
+        messages: vec![Message {
+            role: Role::Assistant,
+            parts: reply.message.parts.clone(),
+        }],
+        ..CompletionRequest::default()
+    };
+    let history = anthropic::encode_request(&req, "m").unwrap();
+    let block = &history["messages"][0]["content"][0];
+    assert_eq!(block["type"], "text");
+    assert_eq!(block["text"], "answer");
+    assert!(block.get("citations").is_none());
+    // A reply body keeps them.
+    assert_eq!(
+        anthropic::encode_response(&reply)["content"][0]["citations"],
+        json!([citation()])
+    );
+}
