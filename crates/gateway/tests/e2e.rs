@@ -161,6 +161,48 @@ async fn spawn_mock() -> (String, Arc<Mutex<Option<Value>>>) {
     (format!("http://{addr}"), last_request)
 }
 
+/// A vendor that ignores `stream: true` and always answers with one whole
+/// JSON body.
+async fn spawn_whole_reply_mock() -> (String, Arc<Mutex<Option<Value>>>) {
+    let last_request = Arc::new(Mutex::new(None));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(whole_chat_completions))
+        .with_state(MockUpstream {
+            last_request: last_request.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), last_request)
+}
+
+async fn whole_chat_completions(
+    State(mock): State<MockUpstream>,
+    body: axum::body::Bytes,
+) -> Response {
+    let v: Value = serde_json::from_slice(&body).expect("upstream body is JSON");
+    *mock.last_request.lock().unwrap() = Some(v);
+    Json(json!({
+        "id": "chatcmpl-whole", "object": "chat.completion", "model": "mock-model",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "Whole reply.",
+                "tool_calls": [{
+                    "id": "call_whole", "type": "function",
+                    "function": {"name": "print", "arguments": "{\"text\": \"whole\"}"}
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {"prompt_tokens": 21, "completion_tokens": 9, "total_tokens": 30}
+    }))
+    .into_response()
+}
+
 async fn spawn_gateway(upstream_base: String) -> String {
     spawn_gateway_with_protocol(upstream_base, Protocol::Chat).await
 }
@@ -239,6 +281,91 @@ async fn spawn_gateway_with_protocol_and_history(
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn stream_request_over_whole_chat_upstream_reply_replays_as_stream() {
+    // A vendor that ignores `stream: true` and answers with one whole JSON
+    // body must not hand its JSON to an agent already reading SSE: the
+    // gateway replays the reply as the client dialect's stream.
+    let (upstream, last) = spawn_whole_reply_mock().await;
+    let gw = spawn_gateway(upstream).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{gw}/v1/messages"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "mock/mock-model",
+            "max_tokens": 100,
+            "stream": true,
+            "messages": [{"role": "user", "content": "Weather?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream")
+    );
+    // The upstream really did see stream:true and answer whole anyway.
+    let upstream_req = last.lock().unwrap().clone().expect("upstream was called");
+    assert_eq!(upstream_req["stream"], true);
+
+    let text = resp.text().await.unwrap();
+    let mut saw_message_start = false;
+    let mut visible = String::new();
+    let mut args = String::new();
+    let mut stop_reason = String::new();
+    let mut output_tokens: Option<u64> = None;
+    let mut saw_message_stop = false;
+    for frame in text.split("\n\n") {
+        let Some(data) = frame.lines().find_map(|l| l.strip_prefix("data: ")) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        match v.get("type").and_then(Value::as_str).unwrap_or_default() {
+            "message_start" => saw_message_start = true,
+            "content_block_delta" => match v
+                .pointer("/delta/type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+            {
+                "text_delta" => visible.push_str(
+                    v.pointer("/delta/text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                ),
+                "input_json_delta" => args.push_str(
+                    v.pointer("/delta/partial_json")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                ),
+                _ => {}
+            },
+            "message_delta" => {
+                stop_reason = v
+                    .pointer("/delta/stop_reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                output_tokens = v.pointer("/usage/output_tokens").and_then(Value::as_u64);
+            }
+            "message_stop" => saw_message_stop = true,
+            _ => {}
+        }
+    }
+    assert!(saw_message_start);
+    assert_eq!(visible, "Whole reply.");
+    assert_eq!(args, r#"{"text":"whole"}"#);
+    assert_eq!(stop_reason, "tool_use");
+    assert_eq!(output_tokens, Some(9));
+    assert!(saw_message_stop);
 }
 
 #[tokio::test]

@@ -17,7 +17,8 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use futures::StreamExt;
-use magpie_core::ir::{CompletionRequest, Usage};
+use magpie_core::ir::{CompletionRequest, CompletionResponse, PartKind, SignatureProtocol, Usage};
+use magpie_core::stream::SignatureTarget;
 use magpie_core::stream::{SseParser, StreamEvent};
 use magpie_core::{anthropic, chat, gemini, responses};
 use serde_json::{Value, json};
@@ -909,7 +910,12 @@ struct StreamLiveness {
 }
 
 enum UpstreamReply {
-    Decoded(magpie_core::ir::CompletionResponse),
+    Decoded {
+        ir: magpie_core::ir::CompletionResponse,
+        /// The vendor ignored `stream: true` and answered whole while the
+        /// client reads SSE; the caller replays the reply as a stream.
+        whole_as_stream: bool,
+    },
     Stream {
         events: UpstreamEvents,
         empty_retries: usize,
@@ -1097,7 +1103,17 @@ async fn send_with_fallback(
                 let status = resp.status();
                 liveness.activity.headers(status.is_success());
                 if status.is_success() {
-                    if !creq.stream {
+                    // A vendor that ignored `stream: true` answers with a
+                    // whole JSON body, not an SSE stream. It can no longer go
+                    // to the agent as one: replay it as the client's stream.
+                    let content_type = resp
+                        .headers()
+                        .get(header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    let streamed = creq.stream && content_type.contains("text/event-stream");
+                    if !creq.stream || !streamed {
                         let value: Value = match resp.json().await {
                             Ok(value) => value,
                             Err(error) => {
@@ -1184,7 +1200,13 @@ async fn send_with_fallback(
                             }
                         };
                         tracker.record_attempt(&route.provider.id, *key_slot, "ok");
-                        return Ok((UpstreamReply::Decoded(ir), candidate));
+                        return Ok((
+                            UpstreamReply::Decoded {
+                                ir,
+                                whole_as_stream: creq.stream,
+                            },
+                            candidate,
+                        ));
                     }
                     let headers = resp.headers().clone();
                     let (events, failure) = match first_token
@@ -1497,6 +1519,83 @@ fn decode_upstream_response(
     }
 }
 
+/// A whole reply from a vendor that ignored `stream: true`, as the stream
+/// events that say it. The agent asked for a stream and already has the
+/// stream's headers, so a whole reply can no longer go to it as one.
+fn whole_as_stream_events(reply: &CompletionResponse) -> Vec<StreamEvent> {
+    let mut out = vec![StreamEvent::Start {
+        model: reply.model.clone(),
+    }];
+    let mut calls = 0usize;
+    for part in &reply.message.parts {
+        match part.kind() {
+            PartKind::Text => {
+                if !part.text.is_empty() {
+                    out.push(StreamEvent::TextDelta {
+                        text: part.text.clone(),
+                    });
+                }
+            }
+            PartKind::Thinking => {
+                if !part.text.is_empty() {
+                    out.push(StreamEvent::ThinkingDelta {
+                        text: part.text.clone(),
+                    });
+                }
+                // Native signatures only re-emit to their own protocol's
+                // encoder; the Anthropic encoder filters by protocol itself.
+                if !part.signature.is_empty() {
+                    out.push(StreamEvent::Signature {
+                        protocol: SignatureProtocol::Anthropic,
+                        target: SignatureTarget::Thinking,
+                        signature: part.signature.clone(),
+                    });
+                }
+            }
+            PartKind::ToolCall => {
+                let index = calls;
+                calls += 1;
+                out.push(StreamEvent::ToolCallStart {
+                    index,
+                    id: part.id.clone(),
+                    name: part.name.clone(),
+                    namespace: part.namespace.clone(),
+                });
+                let args = if part.args.is_null() {
+                    "{}".to_owned()
+                } else {
+                    part.args.to_string()
+                };
+                if !args.is_empty() {
+                    out.push(StreamEvent::ToolCallDelta { index, args });
+                }
+                out.push(StreamEvent::ToolCallEnd { index });
+            }
+            PartKind::Image => {
+                if !part.data.is_empty() || !part.url.is_empty() {
+                    out.push(StreamEvent::Image {
+                        image: Box::new(part.clone()),
+                    });
+                }
+            }
+            // A completed upstream search replays as its public result;
+            // other kinds have no conversation-facing stream shape.
+            PartKind::Search => {
+                if let Some(search) = part.search.as_ref().filter(|s| s.is_public_result()) {
+                    out.push(StreamEvent::Search {
+                        search: search.clone(),
+                    });
+                }
+            }
+            PartKind::ToolResult => {}
+        }
+    }
+    out.push(StreamEvent::Stop(reply.stop));
+    out.push(StreamEvent::Usage(reply.usage));
+    out.push(StreamEvent::Done);
+    out
+}
+
 fn decode_upstream_chunk(
     protocol: Protocol,
     data: &Value,
@@ -1580,11 +1679,28 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
             }
         };
         let (mut events, mut empty_retries, reask_allowed) = match reply {
-            UpstreamReply::Decoded(mut ir) => {
+            UpstreamReply::Decoded {
+                mut ir,
+                whole_as_stream,
+            } => {
                 tracker.observe_usage(&ir.usage);
                 ir.usage = tracker.total_usage();
                 tracker.finish("ok", &Usage::default());
-                return Ok(ok_json(wire.encode_response(&ir, &creq)));
+                if !whole_as_stream {
+                    return Ok(ok_json(wire.encode_response(&ir, &creq)));
+                }
+                // The vendor ignored `stream: true` and answered whole. The
+                // client already holds the stream's headers, so replay the
+                // reply as the client dialect's stream.
+                (
+                    Box::pin(futures::stream::iter(
+                        whole_as_stream_events(&ir)
+                            .into_iter()
+                            .map(UpstreamEvent::from),
+                    )) as UpstreamEvents,
+                    0usize,
+                    false,
+                )
             }
             UpstreamReply::Stream {
                 events,
