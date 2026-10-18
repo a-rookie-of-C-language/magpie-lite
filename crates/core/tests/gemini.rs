@@ -115,6 +115,79 @@ fn ir_request_encodes_to_gemini_and_back() {
 }
 
 #[test]
+fn interrupted_tool_call_is_answered_and_history_never_ends_with_the_model() {
+    let ir = magpie_core::ir::CompletionRequest {
+        model: "mock/mock-model".into(),
+        system: Vec::new(),
+        messages: vec![
+            magpie_core::ir::Message {
+                role: magpie_core::ir::Role::User,
+                parts: vec![magpie_core::ir::Part::text("read the file")],
+            },
+            magpie_core::ir::Message {
+                role: magpie_core::ir::Role::Assistant,
+                parts: vec![magpie_core::ir::Part::tool_call(
+                    "call_9",
+                    "read",
+                    json!({"path": "/x"}),
+                )],
+            },
+            // The turn was interrupted: the user speaks on without the
+            // call's answer.
+            magpie_core::ir::Message {
+                role: magpie_core::ir::Role::User,
+                parts: vec![magpie_core::ir::Part::text("continue")],
+            },
+        ],
+        ..Default::default()
+    };
+    let encoded = gemini::encode_request(&ir, "mock-model").unwrap();
+    let contents = encoded["contents"].as_array().unwrap();
+    assert_eq!(contents.last().unwrap()["role"], "user");
+    assert_eq!(contents[2]["role"], "user");
+    assert_eq!(
+        contents[2]["parts"][0]["functionResponse"]["id"], "call_9",
+        "the pending call is answered"
+    );
+    assert_eq!(
+        contents[3]["parts"][0]["text"], "continue",
+        "what the user said follows the synthetic answer in its own turn"
+    );
+}
+
+#[test]
+fn user_text_beside_tool_results_gets_a_turn_of_its_own() {
+    let ir = magpie_core::ir::CompletionRequest {
+        model: "mock/mock-model".into(),
+        system: Vec::new(),
+        messages: vec![
+            magpie_core::ir::Message {
+                role: magpie_core::ir::Role::Assistant,
+                parts: vec![magpie_core::ir::Part::tool_call(
+                    "call_1",
+                    "read",
+                    json!({"path": "/x"}),
+                )],
+            },
+            magpie_core::ir::Message {
+                role: magpie_core::ir::Role::User,
+                parts: vec![
+                    magpie_core::ir::Part::tool_result("call_1", "data", false),
+                    magpie_core::ir::Part::text("and now summarize"),
+                ],
+            },
+        ],
+        ..Default::default()
+    };
+    let encoded = gemini::encode_request(&ir, "mock-model").unwrap();
+    let contents = encoded["contents"].as_array().unwrap();
+    assert_eq!(contents[1]["role"], "user");
+    assert!(contents[1]["parts"][0].get("functionResponse").is_some());
+    assert_eq!(contents[2]["role"], "user");
+    assert_eq!(contents[2]["parts"][0]["text"], "and now summarize");
+}
+
+#[test]
 fn chat_response_encodes_to_gemini() {
     let ir = chat::decode_response(&json!({
         "id": "x", "object": "chat.completion", "model": "mock-model",

@@ -7,7 +7,7 @@
 
 mod grounding;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::{CoreError, Result};
 use crate::ir::{
@@ -431,9 +431,33 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
         }
     }
 
-    let mut contents = Vec::new();
-    for message in &crate::ir::join_split_calls(&req.messages) {
+    // A call the client answers nowhere — an interrupted turn leaves its
+    // call pending — is answered with a synthetic result: Google's APIs
+    // turn every later turn of the conversation away with 400 over the
+    // one (#1560). The answer goes in the turn that follows the calls
+    // when that turn already holds answers, and otherwise in a turn of
+    // its own before it: a user turn mixing a functionResponse with text
+    // is turned away too (#1533).
+    const INTERRUPTED_NOTE: &str =
+        "[The result of this tool call is unavailable: the turn was interrupted.]";
+    let joined = crate::ir::join_split_calls(&req.messages);
+    let mut answered: HashSet<String> = HashSet::new();
+    let mut answered_name: HashSet<String> = HashSet::new();
+    for message in &joined {
+        for p in &message.parts {
+            if p.kind() == PartKind::ToolResult {
+                if p.call_id.is_empty() {
+                    answered_name.insert(p.name.clone());
+                } else {
+                    answered.insert(p.call_id.clone());
+                }
+            }
+        }
+    }
+    let mut contents: Vec<Value> = Vec::new();
+    for message in &joined {
         let mut parts = Vec::new();
+        let mut said: Vec<Value> = Vec::new();
         for p in &message.parts {
             match p.kind() {
                 PartKind::Text => {
@@ -506,12 +530,57 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
                 }
             }
         }
+        // What the user said goes in a turn of its own after the tools'
+        // responses: a turn mixing a functionResponse with text is turned
+        // away ("Requests ending with a model turn are not supported").
+        if message.role == Role::User && parts.iter().any(|p| p.get("functionResponse").is_some()) {
+            said = parts
+                .iter()
+                .filter(|p| p.get("functionResponse").is_none())
+                .cloned()
+                .collect();
+            parts.retain(|p| p.get("functionResponse").is_some());
+        }
         if !parts.is_empty() {
+            if let Some(prev) = contents.last_mut()
+                && prev["role"]
+                    == json!(if message.role == Role::Assistant {
+                        "model"
+                    } else {
+                        "user"
+                    })
+                && prev["parts"]
+                    .as_array()
+                    .is_some_and(|ps| ps.iter().any(|p| p.get("functionResponse").is_some()))
+                    == parts.iter().any(|p| p.get("functionResponse").is_some())
+            {
+                prev["parts"]
+                    .as_array_mut()
+                    .expect("contents parts")
+                    .extend(parts);
+            } else {
+                contents.push(json!({
+                    "role": if message.role == Role::Assistant { "model" } else { "user" },
+                    "parts": parts,
+                }));
+            }
+        }
+        if !said.is_empty() {
             contents.push(json!({
-                "role": if message.role == Role::Assistant { "model" } else { "user" },
-                "parts": parts,
+                "role": "user",
+                "parts": said,
             }));
         }
+    }
+    let mut contents = pair_function_turns(contents, &answered, &answered_name, INTERRUPTED_NOTE);
+    // A conversation ending with the model's turn is turned away
+    // ("Requests ending with a model turn are not supported"): a user
+    // turn goes after it.
+    if contents.last().and_then(|c| c["role"].as_str()) == Some("model") {
+        contents.push(json!({
+            "role": "user",
+            "parts": [{"text": "Continue."}],
+        }));
     }
     out.insert("contents".into(), Value::Array(contents));
 
@@ -609,6 +678,63 @@ fn stop_to_gemini(s: StopReason) -> &'static str {
         StopReason::ContentFilter | StopReason::Other => "SAFETY",
         _ => "STOP",
     }
+}
+
+/// Answers a model turn's function calls that the conversation answers
+/// nowhere, as Google's APIs read their histories: a call left pending —
+/// an interrupted turn — turns every later turn of the conversation away
+/// with 400 over the one. The synthetic answer goes in the turn that
+/// follows the calls when that turn already holds answers, and otherwise
+/// in a turn of its own before it (#1560). A call with no id counts as
+/// answered by a response of its name with no id.
+fn pair_function_turns(
+    contents: Vec<Value>,
+    answered: &HashSet<String>,
+    answered_name: &HashSet<String>,
+    note: &str,
+) -> Vec<Value> {
+    if contents.is_empty() {
+        return contents;
+    }
+    let parts_of = |c: &Value| -> Vec<Value> {
+        c.get("parts")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut out: Vec<Value> = Vec::with_capacity(contents.len() + 1);
+    for content in contents {
+        if content["role"] == json!("model") {
+            let mut synth = Vec::new();
+            for part in parts_of(&content) {
+                let Some(call) = part.get("functionCall") else {
+                    continue;
+                };
+                let id = call.get("id").and_then(Value::as_str).unwrap_or("");
+                let name = call.get("name").and_then(Value::as_str).unwrap_or("");
+                if (!id.is_empty() && answered.contains(id))
+                    || (id.is_empty() && answered_name.contains(name))
+                {
+                    continue;
+                }
+                let mut res = json!({
+                    "name": name,
+                    "response": {"output": note},
+                });
+                if !id.is_empty() {
+                    res["id"] = json!(id);
+                }
+                synth.push(json!({"functionResponse": res}));
+            }
+            if !synth.is_empty() {
+                out.push(content);
+                out.push(json!({"role": "user", "parts": synth}));
+                continue;
+            }
+        }
+        out.push(content);
+    }
+    out
 }
 
 fn decode_parts(parts: &[Value]) -> Vec<Part> {

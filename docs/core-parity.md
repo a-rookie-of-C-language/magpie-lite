@@ -444,3 +444,16 @@ Lite's chat decode keeps only Lite IR fields, so client `store`/`metadata`/
 `service_tier`/etc. top-level fields are dropped before this layer — the
 effective surface today is `parallel_tool_calls` (Chat/Responses, only when
 tools are present) and the Responses upstream's hardcoded `store: false`.
+
+## Gemini pending-call pairing and turn shapes (2026-10-18)
+
+The reference gateway answers a Gemini history's function call the client
+never answered — an interrupted turn leaves its call pending — with a
+synthetic result, because Google's APIs refuse every later turn over the
+one (#1560), and it keeps what the user said out of a turn holding tool
+responses, which Vertex answers "Requests ending with a model turn are not
+supported" (#1533). Lite's Gemini encoder now does both: pending calls get
+the reference's note in a user turn before what followed, user text beside
+tool results gets a turn of its own, and a history ending with the model's
+turn is closed with a "Continue." user turn. An answered history is built
+as before; Antigravity's Claude tool_result shape has no Lite surface yet.
