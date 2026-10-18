@@ -28,6 +28,7 @@ use crate::config_store::{ConfigStore, IdempotencyRequest};
 use crate::cooldown::quota_cooldown;
 use crate::edge_block::{BLOCKED_HINT, edge_blocked, edge_blocked_text};
 use crate::model_gone::{model_refused, model_retired};
+use crate::retired as retired_store;
 use crate::stream_empty::{EMPTY_REPLY, GeminiReply};
 use crate::stream_keepalive::{self, Keepalive, UpstreamActivity};
 use crate::stream_loop::LoopGuard;
@@ -188,6 +189,7 @@ pub async fn serve_with_config_path(
         None => crate::config::config_path()?,
     };
     let agent_state_dir = magpie_agents::lifecycle::state_directory(&agent_config)?;
+    retired_store::init(agent_state_dir.join("retired.json"));
     let manager = magpie_agents::lifecycle::Manager::native(agent_state_dir.clone())?;
     let state = Arc::new(AppState {
         agents: Some(crate::agents::AgentService {
@@ -1293,6 +1295,13 @@ async fn send_with_fallback(
                             && route_retryable_status(failure.status, &failure.body, "")
                         {
                             drop(events);
+                            if model_retired(failure.status.as_u16(), &failure.body) {
+                                retired_store::retire(
+                                    &route.provider.id,
+                                    &route.model,
+                                    std::time::SystemTime::now(),
+                                );
+                            }
                             break 'keys;
                         }
                     } else {
@@ -1353,6 +1362,13 @@ async fn send_with_fallback(
                 }
                 if route_index != last_route && route_retryable_status(status, &error.body, &detail)
                 {
+                    if model_retired(status.as_u16(), &error.body) {
+                        retired_store::retire(
+                            &route.provider.id,
+                            &route.model,
+                            std::time::SystemTime::now(),
+                        );
+                    }
                     break 'keys;
                 }
                 if edge_blocked(&error.body) || edge_blocked_text(&detail) {
@@ -1697,6 +1713,11 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
         {
             Ok((resp, candidate)) => {
                 tracker.set_route(&candidate.provider.id, &candidate.model, candidate.key_slot);
+                retired_store::unretire(
+                    &candidate.provider.id,
+                    &candidate.model,
+                    std::time::SystemTime::now(),
+                );
                 (resp, candidate)
             }
             Err((response, candidate)) => {

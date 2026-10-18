@@ -8,6 +8,7 @@ mod edge_block;
 mod model_gone;
 mod provider_tools;
 mod providers;
+mod retired;
 pub mod server;
 mod stream_empty;
 mod stream_keepalive;
@@ -23,4 +24,5 @@ pub use config::{
     config_path,
 };
 pub use config_store::ConfigStore;
+pub use retired::{init as init_retired_store, is_retired as model_is_retired};
 pub use server::{AppState, build_router, serve, serve_with_config_path};

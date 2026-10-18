@@ -282,7 +282,11 @@ transport failures and truncated streams use 502.
   firewall block pages are implemented (`crates/gateway/src/model_gone.rs`,
   `crates/gateway/src/edge_block.rs`): 410/retired-wording and model-refusal
   errors let the next route try, and a firewall block page falls back at any
-  status while reporting the block in plain words instead of the page.
+  status while reporting the block in plain words instead of the page. A
+  model the vendor retires is additionally retired from that provider's
+  catalog for a week (`crates/gateway/src/retired.rs`): it leaves
+  `/v1/models` and bare-name routing until the vendor answers it again or
+  the week passes; an explicit `provider/model` request is still sent.
 
 If all applicable candidates fail, the last attempt's error is delivered once
 in the client protocol. Retry classification adds no management mutation API.

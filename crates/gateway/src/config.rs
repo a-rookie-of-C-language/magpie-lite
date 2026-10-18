@@ -1029,6 +1029,12 @@ impl Config {
         }
         for p in &self.provider {
             for m in &p.models {
+                // A model its vendor answered with a retirement leaves the
+                // lists for that provider only, until it answers again or
+                // the retirement week passes (crates/gateway/src/retired.rs).
+                if crate::retired::is_retired(&p.id, m, std::time::SystemTime::now()) {
+                    continue;
+                }
                 out.push((format!("{}/{}", p.id, m), p.label().to_owned()));
             }
         }

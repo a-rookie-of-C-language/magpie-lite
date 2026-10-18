@@ -10,6 +10,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use magpie_gateway::{
     AppState, Config, GroupConfig, Protocol, ProviderConfig, RoutingPolicy, build_router,
+    init_retired_store, model_is_retired,
 };
 use serde_json::{Value, json};
 
@@ -205,6 +206,18 @@ async fn whole_chat_completions(
 
 async fn spawn_gateway(upstream_base: String) -> String {
     spawn_gateway_with_protocol(upstream_base, Protocol::Chat).await
+}
+
+fn init_retired_for_test(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "magpie-lite-retired-e2e-{}-{name}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("retired.json");
+    let _ = std::fs::remove_file(&path);
+    init_retired_store(path.clone());
+    path
 }
 
 fn request_log(config: &Config) -> Arc<Mutex<magpie_gateway::usage::RequestLog>> {
@@ -585,6 +598,96 @@ async fn retired_model_falls_back_to_another_provider() {
     let text = resp.text().await.unwrap();
     assert!(text.contains("\"Rain\"") && text.contains("[DONE]"));
     assert!(last.lock().unwrap().is_some(), "backup was called");
+}
+
+#[tokio::test]
+async fn retired_model_leaves_the_catalog_until_it_answers() {
+    let path = init_retired_for_test("catalog");
+    let primary = spawn_retired_model().await;
+    let (backup, _) = spawn_mock().await;
+    let gw = spawn_gateway_with_fallback(primary, backup).await;
+    let client = reqwest::Client::new();
+
+    // Before anything: mock-model is listed, and nothing is retired.
+    let models: Value = client
+        .get(format!("{gw}/v1/models"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "primary/mock-model")
+    );
+    assert!(!model_is_retired(
+        "primary",
+        "mock-model",
+        std::time::SystemTime::now()
+    ));
+
+    // The vendor answers 410 ModelDeprecated; the fallback still answers.
+    let resp = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "primary/mock-model",
+            "messages": [{"role": "user", "content": "Weather?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    drop(resp);
+    assert!(model_is_retired(
+        "primary",
+        "mock-model",
+        std::time::SystemTime::now()
+    ));
+
+    // The retired model leaves the catalog; the group entry stays.
+    let models: Value = client
+        .get(format!("{gw}/v1/models"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        !models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "primary/mock-model")
+    );
+
+    // A vendor answer takes the retirement back, and the model is listed.
+    let _ = std::fs::remove_file(&path);
+    init_retired_store(path.clone());
+    let models: Value = client
+        .get(format!("{gw}/v1/models"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "primary/mock-model")
+    );
+    let _ = std::fs::remove_file(&path);
 }
 
 async fn edge_blocked_chat() -> Response {
