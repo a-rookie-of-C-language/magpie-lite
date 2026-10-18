@@ -258,14 +258,18 @@ async fn spawn_gateway_with_protocol_and_history(
             id: "mock".into(),
             name: "Mock".into(),
             protocol,
-            base_url: format!(
-                "{upstream_base}/{}",
-                if protocol == Protocol::Gemini {
-                    "v1beta"
-                } else {
-                    "v1"
-                }
-            ),
+            base_url: if protocol == Protocol::Anthropic {
+                upstream_base.clone()
+            } else {
+                format!(
+                    "{upstream_base}/{}",
+                    if protocol == Protocol::Gemini {
+                        "v1beta"
+                    } else {
+                        "v1"
+                    }
+                )
+            },
             api_key: "test-key".into(),
             api_keys: Vec::new(),
             models: vec!["mock-model".into()],
@@ -620,6 +624,61 @@ async fn spawn_scripted(replies: Vec<(u16, Value)>) -> (String, Arc<Mutex<usize>
     let requests = mock.requests.clone();
     let app = Router::new()
         .route("/v1/chat/completions", post(scripted_chat_completions))
+        .with_state(mock);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), requests)
+}
+
+/// The scripted upstream over Anthropic's path: the Nth request gets the
+/// Nth scripted reply, or a plain OK Anthropic message once the script
+/// runs out. It counts requests.
+#[derive(Clone)]
+struct ScriptedAnthropicUpstream {
+    replies: Arc<Mutex<Vec<(u16, Value)>>>,
+    requests: Arc<Mutex<usize>>,
+}
+
+async fn scripted_anthropic_messages(
+    State(mock): State<ScriptedAnthropicUpstream>,
+    body: axum::body::Bytes,
+) -> Response {
+    let _ = serde_json::from_slice::<Value>(&body).expect("upstream body is JSON");
+    let count = {
+        let mut requests = mock.requests.lock().unwrap();
+        let count = *requests;
+        *requests += 1;
+        count
+    };
+    let replies = mock.replies.lock().unwrap();
+    let index = count.min(replies.len().saturating_sub(1));
+    if let Some((status, reply)) = replies.get(index).cloned() {
+        drop(replies);
+        let status = StatusCode::from_u16(status).unwrap();
+        return (status, Json(reply)).into_response();
+    }
+    drop(replies);
+    Json(json!({
+        "id": "msg-scripted", "type": "message", "role": "assistant",
+        "model": "m",
+        "content": [{"type": "text", "text": "hello"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    }))
+    .into_response()
+}
+
+async fn spawn_scripted_anthropic(replies: Vec<(u16, Value)>) -> (String, Arc<Mutex<usize>>) {
+    let mock = ScriptedAnthropicUpstream {
+        replies: Arc::new(Mutex::new(replies)),
+        requests: Arc::new(Mutex::new(0)),
+    };
+    let requests = mock.requests.clone();
+    let app = Router::new()
+        .route("/v1/messages", post(scripted_anthropic_messages))
         .with_state(mock);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -2764,4 +2823,37 @@ async fn refused_optional_field_is_retried_without_it_and_then_omitted() {
     let body: Value = second.json().await.unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], "hello");
     assert_eq!(*requests.lock().unwrap(), 3);
+}
+
+/// A Claude refusing a sampling parameter by wording no other rule reads
+/// (#1454) is asked once more without it, on the same credential, before
+/// anything reaches the client.
+#[tokio::test]
+async fn sampling_refusal_is_retried_without_the_sampling() {
+    let error = json!({
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": "`temperature` is deprecated for this model."
+        }
+    });
+    let (upstream, requests) =
+        spawn_scripted_anthropic(vec![(400, error), (200, json!({"id": "msg-scripted", "type": "message", "role": "assistant", "model": "m", "content": [{"type": "text", "text": "hello"}], "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}}))]).await;
+    let gw = spawn_gateway_with_protocol(upstream, Protocol::Anthropic).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "mock/mock-model",
+            "temperature": 0.2,
+            "messages": [{"role": "user", "content": "Weather?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "hello");
+    assert_eq!(*requests.lock().unwrap(), 2);
 }

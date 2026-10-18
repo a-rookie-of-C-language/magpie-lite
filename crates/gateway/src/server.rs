@@ -884,6 +884,22 @@ fn quota_limited_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 402 | 429)
 }
 
+/// A Claude refusing a sampling parameter: "`temperature` is deprecated
+/// for this model" (and `top_p`, `top_k` — the reference
+/// `samplingDeprecated`, #1454).
+fn sampling_refused(status: reqwest::StatusCode, body: &Value) -> bool {
+    if status.as_u16() != 400 {
+        return false;
+    }
+    let text = body.to_string().to_lowercase();
+    ["temperature", "top_p", "top_k"].iter().any(|param| {
+        text.contains(&format!("{param}` is deprecated for this model"))
+            || text.contains(&format!("{param} is deprecated for this model"))
+            || text.contains(&format!("{param}` is not supported for this model"))
+            || text.contains(&format!("{param} is not supported for this model"))
+    })
+}
+
 /// Whether an upstream status is worth spending another route on.
 /// `text` carries the raw human-readable error: HTML block pages never
 /// parse into `body`, so the blocked-page wording arrives here instead.
@@ -1048,6 +1064,7 @@ async fn send_with_fallback(
             tracker.begin_attempt(&route.provider.id, &route.model, *key_slot);
             let mut empty_retries = 0;
             let mut optional_retry: Option<Vec<&'static str>> = None;
+            let mut sampling_retry = false;
             'candidate: loop {
                 liveness.activity.attempt();
                 let mut body = match upstream::build_request(&route.provider, creq, &route.model) {
@@ -1094,6 +1111,17 @@ async fn send_with_fallback(
                 }
                 if let Some(fields) = &optional_retry {
                     body = optional_fields::without_fields(&body, fields);
+                }
+                if sampling_retry {
+                    body.as_object_mut()
+                        .expect("request body object")
+                        .remove("temperature");
+                    body.as_object_mut()
+                        .expect("request body object")
+                        .remove("top_p");
+                    body.as_object_mut()
+                        .expect("request body object")
+                        .remove("top_k");
                 }
                 tracing::debug!(
                     provider = %route.provider.id,
@@ -1419,6 +1447,18 @@ async fn send_with_fallback(
                         optional_retry = Some(refused);
                         continue 'candidate;
                     }
+                }
+                // A Claude that refuses a sampling parameter by a wording
+                // no other rule reads (#1454, as the reference
+                // `samplingDeprecated`) is asked once more without
+                // temperature and top_p, on the same credential.
+                if sampling_refused(status, &error.body)
+                    && route.provider.protocol == Protocol::Anthropic
+                    && !sampling_retry
+                    && (creq.temperature.is_some() || creq.top_p.is_some())
+                {
+                    sampling_retry = true;
+                    continue 'candidate;
                 }
                 if quota_limited_status(status) {
                     let cooldown = quota_cooldown(
