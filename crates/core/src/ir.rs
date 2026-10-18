@@ -395,7 +395,7 @@ impl StopReason {
     pub fn from_anthropic(s: &str) -> StopReason {
         match s {
             "tool_use" => StopReason::ToolUse,
-            "max_tokens" => StopReason::MaxTokens,
+            "max_tokens" | "model_context_window_exceeded" => StopReason::MaxTokens,
             "stop_sequence" => StopReason::StopSequence,
             "refusal" => StopReason::ContentFilter,
             _ => StopReason::EndTurn,
@@ -540,5 +540,21 @@ mod tests {
         let joined = join_split_calls(&messages);
         assert_eq!(joined.len(), 3);
         assert_eq!(joined[1].parts.len(), 2);
+    }
+
+    #[test]
+    fn anthropic_context_window_stop_is_length() {
+        assert_eq!(
+            StopReason::from_anthropic("model_context_window_exceeded"),
+            StopReason::MaxTokens
+        );
+        assert_eq!(
+            StopReason::from_anthropic("max_tokens"),
+            StopReason::MaxTokens
+        );
+        assert_eq!(
+            StopReason::from_anthropic("pause_turn"),
+            StopReason::EndTurn
+        );
     }
 }

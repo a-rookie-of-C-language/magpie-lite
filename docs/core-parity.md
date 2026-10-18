@@ -353,3 +353,15 @@ and SSE, with decoded signature provenance preventing foreign-protocol leaks.
 See docs/native-signatures.md and the core/gateway signatures suites for exact
 coverage, stream commitment/retry semantics and privacy evidence. Real vendor
 and model-specific signed transcript acceptance remain unverified.
+
+## Anthropic context-window stop parity (2026-10-18)
+
+The reference gateway maps Anthropic's `model_context_window_exceeded` stop
+reason to its length class, beside `max_tokens`. Lite's decoder treated it as
+end-turn, losing the distinction that the reply stopped because the model ran
+out of context before finishing. `StopReason::from_anthropic` now maps it to
+`MaxTokens`, so every client dialect reports a length stop.
+
+Native text `citations` and Responses output-text `annotations` remain
+untranslated: they are not retained in IR or re-emitted to other dialects.
+Anthropic `pause_turn` has no reference mapping and is still not represented.
