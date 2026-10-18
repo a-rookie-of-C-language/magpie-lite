@@ -2695,3 +2695,73 @@ async fn anthropic_x_api_key_and_public_health_probe_work() {
     let body: Value = health.json().await.unwrap();
     assert_eq!(body["status"], "ok");
 }
+
+#[tokio::test]
+async fn refused_optional_field_is_retried_without_it_and_then_omitted() {
+    let error = json!({
+        "error": {
+            "message": "Unsupported parameter: 'parallel_tool_calls' is unsupported",
+            "code": "unsupported_parameter",
+            "param": "parallel_tool_calls"
+        }
+    });
+    let (upstream, requests) = spawn_scripted(vec![
+        (400, error),
+        (
+            200,
+            json!({
+                "id": "chatcmpl-optional-ok",
+                "object": "chat.completion",
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hello"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2
+                }
+            }),
+        ),
+    ])
+    .await;
+    let gw = spawn_gateway(upstream).await;
+    let client = reqwest::Client::new();
+    let post = |url: String| client.post(url).bearer_auth("magpie-lite");
+    let payload = json!({
+        "model": "mock/mock-model",
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "echo",
+                "description": "Echo",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        }],
+        "parallel_tool_calls": false,
+        "messages": [{"role": "user", "content": "Weather?"}]
+    });
+    let first = post(format!("{gw}/v1/chat/completions"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let body: Value = first.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "hello");
+    assert_eq!(*requests.lock().unwrap(), 2);
+
+    // The refusal is remembered: the next request is without the field
+    // from the start.
+    let second = post(format!("{gw}/v1/chat/completions"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let body: Value = second.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "hello");
+    assert_eq!(*requests.lock().unwrap(), 3);
+}

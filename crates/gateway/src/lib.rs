@@ -6,6 +6,7 @@ pub mod config_store;
 pub mod cooldown;
 mod edge_block;
 mod model_gone;
+mod optional_fields;
 mod provider_tools;
 mod providers;
 mod retired;
@@ -16,6 +17,7 @@ mod stream_loop;
 mod stream_refusal;
 mod stream_status;
 mod stream_timeout;
+mod unfit_fields;
 pub mod upstream;
 pub mod usage;
 

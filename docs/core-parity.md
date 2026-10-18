@@ -424,3 +424,23 @@ no strict field and its Responses encoder hardcoded `false`. `Tool` now
 carries `strict` (Chat and Responses decode it, Anthropic and Gemini have
 no such field), and the Responses encoder emits what the client asked,
 defaulting to `false` exactly as before.
+
+## Refused optional fields (2026-10-18)
+
+The reference gateway asks an upstream again without an optional request
+field the vendor names in a 400/422 refusal, then remembers the refusal for
+that provider/model so later requests leave it out from the start (#393,
+#1117). Lite now ports that: its optional-field table covers `store`,
+`metadata`, `service_tier`, `prompt_cache_key`, `prompt_cache_retention`,
+`safety_identifier`, `stream_options`, `parallel_tool_calls`, `verbosity`,
+`thinking` and `enable_thinking`; a named refusal is read from structured
+`extra_forbidden`/`param` shapes and the reference's free-text wordings,
+including a proxy's embedded JSON error. The field is retried once on the
+same credential and, on success, remembered in-process per provider, model
+and protocol. Invalid-value refusals and fields every API requires are not
+dropped; Anthropic's 400 shape is not treated as this refusal.
+
+Lite's chat decode keeps only Lite IR fields, so client `store`/`metadata`/
+`service_tier`/etc. top-level fields are dropped before this layer — the
+effective surface today is `parallel_tool_calls` (Chat/Responses, only when
+tools are present) and the Responses upstream's hardcoded `store: false`.

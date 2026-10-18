@@ -31,12 +31,14 @@ use crate::model_gone::{
     context_overflowed, model_refused, model_retired, prompt_refused, protection_refused,
     shape_refused,
 };
+use crate::optional_fields;
 use crate::retired as retired_store;
 use crate::stream_empty::{EMPTY_REPLY, GeminiReply};
 use crate::stream_keepalive::{self, Keepalive, UpstreamActivity};
 use crate::stream_loop::LoopGuard;
 use crate::stream_refusal::{self, REFUSAL};
 use crate::stream_timeout::{GroupFirstToken, ResponsesHold, StreamClock, StreamTimeout};
+use crate::unfit_fields;
 use crate::upstream;
 use crate::usage::{RequestLog, RequestTracker};
 
@@ -1045,9 +1047,10 @@ async fn send_with_fallback(
             let candidate = UpstreamCandidate::new(&route, *key_slot);
             tracker.begin_attempt(&route.provider.id, &route.model, *key_slot);
             let mut empty_retries = 0;
+            let mut optional_retry: Option<Vec<&'static str>> = None;
             'candidate: loop {
                 liveness.activity.attempt();
-                let body = match upstream::build_request(&route.provider, creq, &route.model) {
+                let mut body = match upstream::build_request(&route.provider, creq, &route.model) {
                     Ok(body) => body,
                     Err(error) => {
                         // A local conversion error is not a bad credential or
@@ -1063,6 +1066,35 @@ async fn send_with_fallback(
                         ));
                     }
                 };
+                // A vendor that turned an optional field away once gets a
+                // request without it from the start.
+                if body.as_object().is_some() {
+                    let unfit: Vec<&str> = optional_fields::OPTIONAL_FIELDS
+                        .iter()
+                        .copied()
+                        .filter(|field| {
+                            body.get(*field).is_some()
+                                && unfit_fields::unfit(
+                                    &route.provider.id,
+                                    &route.model,
+                                    route.provider.protocol.as_str(),
+                                    field,
+                                )
+                        })
+                        .collect();
+                    if !unfit.is_empty() {
+                        body = optional_fields::without_fields(&body, &unfit);
+                        tracing::debug!(
+                            provider = %route.provider.id,
+                            model = %route.model,
+                            fields = ?unfit,
+                            "omitting optional fields an upstream refused"
+                        );
+                    }
+                }
+                if let Some(fields) = &optional_retry {
+                    body = optional_fields::without_fields(&body, fields);
+                }
                 tracing::debug!(
                     provider = %route.provider.id,
                     model = %route.model,
@@ -1135,6 +1167,20 @@ async fn send_with_fallback(
 
                 let status = resp.status();
                 liveness.activity.headers(status.is_success());
+                if status.is_success()
+                    && let Some(fields) = optional_retry.take()
+                {
+                    // The retried ask accepted the request: this vendor and
+                    // model do not take these fields at all.
+                    for field in fields {
+                        unfit_fields::refuse(
+                            &route.provider.id,
+                            &route.model,
+                            route.provider.protocol.as_str(),
+                            field,
+                        );
+                    }
+                }
                 if status.is_success() {
                     // A vendor that ignored `stream: true` answers with a
                     // whole JSON body, not an SSE stream. It can no longer go
@@ -1357,6 +1403,23 @@ async fn send_with_fallback(
                     return Err((ProxyFailure::refusal(), candidate));
                 }
                 tracker.record_attempt(&route.provider.id, *key_slot, &status.as_u16().to_string());
+                // A vendor that names an optional request field in a 400/422
+                // gets one more ask without it, on the same credential. An
+                // invalid value must reach the client instead.
+                if optional_fields::bad_request(status.as_u16())
+                    && route.provider.protocol != Protocol::Anthropic
+                    && optional_retry.is_none()
+                {
+                    let refused = optional_fields::refused_optional(
+                        status.as_u16(),
+                        &body,
+                        &error.body.get("error").unwrap_or(&error.body).clone(),
+                    );
+                    if !refused.is_empty() {
+                        optional_retry = Some(refused);
+                        continue 'candidate;
+                    }
+                }
                 if quota_limited_status(status) {
                     let cooldown = quota_cooldown(
                         &headers,
