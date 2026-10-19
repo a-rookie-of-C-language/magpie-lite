@@ -31,6 +31,7 @@ async fn server(enabled: bool) -> Server {
         token: TOKEN.into(),
         port: 12345,
         default_provider: "mock".into(),
+        hidden_auto_groups: Vec::new(),
         provider: vec![ProviderConfig {
             id: "mock".into(),
             name: "Mock".into(),
@@ -60,6 +61,7 @@ async fn server(enabled: bool) -> Server {
             classifier: String::new(),
             effort: String::new(),
             pick: String::new(),
+            auto: false,
             weights: Vec::new(),
             routing: RoutingPolicy::default(),
             first_token_timeout_ms: 0,

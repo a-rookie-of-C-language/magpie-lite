@@ -175,6 +175,7 @@ async fn gateway(
             classifier: String::new(),
             effort: String::new(),
             pick: String::new(),
+            auto: false,
             weights: Vec::new(),
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
@@ -186,6 +187,7 @@ async fn gateway(
     let config = Config {
         token: "magpie-lite".into(),
         default_provider: id.into(),
+        hidden_auto_groups: Vec::new(),
         provider: providers,
         group: groups,
         ..Config::default()

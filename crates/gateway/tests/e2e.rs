@@ -311,6 +311,7 @@ async fn spawn_gateway_with_providers_and_groups(
         stream_loop_guard: Config::default().stream_loop_guard,
         history_path,
         default_provider: provider.first().map(|p| p.id.clone()).unwrap_or_default(),
+        hidden_auto_groups: Vec::new(),
         provider,
         group: if group_routes.is_empty() {
             Vec::new()
@@ -323,6 +324,7 @@ async fn spawn_gateway_with_providers_and_groups(
                 classifier: String::new(),
                 effort: String::new(),
                 pick: String::new(),
+                auto: false,
                 weights: Vec::new(),
                 routing: RoutingPolicy::Order,
                 first_token_timeout_ms: 0,
@@ -1821,6 +1823,7 @@ async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) ->
         stream_loop_guard: Config::default().stream_loop_guard,
         history_path: None,
         default_provider: "primary".into(),
+        hidden_auto_groups: Vec::new(),
         provider: providers,
         group: Vec::new(),
     };
@@ -1865,6 +1868,7 @@ async fn spawn_gateway_with_fallback_named(
         stream_loop_guard: Config::default().stream_loop_guard,
         history_path: None,
         default_provider: "primary".into(),
+        hidden_auto_groups: Vec::new(),
         provider: vec![
             ProviderConfig {
                 id: primary_id.into(),
@@ -1944,6 +1948,7 @@ async fn spawn_gateway_with_same_provider_group(upstream: String) -> String {
         stream_loop_guard: Config::default().stream_loop_guard,
         history_path: None,
         default_provider: "mock".into(),
+        hidden_auto_groups: Vec::new(),
         provider: vec![ProviderConfig {
             id: "mock".into(),
             name: "Mock".into(),
@@ -1973,6 +1978,7 @@ async fn spawn_gateway_with_same_provider_group(upstream: String) -> String {
             classifier: String::new(),
             effort: String::new(),
             pick: String::new(),
+            auto: false,
             weights: Vec::new(),
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
@@ -2024,6 +2030,7 @@ async fn spawn_gateway_with_group_weights(
         stream_loop_guard: Config::default().stream_loop_guard,
         history_path: None,
         default_provider: "primary".into(),
+        hidden_auto_groups: Vec::new(),
         provider: vec![
             ProviderConfig {
                 id: "primary".into(),
@@ -2076,6 +2083,7 @@ async fn spawn_gateway_with_group_weights(
             classifier: String::new(),
             effort: String::new(),
             pick: String::new(),
+            auto: false,
             weights,
             routing,
             first_token_timeout_ms: 0,

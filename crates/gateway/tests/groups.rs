@@ -641,6 +641,199 @@ async fn group_rules_round_trip_and_reject_bad_shapes() {
     assert!(Config::load(&gw.path).unwrap().group[0].rules.is_empty());
 }
 
+async fn gateway_with_shared_model() -> Gateway {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let last = Arc::new(Mutex::new(None));
+    let (upstream, upstream_task) = bind(
+        Router::new()
+            .route("/v1/chat/completions", post(mock))
+            .with_state(last.clone()),
+    )
+    .await;
+    let peer = |id: &str| ProviderConfig {
+        id: id.into(),
+        name: id.into(),
+        protocol: Protocol::Chat,
+        base_url: format!("{upstream}/v1"),
+        api_key: "secret-provider-key".into(),
+        api_keys: Vec::new(),
+        models: vec!["shared".into()],
+        contexts: Default::default(),
+        fallback: Vec::new(),
+        key_cooldown_ms: None,
+        capabilities: Default::default(),
+        routing: magpie_gateway::RoutingPolicy::Rotate,
+        weights: Vec::new(),
+        affinity: Default::default(),
+        max_concurrency: None,
+        max_rpm: None,
+        queue_limit: None,
+        queue_wait_s: None,
+        key_generation: 0,
+    };
+    let config = Config {
+        provider: vec![peer("mock-a"), peer("mock-b")],
+        ..Config::default()
+    };
+    config.save(&path).unwrap();
+    let state = Arc::new(AppState {
+        agents: None,
+        config: ConfigStore::new(config, Some(path.clone())),
+        http: magpie_gateway::upstream::http_client().unwrap(),
+        requests: Arc::new(Mutex::new(magpie_gateway::usage::RequestLog::default())),
+        key_rotation: magpie_gateway::KeyRotator::default(),
+        affinity: magpie_gateway::AffinityStore::default(),
+        lanes: magpie_gateway::lanes::Lanes::default(),
+        rpms: magpie_gateway::lanes::Rpms::default(),
+    });
+    let (url, gateway_task) = bind(build_router(state)).await;
+    Gateway {
+        url,
+        path,
+        last,
+        _directory: directory,
+        tasks: vec![upstream_task, gateway_task],
+    }
+}
+
+#[tokio::test]
+async fn found_groups_serve_hide_and_come_back() {
+    async fn models(gw: &Gateway) -> Value {
+        Client::new()
+            .get(format!("{}/v1/models", gw.url))
+            .bearer_auth("magpie-lite")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+    async fn ask(gw: &Gateway) -> StatusCode {
+        Client::new()
+            .post(format!("{}/v1/chat/completions", gw.url))
+            .bearer_auth("magpie-lite")
+            .json(&json!({
+                "model": "group/auto-shared",
+                "messages": [{"role": "user", "content": "Hi"}],
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    }
+    fn listed(models: &Value) -> bool {
+        models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "group/auto-shared")
+    }
+    let gw = gateway_with_shared_model().await;
+
+    // Found, served and listed without writing anything.
+    let snapshot: Value = Client::new()
+        .get(format!("{}/config", gw.url))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let found = snapshot["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["id"] == "auto-shared")
+        .expect("found group in snapshot");
+    assert_eq!(found["routes"], json!(["mock-a/shared", "mock-b/shared"]));
+    assert_eq!(found["auto"], true);
+    assert!(listed(&models(&gw).await));
+    assert_eq!(ask(&gw).await, StatusCode::OK);
+    assert!(Config::load(&gw.path).unwrap().group.is_empty());
+
+    // Deleting a found group hides it: unlisted, unrouted, kept for
+    // bringing back.
+    let removed = edit(
+        &gw,
+        Method::DELETE,
+        "/config/groups/auto-shared",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(removed.status(), StatusCode::OK);
+    let snapshot: Value = removed.json().await.unwrap();
+    let hidden = snapshot["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["id"] == "auto-shared")
+        .expect("hidden group in snapshot");
+    assert_eq!(hidden["hidden"], true);
+    assert!(!listed(&models(&gw).await));
+    assert_eq!(ask(&gw).await, StatusCode::NOT_FOUND);
+    assert_eq!(
+        Config::load(&gw.path).unwrap().hidden_auto_groups,
+        vec!["auto-shared"]
+    );
+
+    // Saving it again brings it back as the user's own.
+    let mut back = group("auto-shared", "shared");
+    back["routes"] = json!(["mock-a/shared", "mock-b/shared"]);
+    let restored = edit(&gw, Method::POST, "/config/groups", back).await;
+    assert_eq!(restored.status(), StatusCode::CREATED);
+    let snapshot: Value = restored.json().await.unwrap();
+    let owned = snapshot["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["id"] == "auto-shared")
+        .expect("restored group in snapshot");
+    assert_eq!(owned["auto"], Value::Null);
+    assert_eq!(ask(&gw).await, StatusCode::OK);
+    assert!(
+        Config::load(&gw.path)
+            .unwrap()
+            .hidden_auto_groups
+            .is_empty()
+    );
+
+    // Removing the user's own with a found id shows the found one again;
+    // changing that found one makes it theirs, over PUT too.
+    let removed = edit(
+        &gw,
+        Method::DELETE,
+        "/config/groups/auto-shared",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(removed.status(), StatusCode::OK);
+    let snapshot: Value = removed.json().await.unwrap();
+    let found = snapshot["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["id"] == "auto-shared")
+        .expect("found group back in snapshot");
+    assert_eq!(found["auto"], true);
+    let mut changed = group("auto-shared", "shared");
+    changed["routes"] = json!(["mock-b/shared"]);
+    let updated = edit(&gw, Method::PUT, "/config/groups/auto-shared", changed).await;
+    assert_eq!(updated.status(), StatusCode::OK);
+    let snapshot: Value = updated.json().await.unwrap();
+    let owned = snapshot["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["id"] == "auto-shared")
+        .expect("changed group in snapshot");
+    assert_eq!(owned["auto"], Value::Null);
+    assert_eq!(owned["routes"], json!(["mock-b/shared"]));
+    assert_eq!(ask(&gw).await, StatusCode::OK);
+}
+
 #[tokio::test]
 async fn manual_group_sends_every_request_to_its_pick_and_rules_wait() {
     async fn ask(gw: &Gateway, content: &str) -> StatusCode {

@@ -126,6 +126,7 @@ async fn gateway(providers: Vec<ProviderConfig>) -> (String, Arc<AppState>) {
         stream_loop_guard: Config::default().stream_loop_guard,
         history_path: None,
         default_provider,
+        hidden_auto_groups: Vec::new(),
         provider: providers,
         group: vec![GroupConfig {
             id: "g".into(),
@@ -135,6 +136,7 @@ async fn gateway(providers: Vec<ProviderConfig>) -> (String, Arc<AppState>) {
             classifier: String::new(),
             effort: String::new(),
             pick: String::new(),
+            auto: false,
             weights: Vec::new(),
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
@@ -332,6 +334,7 @@ async fn gateway_with_fallback(
         stream_loop_guard: Config::default().stream_loop_guard,
         history_path: None,
         default_provider: primary.id.clone(),
+        hidden_auto_groups: Vec::new(),
         provider: vec![primary, fallback],
         group: Vec::new(),
     };

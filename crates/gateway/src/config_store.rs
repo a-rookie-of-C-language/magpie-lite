@@ -600,6 +600,7 @@ mod tests {
                     classifier: String::new(),
                     effort: String::new(),
                     pick: String::new(),
+                    auto: false,
                     weights: Vec::new(),
                     routing: RoutingPolicy::default(),
                     first_token_timeout_ms: 0,

@@ -462,6 +462,7 @@ async fn main() -> Result<()> {
                         classifier: classifier.trim().to_owned(),
                         effort: effort.trim().to_owned(),
                         pick: pick.trim().to_owned(),
+                        auto: false,
                         weights: route_weights,
                         routing,
                         first_token_timeout_ms,
@@ -479,6 +480,7 @@ async fn main() -> Result<()> {
                         Some(i) => cfg.group[i] = group,
                         None => cfg.group.push(group),
                     }
+                    cfg.hidden_auto_groups.retain(|hidden| hidden != &id);
                     save_config(&path, &cfg)?;
                     println!("saved group `group/{id}` to {}", path.display());
                 }
@@ -490,7 +492,8 @@ async fn main() -> Result<()> {
                         );
                         return Ok(());
                     }
-                    for g in &cfg.group {
+                    let auto = cfg.auto_groups();
+                    for g in cfg.group.iter().chain(auto.iter()) {
                         let label = if g.name.is_empty() {
                             g.id.as_str()
                         } else {
@@ -505,6 +508,14 @@ async fn main() -> Result<()> {
                             g.affinity.as_str(),
                             g.first_token_timeout_ms
                         );
+                        if g.auto {
+                            println!(
+                                "{:<26} found: one model on {} providers; `group rm {}` hides it",
+                                "",
+                                g.routes.len(),
+                                g.id,
+                            );
+                        }
                         for (i, route) in g.routes.iter().enumerate() {
                             let marker = if g.routing == RoutingPolicy::Manual {
                                 if route == &g.pick { "pick" } else { "waiting" }
@@ -530,17 +541,39 @@ async fn main() -> Result<()> {
                             println!("{:<26} {kind} {}: {}", "", i + 1, rule.summary());
                         }
                     }
+                    for g in cfg.hidden_found_groups() {
+                        let bring = g
+                            .routes
+                            .iter()
+                            .map(|route| format!("--route {route}"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        println!("group/{:<18} {} [found, hidden]", g.id, g.label());
+                        println!(
+                            "{:<26} bring back with: magpie-lite group add {} {bring}",
+                            "", g.id
+                        );
+                    }
                 }
                 GroupCommand::Rm { id } => {
                     let path = provider_path(&cli.config)?;
                     let mut cfg = Config::load(&path)?;
                     let before = cfg.group.len();
                     cfg.group.retain(|g| g.id != id);
-                    if cfg.group.len() == before {
+                    if cfg.group.len() != before {
+                        save_config(&path, &cfg)?;
+                        println!("removed group `{id}`");
+                    } else if cfg.group(&id).is_some() {
+                        // Found, never changed: hide it rather than deleting
+                        // what the providers still derive.
+                        if !cfg.hidden_auto_groups.iter().any(|hidden| hidden == &id) {
+                            cfg.hidden_auto_groups.push(id.clone());
+                        }
+                        save_config(&path, &cfg)?;
+                        println!("hid found group `{id}`; `group list` brings it back");
+                    } else {
                         anyhow::bail!("no group `{id}`");
                     }
-                    save_config(&path, &cfg)?;
-                    println!("removed group `{id}`");
                 }
             }
         }

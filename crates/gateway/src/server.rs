@@ -369,6 +369,61 @@ fn decode_group(bytes: &[u8]) -> Result<GroupConfig, &'static str> {
     serde_json::from_slice(bytes).map_err(|_| "expected JSON with id, optional name, and routes")
 }
 
+/// Bring a removed found group back: saving any group with its id
+/// unhides it (a group written with a found id is the user's own).
+fn unhide_group(config: &mut crate::config::Config, id: &str) {
+    config.hidden_auto_groups.retain(|hidden| hidden != id);
+}
+
+/// Save a group over the user's own with its id, or over a found one the
+/// user just changed (theirs now, as the reference keeps found groups out
+/// of the file).
+fn place_group(
+    config: &mut crate::config::Config,
+    group: GroupConfig,
+) -> Result<(), (StatusCode, String)> {
+    unhide_group(config, &group.id);
+    if let Some(existing) = config
+        .group
+        .iter_mut()
+        .find(|existing| existing.id == group.id)
+    {
+        *existing = group;
+        return Ok(());
+    }
+    if config.group(&group.id).is_some() {
+        config.group.push(group);
+        return Ok(());
+    }
+    Err((StatusCode::NOT_FOUND, "group not found".to_owned()))
+}
+
+/// Remove a group: one the user wrote is gone; one magpie found hides
+/// until brought back, unless a provider fallback still names it.
+fn remove_group(config: &mut crate::config::Config, id: &str) -> Result<(), (StatusCode, String)> {
+    let reference = format!("group/{id}");
+    if config
+        .provider
+        .iter()
+        .any(|provider| provider.fallback.contains(&reference))
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "group is referenced by a provider fallback".to_owned(),
+        ));
+    }
+    if let Some(index) = config.group.iter().position(|group| group.id == id) {
+        config.group.remove(index);
+    } else if config.group(id).is_some() {
+        if !config.hidden_auto_groups.iter().any(|hidden| hidden == id) {
+            config.hidden_auto_groups.push(id.to_owned());
+        }
+    } else {
+        return Err((StatusCode::NOT_FOUND, "group not found".to_owned()));
+    }
+    Ok(())
+}
+
 fn validate_group(config: &Config, group: &mut GroupConfig) -> Result<(), (StatusCode, String)> {
     group
         .validate()
@@ -413,6 +468,7 @@ async fn create_group(
                 if config.group.iter().any(|existing| existing.id == group.id) {
                     return Err((StatusCode::CONFLICT, "group already exists".to_owned()));
                 }
+                unhide_group(config, &group.id);
                 config.group.push(group);
                 Ok(())
             })
@@ -426,6 +482,7 @@ async fn create_group(
                 if config.group.iter().any(|existing| existing.id == group.id) {
                     return Err((StatusCode::CONFLICT, "group already exists".to_owned()));
                 }
+                unhide_group(config, &group.id);
                 config.group.push(group);
                 Ok(())
             })
@@ -461,13 +518,7 @@ async fn update_group(
             .config
             .update_idempotent(expected, request, move |config| {
                 validate_group(config, &mut group)?;
-                let existing = config
-                    .group
-                    .iter_mut()
-                    .find(|existing| existing.id == id)
-                    .ok_or_else(|| (StatusCode::NOT_FOUND, "group not found".to_owned()))?;
-                *existing = group;
-                Ok(())
+                place_group(config, group)
             })
             .await
             .map(|(snapshot, _)| snapshot)
@@ -476,13 +527,7 @@ async fn update_group(
             .config
             .update_if_revision(expected, move |config| {
                 validate_group(config, &mut group)?;
-                let existing = config
-                    .group
-                    .iter_mut()
-                    .find(|existing| existing.id == id)
-                    .ok_or_else(|| (StatusCode::NOT_FOUND, "group not found".to_owned()))?;
-                *existing = group;
-                Ok(())
+                place_group(config, group)
             })
             .await
     };
@@ -506,51 +551,13 @@ async fn delete_group(
     let result = if let Some(request) = request {
         state
             .config
-            .update_idempotent(expected, request, move |config| {
-                let index = config
-                    .group
-                    .iter()
-                    .position(|group| group.id == id)
-                    .ok_or_else(|| (StatusCode::NOT_FOUND, "group not found".to_owned()))?;
-                let reference = format!("group/{id}");
-                if config
-                    .provider
-                    .iter()
-                    .any(|provider| provider.fallback.contains(&reference))
-                {
-                    return Err((
-                        StatusCode::CONFLICT,
-                        "group is referenced by a provider fallback".to_owned(),
-                    ));
-                }
-                config.group.remove(index);
-                Ok(())
-            })
+            .update_idempotent(expected, request, move |config| remove_group(config, &id))
             .await
             .map(|(snapshot, _)| snapshot)
     } else {
         state
             .config
-            .update_if_revision(expected, move |config| {
-                let index = config
-                    .group
-                    .iter()
-                    .position(|group| group.id == id)
-                    .ok_or_else(|| (StatusCode::NOT_FOUND, "group not found".to_owned()))?;
-                let reference = format!("group/{id}");
-                if config
-                    .provider
-                    .iter()
-                    .any(|provider| provider.fallback.contains(&reference))
-                {
-                    return Err((
-                        StatusCode::CONFLICT,
-                        "group is referenced by a provider fallback".to_owned(),
-                    ));
-                }
-                config.group.remove(index);
-                Ok(())
-            })
+            .update_if_revision(expected, move |config| remove_group(config, &id))
             .await
     };
     group_update_response(result, StatusCode::OK)
@@ -4257,6 +4264,7 @@ mod tests {
                             classifier: String::new(),
                             effort: String::new(),
                             pick: String::new(),
+                            auto: false,
                             weights: Vec::new(),
                             routing: RoutingPolicy::Order,
                             first_token_timeout_ms: 0,

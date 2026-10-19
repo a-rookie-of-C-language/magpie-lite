@@ -1353,6 +1353,26 @@
         li.className = "group-item";
         const id = document.createElement("strong");
         id.textContent = `group/${group.id}`;
+        if (group.hidden) {
+          // Found but removed: kept out of routing and the catalog until
+          // brought back (the reference lists removed found groups last).
+          const label = text("span", group.name || group.id, "model-owner");
+          const policy = text("span", "Found · hidden — not routed, not listed to agents", "model-owner");
+          const route = document.createElement("span");
+          route.className = "model-owner";
+          route.textContent = (group.routes || []).join(" → ") || "No routes";
+          const actions = document.createElement("div");
+          actions.className = "group-actions";
+          const back = text("button", "Bring back", "button secondary");
+          back.type = "button";
+          back.setAttribute("aria-label", `Bring back group ${group.id}`);
+          back.disabled = managementBusy;
+          back.addEventListener("click", () => bringBackGroup(group));
+          actions.append(back);
+          li.append(id, label, policy, route, actions);
+          elements.groupList.append(li);
+          continue;
+        }
         const route = document.createElement("div");
         route.className = "group-actions";
         if (group.routing === "manual") {
@@ -1375,7 +1395,9 @@
         const label = text("span", group.name || group.id, "model-owner");
         const weights = group.routing === "weight" ? ` · weights: ${(group.weights || []).join(", ")}` : "";
         const picked = group.routing === "manual" ? ` → ${group.pick || (group.routes || [])[0] || "—"}` : "";
-        const policy = text("span", `Policy: ${group.routing || "order"}${picked}${weights} · affinity: ${group.affinity || "auto"}`, "model-owner");
+        const found = group.auto ? " · found" : "";
+        const policy = text("span", `Policy: ${group.routing || "order"}${picked}${weights} · affinity: ${group.affinity || "auto"}${found}`, "model-owner");
+        if (group.auto) policy.title = "Magpie found this group: one model served by several providers. Editing it makes it yours; deleting hides it until brought back.";
         const rules = text("span", ruleSummary(group.rules || []), "model-owner");
         if (group.classifier) rules.textContent += ` · classifier: ${group.classifier}`;
         if (group.effort) rules.textContent += ` · effort: ${group.effort}`;
@@ -1855,8 +1877,19 @@
     }
 
     async function deleteGroup(group) {
-      if (managementBusy || !window.confirm(`Delete group/${group.id}? Agents using it will need another model.`)) return;
-      await mutateGroup(`/config/groups/${encodeURIComponent(group.id)}`, "DELETE", null, "Group deleted and saved.");
+      const what = group.auto
+        ? `Hide found group/${group.id}? It leaves routing and the catalog until brought back.`
+        : `Delete group/${group.id}? Agents using it will need another model.`;
+      if (managementBusy || !window.confirm(what)) return;
+      await mutateGroup(`/config/groups/${encodeURIComponent(group.id)}`, "DELETE", null, group.auto ? "Group hidden; bring it back from its card." : "Group deleted and saved.");
+    }
+
+    // A removed found group comes back as the user's own: saving it with
+    // its id unhides it (a group written with a found id is theirs).
+    async function bringBackGroup(group) {
+      if (managementBusy) return;
+      const { auto, hidden, ...rest } = group;
+      await mutateGroup("/config/groups", "POST", rest, `group/${group.id} is back in routing and the catalog.`);
     }
 
     // A manual group's card picks its member in one click: every request

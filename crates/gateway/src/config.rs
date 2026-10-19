@@ -929,6 +929,12 @@ pub struct GroupConfig {
     /// group is routed otherwise, and defaults to its first route.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pick: String,
+    /// Set on a group magpie found — one model served by several
+    /// providers — never on one the user wrote (the reference's
+    /// `Group.Auto`). Found groups are derived, not saved; writing one
+    /// with this id makes it the user's own.
+    #[serde(default, skip_serializing_if = "is_found")]
+    pub auto: bool,
     /// Process-local route selection policy.
     #[serde(default)]
     pub routing: RoutingPolicy,
@@ -947,6 +953,9 @@ impl GroupConfig {
     /// The group's rules are normalized in place (`cleanRules`): times and
     /// days put the one way, folders checked, unknown members refused.
     pub fn validate(&mut self) -> anyhow::Result<()> {
+        // Found-ness is derived, never written: a group saved with a
+        // found id is the user's own from then on.
+        self.auto = false;
         if self.id.is_empty()
             || self
                 .id
@@ -1157,6 +1166,13 @@ pub struct GroupConfigSnapshot {
     pub weights: Vec<u32>,
     /// Route selection policy.
     pub routing: RoutingPolicy,
+    /// Set when magpie found the group rather than the user writing it.
+    #[serde(default, skip_serializing_if = "is_found")]
+    pub auto: bool,
+    /// Set on a found group the user removed; bringing it back is one
+    /// click on its card.
+    #[serde(default, skip_serializing_if = "is_found")]
+    pub hidden: bool,
     /// First-content budget for non-final streaming group routes (0 disables).
     #[serde(default)]
     pub first_token_timeout_ms: u64,
@@ -1241,6 +1257,11 @@ pub struct Config {
     /// Named route chains.
     #[serde(default)]
     pub group: Vec<GroupConfig>,
+    /// Ids of found (`auto-…`) groups the user removed: derived again but
+    /// kept out of the catalog, routing and snapshots until brought back
+    /// (the reference's `Group.Hidden`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_auto_groups: Vec<String>,
 }
 
 fn default_port() -> u16 {
@@ -1249,6 +1270,30 @@ fn default_port() -> u16 {
 
 fn default_key_cooldown_ms() -> u64 {
     60_000
+}
+
+/// The tail of a found group's id: the model id lowercase, every run of
+/// other characters one `-`, none at either end (`Claude Opus 5.5` serves
+/// as `group/auto-claude-opus-5-5`).
+fn auto_slug(model: &str) -> String {
+    let mut slug = String::with_capacity(model.len());
+    let mut dash = false;
+    for c in model.to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c);
+            dash = false;
+        } else if !dash && !slug.is_empty() {
+            slug.push('-');
+            dash = true;
+        }
+    }
+    slug.trim_end_matches('-').to_owned()
+}
+
+/// `skip_serializing_if` for found-group markers: files stay quiet unless
+/// magpie found the group.
+fn is_found(found: &bool) -> bool {
+    !found
 }
 
 fn default_stream_first_content_timeout_ms() -> u64 {
@@ -1295,6 +1340,7 @@ impl Default for Config {
             history_path: None,
             provider: Vec::new(),
             group: Vec::new(),
+            hidden_auto_groups: Vec::new(),
         }
     }
 }
@@ -1494,11 +1540,47 @@ impl Config {
                     classifier: g.classifier.clone(),
                     effort: g.effort.clone(),
                     pick: g.pick.clone(),
+                    auto: g.auto,
+                    hidden: false,
                     weights: g.route_weights(),
                     routing: g.routing,
                     first_token_timeout_ms: g.first_token_timeout_ms,
                     affinity: g.affinity,
                 })
+                .chain(self.auto_groups().iter().map(|g| GroupConfigSnapshot {
+                    id: g.id.clone(),
+                    name: g.label().to_owned(),
+                    routes: g.routes.clone(),
+                    rules: g.rules.clone(),
+                    classifier: g.classifier.clone(),
+                    effort: g.effort.clone(),
+                    pick: g.pick.clone(),
+                    auto: true,
+                    hidden: false,
+                    weights: g.route_weights(),
+                    routing: g.routing,
+                    first_token_timeout_ms: g.first_token_timeout_ms,
+                    affinity: g.affinity,
+                }))
+                .chain(
+                    self.hidden_found_groups()
+                        .iter()
+                        .map(|g| GroupConfigSnapshot {
+                            id: g.id.clone(),
+                            name: g.label().to_owned(),
+                            routes: g.routes.clone(),
+                            rules: g.rules.clone(),
+                            classifier: g.classifier.clone(),
+                            effort: g.effort.clone(),
+                            pick: g.pick.clone(),
+                            auto: true,
+                            hidden: true,
+                            weights: g.route_weights(),
+                            routing: g.routing,
+                            first_token_timeout_ms: g.first_token_timeout_ms,
+                            affinity: g.affinity,
+                        }),
+                )
                 .collect(),
         }
     }
@@ -1509,8 +1591,87 @@ impl Config {
     }
 
     /// Find a routing group by id.
-    pub fn group(&self, id: &str) -> Option<&GroupConfig> {
-        self.group.iter().find(|g| g.id == id)
+    pub fn group(&self, id: &str) -> Option<GroupConfig> {
+        // A found group the user never changed serves as itself; one they
+        // wrote with its id is theirs (the reference keeps found groups
+        // out of the file, user edits becoming their own).
+        self.group
+            .iter()
+            .find(|g| g.id == id)
+            .cloned()
+            .or_else(|| self.auto_groups().into_iter().find(|g| g.id == id))
+    }
+
+    /// The groups magpie found: one model id served by several providers,
+    /// in the order the providers were added (the reference's
+    /// `autoGroups`, without its cross-vendor spelling — lite merges on
+    /// the id the providers list). A group the user wrote with the same
+    /// id is theirs, and one they removed stays hidden until brought
+    /// back. Retired models leave their provider's seat only.
+    pub fn auto_groups(&self) -> Vec<GroupConfig> {
+        self.derived_groups(false)
+    }
+
+    /// Found groups the user removed but could bring back: still served
+    /// by several providers, not theirs, shown last for restoration.
+    pub fn hidden_found_groups(&self) -> Vec<GroupConfig> {
+        self.derived_groups(true)
+    }
+
+    /// Every group magpie found, before hiding: `hidden_only` keeps just
+    /// the removed ones.
+    fn derived_groups(&self, hidden_only: bool) -> Vec<GroupConfig> {
+        let now = std::time::SystemTime::now();
+        let mut order: Vec<String> = Vec::new();
+        let mut by: std::collections::BTreeMap<String, Vec<(String, String)>> =
+            std::collections::BTreeMap::new();
+        for p in &self.provider {
+            for m in &p.models {
+                if m.is_empty() || crate::retired::is_retired(&p.id, m, now) {
+                    continue;
+                }
+                let seats = by.entry(m.clone()).or_default();
+                if !seats.iter().any(|(pid, _)| pid == &p.id) {
+                    if seats.is_empty() {
+                        order.push(m.clone());
+                    }
+                    seats.push((p.id.clone(), m.clone()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for m in order {
+            let seats = &by[&m];
+            if seats.len() < 2 {
+                continue;
+            }
+            let id = format!("auto-{}", auto_slug(&m));
+            if self.group.iter().any(|g| g.id == id) {
+                continue;
+            }
+            let hidden = self.hidden_auto_groups.iter().any(|h| h == &id);
+            if hidden != hidden_only {
+                continue;
+            }
+            out.push(GroupConfig {
+                id,
+                name: m.clone(),
+                routes: seats
+                    .iter()
+                    .map(|(pid, model)| format!("{pid}/{model}"))
+                    .collect(),
+                rules: Vec::new(),
+                classifier: String::new(),
+                effort: String::new(),
+                pick: String::new(),
+                auto: true,
+                weights: Vec::new(),
+                routing: RoutingPolicy::default(),
+                first_token_timeout_ms: 0,
+                affinity: Affinity::default(),
+            });
+        }
+        out
     }
 
     /// The cooldown to apply after a provider key is quota-limited or rate
@@ -1568,7 +1729,8 @@ impl Config {
     /// or `group/<id>`).
     pub fn catalog(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
-        for g in &self.group {
+        let auto = self.auto_groups();
+        for g in self.group.iter().chain(auto.iter()) {
             out.push((format!("group/{}", g.id), g.label().to_owned()));
         }
         for p in &self.provider {
@@ -2051,6 +2213,7 @@ base_url = "http://127.0.0.1:1/v1"
     fn config_snapshot_is_route_metadata_without_secrets() {
         let mut config = Config {
             default_provider: "mock".into(),
+            hidden_auto_groups: Vec::new(),
             key_cooldown_ms: 60_000,
             ..Config::default()
         };
@@ -2083,6 +2246,7 @@ base_url = "http://127.0.0.1:1/v1"
             classifier: String::new(),
             effort: String::new(),
             pick: String::new(),
+            auto: false,
             weights: Vec::new(),
             routing: RoutingPolicy::default(),
             first_token_timeout_ms: 0,
@@ -2118,6 +2282,7 @@ base_url = "http://127.0.0.1:1/v1"
             classifier: String::new(),
             effort: String::new(),
             pick: String::new(),
+            auto: false,
             weights: Vec::new(),
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
@@ -2196,6 +2361,7 @@ affinity = "session"
         let path = directory.path().join("config.toml");
         let mut config = Config {
             default_provider: "mock".into(),
+            hidden_auto_groups: Vec::new(),
             ..Config::default()
         };
         config.provider.push(ProviderConfig {
@@ -2227,6 +2393,7 @@ affinity = "session"
             classifier: String::new(),
             effort: String::new(),
             pick: String::new(),
+            auto: false,
             weights: Vec::new(),
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
@@ -2319,6 +2486,7 @@ affinity = "session"
             classifier: String::new(),
             effort: String::new(),
             pick: String::new(),
+            auto: false,
             weights: Vec::new(),
             routing: RoutingPolicy::Manual,
             first_token_timeout_ms: 0,
@@ -2340,6 +2508,131 @@ affinity = "session"
         group.pick = "z/gone".into();
         group.validate().unwrap();
         assert!(group.pick.is_empty());
+    }
+
+    fn found_provider(id: &str, models: &[&str]) -> ProviderConfig {
+        ProviderConfig {
+            id: id.into(),
+            name: String::new(),
+            protocol: Protocol::Chat,
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: "key".into(),
+            api_keys: Vec::new(),
+            models: models.iter().map(|model| model.to_string()).collect(),
+            contexts: Default::default(),
+            fallback: Vec::new(),
+            key_cooldown_ms: None,
+            capabilities: Default::default(),
+            routing: RoutingPolicy::Rotate,
+            weights: Vec::new(),
+            affinity: Default::default(),
+            max_concurrency: None,
+            max_rpm: None,
+            queue_limit: None,
+            queue_wait_s: None,
+            key_generation: 0,
+        }
+    }
+
+    #[test]
+    fn found_groups_serve_a_model_on_several_providers() {
+        assert_eq!(auto_slug("Claude Opus 5.5"), "claude-opus-5-5");
+        assert_eq!(auto_slug("deepseek-chat"), "deepseek-chat");
+        let config = Config {
+            provider: vec![
+                found_provider("a", &["same", "solo-a"]),
+                found_provider("b", &["same", "solo-b"]),
+                found_provider("c", &["other"]),
+            ],
+            ..Config::default()
+        };
+        // Only the shared model is found, in provider order, both seats.
+        let auto = config.auto_groups();
+        assert_eq!(auto.len(), 1);
+        let found = &auto[0];
+        assert_eq!(found.id, "auto-same");
+        assert_eq!(found.name, "same");
+        assert!(found.auto);
+        assert_eq!(found.routes, vec!["a/same".to_owned(), "b/same".to_owned()]);
+        assert_eq!(found.routing, RoutingPolicy::Order);
+        // Served, listed and resolved like a written group.
+        assert_eq!(config.group("auto-same").unwrap().routes, found.routes);
+        assert!(
+            config
+                .catalog()
+                .iter()
+                .any(|(id, _)| id == "group/auto-same")
+        );
+        assert!(config.resolve("group/auto-same").is_some());
+    }
+
+    #[test]
+    fn found_groups_yield_to_user_groups_and_hiding() {
+        let providers = || {
+            vec![
+                found_provider("a", &["same"]),
+                found_provider("b", &["same"]),
+            ]
+        };
+        // A group the user wrote with a found id is theirs.
+        let mut owned = Config {
+            provider: providers(),
+            ..Config::default()
+        };
+        owned.group.push(GroupConfig {
+            id: "auto-same".into(),
+            name: String::new(),
+            routes: vec!["a/same".to_owned()],
+            rules: Vec::new(),
+            classifier: String::new(),
+            effort: String::new(),
+            pick: String::new(),
+            auto: false,
+            weights: Vec::new(),
+            routing: RoutingPolicy::Order,
+            first_token_timeout_ms: 0,
+            affinity: Default::default(),
+        });
+        assert!(owned.auto_groups().is_empty());
+        let theirs = owned.group("auto-same").unwrap();
+        assert!(!theirs.auto);
+        assert_eq!(theirs.routes, vec!["a/same".to_owned()]);
+        // Found-ness is derived, never written: validating clears it.
+        let mut claimed = theirs.clone();
+        claimed.auto = true;
+        claimed.validate().unwrap();
+        assert!(!claimed.auto);
+
+        // A removed found group hides from serving and listing, shows for
+        // bringing back, and resolves to nothing until it is.
+        let mut hidden = Config {
+            provider: providers(),
+            hidden_auto_groups: vec!["auto-same".into()],
+            ..Config::default()
+        };
+        assert!(hidden.auto_groups().is_empty());
+        assert!(hidden.group("auto-same").is_none());
+        assert!(hidden.resolve("group/auto-same").is_none());
+        assert!(
+            !hidden
+                .catalog()
+                .iter()
+                .any(|(id, _)| id == "group/auto-same")
+        );
+        let back = hidden.hidden_found_groups();
+        assert_eq!(back.len(), 1);
+        assert!(back[0].auto);
+        assert_eq!(
+            back[0].routes,
+            vec!["a/same".to_owned(), "b/same".to_owned()]
+        );
+        let snapshot = hidden.snapshot();
+        let last = snapshot.groups.last().unwrap();
+        assert_eq!(last.id, "auto-same");
+        assert!(last.auto && last.hidden);
+        // Saving any group with its id unhides it.
+        hidden.hidden_auto_groups.retain(|id| id != "auto-same");
+        assert_eq!(hidden.auto_groups().len(), 1);
     }
 
     #[test]
@@ -2375,6 +2668,7 @@ affinity = "session"
             classifier: String::new(),
             effort: String::new(),
             pick: String::new(),
+            auto: false,
             weights: vec![3],
             routing: RoutingPolicy::Weighted,
             first_token_timeout_ms: 0,

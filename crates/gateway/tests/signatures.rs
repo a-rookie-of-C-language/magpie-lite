@@ -222,6 +222,7 @@ async fn fixture(protocol: Protocol, mode: Mode) -> Fixture {
             Config {
                 token: TOKEN.into(),
                 default_provider: "mock".into(),
+                hidden_auto_groups: Vec::new(),
                 history_path: Some(history.clone()),
                 provider: vec![provider, backup],
                 group: vec![GroupConfig {
@@ -232,6 +233,7 @@ async fn fixture(protocol: Protocol, mode: Mode) -> Fixture {
                     classifier: String::new(),
                     effort: String::new(),
                     pick: String::new(),
+                    auto: false,
                     weights: Vec::new(),
                     routing: RoutingPolicy::Order,
                     first_token_timeout_ms: 0,

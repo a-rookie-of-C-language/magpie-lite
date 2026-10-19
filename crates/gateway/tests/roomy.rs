@@ -128,6 +128,7 @@ async fn gateway(free: ProviderConfig, paid: ProviderConfig) -> String {
         stream_loop_guard: Config::default().stream_loop_guard,
         history_path: None,
         default_provider: "free".into(),
+        hidden_auto_groups: Vec::new(),
         provider: vec![free, paid],
         group: vec![GroupConfig {
             id: "g".into(),
@@ -137,6 +138,7 @@ async fn gateway(free: ProviderConfig, paid: ProviderConfig) -> String {
             classifier: String::new(),
             effort: String::new(),
             pick: String::new(),
+            auto: false,
             weights: Vec::new(),
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
