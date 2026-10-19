@@ -422,10 +422,11 @@ async fn main() -> Result<()> {
             } => {
                 let path = provider_path(&cli.config)?;
                 let mut cfg = Config::load(&path)?;
-                let group = GroupConfig {
+                let mut group = GroupConfig {
                     id: id.clone(),
                     name: name.unwrap_or_default(),
                     routes,
+                    rules: Vec::new(),
                     weights: route_weights,
                     routing,
                     first_token_timeout_ms,

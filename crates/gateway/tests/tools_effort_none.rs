@@ -171,6 +171,7 @@ async fn gateway(
             } else {
                 vec![format!("{id}/gpt-6.1-sol")]
             },
+            rules: Vec::new(),
             weights: Vec::new(),
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,

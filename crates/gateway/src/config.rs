@@ -885,6 +885,13 @@ pub struct GroupConfig {
     /// weighted selection while leaving it as a fallback candidate.
     #[serde(default)]
     pub weights: Vec<u32>,
+    /// Rules sending the requests they match to one route first, in order:
+    /// the first that matches decides as a user's turn begins, and the
+    /// request's rest within that turn stays with it (the reference's
+    /// `Rule`). A `pause` rule instead leaves the route it names out of the
+    /// group while it holds.
+    #[serde(default)]
+    pub rules: Vec<crate::rules::Rule>,
     /// Process-local route selection policy.
     #[serde(default)]
     pub routing: RoutingPolicy,
@@ -900,7 +907,9 @@ pub struct GroupConfig {
 
 impl GroupConfig {
     /// The same rules the CLI and console API enforce.
-    pub fn validate(&self) -> anyhow::Result<()> {
+    /// The group's rules are normalized in place (`cleanRules`): times and
+    /// days put the one way, folders checked, unknown members refused.
+    pub fn validate(&mut self) -> anyhow::Result<()> {
         if self.id.is_empty()
             || self
                 .id
@@ -928,6 +937,10 @@ impl GroupConfig {
             if provider.is_empty() || model.is_empty() || route.chars().any(char::is_whitespace) {
                 anyhow::bail!("group routes must use non-empty provider/model without whitespace");
             }
+        }
+        for (index, rule) in self.rules.iter_mut().enumerate() {
+            rule.clean(&self.routes, index + 1)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         Ok(())
     }
@@ -1020,6 +1033,9 @@ pub struct GroupConfigSnapshot {
     pub name: String,
     /// Ordered route chain.
     pub routes: Vec<String>,
+    /// The group's routing rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<crate::rules::Rule>,
     /// Per-route weights, parallel to the route chain, for the `weight` policy.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub weights: Vec<u32>,
@@ -1358,6 +1374,7 @@ impl Config {
                     id: g.id.clone(),
                     name: g.label().to_owned(),
                     routes: g.routes.clone(),
+                    rules: g.rules.clone(),
                     weights: g.route_weights(),
                     routing: g.routing,
                     first_token_timeout_ms: g.first_token_timeout_ms,
@@ -1943,6 +1960,7 @@ base_url = "http://127.0.0.1:1/v1"
             id: "daily".into(),
             name: "Daily coding".into(),
             routes: vec!["mock/mock-model".into(), "backup/other".into()],
+            rules: Vec::new(),
             weights: Vec::new(),
             routing: RoutingPolicy::default(),
             first_token_timeout_ms: 0,
@@ -1970,10 +1988,11 @@ base_url = "http://127.0.0.1:1/v1"
     }
     #[test]
     fn group_validation_allows_distinct_models_from_one_provider() {
-        let group = GroupConfig {
+        let mut group = GroupConfig {
             id: "same-provider".into(),
             name: String::new(),
             routes: vec!["mock/model-a".into(), "mock/model-b".into()],
+            rules: Vec::new(),
             weights: Vec::new(),
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
@@ -2079,6 +2098,7 @@ affinity = "session"
             id: "daily".into(),
             name: String::new(),
             routes: vec!["mock/model".into()],
+            rules: Vec::new(),
             weights: Vec::new(),
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
@@ -2166,6 +2186,7 @@ affinity = "session"
             id: "daily".into(),
             name: String::new(),
             routes: vec!["mock/one".into(), "mock/two".into()],
+            rules: Vec::new(),
             weights: vec![3],
             routing: RoutingPolicy::Weighted,
             first_token_timeout_ms: 0,

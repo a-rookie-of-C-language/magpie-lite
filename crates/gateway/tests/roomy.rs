@@ -133,6 +133,7 @@ async fn gateway(free: ProviderConfig, paid: ProviderConfig) -> String {
             id: "g".into(),
             name: "G".into(),
             routes: vec!["free/mock-model".into(), "paid/mock-model".into()],
+            rules: Vec::new(),
             weights: Vec::new(),
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,

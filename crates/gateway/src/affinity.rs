@@ -601,7 +601,7 @@ fn seat_of(who: &str, model: &str) -> String {
 }
 
 /// What a request's conversation came to: the identity kept, and why.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Trace {
     /// The provider's or group's affinity as configured.
     pub mode: Affinity,
@@ -620,7 +620,7 @@ pub struct Trace {
 
 /// The outcome of [`AffinityStore::affine`]: what to put first, if anything,
 /// and the trace of the decision.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Decision {
     /// The conversation identity the decision was made under.
     pub key: String,

@@ -3,7 +3,7 @@
 //! agents, translates each request through the IR, and forwards it to
 //! whichever provider serves the model.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -368,7 +368,7 @@ fn decode_group(bytes: &[u8]) -> Result<GroupConfig, &'static str> {
     serde_json::from_slice(bytes).map_err(|_| "expected JSON with id, optional name, and routes")
 }
 
-fn validate_group(config: &Config, group: &GroupConfig) -> Result<(), (StatusCode, String)> {
+fn validate_group(config: &Config, group: &mut GroupConfig) -> Result<(), (StatusCode, String)> {
     group
         .validate()
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -397,7 +397,7 @@ async fn create_group(
         Ok(value) => value,
         Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
     };
-    let group = match decode_group(&bytes) {
+    let mut group = match decode_group(&bytes) {
         Ok(group) => group,
         Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
     };
@@ -405,7 +405,7 @@ async fn create_group(
         state
             .config
             .update_idempotent(expected, request, move |config| {
-                validate_group(config, &group)?;
+                validate_group(config, &mut group)?;
                 if config.group.iter().any(|existing| existing.id == group.id) {
                     return Err((StatusCode::CONFLICT, "group already exists".to_owned()));
                 }
@@ -418,7 +418,7 @@ async fn create_group(
         state
             .config
             .update_if_revision(expected, move |config| {
-                validate_group(config, &group)?;
+                validate_group(config, &mut group)?;
                 if config.group.iter().any(|existing| existing.id == group.id) {
                     return Err((StatusCode::CONFLICT, "group already exists".to_owned()));
                 }
@@ -445,7 +445,7 @@ async fn update_group(
         Ok(value) => value,
         Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
     };
-    let group = match decode_group(&bytes) {
+    let mut group = match decode_group(&bytes) {
         Ok(group) => group,
         Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
     };
@@ -456,7 +456,7 @@ async fn update_group(
         state
             .config
             .update_idempotent(expected, request, move |config| {
-                validate_group(config, &group)?;
+                validate_group(config, &mut group)?;
                 let existing = config
                     .group
                     .iter_mut()
@@ -471,7 +471,7 @@ async fn update_group(
         state
             .config
             .update_if_revision(expected, move |config| {
-                validate_group(config, &group)?;
+                validate_group(config, &mut group)?;
                 let existing = config
                     .group
                     .iter_mut()
@@ -1493,6 +1493,7 @@ async fn send_with_fallback(
     tracker: &mut RequestTracker,
     liveness: &StreamLiveness,
     conversation: &str,
+    agent: &str,
     affinity_scope: (String, Affinity, bool),
 ) -> Result<(UpstreamReply, UpstreamCandidate, Decision), (ProxyFailure, UpstreamCandidate, Decision)>
 {
@@ -1503,6 +1504,72 @@ async fn send_with_fallback(
         &creq.model,
         group_plan,
     );
+    // A group's rules: a pause leaves its member out for now; a matching
+    // rule's member goes first, the members the rules after it also name
+    // behind it, before the group's others (the reference's `ruleFor` /
+    // `applyRule`). The decision is made as a user's turn begins and held
+    // for the requests within it.
+    if let Some(plan) = group_plan
+        && let Some(group) = config.group(&plan.id)
+        && !group.rules.is_empty()
+    {
+        let kept = crate::rules::paused_out(
+            &group.rules,
+            routes
+                .iter()
+                .map(|r| format!("{}/{}", r.provider.id, r.model))
+                .collect(),
+            agent,
+            crate::rules::local_clock(),
+        );
+        if kept.is_empty() && !routes.is_empty() {
+            let candidate = UpstreamCandidate::new(&routes[0], 0);
+            return Err((
+                ProxyFailure::new(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "every model of group/{} is paused now by its rules; \
+                         change the rules or ask again when they end",
+                        plan.id
+                    ),
+                ),
+                candidate,
+                Decision {
+                    key: format!("group/{}|{conversation}", plan.id),
+                    trace: crate::affinity::Trace::default(),
+                    first: None,
+                    first_route: None,
+                },
+            ));
+        }
+        routes.retain(|r| kept.contains(&format!("{}/{}", r.provider.id, r.model)));
+        let windows: HashMap<String, u64> = routes
+            .iter()
+            .map(|r| {
+                (
+                    format!("{}/{}", r.provider.id, r.model),
+                    r.provider.window_of(&r.model),
+                )
+            })
+            .collect();
+        if let Some(hit) =
+            crate::rules::rule_for(&plan.id, &group.rules, creq, agent, conversation, &windows)
+            && !hit.use_.is_empty()
+        {
+            // Put the rule's member first, then those the rules after it
+            // also name (`then`), each once, the rest behind in order.
+            let mut rank: HashMap<String, usize> = HashMap::new();
+            rank.insert(hit.use_.clone(), 0);
+            for (i, id) in hit.then.iter().enumerate() {
+                rank.entry(id.clone()).or_insert(i + 1);
+            }
+            routes.sort_by_key(|r| {
+                rank.get(&format!("{}/{}", r.provider.id, r.model))
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            });
+        }
+    }
     let mut decision = None;
     if let Some(decided) = {
         let (scope, mode, rotate) = affinity_scope.clone();
@@ -2805,9 +2872,17 @@ async fn proxy_parsed(
     let model = creq.model.clone();
     let body_bytes = bytes.to_vec();
     let conversation = crate::affinity::conversation_id_from_value(&headers, &body, &body_bytes);
+    let agent = crate::rules::agent_of(
+        headers
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+    );
+    let agent = std::sync::Arc::new(agent);
     // Keep ownership through both header waiting and body polling. Dropping
     // either stage cancels the same work and finalizes the same tracker.
     let execute = async move {
+        let rule_group = group_plan.as_ref().map(|p| p.id.clone());
         let mut tracker = RequestTracker::new(
             state.requests.clone(),
             wire.name(),
@@ -2826,6 +2901,7 @@ async fn proxy_parsed(
             &mut tracker,
             &liveness,
             &conversation,
+            &agent,
             affinity_scope.clone(),
         )
         .await
@@ -2877,6 +2953,16 @@ async fn proxy_parsed(
                     decision.trace.turn,
                     tracker.total_usage().cache_read.unwrap_or(0),
                 );
+                // What the vendor counted the conversation's last request as:
+                // the floor a `tokens` rule goes by next turn.
+                if let Some(group_id) = rule_group.as_deref() {
+                    crate::rules::rule_answered(
+                        group_id,
+                        &conversation,
+                        &creq,
+                        &tracker.total_usage(),
+                    );
+                }
                 tracker.finish("ok", &Usage::default());
                 if !whole_as_stream {
                     // A whole JSON reply has no body stream to own the guard.
@@ -3141,6 +3227,14 @@ async fn proxy_parsed(
                                 decision.trace.turn,
                                 tracker.total_usage().cache_read.unwrap_or(0),
                             );
+                            if let Some(group_id) = rule_group.as_deref() {
+                                crate::rules::rule_answered(
+                                    group_id,
+                                    &conversation,
+                                    &creq,
+                                    &tracker.total_usage(),
+                                );
+                            }
                         } else if status != "ok" {
                             // The reply had begun and broke off: not an
                             // answer, so the agent's retry goes by routing
@@ -3820,6 +3914,7 @@ mod tests {
                             id: "daily".into(),
                             name: "Daily".into(),
                             routes: vec!["primary/first-model".into(), "spare/second-model".into()],
+                            rules: Vec::new(),
                             weights: Vec::new(),
                             routing: RoutingPolicy::Order,
                             first_token_timeout_ms: 0,

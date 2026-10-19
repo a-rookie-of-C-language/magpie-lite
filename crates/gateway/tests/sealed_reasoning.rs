@@ -218,6 +218,7 @@ async fn fixture(protocol: Protocol, fail: bool) -> Fixture {
             id: "daily".into(),
             name: "Daily".into(),
             routes: vec!["mock/native-model".into(), "backup/native-model".into()],
+            rules: Vec::new(),
             weights: Vec::new(),
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,

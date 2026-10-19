@@ -22,6 +22,7 @@ mod providers;
 mod reply_room;
 mod retired;
 mod roomy;
+pub mod rules;
 pub mod server;
 mod stream_empty;
 mod stream_keepalive;
