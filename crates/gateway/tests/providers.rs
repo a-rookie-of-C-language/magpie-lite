@@ -6,7 +6,7 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::routing::post;
 use axum::{Json, Router};
-use magpie_gateway::{AppState, Config, ConfigStore, KeyRotator, build_router};
+use magpie_gateway::{AffinityStore, AppState, Config, ConfigStore, KeyRotator, build_router};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
@@ -114,6 +114,7 @@ async fn gateway() -> Gateway {
         http: magpie_gateway::upstream::http_client().unwrap(),
         requests: Arc::new(Mutex::new(magpie_gateway::usage::RequestLog::default())),
         key_rotation: KeyRotator::default(),
+        affinity: AffinityStore::default(),
     });
     let (url, task) = bind(build_router(state.clone())).await;
     Gateway {
@@ -406,7 +407,10 @@ async fn provider_routing_and_key_weights_round_trip_and_preserve_on_update() {
         StatusCode::OK
     );
     let kept = Config::load(&gw.path).unwrap();
-    assert_eq!(kept.provider[0].routing, magpie_gateway::RoutingPolicy::Weighted);
+    assert_eq!(
+        kept.provider[0].routing,
+        magpie_gateway::RoutingPolicy::Weighted
+    );
     assert_eq!(kept.provider[0].weights, vec![3, 1, 4]);
 
     // An explicit empty list clears the weights without dropping the policy.
@@ -420,7 +424,10 @@ async fn provider_routing_and_key_weights_round_trip_and_preserve_on_update() {
         StatusCode::OK
     );
     let cleared = Config::load(&gw.path).unwrap();
-    assert_eq!(cleared.provider[0].routing, magpie_gateway::RoutingPolicy::Rotate);
+    assert_eq!(
+        cleared.provider[0].routing,
+        magpie_gateway::RoutingPolicy::Rotate
+    );
     assert!(cleared.provider[0].weights.is_empty());
 
     // Unknown policies and out-of-range weights are refused, and no key leaks.
@@ -436,6 +443,61 @@ async fn provider_routing_and_key_weights_round_trip_and_preserve_on_update() {
     let response = edit(&gw, Method::POST, "/config/providers", too_heavy).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(!response.text().await.unwrap().contains("private-one"));
+}
+
+#[tokio::test]
+async fn provider_affinity_round_trips_and_preserves_on_update() {
+    let gw = gateway().await;
+    let mut body = provider(&gw, "sticky");
+    body["affinity"] = json!("session");
+    let created = edit(&gw, Method::POST, "/config/providers", body.clone()).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let shown = snapshot(&gw, "/config").await["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["id"] == "sticky")
+        .unwrap()
+        .clone();
+    assert_eq!(shown["affinity"], json!("session"));
+    assert_eq!(
+        Config::load(&gw.path).unwrap().provider[0].affinity,
+        magpie_gateway::Affinity::Session
+    );
+
+    let mut preserve = body.clone();
+    preserve.as_object_mut().unwrap().remove("affinity");
+    assert_eq!(
+        edit(&gw, Method::PUT, "/config/providers/sticky", preserve)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        Config::load(&gw.path).unwrap().provider[0].affinity,
+        magpie_gateway::Affinity::Session
+    );
+
+    body["affinity"] = json!("turn");
+    assert_eq!(
+        edit(&gw, Method::PUT, "/config/providers/sticky", body)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        Config::load(&gw.path).unwrap().provider[0].affinity,
+        magpie_gateway::Affinity::Turn
+    );
+
+    let mut invalid = provider(&gw, "invalid-affinity");
+    invalid["affinity"] = json!("forever");
+    assert_eq!(
+        edit(&gw, Method::POST, "/config/providers", invalid)
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
 }
 
 #[tokio::test]
@@ -457,6 +519,7 @@ async fn metadata_edit_preserves_legacy_keys_and_cooldown_then_explicit_clear_re
         http: magpie_gateway::upstream::http_client().unwrap(),
         requests: Arc::new(Mutex::new(magpie_gateway::usage::RequestLog::default())),
         key_rotation: KeyRotator::default(),
+        affinity: AffinityStore::default(),
     });
     let (url, task) = bind(build_router(state.clone())).await;
     let mut gw = gw;

@@ -598,6 +598,7 @@ mod tests {
                     routes: vec!["mock/model".into()],
                     routing: RoutingPolicy::default(),
                     first_token_timeout_ms: 0,
+                    affinity: Default::default(),
                 });
                 Ok(())
             })
@@ -632,6 +633,7 @@ mod tests {
                     capabilities: Default::default(),
                     routing: RoutingPolicy::Rotate,
                     weights: Vec::new(),
+                    affinity: Default::default(),
                     key_generation: 0,
                 };
                 config.set_provider(provider, true).unwrap();
@@ -752,6 +754,7 @@ mod tests {
                             capabilities: Default::default(),
                             routing: RoutingPolicy::Rotate,
                             weights: Vec::new(),
+                            affinity: Default::default(),
                             key_generation: 0,
                         },
                         true,

@@ -8,8 +8,8 @@ use axum::{
     routing::post,
 };
 use magpie_gateway::{
-    AppState, Config, ConfigStore, GroupConfig, KeyRotator, Protocol, ProviderConfig,
-    RoutingPolicy, build_router, usage::RequestLog,
+    AffinityStore, AppState, Config, ConfigStore, GroupConfig, KeyRotator, Protocol,
+    ProviderConfig, RoutingPolicy, build_router, usage::RequestLog,
 };
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -196,6 +196,7 @@ async fn fixture(protocol: Protocol, fail: bool) -> Fixture {
         key_cooldown_ms: None,
         routing: RoutingPolicy::Rotate,
         weights: Vec::new(),
+        affinity: Default::default(),
         key_generation: 0,
     };
     let backup = ProviderConfig {
@@ -214,6 +215,7 @@ async fn fixture(protocol: Protocol, fail: bool) -> Fixture {
             routes: vec!["mock/native-model".into(), "backup/native-model".into()],
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
+            affinity: Default::default(),
         }],
         ..Config::default()
     };
@@ -224,6 +226,7 @@ async fn fixture(protocol: Protocol, fail: bool) -> Fixture {
         http: magpie_gateway::upstream::http_client().unwrap(),
         requests: log.clone(),
         key_rotation: KeyRotator::default(),
+        affinity: AffinityStore::default(),
     })))
     .await;
     Fixture {
@@ -458,7 +461,10 @@ async fn opaque_reasoning_history_and_replies_survive_native_routes_without_fore
                     wait_records(&f, completed).await;
                     {
                         let seen = f.seen.lock().unwrap();
-                        assert_eq!(seen.len(), completed as usize);
+                        // A streamed reply may take one extra same-key ask
+                        // before it answers, so the upstream saw at least one
+                        // call per completed request.
+                        assert!(seen.len() >= completed as usize);
                         let body = seen.last().unwrap();
                         assert_eq!(body["model"], "native-model");
                         assert_eq!(body["stream"], stream);
@@ -480,14 +486,23 @@ async fn opaque_reasoning_history_and_replies_survive_native_routes_without_fore
                     assert_eq!(record.requested_model, model);
                     assert_eq!(record.usage.input, Some(5));
                     assert_eq!(record.usage.output, Some(2));
-                    assert_eq!(
-                        stats.providers["mock"].keys["0"].attempts
-                            + stats.providers["mock"]
-                                .keys
-                                .get("1")
-                                .map_or(0, |key| key.attempts),
-                        completed
-                    );
+                    let attempts = |log: &Arc<Mutex<RequestLog>>| {
+                        let stats = log.lock().unwrap().snapshot();
+                        stats
+                            .providers
+                            .values()
+                            .map(|p| p.keys.values().map(|k| k.attempts).sum::<u64>())
+                            .sum::<u64>()
+                    };
+                    // The attempt counter is written after the request log
+                    // entry, so wait for each completed request to be counted.
+                    // A fallback route counts here too: a sealed history the
+                    // provider refuses goes to the backup.
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    while attempts(&f.log) < completed && std::time::Instant::now() < deadline {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    assert_eq!(attempts(&f.log), completed);
                 }
             }
         }

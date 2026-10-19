@@ -4,7 +4,9 @@ use magpie_agents::lifecycle::{Action, AgentId, Gateway, Manager, state_director
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use magpie_gateway::{Config, GroupConfig, Protocol, ProviderConfig, RoutingPolicy, config_path};
+use magpie_gateway::{
+    Affinity, Config, GroupConfig, Protocol, ProviderConfig, RoutingPolicy, config_path,
+};
 
 #[derive(Parser)]
 #[command(
@@ -139,6 +141,9 @@ enum GroupCommand {
         /// First-content budget (ms) for streaming non-final routes; 0 disables.
         #[arg(long, default_value_t = 0)]
         first_token_timeout_ms: u64,
+        /// How strongly a conversation stays with the key that answered it: auto, session, turn, or off.
+        #[arg(long, default_value = "auto")]
+        affinity: Affinity,
     },
     /// List configured groups.
     List,
@@ -182,6 +187,9 @@ enum ProviderCommand {
         /// Per-key weight for `--routing weight`, in pool order; repeat for each key.
         #[arg(long = "key-weight", num_args = 1)]
         key_weights: Vec<u32>,
+        /// How strongly a conversation stays with the key that answered it: auto, session, turn, or off.
+        #[arg(long, default_value = "auto")]
+        affinity: Affinity,
         /// Make this the provider for models that name none.
         #[arg(long)]
         default: bool,
@@ -281,6 +289,7 @@ async fn main() -> Result<()> {
                 key_cooldown_ms,
                 routing,
                 key_weights,
+                affinity,
                 default,
             } => {
                 if id == "group" {
@@ -301,6 +310,7 @@ async fn main() -> Result<()> {
                     routing,
                     weights: key_weights,
                     capabilities: Default::default(),
+                    affinity,
                     key_generation: 0,
                 };
                 cfg.set_provider(provider, default)?;
@@ -324,14 +334,16 @@ async fn main() -> Result<()> {
                     let key_count = p.api_key_pool().len();
                     let cooldown = cfg.key_cooldown_for(p);
                     println!(
-                        "{:<14} {:<10} {}{} [{} key{}, cooldown {}s]",
+                        "{:<14} {:<10} {}{} [{} key{}, cooldown {}s, routing {}, affinity {}]",
                         p.id,
                         p.protocol.as_str(),
                         p.base_url,
                         marker,
                         key_count,
                         if key_count == 1 { "" } else { "s" },
-                        cooldown.as_secs_f32()
+                        cooldown.as_secs_f32(),
+                        p.routing.as_str(),
+                        p.affinity.as_str()
                     );
                     for m in &p.models {
                         println!("               {}/{}", p.id, m);
@@ -356,6 +368,7 @@ async fn main() -> Result<()> {
                 routes,
                 routing,
                 first_token_timeout_ms,
+                affinity,
             } => {
                 let path = provider_path(&cli.config)?;
                 let mut cfg = Config::load(&path)?;
@@ -365,6 +378,7 @@ async fn main() -> Result<()> {
                     routes,
                     routing,
                     first_token_timeout_ms,
+                    affinity,
                 };
                 group.validate()?;
                 for route in &group.routes {
@@ -395,10 +409,11 @@ async fn main() -> Result<()> {
                         g.name.as_str()
                     };
                     println!(
-                        "group/{:<18} {} [routing: {}, first-token: {} ms]",
+                        "group/{:<18} {} [routing: {}, affinity: {}, first-token: {} ms]",
                         g.id,
                         label,
                         g.routing.as_str(),
+                        g.affinity.as_str(),
                         g.first_token_timeout_ms
                     );
                     for (i, route) in g.routes.iter().enumerate() {

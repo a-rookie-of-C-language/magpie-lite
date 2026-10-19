@@ -23,7 +23,8 @@ use magpie_core::stream::{SseParser, StreamEvent};
 use magpie_core::{anthropic, chat, gemini, responses};
 use serde_json::{Value, json};
 
-use crate::config::{Config, GroupConfig, Protocol, ProviderConfig};
+use crate::affinity::{AffinityStore, Decision, Seat, who_of};
+use crate::config::{Affinity, Config, GroupConfig, Protocol, ProviderConfig};
 use crate::config_store::{ConfigStore, IdempotencyRequest};
 use crate::cooldown::quota_cooldown;
 use crate::edge_block::{BLOCKED_HINT, edge_blocked, edge_blocked_text};
@@ -58,6 +59,9 @@ pub struct AppState {
     pub requests: Arc<Mutex<RequestLog>>,
     /// Round-robin cursors for providers with multiple API keys.
     pub key_rotation: crate::config::KeyRotator,
+    /// Which key answered each conversation, so its prompt cache keeps
+    /// hitting.
+    pub affinity: AffinityStore,
 }
 
 /// Build the router around a state; what `serve` runs and tests drive.
@@ -196,6 +200,9 @@ pub async fn serve_with_config_path(
     let agent_state_dir = magpie_agents::lifecycle::state_directory(&agent_config)?;
     retired_store::init(agent_state_dir.join("retired.json"));
     let manager = magpie_agents::lifecycle::Manager::native(agent_state_dir.clone())?;
+    // Persist affinity beside the resolved config even when the embedded
+    // caller supplied no path and the default config location is in use.
+    let affinity = AffinityStore::beside(Some(agent_config.as_path()));
     let state = Arc::new(AppState {
         agents: Some(crate::agents::AgentService {
             manager: Arc::new(manager),
@@ -206,6 +213,7 @@ pub async fn serve_with_config_path(
         http,
         requests,
         key_rotation: crate::config::KeyRotator::default(),
+        affinity,
     });
     let app = build_router(state);
 
@@ -576,6 +584,8 @@ struct UpstreamCandidate {
     provider: Arc<ProviderConfig>,
     model: String,
     key_slot: usize,
+    /// The key as a conversation's stick names it, without the secret.
+    who: String,
 }
 
 impl UpstreamCandidate {
@@ -584,6 +594,12 @@ impl UpstreamCandidate {
             provider: route.provider.clone(),
             model: route.model.clone(),
             key_slot,
+            who: route
+                .api_keys
+                .iter()
+                .find(|(slot, _)| *slot == key_slot)
+                .map(|(_, key)| who_of(&route.provider.id, key))
+                .unwrap_or_else(|| who_of(&route.provider.id, "")),
         }
     }
 }
@@ -707,7 +723,15 @@ fn prepare(
     key_rotation: &crate::config::KeyRotator,
     body: &Value,
     wire: ClientWire,
-) -> Result<(CompletionRequest, UpstreamRoute, Option<GroupRoutePlan>), (StatusCode, Value)> {
+) -> Result<
+    (
+        CompletionRequest,
+        UpstreamRoute,
+        Option<GroupRoutePlan>,
+        (String, Affinity, bool),
+    ),
+    (StatusCode, Value),
+> {
     let creq = wire.decode_request(body).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -769,6 +793,20 @@ fn prepare(
             };
             (provider, upstream_model, None, None)
         };
+    let affinity = if let Some(plan) = group_plan.as_ref() {
+        let group = config.group(&plan.id).expect("group just resolved");
+        (
+            format!("group/{}", plan.id),
+            group.affinity,
+            group.routing == crate::config::RoutingPolicy::Rotate,
+        )
+    } else {
+        (
+            format!("{}/{}", provider.id, upstream_model),
+            provider.affinity,
+            provider.routing == crate::config::RoutingPolicy::Rotate,
+        )
+    };
 
     Ok((
         creq,
@@ -780,6 +818,7 @@ fn prepare(
             group_route_index,
         },
         group_plan,
+        affinity,
     ))
 }
 
@@ -880,6 +919,40 @@ fn upstream_routes(
     out
 }
 
+/// Move the seat a conversation is kept on, and its route, to the front of the
+/// order the request will try. Routing still supplies everyone else: only the
+/// front changes.
+fn apply_affinity(routes: &mut Vec<UpstreamRoute>, decision: &Decision) {
+    let Some((route_slot, key_slot)) = decision.first else {
+        return;
+    };
+    let route_at = decision
+        .first_route
+        .filter(|index| *index < routes.len())
+        .or_else(|| {
+            routes
+                .iter()
+                .position(|route| route.api_keys.iter().any(|(slot, _)| *slot == route_slot))
+        });
+    let Some(route_at) = route_at else {
+        return;
+    };
+    if route_at > 0 {
+        let route = routes.remove(route_at);
+        routes.insert(0, route);
+    }
+    let route = &mut routes[0];
+    if let Some(key_at) = route
+        .api_keys
+        .iter()
+        .position(|(slot, _)| *slot == key_slot)
+        && key_at > 0
+    {
+        let key = route.api_keys.remove(key_at);
+        route.api_keys.insert(0, key);
+    }
+}
+
 /// Statuses that make the next key in the same provider worth one attempt.
 fn key_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 401 | 402 | 403 | 429)
@@ -902,12 +975,9 @@ fn record_key_served(
         .saturating_add(usage.output.unwrap_or(0))
         .saturating_add(usage.cache_read.unwrap_or(0))
         .saturating_add(usage.cache_write.unwrap_or(0));
-    state.key_rotation.record_served(
-        &provider.id,
-        provider.key_generation,
-        key_slot,
-        tokens,
-    );
+    state
+        .key_rotation
+        .record_served(&provider.id, provider.key_generation, key_slot, tokens);
 }
 
 /// Quota and rate-limit responses should influence later key selection.
@@ -1061,14 +1131,56 @@ async fn send_with_fallback(
     group_plan: Option<&GroupRoutePlan>,
     tracker: &mut RequestTracker,
     liveness: &StreamLiveness,
-) -> Result<(UpstreamReply, UpstreamCandidate), (ProxyFailure, UpstreamCandidate)> {
-    let routes = upstream_routes(
+    headers: &HeaderMap,
+    body_bytes: &[u8],
+    affinity_scope: (String, Affinity, bool),
+) -> Result<(UpstreamReply, UpstreamCandidate, Decision), (ProxyFailure, UpstreamCandidate, Decision)>
+{
+    let mut routes = upstream_routes(
         config,
         &state.key_rotation,
         initial,
         &creq.model,
         group_plan,
     );
+    let mut decision = None;
+    if let Some(decided) = {
+        let (scope, mode, rotate) = affinity_scope.clone();
+        let seats = routes
+            .iter()
+            .enumerate()
+            .flat_map(|(route_index, route)| {
+                route
+                    .api_keys
+                    .iter()
+                    .enumerate()
+                    .map(move |(key, (slot, api_key))| Seat {
+                        who: who_of(&route.provider.id, api_key),
+                        model: route.model.clone(),
+                        route_index,
+                        route: *slot,
+                        key: key,
+                        resting: state.key_rotation.cooling(
+                            &route.provider.id,
+                            route.provider.key_generation,
+                            *slot,
+                        ),
+                    })
+            })
+            .collect::<Vec<_>>();
+        if !seats.is_empty() {
+            let decided = state
+                .affinity
+                .affine(&scope, mode, rotate, headers, body_bytes, creq, &seats);
+            apply_affinity(&mut routes, &decided);
+            Some(decided)
+        } else {
+            None
+        }
+    } {
+        decision = Some(decided);
+    }
+    let decision = decision.expect("a route always carries its affinity");
     let last_route = routes.len().saturating_sub(1);
     let no_route = routes
         .first()
@@ -1111,6 +1223,7 @@ async fn send_with_fallback(
                         return Err((
                             ProxyFailure::new(StatusCode::BAD_REQUEST, error.to_string()),
                             candidate,
+                            decision.clone(),
                         ));
                     }
                 };
@@ -1203,6 +1316,7 @@ async fn send_with_fallback(
                             return Err((
                                 ProxyFailure::new(StatusCode::GATEWAY_TIMEOUT, timeout.message()),
                                 candidate,
+                                decision.clone(),
                             ));
                         }
                         // No response headers: an endpoint timeout is not a bad key.
@@ -1216,6 +1330,7 @@ async fn send_with_fallback(
                             return Err((
                                 ProxyFailure::new(StatusCode::BAD_GATEWAY, message),
                                 candidate,
+                                decision.clone(),
                             ));
                         }
                         // A connection-level failure belongs to the endpoint, not
@@ -1266,6 +1381,7 @@ async fn send_with_fallback(
                                         format!("bad upstream body: {error}"),
                                     ),
                                     candidate,
+                                    decision.clone(),
                                 ));
                             }
                         };
@@ -1279,7 +1395,7 @@ async fn send_with_fallback(
                             if route_index != last_route {
                                 break 'keys;
                             }
-                            return Err((ProxyFailure::refusal(), candidate));
+                            return Err((ProxyFailure::refusal(), candidate, decision.clone()));
                         }
                         if value.get("error").is_some() {
                             tracker.record_attempt(&route.provider.id, *key_slot, "upstream_error");
@@ -1289,6 +1405,7 @@ async fn send_with_fallback(
                                     "upstream returned an error instead of a reply",
                                 ),
                                 candidate,
+                                decision.clone(),
                             ));
                         }
                         if protocol == Protocol::Gemini {
@@ -1320,6 +1437,7 @@ async fn send_with_fallback(
                                 return Err((
                                     ProxyFailure::new(StatusCode::BAD_GATEWAY, EMPTY_REPLY),
                                     candidate,
+                                    decision.clone(),
                                 ));
                             }
                         }
@@ -1334,6 +1452,7 @@ async fn send_with_fallback(
                                 return Err((
                                     ProxyFailure::new(StatusCode::BAD_GATEWAY, error.to_string()),
                                     candidate,
+                                    decision.clone(),
                                 ));
                             }
                         };
@@ -1344,6 +1463,7 @@ async fn send_with_fallback(
                                 whole_as_stream: creq.stream,
                             },
                             candidate,
+                            decision.clone(),
                         ));
                     }
                     let headers = resp.headers().clone();
@@ -1386,7 +1506,7 @@ async fn send_with_fallback(
                             if route_index != last_route {
                                 break 'keys;
                             }
-                            return Err((ProxyFailure::refusal(), candidate));
+                            return Err((ProxyFailure::refusal(), candidate, decision.clone()));
                         }
                         if failure.kind == FailureKind::EmptyReply && empty_retries == 0 {
                             drop(events);
@@ -1438,6 +1558,7 @@ async fn send_with_fallback(
                             reask_allowed: failure.is_none(),
                         },
                         candidate,
+                        decision.clone(),
                     ));
                 }
                 let headers = resp.headers().clone();
@@ -1449,6 +1570,7 @@ async fn send_with_fallback(
                             return Err((
                                 ProxyFailure::new(StatusCode::GATEWAY_TIMEOUT, timeout.message()),
                                 candidate,
+                                decision.clone(),
                             ));
                         }
                         break 'keys;
@@ -1459,7 +1581,7 @@ async fn send_with_fallback(
                     if route_index != last_route {
                         break 'keys;
                     }
-                    return Err((ProxyFailure::refusal(), candidate));
+                    return Err((ProxyFailure::refusal(), candidate, decision.clone()));
                 }
                 tracker.record_attempt(&route.provider.id, *key_slot, &status.as_u16().to_string());
                 // A vendor that names an optional request field in a 400/422
@@ -1529,7 +1651,11 @@ async fn send_with_fallback(
                 }
                 let status =
                     StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-                return Err((ProxyFailure::new(status, detail), candidate));
+                return Err((
+                    ProxyFailure::new(status, detail),
+                    candidate,
+                    decision.clone(),
+                ));
             }
         }
     }
@@ -1537,6 +1663,7 @@ async fn send_with_fallback(
     Err((
         ProxyFailure::new(StatusCode::BAD_GATEWAY, "no upstream route"),
         no_route,
+        decision,
     ))
 }
 
@@ -1805,8 +1932,26 @@ fn decode_upstream_chunk(
     }
 }
 
+/// Releases the in-flight opening count when a request ends, including when
+/// its future or response stream is dropped before a terminal event.
+struct AffinityOpening {
+    state: Arc<AppState>,
+    key: String,
+}
+
+impl Drop for AffinityOpening {
+    fn drop(&mut self) {
+        self.state.affinity.opened(&self.key);
+    }
+}
+
 /// A single handler implementation for every agent-facing protocol.
-async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response {
+async fn proxy(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    bytes: Bytes,
+    wire: ClientWire,
+) -> Response {
     let body: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => {
@@ -1818,10 +1963,11 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
         }
     };
     let config = state.config.current();
-    let (creq, initial, group_plan) = match prepare(&config, &state.key_rotation, &body, wire) {
-        Ok(x) => x,
-        Err((status, body)) => return err_response(status, body),
-    };
+    let (creq, initial, group_plan, affinity_scope) =
+        match prepare(&config, &state.key_rotation, &body, wire) {
+            Ok(x) => x,
+            Err((status, body)) => return err_response(status, body),
+        };
 
     let (activity, keepalive) = if creq.stream && !matches!(wire, ClientWire::Gemini) {
         Keepalive::new(
@@ -1842,6 +1988,8 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
         ),
     };
     let model = creq.model.clone();
+    let body_bytes = bytes.to_vec();
+    let request_headers = headers;
     // Keep ownership through both header waiting and body polling. Dropping
     // either stage cancels the same work and finalizes the same tracker.
     let execute = async move {
@@ -1853,7 +2001,7 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
             &initial.model,
             0,
         );
-        let (reply, candidate) = match send_with_fallback(
+        let (reply, candidate, decision) = match send_with_fallback(
             &state,
             &config,
             &creq,
@@ -1861,24 +2009,39 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
             group_plan.as_ref(),
             &mut tracker,
             &liveness,
+            &request_headers,
+            &body_bytes,
+            affinity_scope.clone(),
         )
         .await
         {
-            Ok((resp, candidate)) => {
+            Ok((resp, candidate, decision)) => {
                 tracker.set_route(&candidate.provider.id, &candidate.model, candidate.key_slot);
                 retired_store::unretire(
                     &candidate.provider.id,
                     &candidate.model,
                     std::time::SystemTime::now(),
                 );
-                (resp, candidate)
+                (resp, candidate, decision)
             }
-            Err((response, candidate)) => {
+            Err((response, candidate, decision)) => {
                 tracker.set_route(&candidate.provider.id, &candidate.model, candidate.key_slot);
                 tracker.finish(response.history_status(), &Usage::default());
+                // `affine` counted this conversation while its first request
+                // was out. A failed request has no stream to own the guard, so
+                // end that count here or it would hold a seat until expiry.
+                state.affinity.opened(&decision.key);
                 return Err(response);
             }
         };
+        // `least_held` counts an unanswered conversation while its first
+        // request is out. Keep that count alive through both the header wait
+        // and the body stream; a plain `opened` call would miss cancellation
+        // and early client disconnects.
+        let mut opening = Some(AffinityOpening {
+            state: state.clone(),
+            key: decision.key.clone(),
+        });
         let (mut events, mut empty_retries, reask_allowed) = match reply {
             UpstreamReply::Decoded {
                 mut ir,
@@ -1890,8 +2053,19 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
                 // whether the client gets JSON or the answer is replayed as a
                 // stream below.
                 record_key_served(&state, &candidate.provider, candidate.key_slot, &tracker);
+                // A whole answer is the reply the key served: remember it as
+                // the conversation's answerer before the reply goes out.
+                state.affinity.answered(
+                    &decision.key,
+                    &candidate.who,
+                    &candidate.model,
+                    decision.trace.turn,
+                    tracker.total_usage().cache_read.unwrap_or(0),
+                );
                 tracker.finish("ok", &Usage::default());
                 if !whole_as_stream {
+                    // A whole JSON reply has no body stream to own the guard.
+                    drop(opening.take());
                     return Ok(ok_json(wire.encode_response(&ir, &creq)));
                 }
                 // The vendor ignored `stream: true` and answered whole. The
@@ -1915,7 +2089,9 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
         };
 
         let reask_candidate = candidate.clone();
+        let opening = opening.expect("a stream reply keeps its opening guard");
         let out = async_stream::stream! {
+            let _opening = opening;
             let mut encoder = ClientStreamEncoder::for_request(wire, &creq);
             let mut reasked = false;
             let mut reasoning_reasked = false;
@@ -2010,6 +2186,22 @@ async fn proxy(state: Arc<AppState>, bytes: Bytes, wire: ClientWire) -> Response
                                 reask_candidate.key_slot,
                                 &tracker,
                             );
+                            // A stream that reached its own Done answered the
+                            // conversation, and the key that served it keeps it.
+                            state.affinity.answered(
+                                &decision.key,
+                                &reask_candidate.who,
+                                &reask_candidate.model,
+                                decision.trace.turn,
+                                tracker.total_usage().cache_read.unwrap_or(0),
+                            );
+                        } else if status != "ok" {
+                            // The reply had begun and broke off: not an
+                            // answer, so the agent's retry goes by routing
+                            // again, not back to the one that just failed it.
+                            state
+                                .affinity
+                                .unanswered(&decision.key, &reask_candidate.who);
                         }
                         tracker.finish(status, &Usage::default());
                         if !suppress_start && let Some(frame) = encoder.encode(&event) {
@@ -2452,7 +2644,11 @@ fn upstream_events(
 }
 
 /// POST /v1/chat/completions — the OpenAI Chat dialect.
-async fn chat_completions(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+async fn chat_completions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let include_usage = serde_json::from_slice::<Value>(&body)
         .ok()
         .and_then(|v| {
@@ -2460,17 +2656,25 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: Bytes) -> Re
                 .and_then(Value::as_bool)
         })
         .unwrap_or(false);
-    proxy(state, body, ClientWire::Chat { include_usage }).await
+    proxy(state, headers, body, ClientWire::Chat { include_usage }).await
 }
 
 /// POST /v1/messages — the Anthropic Messages dialect.
-async fn anthropic_messages(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
-    proxy(state, body, ClientWire::Anthropic).await
+async fn anthropic_messages(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    proxy(state, headers, body, ClientWire::Anthropic).await
 }
 
 /// POST /v1/responses — the OpenAI Responses dialect Codex speaks.
-async fn responses_api(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
-    proxy(state, body, ClientWire::Responses).await
+async fn responses_api(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    proxy(state, headers, body, ClientWire::Responses).await
 }
 
 /// POST /v1beta/models/{model}:generateContent and its streaming sibling.
@@ -2478,6 +2682,7 @@ async fn responses_api(State(state): State<Arc<AppState>>, body: Bytes) -> Respo
 async fn gemini_generate(
     State(state): State<Arc<AppState>>,
     Path(raw): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let wire = ClientWire::Gemini;
@@ -2523,7 +2728,7 @@ async fn gemini_generate(
     value["model"] = json!(model);
     value["stream"] = json!(stream);
     let bytes = Bytes::from(value.to_string());
-    proxy(state, bytes, wire).await
+    proxy(state, headers, bytes, wire).await
 }
 
 #[cfg(test)]
@@ -2565,6 +2770,7 @@ mod tests {
             capabilities: Default::default(),
             routing: RoutingPolicy::Rotate,
             weights: Vec::new(),
+            affinity: Default::default(),
             key_generation: 0,
         }
     }
@@ -2620,6 +2826,7 @@ mod tests {
                             routes: vec!["primary/first-model".into(), "spare/second-model".into()],
                             routing: RoutingPolicy::Order,
                             first_token_timeout_ms: 0,
+                            affinity: Default::default(),
                         }]
                     } else {
                         vec![]
@@ -2635,6 +2842,7 @@ mod tests {
                     http: upstream::http_client().unwrap(),
                     requests: log.clone(),
                     key_rotation: Default::default(),
+                    affinity: AffinityStore::default(),
                 });
                 let requested = if grouped {
                     "group/daily"
@@ -2644,6 +2852,7 @@ mod tests {
                 let body = Bytes::from(json!({"model":requested,"stream":stream,"messages":[{"role":"user","content":"private prompt"}]}).to_string());
                 let task = tokio::spawn(proxy(
                     state,
+                    HeaderMap::default(),
                     body,
                     ClientWire::Chat {
                         include_usage: true,

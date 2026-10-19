@@ -12,8 +12,8 @@ use axum::{
     routing::post,
 };
 use magpie_gateway::{
-    AppState, Config, ConfigStore, KeyRotator, Protocol, ProviderConfig, build_router,
-    usage::RequestLog,
+    AffinityStore, AppState, Config, ConfigStore, KeyRotator, Protocol, ProviderConfig,
+    build_router, usage::RequestLog,
 };
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
@@ -310,6 +310,7 @@ impl Fixture {
             capabilities: Default::default(),
             routing: magpie_gateway::RoutingPolicy::Rotate,
             weights: Vec::new(),
+            affinity: Default::default(),
             key_generation: 0,
         };
         let mut config = Config {
@@ -329,6 +330,7 @@ impl Fixture {
             http: magpie_gateway::upstream::http_client().unwrap(),
             requests: log.clone(),
             key_rotation: KeyRotator::default(),
+            affinity: AffinityStore::default(),
         });
         let gateway = serve(build_router(state.clone())).await;
         Self {
@@ -897,6 +899,7 @@ async fn early_stream_errors_fall_back_across_protocols_and_groups() {
                                 routes: vec!["mock/up-model".into(), "spare/backup-model".into()],
                                 routing: RoutingPolicy::Order,
                                 first_token_timeout_ms: 0,
+                                affinity: Default::default(),
                             });
                         } else {
                             config.provider[0].fallback = vec!["spare/backup-model".into()];
@@ -1061,6 +1064,7 @@ async fn cancelled_fallback_persists_only_selected_provider_and_partial_usage() 
                         routes: vec!["mock/up-model".into(), "spare/backup-model".into()],
                         routing: magpie_gateway::RoutingPolicy::Order,
                         first_token_timeout_ms: 0,
+                        affinity: Default::default(),
                     });
                 } else {
                     config.provider[0].fallback = vec!["spare/backup-model".into()];
@@ -1203,6 +1207,7 @@ async fn oversized_opening_frames_fall_back_before_content_for_routes_and_groups
                             routes: vec!["mock/up-model".into(), "spare/backup-model".into()],
                             routing: magpie_gateway::RoutingPolicy::Order,
                             first_token_timeout_ms: 0,
+                            affinity: Default::default(),
                         });
                     } else {
                         config.provider[0].fallback = vec!["spare/backup-model".into()];
@@ -1435,6 +1440,7 @@ fn configure_timeout_fallback(config: &mut Config, grouped: bool) {
             routes: vec!["mock/up-model".into(), "spare/backup-model".into()],
             routing: magpie_gateway::RoutingPolicy::Order,
             first_token_timeout_ms: 0,
+            affinity: Default::default(),
         });
     } else {
         config.provider[0].fallback = vec!["spare/backup-model".into()];
@@ -2050,6 +2056,7 @@ async fn socket_disconnect_after_fallback_keeps_only_last_attempt_and_persists()
                                     ],
                                     routing: RoutingPolicy::Order,
                                     first_token_timeout_ms: 0,
+                                    affinity: Default::default(),
                                 });
                             } else {
                                 config.provider[0].fallback = vec!["spare/backup-model".into()];
@@ -3600,6 +3607,7 @@ async fn group_first_token_applies_to_distinct_models_on_one_provider() {
                 routes: vec!["mock/up-model".into(), "mock/alternate-model".into()],
                 routing: magpie_gateway::RoutingPolicy::Order,
                 first_token_timeout_ms: 120,
+                affinity: Default::default(),
             });
         },
     )
@@ -4180,6 +4188,7 @@ async fn loop_guard_after_fallback_and_keepalive_persists_only_selected_partial_
                                 routes: vec!["mock/up-model".into(), "spare/backup-model".into()],
                                 routing: RoutingPolicy::Order,
                                 first_token_timeout_ms: 0,
+                                affinity: Default::default(),
                             });
                         } else {
                             config.provider[0].fallback = vec!["spare/backup-model".into()];

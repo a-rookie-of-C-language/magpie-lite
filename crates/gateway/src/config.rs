@@ -149,6 +149,10 @@ pub struct ProviderConfig {
     /// missing or zero entry weighs 1.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub weights: Vec<u32>,
+    /// How much this provider keeps one conversation on the account that
+    /// already answered it. `auto` follows the routing policy.
+    #[serde(default)]
+    pub affinity: Affinity,
     /// Process-local credential/endpoint version; never saved or disclosed.
     #[serde(skip)]
     pub key_generation: u64,
@@ -445,7 +449,11 @@ impl KeyRotator {
             .copied()
             .filter(|slot| !state.cooldowns.contains_key(slot))
             .collect::<Vec<_>>();
-        let ordered = if available.is_empty() { ordered } else { available };
+        let ordered = if available.is_empty() {
+            ordered
+        } else {
+            available
+        };
         ordered
             .into_iter()
             .map(|slot| (slot, keys[slot].clone()))
@@ -455,13 +463,7 @@ impl KeyRotator {
     /// Count what a key just answered against it for the `usage` policy, and
     /// wake it: a key that answers is not resting any more. `tokens` of zero
     /// still counts as one request served.
-    pub fn record_served(
-        &self,
-        provider_id: &str,
-        generation: u64,
-        key_slot: usize,
-        tokens: u64,
-    ) {
+    pub fn record_served(&self, provider_id: &str, generation: u64, key_slot: usize, tokens: u64) {
         let now = Instant::now();
         let mut states = self
             .states
@@ -477,14 +479,10 @@ impl KeyRotator {
                 ..Default::default()
             };
         }
-        let served = state
-            .served
-            .get(&key_slot)
-            .copied()
-            .unwrap_or(TokenUse {
-                tokens: 0.0,
-                at: now,
-            });
+        let served = state.served.get(&key_slot).copied().unwrap_or(TokenUse {
+            tokens: 0.0,
+            at: now,
+        });
         state.served.insert(
             key_slot,
             TokenUse {
@@ -530,9 +528,7 @@ impl KeyRotator {
         let indices = match state.policy {
             // A group has no per-route weights, so a weighted provider
             // policy takes its configured order here.
-            RoutingPolicy::Order | RoutingPolicy::Weighted => {
-                (0..routes.len()).collect::<Vec<_>>()
-            }
+            RoutingPolicy::Order | RoutingPolicy::Weighted => (0..routes.len()).collect::<Vec<_>>(),
             RoutingPolicy::Rotate => {
                 let start = state.cursor % routes.len();
                 state.cursor = (start + 1) % routes.len();
@@ -658,6 +654,28 @@ impl KeyRotator {
             state.cooldowns.insert(key_slot, until);
         }
     }
+
+    /// Whether a provider's key slot is resting right now: quota- or
+    /// rate-limited, and not yet woken by an answer or by time.
+    pub fn cooling(&self, provider_id: &str, generation: u64, key_slot: usize) -> bool {
+        let now = Instant::now();
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = states.entry(provider_id.to_owned()).or_default();
+        if generation < state.generation {
+            return false;
+        }
+        if generation > state.generation {
+            *state = KeyRotationState {
+                generation,
+                ..Default::default()
+            };
+        }
+        state.cooldowns.retain(|_, until| *until > now);
+        state.cooldowns.contains_key(&key_slot)
+    }
 }
 
 /// How a routing group chooses its next route.
@@ -708,6 +726,53 @@ impl std::str::FromStr for RoutingPolicy {
     }
 }
 
+/// How strongly a route keeps one conversation on the account that already
+/// answered it, so a vendor's prompt cache keeps hitting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Affinity {
+    /// Follow the routing policy: `rotate` spreads load, everything else
+    /// sticks by conversation.
+    #[default]
+    Auto,
+    /// Keep every turn of a conversation on its first answering account.
+    Session,
+    /// Re-pick each turn, but only among accounts that already answered this
+    /// conversation before.
+    Turn,
+    /// Ignore conversation history and pick fresh every request.
+    Off,
+}
+
+impl Affinity {
+    /// The canonical spelling used by config files, APIs, and the CLI.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Session => "session",
+            Self::Turn => "turn",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl std::str::FromStr for Affinity {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "" | "auto" => Ok(Self::Auto),
+            "session" => Ok(Self::Session),
+            "turn" => Ok(Self::Turn),
+            "off" => Ok(Self::Off),
+            _ => Err(format!(
+                "unknown affinity `{}`; expected auto, session, turn or off",
+                value
+            )),
+        }
+    }
+}
+
 /// A named route chain agents can pick as one model id: `group/daily-coding`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupConfig {
@@ -726,6 +791,10 @@ pub struct GroupConfig {
     /// Zero disables this group limit; gateway-wide stream limits still apply.
     #[serde(default)]
     pub first_token_timeout_ms: u64,
+    /// How much this group keeps one conversation on the account that already
+    /// answered it. `auto` follows the routing policy.
+    #[serde(default)]
+    pub affinity: Affinity,
 }
 
 impl GroupConfig {
@@ -797,6 +866,8 @@ pub struct ProviderConfigSnapshot {
     /// Per-key weights, parallel to the key pool, for the `weight` policy.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub weights: Vec<u32>,
+    /// How much this provider keeps one conversation on the same account.
+    pub affinity: Affinity,
 }
 
 /// Capability metadata exposed by the secret-free configuration snapshot.
@@ -827,6 +898,8 @@ pub struct GroupConfigSnapshot {
     /// First-content budget for non-final streaming group routes (0 disables).
     #[serde(default)]
     pub first_token_timeout_ms: u64,
+    /// How much this group keeps one conversation on the same account.
+    pub affinity: Affinity,
 }
 
 /// Secret-free routing configuration for the token-protected console.
@@ -1140,6 +1213,7 @@ impl Config {
                         as u64,
                     routing: p.routing,
                     weights: p.key_weights(),
+                    affinity: p.affinity,
                 })
                 .collect(),
             groups: self
@@ -1151,6 +1225,7 @@ impl Config {
                     routes: g.routes.clone(),
                     routing: g.routing,
                     first_token_timeout_ms: g.first_token_timeout_ms,
+                    affinity: g.affinity,
                 })
                 .collect(),
         }
@@ -1290,6 +1365,7 @@ mod tests {
             capabilities: Default::default(),
             routing: RoutingPolicy::Rotate,
             weights: Vec::new(),
+            affinity: Default::default(),
             key_generation: 0,
         };
 
@@ -1326,6 +1402,7 @@ base_url = "http://127.0.0.1:1/v1"
             key_cooldown_ms: None,
             routing: RoutingPolicy::Rotate,
             weights: Vec::new(),
+            affinity: Default::default(),
             key_generation: 0,
         };
         let encoded = toml::to_string(&provider).unwrap();
@@ -1356,6 +1433,7 @@ base_url = "http://127.0.0.1:1/v1"
             key_cooldown_ms: None,
             routing: RoutingPolicy::Rotate,
             weights: Vec::new(),
+            affinity: Default::default(),
             key_generation: 0,
         };
         assert!(provider.validate().is_err());
@@ -1381,6 +1459,7 @@ base_url = "http://127.0.0.1:1/v1"
             key_cooldown_ms: None,
             routing: RoutingPolicy::Rotate,
             weights: Vec::new(),
+            affinity: Default::default(),
             key_generation: 0,
         });
         let snapshot = config.snapshot();
@@ -1509,8 +1588,7 @@ base_url = "http://127.0.0.1:1/v1"
 
         let mut firsts = Vec::new();
         for _ in 0..4 {
-            let order =
-                rotator.rotate_routed("mock", 0, RoutingPolicy::Weighted, &keys, &weights);
+            let order = rotator.rotate_routed("mock", 0, RoutingPolicy::Weighted, &keys, &weights);
             // The cooling key is left out entirely while others are healthy,
             // matching how the pool already hides a key in cooldown.
             assert!(order.iter().all(|(slot, _)| *slot != 2));
@@ -1590,6 +1668,7 @@ base_url = "http://127.0.0.1:1/v1"
                 capabilities: Default::default(),
                 routing: RoutingPolicy::Rotate,
                 weights: Vec::new(),
+                affinity: Default::default(),
                 key_generation: 0,
             }],
             ..Default::default()
@@ -1623,6 +1702,7 @@ base_url = "http://127.0.0.1:1/v1"
             capabilities: Default::default(),
             routing: RoutingPolicy::Rotate,
             weights: Vec::new(),
+            affinity: Default::default(),
             key_generation: 0,
         });
         config.group.push(GroupConfig {
@@ -1631,6 +1711,7 @@ base_url = "http://127.0.0.1:1/v1"
             routes: vec!["mock/mock-model".into(), "backup/other".into()],
             routing: RoutingPolicy::default(),
             first_token_timeout_ms: 0,
+            affinity: Default::default(),
         });
 
         let snapshot = config.snapshot();
@@ -1642,8 +1723,10 @@ base_url = "http://127.0.0.1:1/v1"
         assert_eq!(provider.protocol, Protocol::Chat);
         assert_eq!(provider.key_count, 2);
         assert_eq!(provider.key_cooldown_ms, 1_200);
+        assert_eq!(provider.affinity, Affinity::Auto);
         assert_eq!(snapshot.groups[0].id, "daily");
         assert_eq!(snapshot.groups[0].routes.len(), 2);
+        assert_eq!(snapshot.groups[0].affinity, Affinity::Auto);
 
         let json = serde_json::to_string(&snapshot).unwrap();
         assert!(!json.contains("secret-one"));
@@ -1658,6 +1741,7 @@ base_url = "http://127.0.0.1:1/v1"
             routes: vec!["mock/model-a".into(), "mock/model-b".into()],
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
+            affinity: Default::default(),
         };
 
         assert!(group.validate().is_ok());
@@ -1677,11 +1761,94 @@ routes = ["mock/model"]
         .unwrap();
         assert_eq!(group.routing, RoutingPolicy::Order);
         assert_eq!(group.first_token_timeout_ms, 0);
+        assert_eq!(group.affinity, Affinity::Auto);
         let mut configured = group;
         configured.first_token_timeout_ms = 1234;
+        configured.affinity = Affinity::Session;
         let encoded = toml::to_string(&configured).unwrap();
         let decoded: GroupConfig = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded.first_token_timeout_ms, 1234);
+        assert_eq!(decoded.affinity, Affinity::Session);
+    }
+
+    #[test]
+    fn affinity_parses_aliases_and_roundtrips_provider_and_group_config() {
+        assert_eq!("".parse(), Ok(Affinity::Auto));
+        assert_eq!("auto".parse(), Ok(Affinity::Auto));
+        assert_eq!("session".parse(), Ok(Affinity::Session));
+        assert_eq!("turn".parse(), Ok(Affinity::Turn));
+        assert_eq!("off".parse(), Ok(Affinity::Off));
+        assert!("forever".parse::<Affinity>().is_err());
+        assert_eq!(Affinity::Session.as_str(), "session");
+
+        let provider: ProviderConfig = toml::from_str(
+            r#"id = "mock"
+protocol = "chat"
+base_url = "http://127.0.0.1:1/v1"
+affinity = "turn"
+"#,
+        )
+        .unwrap();
+        assert_eq!(provider.affinity, Affinity::Turn);
+        let restored: ProviderConfig =
+            toml::from_str(&toml::to_string(&provider).unwrap()).unwrap();
+        assert_eq!(restored.affinity, Affinity::Turn);
+
+        let group: GroupConfig = toml::from_str(
+            r#"id = "daily"
+routes = ["mock/model"]
+affinity = "session"
+"#,
+        )
+        .unwrap();
+        assert_eq!(group.affinity, Affinity::Session);
+        assert_eq!(
+            toml::from_str::<GroupConfig>(&toml::to_string(&group).unwrap())
+                .unwrap()
+                .affinity,
+            Affinity::Session
+        );
+    }
+
+    #[test]
+    fn affinity_survives_a_full_config_save_and_load() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let mut config = Config {
+            default_provider: "mock".into(),
+            ..Config::default()
+        };
+        config.provider.push(ProviderConfig {
+            id: "mock".into(),
+            name: "Mock".into(),
+            protocol: Protocol::Chat,
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: "secret".into(),
+            api_keys: Vec::new(),
+            models: vec!["model".into()],
+            fallback: Vec::new(),
+            key_cooldown_ms: None,
+            capabilities: Default::default(),
+            routing: RoutingPolicy::Rotate,
+            weights: Vec::new(),
+            affinity: Affinity::Session,
+            key_generation: 0,
+        });
+        config.group.push(GroupConfig {
+            id: "daily".into(),
+            name: String::new(),
+            routes: vec!["mock/model".into()],
+            routing: RoutingPolicy::Order,
+            first_token_timeout_ms: 0,
+            affinity: Affinity::Turn,
+        });
+        config.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.provider[0].affinity, Affinity::Session);
+        assert_eq!(loaded.group[0].affinity, Affinity::Turn);
+        let snapshot = loaded.snapshot();
+        assert_eq!(snapshot.providers[0].affinity, Affinity::Session);
+        assert_eq!(snapshot.groups[0].affinity, Affinity::Turn);
     }
 
     #[test]
@@ -1744,6 +1911,7 @@ routes = ["mock/model"]
             capabilities: Default::default(),
             routing: RoutingPolicy::Rotate,
             weights: Vec::new(),
+            affinity: Default::default(),
             key_generation: 0,
         };
 

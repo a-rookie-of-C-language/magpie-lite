@@ -23,8 +23,9 @@ Zed ─────────┘   Chat + Responses +
 - **Upstream web-search results**: Anthropic hosted search, Gemini grounding and Responses search actions pass through the shared IR to Anthropic, Gemini and Responses replies, including SSE. Native Anthropic search IDs, block order, errors and encrypted results are retained; only public queries/sources cross providers. Gemini JSON replies retain results from multiple searches. Gemini SSE preserves later grounding/citation updates and deduplicates public queries/sources across cumulative updates; native-only metadata does not fabricate foreign search results. Search starts count as answer activity before arguments/results arrive, preventing unsafe replay; built-in search requests are supported separately below.
 - **Built-in web-search requests**: four client dialects can enable provider-executed search alongside function tools. Native options are retained; bare search intent translates across protocols. Incompatible configured policies fail safely or use a compatible fallback rather than silently dropping restrictions. OpenRouter Chat uses its web plugin; xAI Responses omits the OpenAI sources include.
 - **Providers** from one TOML file: Chat-compatible, Responses-compatible, Anthropic, or Gemini upstreams; console CRUD, bounded model discovery and connection checks, credential rotation and cooldown editing with immediate runtime updates
-- **Model routing**: `deepseek/deepseek-chat` by provider id, `group/daily-coding` route chains with process-local `order`, `rotate`, or `usage` scheduling, bare names by provider model lists, default provider fallback
+- **Model routing**: `deepseek/deepseek-chat` by provider id, `group/daily-coding` route chains with process-local `order`, `rotate`, or `usage` scheduling, bare names by provider model lists, default provider fallback, and optional conversation affinity (`auto`, `session`, `turn`, `off`)
 - **Multi-key pools**: repeat `--api-key`; rejected/rate-limited keys are retried before route fallback, and `402`/`429` starts a cooldown from `Retry-After`, common duration/reset headers, absolute reset timestamps, or JSON error-body retry delays (60s fallback, per-provider `key_cooldown_ms` / `--key-cooldown-ms` override; `0` disables it). A per-provider `routing` policy spreads a pool by `order`, `rotate` (default), `usage` (least-recently-served token load), or `weight` (smooth weighted round-robin over per-key `--key-weight` shares of `0`-`1000`, cooling keys skipped)
+- **Conversation affinity**: keep a conversation on the provider key slot that answered it so the vendor's prompt cache can keep hitting. `auto` follows the routing policy (`rotate` starts new turns elsewhere; other policies stick), `session` keeps every turn, `turn` keeps only while tool results are coming back, and `off` disables it. The decision is per provider key slot, persisted in `affinity.json` beside the config, and is not account/subscription affinity; see the CLI `--affinity` option and console selectors.
 - **Failover**: ordered provider fallbacks and routing-group routes, tried before any reply bytes are streamed when the active provider is rate limited, out of quota, overloaded, or unreachable
 - **Local authentication**: every non-health route requires the configured token as Bearer, Anthropic `x-api-key`, or Gemini `x-goog-api-key`; `/health` stays public
 - **Web console**: open `http://127.0.0.1:3426/`, enter the local token, and manage Agent connections, providers and routing groups, discover upstream models, test draft connections, or inspect provider totals, routing providers and groups, key-slot totals and active cooldowns, available models, recent requests, and recent usage; prompts, replies, and saved keys are never returned to the page or persisted in request history
@@ -55,13 +56,13 @@ magpie-lite provider add kimi \
 magpie-lite provider add deepseek \
   --base-url https://api.deepseek.com/v1 \
   --api-key sk-one... --api-key sk-two... \
-  --routing weight --key-weight 3 --key-weight 1 \
+  --routing weight --key-weight 3 --key-weight 1 --affinity auto \
   --models deepseek-chat deepseek-reasoner --default \
   --fallback kimi/moonshot-v1-128k
 
 # add a named route chain agents pick as one model
 magpie-lite group add daily-coding \
-  --routing rotate \
+  --routing rotate --affinity auto \
   --route deepseek/deepseek-chat \
   --route kimi/moonshot-v1-128k
 
@@ -330,8 +331,10 @@ digits, hyphens and underscores; routes require an existing provider and a nonem
 model. Models may be unlisted, for providers that discover them dynamically. Choose
 `order` to always start at the first route, `rotate` to advance the starting route
 for each request, or `usage` to prefer routes with fewer attempts in this gateway
-process. All remaining routes are still tried as fallbacks before response bytes
-are streamed.
+process. Each group also accepts `affinity` (`auto` by default); `auto` follows
+the route policy, `session` keeps a conversation on its first answering key slot,
+`turn` keeps it only within a tool-return turn, and `off` disables affinity. All
+remaining routes are still tried as fallbacks before response bytes are streamed.
 
 Each group also accepts `first_token_timeout_ms` (default `0`, disabled), available
 in the console as **First-content timeout (ms)** and from the CLI:
@@ -357,8 +360,8 @@ The following endpoints require the same local token as inference routes:
 
 | Method | Endpoint | Body / response |
 |---|---|---|
-| POST | `/config/groups` | `{"id":"daily","name":"Daily","routing":"rotate","first_token_timeout_ms":2000,"routes":["deepseek/deepseek-chat"]}`; 201 on creation |
-| PUT | `/config/groups/{id}` | Same body with matching ID; replaces name, routing, routes, and first-token budget (omitted budget resets to 0); 200 |
+| POST | `/config/groups` | `{"id":"daily","name":"Daily","routing":"rotate","affinity":"auto","first_token_timeout_ms":2000,"routes":["deepseek/deepseek-chat"]}`; 201 on creation |
+| PUT | `/config/groups/{id}` | Same body with matching ID; replaces name, routing, affinity, routes, and first-token budget (omitted affinity/budget reset to `auto`/0); 200 |
 | DELETE | `/config/groups/{id}` | No body; 200 |
 
 Successful edits return the secret-free `/config` snapshot. Invalid input returns

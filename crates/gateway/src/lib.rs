@@ -1,5 +1,6 @@
 //! magpie-gateway: the local server agents talk to.
 
+pub mod affinity;
 pub mod agents;
 pub mod config;
 pub mod config_store;
@@ -21,9 +22,10 @@ mod unfit_fields;
 pub mod upstream;
 pub mod usage;
 
+pub use affinity::AffinityStore;
 pub use config::{
-    Config, GroupConfig, KeyRotator, Protocol, ProviderCapabilities, ProviderConfig, RoutingPolicy,
-    config_path,
+    Affinity, Config, GroupConfig, KeyRotator, Protocol, ProviderCapabilities, ProviderConfig,
+    RoutingPolicy, config_path,
 };
 pub use config_store::ConfigStore;
 pub use retired::{init as init_retired_store, is_retired as model_is_retired};

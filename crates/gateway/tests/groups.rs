@@ -70,6 +70,7 @@ async fn gateway(referenced: bool) -> Gateway {
             capabilities: Default::default(),
             routing: magpie_gateway::RoutingPolicy::Rotate,
             weights: Vec::new(),
+            affinity: Default::default(),
             key_generation: 0,
         }],
         ..Config::default()
@@ -81,6 +82,7 @@ async fn gateway(referenced: bool) -> Gateway {
         http: magpie_gateway::upstream::http_client().unwrap(),
         requests: Arc::new(Mutex::new(magpie_gateway::usage::RequestLog::default())),
         key_rotation: magpie_gateway::KeyRotator::default(),
+        affinity: magpie_gateway::AffinityStore::default(),
     });
     let (url, gateway_task) = bind(build_router(state)).await;
     Gateway {
@@ -455,5 +457,52 @@ async fn group_first_token_budget_is_persisted_exposed_editable_and_defaults_to_
     assert_eq!(
         Config::load(&gw.path).unwrap().group[0].first_token_timeout_ms,
         0
+    );
+}
+
+#[tokio::test]
+async fn group_affinity_round_trips_and_defaults_on_replace() {
+    let gw = gateway(false).await;
+    let mut body = group("sticky", "original");
+    body["affinity"] = json!("session");
+    let created = edit(&gw, Method::POST, "/config/groups", body.clone()).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    assert_eq!(
+        created.json::<Value>().await.unwrap()["groups"][0]["affinity"],
+        "session"
+    );
+    assert_eq!(
+        Config::load(&gw.path).unwrap().group[0].affinity,
+        magpie_gateway::Affinity::Session
+    );
+
+    body["affinity"] = json!("turn");
+    let updated = edit(&gw, Method::PUT, "/config/groups/sticky", body).await;
+    assert_eq!(updated.status(), StatusCode::OK);
+    assert_eq!(
+        updated.json::<Value>().await.unwrap()["groups"][0]["affinity"],
+        "turn"
+    );
+    assert_eq!(
+        Config::load(&gw.path).unwrap().group[0].affinity,
+        magpie_gateway::Affinity::Turn
+    );
+
+    // PUT replaces the group, so an omitted affinity returns to auto.
+    let reset = edit(
+        &gw,
+        Method::PUT,
+        "/config/groups/sticky",
+        group("sticky", "original"),
+    )
+    .await;
+    assert_eq!(reset.status(), StatusCode::OK);
+    assert_eq!(
+        reset.json::<Value>().await.unwrap()["groups"][0]["affinity"],
+        "auto"
+    );
+    assert_eq!(
+        Config::load(&gw.path).unwrap().group[0].affinity,
+        magpie_gateway::Affinity::Auto
     );
 }

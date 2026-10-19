@@ -12,8 +12,8 @@ use axum::{
     routing::post,
 };
 use magpie_gateway::{
-    AppState, Config, ConfigStore, GroupConfig, KeyRotator, Protocol, ProviderConfig,
-    RoutingPolicy, build_router, usage::RequestLog,
+    AffinityStore, AppState, Config, ConfigStore, GroupConfig, KeyRotator, Protocol,
+    ProviderConfig, RoutingPolicy, build_router, usage::RequestLog,
 };
 use serde_json::{Value, json};
 
@@ -243,6 +243,7 @@ async fn fixture() -> Fixture {
             key_cooldown_ms: None,
             routing: RoutingPolicy::Rotate,
             weights: Vec::new(),
+            affinity: Default::default(),
             key_generation: 0,
         }],
         group: vec![GroupConfig {
@@ -251,6 +252,7 @@ async fn fixture() -> Fixture {
             routes: vec!["mock/mock-model".into()],
             routing: RoutingPolicy::Rotate,
             first_token_timeout_ms: 0,
+            affinity: Default::default(),
         }],
         ..Config::default()
     };
@@ -261,6 +263,7 @@ async fn fixture() -> Fixture {
         http: magpie_gateway::upstream::http_client().unwrap(),
         requests: log.clone(),
         key_rotation: KeyRotator::default(),
+        affinity: AffinityStore::default(),
     });
     let gateway = serve(build_router(state)).await;
     Fixture {

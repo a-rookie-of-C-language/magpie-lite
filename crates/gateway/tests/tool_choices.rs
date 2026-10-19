@@ -8,8 +8,8 @@ use axum::{
     routing::post,
 };
 use magpie_gateway::{
-    AppState, Config, ConfigStore, GroupConfig, KeyRotator, Protocol, ProviderConfig,
-    RoutingPolicy, build_router, usage::RequestLog,
+    AffinityStore, AppState, Config, ConfigStore, GroupConfig, KeyRotator, Protocol,
+    ProviderConfig, RoutingPolicy, build_router, usage::RequestLog,
 };
 use serde_json::{Value, json};
 use std::{
@@ -296,6 +296,7 @@ impl Fixture {
                 key_cooldown_ms: None,
                 routing: RoutingPolicy::Rotate,
                 weights: Vec::new(),
+                affinity: Default::default(),
                 key_generation: 0,
             });
             upstreams.push(server);
@@ -316,6 +317,7 @@ impl Fixture {
                             .collect(),
                         routing: RoutingPolicy::Order,
                         first_token_timeout_ms: 0,
+                        affinity: Default::default(),
                     }],
                     ..Config::default()
                 },
@@ -324,6 +326,7 @@ impl Fixture {
             http: magpie_gateway::upstream::http_client().unwrap(),
             requests: Arc::new(Mutex::new(RequestLog::open(&history).unwrap())),
             key_rotation: KeyRotator::default(),
+            affinity: AffinityStore::default(),
         });
         let gateway = serve(build_router(state.clone())).await;
         Self {

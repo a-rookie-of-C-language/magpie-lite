@@ -44,6 +44,7 @@ async fn server(enabled: bool) -> Server {
             capabilities: Default::default(),
             routing: RoutingPolicy::Rotate,
             weights: Vec::new(),
+            affinity: Default::default(),
             key_generation: 0,
         }],
         group: vec![GroupConfig {
@@ -52,6 +53,7 @@ async fn server(enabled: bool) -> Server {
             routes: vec!["mock/model".into()],
             routing: RoutingPolicy::default(),
             first_token_timeout_ms: 0,
+            affinity: Default::default(),
         }],
         ..Config::default()
     };
@@ -75,6 +77,7 @@ async fn server(enabled: bool) -> Server {
         http: magpie_gateway::upstream::http_client().unwrap(),
         requests: Arc::new(Mutex::new(magpie_gateway::usage::RequestLog::default())),
         key_rotation: magpie_gateway::KeyRotator::default(),
+        affinity: magpie_gateway::AffinityStore::default(),
     });
     let task = tokio::spawn(async move {
         axum::serve(listener, build_router(state)).await.unwrap();

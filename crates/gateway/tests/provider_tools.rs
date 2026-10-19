@@ -7,7 +7,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
-use magpie_gateway::{AppState, Config, ConfigStore, KeyRotator, build_router};
+use magpie_gateway::{AffinityStore, AppState, Config, ConfigStore, KeyRotator, build_router};
 use serde_json::{Value, json};
 
 #[derive(Default)]
@@ -160,6 +160,7 @@ impl Fixture {
             http: magpie_gateway::upstream::http_client().unwrap(),
             requests: Arc::new(Mutex::new(magpie_gateway::usage::RequestLog::default())),
             key_rotation: KeyRotator::default(),
+            affinity: AffinityStore::default(),
         });
         let (url, task) = bind(build_router(state.clone())).await;
         Self {
@@ -379,6 +380,7 @@ async fn tools_require_authentication_validate_before_network_and_need_no_persis
         http: magpie_gateway::upstream::http_client().unwrap(),
         requests: Arc::new(Mutex::new(magpie_gateway::usage::RequestLog::default())),
         key_rotation: KeyRotator::default(),
+        affinity: AffinityStore::default(),
     });
     let (url, task) = bind(build_router(state)).await;
     let response = reqwest::Client::new()

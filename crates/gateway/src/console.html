@@ -654,6 +654,7 @@
                 <div class="field"><label for="provider-key-mode">API keys</label><select id="provider-key-mode" class="token-input" aria-describedby="provider-key-help"><option value="keep">Keep existing keys</option><option value="replace">Replace key pool</option><option value="clear">No upstream authentication</option></select><p id="provider-key-help" class="group-help">Saved keys are never displayed. Choose Replace to rotate credentials, or No upstream authentication for a local service.</p></div>
                 <div id="provider-keys-field" class="field" hidden><label for="provider-keys">New key pool</label><textarea id="provider-keys" class="token-input" autocomplete="off" spellcheck="false" aria-describedby="provider-keys-help"></textarea><p id="provider-keys-help" class="group-help">One API key per line, in rotation order. These values are sent when you save, discover models or test a connection.</p></div>
                 <div class="field"><label for="provider-routing">Key routing</label><select id="provider-routing" class="token-input" aria-describedby="provider-routing-help"><option value="rotate">Rotate</option><option value="order">Ordered</option><option value="usage">Least used</option><option value="weight">Weighted</option></select><p id="provider-routing-help" class="group-help">Rotate spreads requests across the key pool, the default. Ordered always starts at the first key. Least used prefers the key that served the fewest tokens lately. Weighted spreads by each key's weight.</p></div>
+                <div class="field"><label for="provider-affinity">Conversation affinity</label><select id="provider-affinity" class="token-input" aria-describedby="provider-affinity-help"><option value="auto">Auto</option><option value="session">Whole session</option><option value="turn">Within a turn</option><option value="off">Off</option></select><p id="provider-affinity-help" class="group-help">Keep a conversation on the key that answered it so the vendor's prompt cache keeps hitting. Auto follows the key routing: rotate spreads load, everything else sticks by conversation.</p></div>
                 <div id="provider-weights-field" class="field" hidden><label for="provider-weights">Key weights</label><textarea id="provider-weights" class="token-input" placeholder="3&#10;1&#10;4" aria-describedby="provider-weights-help"></textarea><p id="provider-weights-help" class="group-help">One weight per key slot, in pool order, each a whole number from 0 to 1000. A missing or zero weight counts as 1.</p></div>
                 <div class="editor-grid">
                   <div class="field"><label for="provider-cap-streaming">Streaming support</label><select id="provider-cap-streaming" class="token-input"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></div>
@@ -697,6 +698,7 @@
                 <div class="field"><label for="group-name">Display name (optional)</label><input id="group-name" class="token-input" placeholder="Daily coding"></div>
                 <div class="field"><label for="group-routes">Routes in fallback order</label><textarea id="group-routes" class="token-input" required placeholder="deepseek/deepseek-chat&#10;kimi/moonshot-v1-128k" aria-describedby="group-routes-help"></textarea><p id="group-routes-help" class="group-help">One provider/model per line. The selected policy chooses the starting route; remaining routes are fallback candidates.</p><p id="group-providers" class="group-help"></p></div>
                 <div class="field"><label for="group-routing">Route policy</label><select id="group-routing" class="token-input" aria-describedby="group-routing-help"><option value="order">Ordered</option><option value="rotate">Rotate</option><option value="usage">Least used</option></select><p id="group-routing-help" class="group-help">Ordered always starts at the first route. Rotate advances the starting route per request. Least used prefers routes with fewer attempts in this gateway process.</p></div>
+                <div class="field"><label for="group-affinity">Conversation affinity</label><select id="group-affinity" class="token-input" aria-describedby="group-affinity-help"><option value="auto">Auto</option><option value="session">Whole session</option><option value="turn">Within a turn</option><option value="off">Off</option></select><p id="group-affinity-help" class="group-help">Keep a conversation on the route that answered it so the vendor's prompt cache keeps hitting. Auto follows the route policy: rotate spreads load, everything else sticks by conversation.</p></div>
                 <div class="field"><label for="group-first-token">First-content timeout (ms)</label><input id="group-first-token" class="token-input" type="number" min="0" max="9007199254740991" step="1" value="0" required aria-describedby="group-first-token-help"><p id="group-first-token-help" class="group-help">0 disables this group limit. Streaming requests only: a slow non-final route switches to the next candidate before any reply is released. The final route still obeys gateway-wide limits.</p></div>
                 <div class="group-actions"><button id="group-save" class="button" type="submit">Save group</button><button id="group-cancel" class="button secondary" type="button">Cancel</button></div>
               </form>
@@ -781,6 +783,7 @@
       providerKeysField: document.getElementById("provider-keys-field"),
       providerKeys: document.getElementById("provider-keys"),
       providerRouting: document.getElementById("provider-routing"),
+      providerAffinity: document.getElementById("provider-affinity"),
       providerWeightsField: document.getElementById("provider-weights-field"),
       providerWeights: document.getElementById("provider-weights"),
       providerFallback: document.getElementById("provider-fallback"),
@@ -802,6 +805,7 @@
       groupName: document.getElementById("group-name"),
       groupRoutes: document.getElementById("group-routes"),
       groupRouting: document.getElementById("group-routing"),
+      groupAffinity: document.getElementById("group-affinity"),
       groupFirstToken: document.getElementById("group-first-token"),
       groupProviders: document.getElementById("group-providers"),
       groupNew: document.getElementById("group-new"),
@@ -1302,7 +1306,7 @@
         route.className = "model-owner";
         route.textContent = (group.routes || []).join(" → ") || "No routes";
         const label = text("span", group.name || group.id, "model-owner");
-        const policy = text("span", `Policy: ${group.routing || "order"}`, "model-owner");
+        const policy = text("span", `Policy: ${group.routing || "order"} · affinity: ${group.affinity || "auto"}`, "model-owner");
         const actions = document.createElement("div");
         actions.className = "group-actions";
         const edit = text("button", "Edit", "button secondary");
@@ -1340,9 +1344,11 @@
     // A provider's key policy, with its weights shown only when it uses them.
     function routingSummary(provider) {
       const policy = provider.routing || "rotate";
-      if (policy !== "weight") return policy;
+      const affinity = provider.affinity || "auto";
+      if (policy !== "weight") return `${policy} · affinity: ${affinity}`;
       const weights = provider.weights || [];
-      return weights.length ? `weight: ${weights.join(", ")}` : "weight";
+      const weightsText = weights.length ? `weight: ${weights.join(", ")}` : "weight";
+      return `${weightsText} · affinity: ${affinity}`;
     }
 
     function renderModels(models) {
@@ -1413,6 +1419,7 @@
       elements.providerModels.value = (provider?.models || []).join("\n");
       elements.providerFallback.value = (provider?.fallback || []).join("\n");
       elements.providerRouting.value = provider?.routing || "rotate";
+      elements.providerAffinity.value = provider?.affinity || "auto";
       elements.providerWeights.value = (provider?.weights || []).join("\n");
       routingChanged();
       elements.providerCooldown.value = provider?.key_cooldown_override_ms ?? "";
@@ -1532,6 +1539,7 @@
       };
       const routing = elements.providerRouting.value;
       body.routing = routing;
+      body.affinity = elements.providerAffinity.value;
       // Only the weighted policy reads weights; an empty list clears them.
       if (routing === "weight") {
         const raw = lines(elements.providerWeights.value);
@@ -1613,6 +1621,7 @@
       elements.groupName.value = group?.name || "";
       elements.groupRoutes.value = (group?.routes || []).join("\n");
       elements.groupRouting.value = group?.routing || "order";
+      elements.groupAffinity.value = group?.affinity || "auto";
       elements.groupFirstToken.value = group?.first_token_timeout_ms ?? 0;
       elements.groupMessage.textContent = "";
       elements.groupEditor.hidden = false;
@@ -1694,6 +1703,7 @@
         name: elements.groupName.value.trim(),
         routes: elements.groupRoutes.value.split(/\r?\n/).map(route => route.trim()).filter(Boolean),
         routing: elements.groupRouting.value,
+        affinity: elements.groupAffinity.value,
         first_token_timeout_ms: Number(elements.groupFirstToken.value)
       };
       if (!body.routes.length) {
