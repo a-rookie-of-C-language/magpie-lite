@@ -875,6 +875,9 @@
     let statsQuery = null;
     let dataRevision = 0;
     let sessionRevision = 0;
+    // Classifiers that could not say when last asked, by model, from the
+    // latest stats: a group whose classifier fails says so on its card.
+    let classifierStatusByModel = {};
 
     const number = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
 
@@ -985,6 +988,24 @@
       renderProviders(stats.providers || {}, stats.key_cooldowns || {});
       renderRequests(stats.recent_requests || []);
       renderUsage(stats.recent_usage?.by_model || {});
+      classifierStatusByModel = {};
+      for (const status of stats.classifier_status || []) {
+        if (status && status.model) classifierStatusByModel[status.model] = status;
+      }
+    }
+
+    function truncateWords(value, length) {
+      const text = String(value || "");
+      return text.length > length ? text.slice(0, length) + "…" : text;
+    }
+
+    function classifiedSummary(classified) {
+      if (!classified) return "";
+      const verdict = classified.intent ? `intent: ${classified.intent}` : "intent: ?";
+      const kept = classified.fallback === "previous" ? " (kept from the turn before)" : "";
+      const cached = classified.cached ? " (cached)" : "";
+      const err = !classified.intent && classified.error ? ` (${truncateWords(classified.error, 90)})` : "";
+      return ` · ${verdict}${kept}${cached}${err}`;
     }
 
     function renderProviders(providers, cooldowns) {
@@ -1050,13 +1071,18 @@
           text("td", formatTime(request.started_unix_ms)),
           text("td", request.client_protocol),
           text("td", request.requested_model),
-          text("td", request.provider ? `${request.provider} / ${request.upstream_model}` : "—"),
+          text("td", routeSummary(request)),
           text("td", request.key_slot === undefined ? "—" : `slot ${request.key_slot}`),
           text("td", request.status, statusClass(request.status)),
           text("td", `${fmt(request.latency_ms)} ms`),
           text("td", tokens)
         ]));
       }
+    }
+
+    function routeSummary(request) {
+      const route = request.provider ? `${request.provider} / ${request.upstream_model}` : "—";
+      return route + classifiedSummary(request.classified);
     }
 
     function renderUsage(usage) {
@@ -1327,6 +1353,16 @@
         const policy = text("span", `Policy: ${group.routing || "order"}${weights} · affinity: ${group.affinity || "auto"}`, "model-owner");
         const rules = text("span", ruleSummary(group.rules || []), "model-owner");
         if (group.classifier) rules.textContent += ` · classifier: ${group.classifier}`;
+      const failure = group.classifier ? classifierStatusByModel[group.classifier] : undefined;
+      if (failure) {
+        const bad = text(
+          "span",
+          ` · ${group.classifier} can't say: ${truncateWords(failure.error, 100)}`,
+          "model-owner status bad"
+        );
+        bad.title = `Last failed ask: ${formatTime(failure.at_unix_ms)}`;
+        rules.after(bad);
+      }
         const actions = document.createElement("div");
         actions.className = "group-actions";
         const edit = text("button", "Edit", "button secondary");

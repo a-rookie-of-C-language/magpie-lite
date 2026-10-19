@@ -292,6 +292,7 @@ async fn stats(State(state): State<Arc<AppState>>, Query(query): Query<StatsQuer
     snapshot.key_cooldowns = state
         .key_rotation
         .cooldown_snapshot(&state.config.current());
+    snapshot.classifier_status = crate::classify::failures();
     Json(snapshot).into_response()
 }
 
@@ -1677,8 +1678,10 @@ async fn send_with_fallback(
         // reference's `ruleFor` classifier call). Within the turn the
         // stored answer is gone by instead; a compaction is decided on
         // its own, its classifier never asked. When it cannot say, no
-        // intent matches and the turn goes by the other conditions.
+        // intent matches and the turn goes by the other conditions. What
+        // was asked and said goes on the request's record.
         let mut intent = String::new();
+        let mut classified: Option<crate::rules::Classified> = None;
         let within_turn = crate::affinity::turn_of(creq).1;
         if !group.classifier.is_empty() && !within_turn && !crate::rules::compacting(creq) {
             let query = crate::rules::rule_query(&group.rules, &plan.id, creq, agent, conversation);
@@ -1706,21 +1709,43 @@ async fn send_with_fallback(
                         let c = caller.clone();
                         Box::pin(ask_classifier(c, m, i, p, t)) as crate::classify::AskFuture
                     });
-                    let (said, _cached, err) =
+                    let asked_at = std::time::Instant::now();
+                    let (said, cached, err) =
                         crate::classify::classify(ask, &group.classifier, &intents, &prev, &text)
                             .await;
+                    let ms = asked_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                    let mut fallback = String::new();
                     if said.is_empty() && err.is_some() && !after.is_empty() {
                         // Timed out, failed or resting — not answered none:
                         // the turn before's intent, still one of this
                         // turn's, is a better guess than none (#1826).
-                        intent = after;
+                        intent = after.clone();
+                        fallback = "previous".to_owned();
                     } else {
                         intent = said;
                     }
+                    classified = Some(crate::rules::Classified {
+                        by: group.classifier.clone(),
+                        intents: intents.clone(),
+                        intent: intent.clone(),
+                        after,
+                        cached,
+                        ms,
+                        error: err.unwrap_or_default(),
+                        fallback,
+                    });
+                } else {
+                    classified = Some(crate::rules::Classified {
+                        by: group.classifier.clone(),
+                        intents: intents.clone(),
+                        error: "the message has no words to classify".to_owned(),
+                        ..Default::default()
+                    });
                 }
             }
         }
-        if let Some(hit) = crate::rules::rule_for(
+        tracker.set_classified(classified.clone());
+        if let Some(mut hit) = crate::rules::rule_for(
             &plan.id,
             &group.rules,
             creq,
@@ -1730,6 +1755,7 @@ async fn send_with_fallback(
             &intent,
         ) && !hit.use_.is_empty()
         {
+            hit.classified = classified;
             // Put the rule's member first, then those the rules after it
             // also name (`then`), each once, the rest behind in order.
             let mut rank: HashMap<String, usize> = HashMap::new();

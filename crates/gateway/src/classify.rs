@@ -15,6 +15,7 @@
 //! asks, and the cache dedups after — which is only ever a duplicate
 //! classifier call, never a wrong answer.
 use magpie_core::ir::{CompletionRequest, Message, Part, PartKind, Role};
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
@@ -74,6 +75,9 @@ struct ClassifiedAs {
 struct ClassifyFailure {
     err: String,
     at: Instant,
+    /// Wall-clock milliseconds, for the console: an `Instant` never leaves
+    /// the process.
+    at_ms: u64,
 }
 #[derive(Default)]
 struct Classified {
@@ -94,6 +98,41 @@ pub fn reset() {
 pub fn classifier_failure(model: &str) -> Option<(String, Instant)> {
     let map = CLASSIFIED.lock().unwrap();
     map.last.get(model).map(|f| (f.err.clone(), f.at))
+}
+/// A classifier that could not say when last asked, for the console's
+/// group cards (the reference's `ClassifierFailure` on the Routing page,
+/// #1929): a classifier that fails at every turn otherwise only shows in
+/// each request's own details.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClassifierStatus {
+    /// The classifier model, as the group names it.
+    pub model: String,
+    /// Why it could not say.
+    pub error: String,
+    /// Wall-clock milliseconds of the failed ask.
+    pub at_unix_ms: u64,
+}
+/// Every classifier that could not say when last asked, oldest first.
+pub fn failures() -> Vec<ClassifierStatus> {
+    let map = CLASSIFIED.lock().unwrap();
+    let mut out: Vec<ClassifierStatus> = map
+        .last
+        .iter()
+        .map(|(model, f)| ClassifierStatus {
+            model: model.clone(),
+            error: f.err.clone(),
+            at_unix_ms: f.at_ms,
+        })
+        .collect();
+    out.sort_by_key(|s| s.at_unix_ms);
+    out
+}
+/// Wall-clock milliseconds now, for [`ClassifierStatus`].
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 /// Ask which of `intents` the message is, from what was asked before when
 /// it can be: the same message and intents within `CLASSIFY_KEEP`. A
@@ -176,6 +215,7 @@ pub async fn classify(
                 ClassifyFailure {
                     err: err.clone(),
                     at: Instant::now(),
+                    at_ms: wall_ms(),
                 },
             );
             (String::new(), false, Some(err))
@@ -190,6 +230,7 @@ pub async fn classify(
                 ClassifyFailure {
                     err: err.clone(),
                     at,
+                    at_ms: wall_ms(),
                 },
             );
             map.last.insert(
@@ -197,6 +238,7 @@ pub async fn classify(
                 ClassifyFailure {
                     err: err.clone(),
                     at,
+                    at_ms: wall_ms(),
                 },
             );
             (String::new(), false, Some(err))

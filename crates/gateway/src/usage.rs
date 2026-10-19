@@ -62,6 +62,11 @@ pub struct RequestRecord {
     pub latency_ms: u64,
     /// Provider usage, when reported.
     pub usage: UsageSnapshot,
+    /// What the routing group's classifier was asked as the turn began,
+    /// and said; absent when no rule waited on an intent. Older history
+    /// lines predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classified: Option<crate::rules::Classified>,
 }
 
 /// Per-key totals inside a provider. Slot names are stable, secret-free ids.
@@ -173,6 +178,9 @@ pub struct StatsSnapshot {
     pub recent_usage: RecentUsageSummary,
     /// The most recent records, oldest first.
     pub recent_requests: Vec<RequestRecord>,
+    /// Classifiers that could not say when last asked, oldest first: a
+    /// group whose classifier fails says so on its card.
+    pub classifier_status: Vec<crate::classify::ClassifierStatus>,
 }
 
 /// Request totals and recent history for one gateway process.
@@ -291,6 +299,7 @@ impl RequestLog {
             key_cooldowns: BTreeMap::new(),
             recent_usage: summarize_recent(&recent_requests),
             recent_requests,
+            classifier_status: Vec::new(),
         }
     }
 
@@ -371,11 +380,18 @@ impl RequestTracker {
                 status: "incomplete".to_owned(),
                 latency_ms: 0,
                 usage: UsageSnapshot::default(),
+                classified: None,
             },
             usage: Usage::default(),
             reask_usage: Usage::default(),
             finished: false,
         }
+    }
+
+    /// What the routing group's classifier was asked as the turn began,
+    /// and said, for the request's record.
+    pub fn set_classified(&mut self, classified: Option<crate::rules::Classified>) {
+        self.record.classified = classified;
     }
 
     /// Record a concrete upstream attempt without waiting for the full reply.
@@ -510,6 +526,7 @@ mod tests {
                 cache_read: None,
                 cache_write: None,
             },
+            classified: None,
         }
     }
 

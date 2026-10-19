@@ -998,11 +998,54 @@ pub struct RuleHit {
     pub folder: String,
     /// The members the rules after it that match too send to (`Then`).
     pub then: Vec<String>,
+    /// What the group's classifier was asked as the turn began, and said
+    /// (the reference's `Classified`, without effort — lite never judges
+    /// it — and without the decision models' confidence).
+    pub classified: Option<Classified>,
     /// The request is the agent compacting its conversation.
     pub compact: bool,
     /// The members of rules it matched that take less than it is long,
     /// passed over.
     pub small: Vec<String>,
+}
+
+/// What the classifier was asked as a turn began, and said (`Classified`).
+/// Told on the request's record; a group whose classifier fails says so
+/// on its card through [`crate::classify::failures`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Classified {
+    /// The classifier model, as the group names it.
+    pub by: String,
+    /// What it chose among: the intents of the rules that could match first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intents: Vec<String>,
+    /// What it said the message is; "" when it could not say.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub intent: String,
+    /// What it said the turn before was, which it was told; "" for none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub after: String,
+    /// Said before, for the same message.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cached: bool,
+    /// How long asking it took, in milliseconds.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ms: u64,
+    /// Why it could not say: no intent matches then, unless `fallback`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    /// "previous" when it could not say and the turn keeps the intent the
+    /// turn before had.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fallback: String,
+}
+
+fn is_zero(ms: &u64) -> bool {
+    *ms == 0
+}
+
+fn is_false(cached: &bool) -> bool {
+    !cached
 }
 
 /// The conversation a group's rules keep a turn's decision for: the agent's

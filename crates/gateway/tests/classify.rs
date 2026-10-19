@@ -631,6 +631,22 @@ async fn ask(gw: &Gateway, group: &str, session: &str, messages: Value) -> Statu
 fn cls_asked(gw: &Gateway) -> usize {
     gw.cls_bodies.lock().unwrap().len()
 }
+
+async fn stats(gw: &Gateway) -> Value {
+    Client::new()
+        .get(format!("{}/stats", gw.url))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+fn last_classified(stats: &Value) -> Value {
+    stats["recent_requests"].as_array().unwrap().last().unwrap()["classified"].clone()
+}
 #[test]
 fn an_intent_rule_needs_its_group_classifier() {
     let members = vec!["a/one".to_owned(), "b/two".to_owned()];
@@ -718,6 +734,63 @@ async fn a_turn_goes_by_what_the_classifier_says_once() {
     );
     assert_eq!(gw.bodies[1].lock().unwrap().len(), 2);
     assert_eq!(cls_asked(&gw), 1);
+    // the verdict goes on the request's record; the card stays quiet
+    let recent = stats(&gw).await;
+    let records = recent["recent_requests"].as_array().unwrap();
+    // the classifier's own call leaves a record too; the turn's first
+    // agent request carries the verdict
+    let started = records.iter().find(|r| !r["classified"].is_null()).unwrap();
+    assert_eq!(started["requested_model"], "group/g-verdict");
+    assert_eq!(started["classified"]["by"], "c/judge-verdict");
+    assert_eq!(started["classified"]["intent"], "refactoring");
+    assert_eq!(started["classified"]["intents"], json!(["refactoring"]));
+    // within the turn nothing is asked again, so nothing is told either
+    let agent: Vec<_> = records
+        .iter()
+        .filter(|r| r["requested_model"] == "group/g-verdict")
+        .collect();
+    assert_eq!(agent.len(), 2);
+    assert!(
+        agent[1]["classified"].is_null(),
+        "{}",
+        agent[1]["classified"]
+    );
+    // answered: nothing for the card
+    assert!(
+        recent["classifier_status"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["model"] != "c/judge-verdict")
+    );
+}
+
+#[test]
+fn classified_keeps_only_what_was_asked_and_said() {
+    let full = magpie_gateway::rules::Classified {
+        by: "c/judge".into(),
+        intents: vec!["bug".into()],
+        intent: "bug".into(),
+        after: String::new(),
+        cached: true,
+        ms: 12,
+        error: String::new(),
+        fallback: String::new(),
+    };
+    let value = serde_json::to_value(&full).unwrap();
+    assert_eq!(
+        value,
+        json!({"by": "c/judge", "intents": ["bug"], "intent": "bug", "cached": true, "ms": 12})
+    );
+    // older history lines predate it
+    let record: magpie_gateway::usage::RequestRecord = serde_json::from_value(json!({
+        "started_unix_ms": 1, "client_protocol": "chat", "requested_model": "m",
+        "provider": "a", "upstream_model": "one", "key_slot": 0,
+        "stream": false, "status": "ok", "latency_ms": 2,
+        "usage": {},
+    }))
+    .unwrap();
+    assert!(record.classified.is_none());
 }
 
 #[tokio::test]
@@ -743,6 +816,29 @@ async fn a_failed_classifier_leaves_the_turn_to_the_rest_of_the_rules() {
     assert_eq!(ask(&gw, "g-down", "s-down-2", second).await, StatusCode::OK);
     assert_eq!(gw.bodies[0].lock().unwrap().len(), 2);
     assert_eq!(cls_asked(&gw), 1);
+    // the failed ask goes on the request's record and on the card's status
+    let record = last_classified(&stats(&gw).await);
+    assert_eq!(record["by"], "c/judge-down");
+    assert!(record.get("intent").is_none(), "{record}");
+    assert!(
+        record["error"]
+            .as_str()
+            .unwrap()
+            .contains("classifier down"),
+        "{record}"
+    );
+    let status = &stats(&gw).await["classifier_status"];
+    let down = status
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["model"] == "c/judge-down")
+        .unwrap()
+        .clone();
+    assert!(
+        down["error"].as_str().unwrap().contains("classifier down"),
+        "{down}"
+    );
 }
 
 #[tokio::test]
@@ -777,4 +873,15 @@ async fn a_failed_classifier_keeps_the_turn_before_intent() {
     assert_eq!(ask(&gw, "g-keep", "s-keep", follow).await, StatusCode::OK);
     assert_eq!(gw.bodies[1].lock().unwrap().len(), 3);
     assert_eq!(cls_asked(&gw), 2);
+    // the record says the intent was kept from the turn before, not asked
+    let record = last_classified(&stats(&gw).await);
+    assert_eq!(record["intent"], "refactoring");
+    assert_eq!(record["fallback"], "previous");
+    assert!(
+        record["error"]
+            .as_str()
+            .unwrap()
+            .contains("classifier down"),
+        "{record}"
+    );
 }
