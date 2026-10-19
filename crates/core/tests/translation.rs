@@ -50,6 +50,28 @@ fn a_chat_clients_max_completion_tokens_is_kept() {
 }
 
 #[test]
+fn a_chat_tool_in_another_apis_shape_keeps_its_name() {
+    for tool in [
+        json!({"name":"mcp","description":"d","inputSchema":{"type":"object"}}),
+        json!({"name":"anthropic","input_schema":{"type":"object"}}),
+        json!({"name":"bare","parameters":{"type":"object"}}),
+        json!({"type":"function","name":"flat","parameters":{"type":"object"}}),
+    ] {
+        let ir = chat::decode_request(&json!({"model":"m", "messages":[],
+            "tools":[tool.clone()]}))
+        .unwrap();
+        assert_eq!(ir.tools.len(), 1, "dropped {tool}");
+        assert_eq!(ir.tools[0].name, tool["name"]);
+        assert_eq!(ir.tools[0].parameters["type"], "object");
+    }
+    // A hosted tool is not a function and stays out of the function set.
+    let ir = chat::decode_request(&json!({"model":"m", "messages":[],
+        "tools":[{"type":"web_search"}]}))
+    .unwrap();
+    assert!(ir.tools.is_empty());
+}
+
+#[test]
 fn chat_request_decodes_into_ir() {
     let ir = chat::decode_request(&chat_request()).expect("decode");
     assert_eq!(ir.model, "deepseek/deepseek-chat");

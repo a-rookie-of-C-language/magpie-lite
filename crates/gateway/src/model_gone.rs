@@ -84,6 +84,22 @@ pub(crate) fn model_refused(status: u16, body: &Value) -> bool {
 /// or parameter it doesn't know, which another vendor's API may take:
 /// xAI's 422 "Failed to deserialize the JSON body …: unknown item type"
 /// (#350), OpenAI's "Unknown parameter".
+///
+/// It also names a vendor turning the request away with nothing but a
+/// trace id: Command Code's `{"message":"invalid request error trace_id:
+/// <hex>","type":"invalid_request_error"}`, a 400 (a 422 before) with no
+/// code and no param (#2313). The key and the account are fine, and
+/// another member may take the same request, so the group moves on and
+/// this member doesn't rest. An overflow that says so before the trace
+/// id, and a message that says more after it, are the request's.
+fn unsaid_words() -> &'static Regex {
+    static UNSAID: OnceLock<Regex> = OnceLock::new();
+    UNSAID.get_or_init(|| {
+        Regex::new(r#"(?i)(^|"|\\"|: )invalid request error trace_id: [0-9a-f]{16,}(\\?"|\s*$)"#)
+            .expect("unsaid words regex")
+    })
+}
+
 fn shape_words() -> &'static Regex {
     static SHAPE: OnceLock<Regex> = OnceLock::new();
     SHAPE.get_or_init(|| {
@@ -103,7 +119,7 @@ pub(crate) fn shape_refused(status: u16, body: &Value) -> bool {
         return false;
     }
     let text = error_text(body);
-    shape_words().is_match(&text)
+    (shape_words().is_match(&text) || unsaid_words().is_match(&text))
         && !quota_words().is_match(&text)
         && !unserved_words().is_match(&text)
         && !refused_words().is_match(&text)
@@ -361,6 +377,47 @@ mod tests {
             500,
             &json!({"error": "Failed to deserialize the JSON body into the target type: input[0]: unknown item type \"additional_tools\""})
         ));
+    }
+
+    #[test]
+    fn a_bare_trace_id_is_a_shape_refusal() {
+        // Command Code's Provider API turns a request away with nothing
+        // but a trace id (#2313): the key is fine and another member may
+        // take the same request.
+        let bare = json!({"message":"invalid request error trace_id: 251c3c29761c17fdc459480ed9c68932",
+            "type":"invalid_request_error"});
+        for status in [400, 422] {
+            assert!(shape_refused(status, &bare));
+        }
+        // A provider's name in front, and a wrapped copy, read the same.
+        assert!(shape_refused(
+            400,
+            &json!({"message":"Command Code: invalid request error trace_id: a050673b3298a747a15895803095bcf0"})
+        ));
+        assert!(shape_refused(
+            422,
+            &json!({"message":"{\"message\":\"invalid request error trace_id: f9965636e3da815215348ef4ddf2ae63\",\"type\":\"invalid_request_error\"}",
+                "type":"server_error"})
+        ));
+        // Its overflow, a parameter it names, a message that says more
+        // after the trace id, and a 200 are not this refusal.
+        for (status, body) in [
+            (
+                400,
+                json!({"message":"The input is longer than the model's context length trace_id: e811a6f10da868000cc12a043c07a73b"}),
+            ),
+            (
+                400,
+                json!({"error":{"message":"Invalid option: expected one of \"low\"|\"medium\"","type":"invalid_request_error","param":"reasoning_effort"}}),
+            ),
+            (
+                400,
+                json!({"message":"invalid request error trace_id: 251c3c29761c17fdc459480ed9c68932: messages.3.content too long"}),
+            ),
+            (200, bare.clone()),
+        ] {
+            assert!(!shape_refused(status, &body), "{status} {body}");
+        }
     }
 
     #[test]

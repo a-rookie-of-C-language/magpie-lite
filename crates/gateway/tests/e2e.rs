@@ -242,21 +242,33 @@ async fn spawn_gateway_with_protocol_and_history(
     protocol: Protocol,
     history_path: Option<std::path::PathBuf>,
 ) -> String {
-    let config = Config {
-        port: 0,
-        token: "magpie-lite".into(),
-        key_cooldown_ms: 60_000,
-        stream_first_content_timeout_ms: Config::default().stream_first_content_timeout_ms,
-        stream_idle_timeout_ms: Config::default().stream_idle_timeout_ms,
-        stream_keepalive_interval_ms: Config::default().stream_keepalive_interval_ms,
-        stream_keepalive_max_silence_ms: Config::default().stream_keepalive_max_silence_ms,
-        stream_responses_hold_timeout_ms: Config::default().stream_responses_hold_timeout_ms,
-        stream_loop_guard: Config::default().stream_loop_guard,
+    spawn_gateway_with_providers_and_groups(
+        vec![(upstream_base, protocol)],
+        Vec::new(),
         history_path,
-        default_provider: "mock".into(),
-        provider: vec![ProviderConfig {
-            id: "mock".into(),
-            name: "Mock".into(),
+    )
+    .await
+}
+
+/// A gateway over the given upstreams, all named `a`, `b`, ... in order,
+/// with `mock-model` on each, and the given routes in a group `g`.
+async fn spawn_gateway_with_providers_and_groups(
+    upstreams: Vec<(String, Protocol)>,
+    group_routes: Vec<String>,
+    history_path: Option<std::path::PathBuf>,
+) -> String {
+    let mut provider = Vec::new();
+    for (i, (upstream_base, protocol)) in upstreams.into_iter().enumerate() {
+        // The single-upstream tests name their provider `mock`; a
+        // multi-upstream one is `a`, `b`, ... as its group routes say.
+        let id = if i == 0 {
+            "mock".to_string()
+        } else {
+            ((b'a' + i as u8) as char).to_string()
+        };
+        provider.push(ProviderConfig {
+            id: id.clone(),
+            name: id.to_uppercase(),
             protocol,
             base_url: if protocol == Protocol::Anthropic {
                 upstream_base.clone()
@@ -280,8 +292,34 @@ async fn spawn_gateway_with_protocol_and_history(
             weights: Vec::new(),
             affinity: Default::default(),
             key_generation: 0,
-        }],
-        group: Vec::new(),
+        });
+    }
+    let config = Config {
+        port: 0,
+        token: "magpie-lite".into(),
+        key_cooldown_ms: 60_000,
+        stream_first_content_timeout_ms: Config::default().stream_first_content_timeout_ms,
+        stream_idle_timeout_ms: Config::default().stream_idle_timeout_ms,
+        stream_keepalive_interval_ms: Config::default().stream_keepalive_interval_ms,
+        stream_keepalive_max_silence_ms: Config::default().stream_keepalive_max_silence_ms,
+        stream_responses_hold_timeout_ms: Config::default().stream_responses_hold_timeout_ms,
+        stream_loop_guard: Config::default().stream_loop_guard,
+        history_path,
+        default_provider: provider.first().map(|p| p.id.clone()).unwrap_or_default(),
+        provider,
+        group: if group_routes.is_empty() {
+            Vec::new()
+        } else {
+            vec![GroupConfig {
+                id: "g".into(),
+                name: "G".into(),
+                routes: group_routes,
+                weights: Vec::new(),
+                routing: RoutingPolicy::Order,
+                first_token_timeout_ms: 0,
+                affinity: Default::default(),
+            }]
+        },
     };
     let requests = request_log(&config);
     let state = Arc::new(AppState {
@@ -561,6 +599,64 @@ async fn a_chat_clients_max_completion_tokens_reaches_an_openai_chat_upstream() 
     let sent = last.lock().unwrap().clone().expect("upstream request");
     assert_eq!(sent["max_tokens"], 900);
     assert!(sent.get("max_completion_tokens").is_none());
+}
+
+#[tokio::test]
+async fn a_bare_trace_id_400_hands_a_group_request_to_the_next_member() {
+    // Command Code's bare 400 names nothing about the request: the key is
+    // fine, and the next member may take the same turn (#2313).
+    let (first, first_calls) = spawn_scripted(vec![(
+        400,
+        json!({"message":"invalid request error trace_id: 251c3c29761c17fdc459480ed9c68932",
+            "type":"invalid_request_error"}),
+    )])
+    .await;
+    let (second, second_calls) = spawn_scripted(Vec::new()).await;
+    let gw = spawn_gateway_with_providers_and_groups(
+        vec![(first, Protocol::Chat), (second, Protocol::Chat)],
+        vec!["mock/mock-model".into(), "b/mock-model".into()],
+        None,
+    )
+    .await;
+    let resp = reqwest::Client::new()
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({"model":"group/g",
+            "messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["choices"][0]["message"]["content"],
+        "hello"
+    );
+    assert_eq!(*first_calls.lock().unwrap(), 1);
+    assert_eq!(*second_calls.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn a_chat_tool_in_another_apis_shape_reaches_the_upstream_named() {
+    // A Chat client may send an MCP or Responses tool by mistake. It must
+    // reach a strict Chat upstream as a function tool with its name, not
+    // as a tool with none (#2622).
+    let (upstream, last) = spawn_mock().await;
+    let gw = spawn_gateway(upstream).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({"model":"mock/mock-model",
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"name":"read_file","description":"Read",
+                "inputSchema":{"type":"object"}}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sent = last.lock().unwrap().clone().expect("upstream request");
+    assert_eq!(sent["tools"][0]["type"], "function");
+    assert_eq!(sent["tools"][0]["function"]["name"], "read_file");
+    assert_eq!(sent["tools"][0]["function"]["parameters"]["type"], "object");
 }
 
 async fn rate_limited_chat() -> Response {

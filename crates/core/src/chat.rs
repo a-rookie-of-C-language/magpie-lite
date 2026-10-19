@@ -14,6 +14,7 @@ use serde_json::{Map, Value, json};
 
 mod silent;
 mod tool_pairing;
+mod tool_shape;
 
 fn missing(field: &'static str) -> CoreError {
     CoreError::MissingField(field)
@@ -70,6 +71,13 @@ fn part_to_content_block(p: &Part) -> Value {
 
 /// Decode an OpenAI Chat Completions request body.
 pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
+    let shaped;
+    let v = if v.get("tools").is_some() {
+        shaped = tool_shape::shape_chat_tools(v.clone());
+        &shaped
+    } else {
+        v
+    };
     let model = str_field(v, "model")?;
     let mut system = Vec::new();
     let mut messages = Vec::new();
