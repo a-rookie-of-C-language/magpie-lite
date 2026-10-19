@@ -121,7 +121,23 @@ pub async fn send(
     model: &str,
     stream: bool,
 ) -> anyhow::Result<reqwest::Response> {
-    let base = p.base_url.trim_end_matches('/');
+    send_at(http, p, api_key, body, model, stream, None).await
+}
+
+/// `send` with an optional base override: a continuation's DeepSeek
+/// `prefix` ask goes under `/beta`, beside the `/v1` the configured base
+/// carries.
+pub async fn send_at(
+    http: &reqwest::Client,
+    p: &ProviderConfig,
+    api_key: &str,
+    body: &Value,
+    model: &str,
+    stream: bool,
+    base_override: Option<String>,
+) -> anyhow::Result<reqwest::Response> {
+    let base = base_override.unwrap_or_else(|| p.base_url.trim_end_matches('/').to_owned());
+    let base = base.trim_end_matches('/');
     let mut req = match p.protocol {
         Protocol::Chat => http.post(format!("{base}/chat/completions")),
         Protocol::Anthropic => http.post(format!("{base}/v1/messages")),

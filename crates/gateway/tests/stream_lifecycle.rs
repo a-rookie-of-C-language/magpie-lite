@@ -1,7 +1,7 @@
 //! Real HTTP fixtures for stream termination and cancellation, not live-vendor tests.
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
@@ -108,7 +108,9 @@ fn error(protocol: Protocol) -> &'static str {
 enum Ending {
     Eof,
     Hold,
-    Reset(Arc<tokio::sync::Notify>),
+    /// Once armed, every ask's stream resets mid-reply — a continuation's
+    /// too.
+    Reset(Arc<AtomicBool>),
     Heartbeats,
     Paced(Vec<(Duration, String)>),
     PacedEof(Vec<(Duration, String)>),
@@ -280,7 +282,11 @@ impl Fixture {
                                 }
                             },
                             Ending::Reset(signal) => {
-                                signal.notified().await;
+                                // Each ask resets once armed: a mid-reply
+                                // continuation gets the same cut again.
+                                while !signal.load(Ordering::SeqCst) {
+                                    tokio::time::sleep(Duration::from_millis(5)).await;
+                                }
                                 yield Err(std::io::Error::other("fixture upstream reset"));
                             }
                         }
@@ -497,6 +503,32 @@ fn assert_partial_usage(record: &Value, protocol: Protocol) {
     }
 }
 
+/// Whether a mid-reply cut asks the same candidate to go on from what the
+/// client has (the reference's `continuation.go`): only where the
+/// upstream goes on from a reply's part sent back — an Anthropic upstream
+/// natively. A Chat upstream re-answers instead, a Gemini or Responses
+/// one isn't asked, so there a cut reply ends as it used to.
+fn mid_reply_continues(protocol: Protocol) -> bool {
+    protocol == Protocol::Anthropic
+}
+
+/// The attempts a mid-reply cut costs: one plus a continuation's tries
+/// where the reply can go on, one where it can't.
+fn cut_attempts(protocol: Protocol) -> Vec<usize> {
+    vec![0; if mid_reply_continues(protocol) { 3 } else { 1 }]
+}
+
+/// assert_partial_usage with the tries' usage summed, as a continuation
+/// bills them.
+fn assert_partial_usage_summed(record: &Value, protocol: Protocol) {
+    if mid_reply_continues(protocol) {
+        assert_eq!(record["usage"]["input"], 7 * 3);
+        assert_eq!(record["usage"]["output"], 0);
+    } else {
+        assert_partial_usage(record, protocol);
+    }
+}
+
 #[tokio::test]
 async fn terminal_markers_release_held_upstream_for_every_protocol_pair() {
     for upstream in PROTOCOLS {
@@ -560,7 +592,10 @@ async fn clean_eof_without_completion_only_succeeds_for_answered_gemini() {
                 assert_no_success(&body);
                 assert_eq!(record["status"], "upstream_stream_error");
             }
-            assert_partial_usage(&record, upstream);
+            if upstream != Protocol::Gemini {
+                assert_eq!(*f.attempts.lock().unwrap(), cut_attempts(upstream));
+            }
+            assert_partial_usage_summed(&record, upstream);
         }
     }
 }
@@ -619,7 +654,7 @@ async fn downstream_disconnect_releases_upstream_and_keeps_observed_usage() {
 async fn upstream_transport_reset_is_not_a_success_and_keeps_usage() {
     for upstream in PROTOCOLS {
         for client in PROTOCOLS {
-            let reset = Arc::new(tokio::sync::Notify::new());
+            let reset = Arc::new(AtomicBool::new(false));
             let f = Fixture::new(upstream, prefix(upstream), Ending::Reset(reset.clone())).await;
             let mut response = f.request(client).await;
             let mut body = String::new();
@@ -637,19 +672,39 @@ async fn upstream_transport_reset_is_not_a_success_and_keeps_usage() {
             .expect("no text before reset");
             // Wait for downstream text so this is a mid-body transport failure,
             // not a connection/header failure or an accidental prefetch race.
-            reset.notify_one();
+            reset.store(true, Ordering::SeqCst);
             body.push_str(
-                &tokio::time::timeout(LIMIT, response.text())
+                // A continuation's asks pause a second apiece between tries.
+                &tokio::time::timeout(LIMIT * 2, response.text())
                     .await
                     .unwrap()
                     .unwrap(),
             );
-            assert!(body.contains("upstream stream read failed"), "{body}");
+            // A continued try's own transport failure reads differently;
+            // the reply ends with an error either way.
+            assert!(
+                body.contains("upstream stream read failed")
+                    || body.contains("reask could not reach upstream"),
+                "{body}"
+            );
             assert!(!body.contains("fixture upstream reset"));
             assert_no_success(&body);
             let record = f.record().await;
             assert_eq!(record["status"], "upstream_stream_error");
-            assert_partial_usage(&record, upstream);
+            // A continued try's transport cut ends the reply rather than
+            // ask a third time.
+            assert_eq!(
+                *f.attempts.lock().unwrap(),
+                vec![0; if mid_reply_continues(upstream) { 2 } else { 1 }]
+            );
+            if mid_reply_continues(upstream) {
+                // The continued try was cut before it said a thing:
+                // nothing of it is billed.
+                assert_eq!(record["usage"]["input"], 7);
+                assert_eq!(record["usage"]["output"], 0);
+            } else {
+                assert_partial_usage(&record, upstream);
+            }
             f.assert_released().await;
         }
     }
@@ -678,7 +733,9 @@ async fn chat_sentinel_is_not_a_completion_marker_in_other_protocols() {
             "upstream stream ended before a completion marker"
         };
         assert!(body.contains(message), "{body}");
-        assert_eq!(*f.attempts.lock().unwrap(), [0]);
+        // An Anthropic upstream goes on from the reply's part sent back,
+        // so the cut is re-asked of it until the tries are up.
+        assert_eq!(*f.attempts.lock().unwrap(), cut_attempts(upstream));
         assert_no_success(&body);
         assert_eq!(f.record().await["status"], "upstream_stream_error");
     }
@@ -1278,11 +1335,13 @@ async fn oversized_frames_after_content_never_retry_and_keep_partial_usage() {
         assert!(body.contains("partial"));
         assert_eq!(body.matches("upstream SSE event exceeds").count(), 1);
         assert_no_success(&body);
-        assert_eq!(*f.attempts.lock().unwrap(), vec![0]);
+        // Where the reply can go on from its part, the cut is asked again
+        // of the same candidate before it ends with the error.
+        assert_eq!(*f.attempts.lock().unwrap(), cut_attempts(upstream));
         let record = f.record().await;
         assert_eq!(record["status"], "upstream_stream_error");
         assert_eq!(record["provider"], "mock");
-        assert_partial_usage(&record, upstream);
+        assert_partial_usage_summed(&record, upstream);
         f.assert_released().await;
     }
 }
@@ -1485,10 +1544,12 @@ async fn stalled_streams_after_content_timeout_without_retry_and_retain_usage() 
                 "{body}"
             );
             assert_no_success(&body);
-            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            // Where the reply can go on, its part is sent back to the same
+            // stalled candidate before the error ends it.
+            assert_eq!(*f.attempts.lock().unwrap(), cut_attempts(upstream));
             let record = f.record().await;
             assert_eq!(record["status"], "upstream_stream_error");
-            assert_partial_usage(&record, upstream);
+            assert_partial_usage_summed(&record, upstream);
             f.assert_released().await;
         }
     }
@@ -2419,8 +2480,13 @@ async fn keepalive_never_extends_first_content_or_read_idle_deadlines() {
                         "upstream first-content timeout"
                     },
                 );
+                // A mode-1 cut mid-reply is asked to go on where the
+                // upstream takes a prefill: a pause a try, not the
+                // deadline restarted.
+                let continued = mode == 1 && mid_reply_continues(upstream);
                 assert!(
-                    start.elapsed() < Duration::from_secs(2),
+                    start.elapsed()
+                        < Duration::from_secs(2) + Duration::from_secs(3 * continued as u64),
                     "comments restarted deadline"
                 );
                 let record = f.record().await;
@@ -2432,7 +2498,14 @@ async fn keepalive_never_extends_first_content_or_read_idle_deadlines() {
                         "upstream_stream_error"
                     }
                 );
-                assert_eq!(*f.attempts.lock().unwrap(), vec![0]);
+                assert_eq!(
+                    *f.attempts.lock().unwrap(),
+                    if continued {
+                        cut_attempts(upstream)
+                    } else {
+                        vec![0]
+                    }
+                );
                 f.assert_released().await;
             }
         }
@@ -3848,15 +3921,27 @@ async fn loop_guard_ends_text_and_reasoning_without_retry_for_every_protocol_pai
                     assert!(body.contains("Now."), "{body}");
                     assert!(!body.contains("SHOULD-NOT-LEAK"), "{body}");
                     assert_no_success(&body);
+                    // A looped reasoning ends as it did; a looped text is
+                    // a cut mid-reply, asked to go on where the upstream
+                    // takes a prefill and nobody else answers for it.
+                    let replays = !reasoning && !grouped && mid_reply_continues(upstream);
                     assert_eq!(
                         *f.attempts.lock().unwrap(),
-                        [0],
-                        "no key/provider/group replay"
+                        if replays {
+                            cut_attempts(upstream)
+                        } else {
+                            vec![0]
+                        },
+                        "unexpected key/provider/group replay"
                     );
                     let record = f.record().await;
                     assert_eq!(record["status"], "upstream_stream_error");
                     assert_eq!(record["provider"], "mock");
-                    assert_partial_usage(&record, upstream);
+                    if replays {
+                        assert_partial_usage_summed(&record, upstream);
+                    } else {
+                        assert_partial_usage(&record, upstream);
+                    }
                     assert!(!record.to_string().contains("Now."));
                     assert!(
                         f.state
@@ -4069,7 +4154,10 @@ async fn loop_guard_checks_unterminated_final_frame_without_success_or_replay() 
                 .unwrap();
             assert_one_stream_error(&body, client, "model's text was stuck in a loop");
             assert_no_success(&body);
-            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            // The reply had begun when its text looped: where it can go
+            // on, the same candidate is asked again before the error ends
+            // it.
+            assert_eq!(*f.attempts.lock().unwrap(), cut_attempts(upstream));
             assert_eq!(f.record().await["status"], "upstream_stream_error");
             f.assert_released().await;
         }
@@ -4655,7 +4743,13 @@ async fn reasoning_reask_opening_and_http_error_body_share_first_content_deadlin
                 .unwrap()
                 .unwrap();
             assert_one_stream_error(&body, client, "upstream first-content timeout");
-            assert_eq!(*f.attempts.lock().unwrap(), [0, 0]);
+            // A timed-out second try is a cut after reasoning the client
+            // has: where it goes on from a prefill it is asked again.
+            let continued = !http_error && mid_reply_continues(client);
+            assert_eq!(
+                *f.attempts.lock().unwrap(),
+                vec![0; if continued { 4 } else { 2 }]
+            );
             let record = f.record().await;
             assert_eq!(record["status"], "upstream_stream_error");
             assert_eq!(
@@ -4663,12 +4757,21 @@ async fn reasoning_reask_opening_and_http_error_body_share_first_content_deadlin
                 if client == Protocol::Responses {
                     Value::Null
                 } else {
-                    json!(if http_error { 7 } else { 14 })
+                    json!(if http_error {
+                        7
+                    } else if continued {
+                        28
+                    } else {
+                        14
+                    })
                 }
             );
             let stats = f.log.lock().unwrap().snapshot();
             let key = &stats.providers["mock"].keys["0"];
-            assert_eq!((key.attempts, key.successes, key.errors), (2, 1, 1));
+            assert_eq!(
+                (key.attempts, key.successes, key.errors),
+                if continued { (4, 1, 3) } else { (2, 1, 1) }
+            );
             assert!(
                 f.state
                     .key_rotation

@@ -4,6 +4,7 @@ pub mod affinity;
 pub mod agents;
 pub mod config;
 pub mod config_store;
+mod continuation;
 pub mod cooldown;
 mod deepseek_schema;
 mod edge_block;

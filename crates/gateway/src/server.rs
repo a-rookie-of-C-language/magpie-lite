@@ -2274,6 +2274,7 @@ async fn reask_stream(
     tracker: &mut RequestTracker,
     liveness: &StreamLiveness,
     pause: Duration,
+    continuation: Option<&crate::continuation::Continuation>,
 ) -> Result<UpstreamEvents, String> {
     tracker.begin_reask();
     tokio::time::sleep(pause).await;
@@ -2284,21 +2285,29 @@ async fn reask_stream(
         .into_iter()
         .nth(candidate.key_slot)
         .ok_or_else(|| "reask key is no longer available".to_owned())?;
-    let body = upstream::build_request(&candidate.provider, creq, &candidate.model)
+    let request = match continuation {
+        Some(cont) => cont.request(creq),
+        None => creq.clone(),
+    };
+    let mut body = upstream::build_request(&candidate.provider, &request, &candidate.model)
         .map_err(|error| error.to_string())?;
+    if let Some(cont) = continuation {
+        cont.mark(&mut body);
+    }
     let clock = StreamClock::new(
         config.stream_first_content_timeout_ms,
         config.stream_idle_timeout_ms,
     );
     liveness.activity.attempt();
     let response = match clock
-        .headers(upstream::send(
+        .headers(upstream::send_at(
             &state.http,
             &candidate.provider,
             &api_key,
             &body,
             &candidate.model,
             true,
+            continuation.map(|c| c.base_url(&candidate.provider)),
         ))
         .await
     {
@@ -2334,6 +2343,26 @@ async fn reask_stream(
         if stream_refusal::policy_error(&detail.body) {
             tracker.record_attempt(&candidate.provider.id, candidate.key_slot, "refusal");
             return Err(REFUSAL.to_owned());
+        }
+        // A model that takes no prefill turned the continuation's ask
+        // away: remember it so the reply isn't asked to go on again, and
+        // end it with what cut it, not with a refusal of an ask the
+        // client never made (the reference's `refusesPrefill`, #1447).
+        if continuation.is_some()
+            && crate::continuation::refuses_prefill(status.as_u16(), &detail.body)
+        {
+            tracker.record_attempt(
+                &candidate.provider.id,
+                candidate.key_slot,
+                "prefill_refused",
+            );
+            unfit_fields::refuse(
+                &candidate.provider.id,
+                &candidate.model,
+                candidate.provider.protocol.as_str(),
+                &crate::continuation::prefill_refused_field(&candidate.model),
+            );
+            return Err(crate::continuation::PREFILL_REFUSED.to_owned());
         }
         tracker.record_attempt(
             &candidate.provider.id,
@@ -2821,6 +2850,28 @@ async fn proxy_parsed(
         };
 
         let reask_candidate = candidate.clone();
+        // A reply the upstream's stream cut mid-way is asked of the same
+        // candidate again, going on from what the client already has —
+        // only where the upstream goes on from a reply's part sent back
+        // (the reference's `continuation.go`).
+        let mut cont = crate::continuation::Continuation::new({
+            let mode =
+                crate::continuation::prefill_how(&reask_candidate.provider, &reask_candidate.model);
+            if !mode.is_empty()
+                && unfit_fields::unfit(
+                    &reask_candidate.provider.id,
+                    &reask_candidate.model,
+                    reask_candidate.provider.protocol.as_str(),
+                    &crate::continuation::prefill_refused_field(&reask_candidate.model),
+                )
+            {
+                // The model turned a prefill away before: don't ask it to
+                // go on.
+                ""
+            } else {
+                mode
+            }
+        });
         // Grok writes a whole number in a call's arguments as 2500.0, which a
         // client that types its arguments strictly turns away. The rule is
         // per reply, and follows the model the client named or the one the
@@ -2835,6 +2886,7 @@ async fn proxy_parsed(
             let mut reasked = false;
             let mut reasoning_reasked = false;
             let mut continued = empty_retries > 0;
+            let mut stream_retries = 0usize;
             let mut usage_since_retry = false;
             let empty_limit = if group_plan.is_some() { 1 } else { 2 };
             let mut emitted_answer = false;
@@ -2864,6 +2916,97 @@ async fn proxy_parsed(
                     let answer = event.is_answer();
                     emitted_answer |= answer || item.answer_observed;
 
+                    // A cut mid-reply — the client already has something
+                    // of it — is asked to go on from there: hold its
+                    // error out of the reply while it may yet go on (the
+                    // reference's `cut`), unless the error is what the
+                    // client must see as it is: a refusal, a named code
+                    // it may act on, or the loop guard's own end; nor is
+                    // the ask repeated where it just failed the same way
+                    // — a 400, a 404, a 422 the same conversation gets
+                    // again.
+                    if let StreamEvent::Error { code, .. } = &event
+                        && cont.possible()
+                        && group_plan.is_none()
+                        && code.is_none()
+                        && !item.loop_reasoning
+                        && !item
+                            .failure
+                            .as_ref()
+                            .is_some_and(|f| f.kind == FailureKind::Refusal)
+                        && cont.again(
+                            item.failure.as_ref().map_or(0, |f| f.status.as_u16()),
+                            false,
+                            stream_retries,
+                        )
+                    {
+                        drop(events);
+                        reasked = true;
+                        continued = true;
+                        integral.reset();
+                        usage_since_retry = false;
+                        stream_retries += 1;
+                        match reask_stream(
+                            &state,
+                            &config,
+                            &creq,
+                            &reask_candidate,
+                            &mut tracker,
+                            &liveness,
+                            Duration::from_secs(1),
+                            Some(&cont),
+                        ).await {
+                            Ok(next_events) => {
+                                events = next_events;
+                                continue 'attempt;
+                            }
+                            Err(message) => {
+                                // The prefill itself was turned away: the
+                                // reply ends with what cut it, as a reply
+                                // that can't go on does.
+                                let message = if message == crate::continuation::PREFILL_REFUSED {
+                                    match &event {
+                                        StreamEvent::Error { message, .. } => message.clone(),
+                                        _ => message,
+                                    }
+                                } else {
+                                    message
+                                };
+                                tracker.finish("upstream_stream_error", &Usage::default());
+                                let error = StreamEvent::Error {
+                                    message,
+                                    code: None,
+                                };
+                                if let Some(frame) = encoder.encode(&error) {
+                                    yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                                }
+                                return;
+                            }
+                        }
+                    }
+
+                    // A continuation's reply doesn't say its framing or
+                    // its reasoning again, and a full echo of the text it
+                    // was prefilled with is dropped (the reference's
+                    // `emit`/`unecho`); what the model says instead of
+                    // echoing goes whole.
+                    if cont.resume {
+                        match &mut event {
+                            StreamEvent::ThinkingDelta { .. }
+                            | StreamEvent::ThinkingStart { .. }
+                            | StreamEvent::Sealed { .. }
+                            | StreamEvent::Signature { .. } => continue,
+                            StreamEvent::TextDelta { text } => {
+                                *text = cont.unecho(std::mem::take(text));
+                                if text.is_empty() {
+                                    continue;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    cont.add(&event);
+
                     let retry_reasoning = item.loop_reasoning && !reasoning_reasked && !emitted_answer;
                     let retry_empty = reask_allowed && item.failure.as_ref().is_some_and(|f| f.kind == FailureKind::EmptyReply)
                         && empty_retries < empty_limit && !emitted_answer;
@@ -2890,6 +3033,7 @@ async fn proxy_parsed(
                             &mut tracker,
                             &liveness,
                             pause,
+                            None,
                         ).await {
                             Ok(next_events) => {
                                 events = next_events;
