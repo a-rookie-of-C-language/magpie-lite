@@ -256,6 +256,7 @@ async fn fixture() -> Fixture {
             name: "Daily".into(),
             routes: vec!["mock/mock-model".into()],
             rules: Vec::new(),
+            classifier: String::new(),
             weights: Vec::new(),
             routing: RoutingPolicy::Rotate,
             first_token_timeout_ms: 0,

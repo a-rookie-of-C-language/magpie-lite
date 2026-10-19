@@ -619,7 +619,7 @@ async fn group_rules_round_trip_and_reject_bad_shapes() {
         (
             "greedy-pause",
             json!([{"use": "mock/first", "pause": true, "images": true}]),
-            "hours, days or agents only",
+            "agents or folders only",
         ),
     ] {
         let mut body = group(name, "first");

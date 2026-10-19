@@ -2,6 +2,7 @@
 
 pub mod affinity;
 pub mod agents;
+pub mod classify;
 pub mod config;
 pub mod config_store;
 mod continuation;

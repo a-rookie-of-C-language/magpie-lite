@@ -9,6 +9,11 @@
 //! with an intent is accepted in config but matches nothing yet — as an
 //! unanswerable classifier does upstream — while every other condition of the
 //! rule still applies.
+//!
+//! The classifier is any model lite serves, asked through lite itself (see
+//! `classify.rs`); when it cannot say, no intent matches. Lite has no
+//! decision providers or decision groups, no per-turn effort judging
+//! (`effort: auto`), and no `useEffort` pairing of model and reasoning.
 
 use magpie_core::ir::{CompletionRequest, PartKind, Role};
 use serde::{Deserialize, Serialize};
@@ -52,8 +57,8 @@ pub struct Rule {
     #[serde(default)]
     pub agents: Vec<String>,
     /// The user's message at the turn's start is of this kind, as the
-    /// group's classifier judges it. Unanswerable in lite until the
-    /// classifier is ported: a rule with one never matches.
+    /// group's classifier judges it. When the classifier cannot say, it
+    /// does not match.
     #[serde(default)]
     pub intent: String,
     /// The agent is compacting its conversation — asking a model to
@@ -66,8 +71,15 @@ pub struct Rule {
     /// The request's working folder is one of these or inside one.
     #[serde(default)]
     pub folders: Vec<String>,
+    /// The request's working folder is none of these nor inside one, as
+    /// [`Self::folders`] reads them. A request whose agent says no folder
+    /// is not known to be in one, so it holds for it.
+    #[serde(default, rename = "exceptFolders")]
+    pub except_folders: Vec<String>,
     /// Rather than sending to `use` first, leave it out of the group while
-    /// the rule holds. Only `time` and `agents` may be its conditions.
+    /// the rule holds. Only `time`, `agents`, `folders` and
+    /// `except_folders` may be its conditions: a pause keeps the model out
+    /// whatever the request asks for.
     #[serde(default)]
     pub pause: bool,
 }
@@ -233,6 +245,9 @@ impl Rule {
         if !self.folders.is_empty() {
             out.push(format!("folder {}", self.folders.join("|")));
         }
+        if !self.except_folders.is_empty() {
+            out.push(format!("not folder {}", self.except_folders.join("|")));
+        }
         out
     }
 
@@ -261,6 +276,17 @@ impl Rule {
             }
         }
         self.folders = folders;
+        let mut except = Vec::new();
+        for p in &self.except_folders {
+            if p.trim().is_empty() {
+                continue;
+            }
+            let c = clean_folder(p).map_err(|e| format!("rule {n}: {e}"))?;
+            if !except.contains(&c) {
+                except.push(c);
+            }
+        }
+        self.except_folders = except;
         if let Some(t) = &mut self.time {
             let mut w = t.clone();
             w.clean().map_err(|e| format!("rule {n}: {e}"))?;
@@ -302,11 +328,10 @@ impl Rule {
                 || self.images
                 || !self.effort.is_empty()
                 || !self.intent.is_empty()
-                || self.compact
-                || !self.folders.is_empty())
+                || self.compact)
         {
             return Err(format!(
-                "rule {n}: a pause holds by hours, days or agents only"
+                "rule {n}: a pause holds by hours, days, agents or folders only"
             ));
         }
         Ok(())
@@ -315,9 +340,9 @@ impl Rule {
     /// Whether the request is one the rule sends to its member first
     /// (`Matches`); a pause rule sends none.
     pub fn matches(&self, q: &RuleRequest) -> bool {
-        // Lite has no classifier yet: a rule with an intent waits on an
-        // answer none gives, as upstream's does when it can't say.
-        if !self.intent.is_empty() {
+        // A rule with an intent waits on the classifier's answer for the
+        // turn; when it cannot say (`q.intent` empty), nothing matches.
+        if !self.intent.is_empty() && !self.intent.eq_ignore_ascii_case(&q.intent) {
             return false;
         }
         self.matches_besides_intent(q)
@@ -350,6 +375,15 @@ impl Rule {
         {
             return false;
         }
+        // Outside every `exceptFolders`: an unknown folder ("") is under
+        // none, so it is outside them (`inFolders`).
+        if self
+            .except_folders
+            .iter()
+            .any(|root| folder_under(&q.folder, root))
+        {
+            return false;
+        }
         match self.effort.as_str() {
             "" => {}
             "on" => {
@@ -375,13 +409,29 @@ impl Rule {
     }
 
     /// Whether a pause rule holds for a request from `agent` at `at`
-    /// (`Pauses`).
-    pub fn pauses(&self, agent: &str, at: Option<(u32, usize)>) -> bool {
-        if !self.pause || (self.time.is_none() && self.agents.is_empty()) {
+    /// (`Pauses`): by the clock, the agent, and the folder it says it is
+    /// in — never what the request asks for.
+    pub fn pauses(&self, agent: &str, folder: &str, at: Option<(u32, usize)>) -> bool {
+        if !self.pause
+            || (self.time.is_none()
+                && self.agents.is_empty()
+                && self.folders.is_empty()
+                && self.except_folders.is_empty())
+        {
             return false;
         }
         if let Some(t) = &self.time
             && !t.holds(at)
+        {
+            return false;
+        }
+        if !self.folders.is_empty() && !self.folders.iter().any(|root| folder_under(folder, root)) {
+            return false;
+        }
+        if self
+            .except_folders
+            .iter()
+            .any(|root| folder_under(folder, root))
         {
             return false;
         }
@@ -413,6 +463,7 @@ pub fn paused_out(
     rules: &[Rule],
     routes: Vec<String>,
     agent: &str,
+    folder: &str,
     at: Option<(u32, usize)>,
 ) -> Vec<String> {
     if !rules.iter().any(|r| r.pause) {
@@ -423,7 +474,7 @@ pub fn paused_out(
         .filter(|route| {
             !rules
                 .iter()
-                .any(|r| &r.use_ == route && r.pauses(agent, at))
+                .any(|r| &r.use_ == route && r.pauses(agent, folder, at))
         })
         .collect()
 }
@@ -439,6 +490,9 @@ pub struct RuleRequest {
     pub effort: String,
     /// The agent, as [`agent_of`] names it.
     pub agent: String,
+    /// The one of the rules' intents the classifier said the turn's
+    /// message is; "" when it could not say (`Intent`).
+    pub intent: String,
     /// The agent compacting its conversation.
     pub compact: bool,
     /// (minutes past midnight, weekday 0 = Sunday) in local time; `None` is
@@ -447,6 +501,29 @@ pub struct RuleRequest {
     /// The working folder the agent says the request is from; "" is in no
     /// rule's folders.
     pub folder: String,
+}
+
+/// The intents the classifier is to choose among for `q`: those of the
+/// rules that match it but for intent, in order, stopping at the first
+/// rule with none — a classifier is asked only when a rule that could be
+/// the first to match waits on its intent (`Intents`).
+pub fn intents(rules: &[Rule], q: &RuleRequest) -> Vec<String> {
+    let mut out = Vec::new();
+    for r in rules {
+        if !r.matches_besides_intent(q) {
+            continue;
+        }
+        if r.intent.is_empty() {
+            break;
+        }
+        if !out
+            .iter()
+            .any(|s: &String| s.eq_ignore_ascii_case(&r.intent))
+        {
+            out.push(r.intent.clone());
+        }
+    }
+    out
 }
 
 // ---- working folder ------------------------------------------------------
@@ -877,6 +954,9 @@ struct TurnRule {
     use_: String,
     /// The rule that matched, 0-based, when one did.
     n: Option<usize>,
+    /// What the classifier said the turn's message is, for a follow-up
+    /// carrying on from it.
+    intent: String,
     at: std::time::Instant,
     /// The tokens the vendor counted the conversation's last request as.
     input: u64,
@@ -926,20 +1006,39 @@ pub struct RuleHit {
 }
 
 /// The conversation a group's rules keep a turn's decision for: the agent's
-/// session and the conversation's first words, as the reference's `ruleKey`.
+/// session and the conversation's first words, as the reference's
+/// `ruleKey`. Only what the user said is taken (the first user message
+/// that has any) — not what the agent put in beside it, which an agent
+/// changes as the conversation goes on — so the key stays the same for
+/// the conversation's whole life (`firstWords`, #1826). A conversation
+/// the user said nothing in yet goes by its first user message's text.
 fn rule_key(group_id: &str, conversation: &str, req: &CompletionRequest) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
+    let mut keyed = false;
     for m in &req.messages {
         if m.role != Role::User {
             continue;
         }
-        for p in &m.parts {
-            if p.kind() == PartKind::Text {
-                h.update(p.text.as_bytes());
-            }
+        let said = crate::classify::user_said(&m.parts);
+        if !said.is_empty() {
+            h.update(said.as_bytes());
+            keyed = true;
+            break;
         }
-        break;
+    }
+    if !keyed {
+        for m in &req.messages {
+            if m.role != Role::User {
+                continue;
+            }
+            for p in &m.parts {
+                if p.kind() == PartKind::Text {
+                    h.update(p.text.as_bytes());
+                }
+            }
+            break;
+        }
     }
     let sum = h.finalize();
     let hex12: String = sum[..12].iter().map(|b| format!("{b:02x}")).collect();
@@ -957,28 +1056,39 @@ pub fn local_clock() -> Option<(u32, usize)> {
     ))
 }
 
-/// The rule a group request goes by (`ruleFor`, lite's flat form — no
-/// groups inside groups, no classifier, so `intent` never matches). At a
-/// turn's start the first matching rule decides; within the turn — tool
-/// results going back — what it decided holds, unless the conversation
-/// outgrew that model's window and a rule sends it to one with more room.
-///
-/// `windows` are the context windows of the group's routes by route id, for
-/// the outgrowth check and a compaction's too-small pass-over; a member
-/// with none (`0` or absent) is never left for it.
-pub fn rule_for(
-    group_id: &str,
+/// What the vendor counted a turn's last request as, a floor for the next
+/// one's estimate (`ruleAnswered` kept it); 0 when nothing was answered.
+fn turn_input(group_id: &str, conversation: &str, req: &CompletionRequest) -> u64 {
+    let key = rule_key(group_id, conversation, req);
+    let map = TURN_RULES.lock().unwrap();
+    map.get(&key)
+        .filter(|tr| tr.at.elapsed() <= STICK_KEEP)
+        .map(|tr| tr.input)
+        .unwrap_or(0)
+}
+
+/// The intent the group's classifier gave the conversation's turn, "" when
+/// none was asked or answered: a short follow-up carrying on from it is
+/// judged as of its kind (`turnRule.intent`, the reference's `tr.intent`).
+pub fn turn_intent(group_id: &str, conversation: &str, req: &CompletionRequest) -> String {
+    let key = rule_key(group_id, conversation, req);
+    let map = TURN_RULES.lock().unwrap();
+    map.get(&key)
+        .filter(|tr| tr.at.elapsed() <= STICK_KEEP)
+        .map(|tr| tr.intent.clone())
+        .unwrap_or_default()
+}
+
+/// What the group's rules look at in `req`: the estimate floored by what
+/// the vendor counted last, images anywhere in it, the folder when a rule
+/// holds by folder, and a compaction as its own match (`q` in ruleFor).
+pub fn rule_query(
     rules: &[Rule],
+    group_id: &str,
     req: &CompletionRequest,
     agent: &str,
     conversation: &str,
-    windows: &HashMap<String, u64>,
-) -> Option<RuleHit> {
-    if rules.is_empty() {
-        return None;
-    }
-    let (turn, within) = crate::affinity::turn_of(req);
-    let now = std::time::Instant::now();
+) -> RuleRequest {
     let size = crate::roomy::estimate(req);
     let mut q = RuleRequest {
         tokens: size,
@@ -998,20 +1108,61 @@ pub fn rule_for(
             break;
         }
     }
+    // what the vendor counted last, a floor
+    let floor = turn_input(group_id, conversation, req);
+    if floor > q.tokens {
+        q.tokens = floor;
+    }
+    if rules
+        .iter()
+        .any(|r| !r.folders.is_empty() || !r.except_folders.is_empty())
+    {
+        q.folder = work_dir(req);
+    }
+    if rules.iter().any(|r| r.compact) && compacting(req) {
+        q.compact = true;
+    }
+    q
+}
+
+/// The rule a group request goes by (`ruleFor`, lite's flat form — no
+/// groups inside groups). At a turn's start the first matching rule
+/// decides; within the turn — tool results going back — what it decided
+/// holds, unless the conversation outgrew that model's window and a rule
+/// sends it to one with more room.
+///
+/// `windows` are the context windows of the group's routes by route id, for
+/// the outgrowth check and a compaction's too-small pass-over; a member
+/// with none (`0` or absent) is never left for it.
+///
+/// `intent` is what the group's classifier said the turn's message is, ""
+/// when it could not say or was not asked; a rule with an intent of its
+/// own only matches that. Within the turn the stored intent is gone by —
+/// the classifier is only asked as the turn begins — whatever `intent`
+/// says.
+pub fn rule_for(
+    group_id: &str,
+    rules: &[Rule],
+    req: &CompletionRequest,
+    agent: &str,
+    conversation: &str,
+    windows: &HashMap<String, u64>,
+    intent: &str,
+) -> Option<RuleHit> {
+    if rules.is_empty() {
+        return None;
+    }
+    let (turn, within) = crate::affinity::turn_of(req);
+    let now = std::time::Instant::now();
+    let size = crate::roomy::estimate(req);
+    let mut q = rule_query(rules, group_id, req, agent, conversation);
+    q.intent = intent.to_owned();
     let key = rule_key(group_id, conversation, req);
     let mut map = TURN_RULES.lock().unwrap();
     let tr = map
         .get(&key)
         .filter(|tr| now.duration_since(tr.at) <= STICK_KEEP)
         .cloned();
-    if let Some(tr) = &tr
-        && tr.input > q.tokens
-    {
-        q.tokens = tr.input; // what the vendor counted last, a floor
-    }
-    if rules.iter().any(|r| !r.folders.is_empty()) {
-        q.folder = work_dir(req);
-    }
     let mut hit = RuleHit {
         turn,
         tokens: q.tokens,
@@ -1052,6 +1203,9 @@ pub fn rule_for(
     if within {
         // the same turn: what was decided as it began, while the group
         // still has that rule; else nothing moves it
+        if let Some(tr) = &tr {
+            q.intent = tr.intent.clone(); // as the classifier said when the turn began
+        }
         match &tr {
             None => hit.waits = true,
             Some(tr) if tr.turn != turn && turn > 0 => hit.waits = true,
@@ -1097,6 +1251,7 @@ pub fn rule_for(
                     turn,
                     use_: hit.use_.clone(),
                     n: hit.n,
+                    intent: q.intent.clone(),
                     at: now,
                     input: tr.as_ref().map(|t| t.input).unwrap_or(0),
                     size,
@@ -1125,6 +1280,7 @@ pub fn rule_for(
             turn,
             use_: hit.use_.clone(),
             n: hit.n,
+            intent: q.intent.clone(),
             at: now,
             input: tr.as_ref().map(|t| t.input).unwrap_or(0),
             size,

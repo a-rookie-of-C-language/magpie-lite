@@ -152,6 +152,10 @@ enum GroupCommand {
         /// they match; a `"pause":true` rule leaves its member out instead.
         #[arg(long = "rule", num_args = 1)]
         rules: Vec<String>,
+        /// The model judging the rules' intents (`provider/model`); a rule
+        /// with an intent needs it.
+        #[arg(long, default_value = "")]
+        classifier: String,
     },
     /// List configured groups.
     List,
@@ -426,6 +430,7 @@ async fn main() -> Result<()> {
                     first_token_timeout_ms,
                     affinity,
                     rules,
+                    classifier,
                 } => {
                     let path = provider_path(&cli.config)?;
                     let mut cfg = Config::load(&path)?;
@@ -441,12 +446,14 @@ async fn main() -> Result<()> {
                         name: name.unwrap_or_default(),
                         routes,
                         rules: parsed,
+                        classifier: classifier.trim().to_owned(),
                         weights: route_weights,
                         routing,
                         first_token_timeout_ms,
                         affinity,
                     };
                     group.validate()?;
+                    group.check_classifier(&cfg)?;
                     for route in &group.routes {
                         let provider = route.split_once('/').unwrap().0;
                         if cfg.provider(provider).is_none() {
@@ -487,6 +494,9 @@ async fn main() -> Result<()> {
                             let marker = if i == 0 { "route" } else { "fallback" };
                             let weight = g.weights.get(i).copied().unwrap_or(1);
                             println!("{:<26} {marker} {route} (weight: {weight})", "");
+                        }
+                        if !g.classifier.is_empty() {
+                            println!("{:<26} classifier {}", "", g.classifier);
                         }
                         for (i, rule) in g.rules.iter().enumerate() {
                             let kind = if rule.pause { "rule (pause)" } else { "rule" };

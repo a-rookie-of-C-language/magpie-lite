@@ -372,6 +372,9 @@ fn validate_group(config: &Config, group: &mut GroupConfig) -> Result<(), (Statu
     group
         .validate()
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    group
+        .check_classifier(config)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     for route in &group.routes {
         let provider = route.split_once('/').expect("validated route").0;
         if config.provider(provider).is_none() {
@@ -910,7 +913,7 @@ fn give_way_to_free_lanes(state: &AppState, routes: &mut Vec<UpstreamRoute>) {
 /// The agent-facing protocol a request arrived in. Beside decoding, this
 /// chooses the reply encoder and the error body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClientWire {
+pub(crate) enum ClientWire {
     Chat { include_usage: bool },
     Anthropic,
     Responses,
@@ -1483,8 +1486,114 @@ impl From<StreamEvent> for UpstreamEvent {
 /// Send to the initial provider's key pool, then its fallback routes. All
 /// routing decisions happen before a successful response body is streamed, so
 /// an agent never receives a half-finished answer from an abandoned provider.
+/// Ask a classifier model through the gateway itself which of `intents` a
+/// message is, as a client would. Every model goes through the gateway —
+/// lite has no decision providers answering a separate protocol — with the
+/// router's User-Agent, so the call shows in the usage as lite's own.
+/// Anything but a numbered answer is the classifier being up but
+/// unanswering, never rested for.
+///
+/// The gateway asking itself cannot name `proxy_parsed` here: its future
+/// reaches `send_with_fallback`, which reaches this call — naming the
+/// concrete future on both sides is an unprovable `Send` cycle (E0391).
+/// The call crosses a `dyn` boundary instead, which erases it.
+pub(crate) trait SelfCall: Send + Sync {
+    fn call(
+        &self,
+        headers: HeaderMap,
+        body: Value,
+        bytes: Bytes,
+        wire: ClientWire,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>>;
+}
+/// How the gateway calls itself: the router's entry point with shared
+/// state, behind [`SelfCall`] so no future type names another.
+#[derive(Clone)]
+struct GatewayCaller {
+    state: Arc<AppState>,
+}
+impl SelfCall for GatewayCaller {
+    fn call(
+        &self,
+        headers: HeaderMap,
+        body: Value,
+        bytes: Bytes,
+        wire: ClientWire,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+        Box::pin(proxy_parsed(self.state.clone(), headers, body, bytes, wire))
+    }
+}
+async fn ask_classifier(
+    caller: std::sync::Arc<dyn SelfCall>,
+    model: String,
+    intents: Vec<String>,
+    prev: crate::classify::Before,
+    text: String,
+) -> Result<crate::classify::Verdict, crate::classify::AskError> {
+    use crate::classify::{AskError, CLASSIFY_TIMEOUT, Verdict};
+    let body = crate::classify::classify_body(&model, &intents, &prev, &text);
+    let bytes =
+        Bytes::from(serde_json::to_vec(&body).map_err(|e| AskError::Failed(e.to_string()))?);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::USER_AGENT,
+        header::HeaderValue::from_static(crate::classify::ROUTER_AGENT),
+    );
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/json"),
+    );
+    // The gateway asking itself: the future type would otherwise name
+    // `send_with_fallback` through `proxy_parsed`, which names this call
+    // again — an unprovable `Send` cycle (E0391). Erase it at the box.
+    let response = tokio::time::timeout(
+        CLASSIFY_TIMEOUT,
+        caller.call(
+            headers,
+            body,
+            bytes,
+            ClientWire::Chat {
+                include_usage: false,
+            },
+        ),
+    )
+    .await
+    .map_err(|_| AskError::Failed(format!("the classifier {model} took longer than 8s")))?;
+    let (parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, 8 * 1024 * 1024)
+        .await
+        .map_err(|e| AskError::Failed(format!("the classifier {model} gave no body: {e}")))?;
+    if !parts.status.is_success() {
+        let mut short: String = String::from_utf8_lossy(&bytes).chars().take(120).collect();
+        if bytes.len() > 120 {
+            short.push('…');
+        }
+        return Err(AskError::Failed(format!(
+            "the classifier {model} answered {}: {short}",
+            parts.status.as_u16()
+        )));
+    }
+    let value: Value =
+        serde_json::from_slice(&bytes).map_err(|e| AskError::Failed(e.to_string()))?;
+    let answer = match value.pointer("/choices/0/message/content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => {
+            return Err(AskError::Failed(format!(
+                "the classifier {model} answered without text"
+            )));
+        }
+    };
+    crate::classify::read_intent(&answer, &intents)
+        .map(|intent| Verdict { intent })
+        .map_err(AskError::Answered)
+}
 async fn send_with_fallback(
-    state: &AppState,
+    state: &Arc<AppState>,
     config: &Config,
     creq: &CompletionRequest,
     wire: ClientWire,
@@ -1513,6 +1622,16 @@ async fn send_with_fallback(
         && let Some(group) = config.group(&plan.id)
         && !group.rules.is_empty()
     {
+        // A pause by folder needs the folder the request says it is from.
+        let by_folder = group
+            .rules
+            .iter()
+            .any(|r| r.pause && (!r.folders.is_empty() || !r.except_folders.is_empty()));
+        let folder = if by_folder {
+            crate::rules::work_dir(creq)
+        } else {
+            String::new()
+        };
         let kept = crate::rules::paused_out(
             &group.rules,
             routes
@@ -1520,6 +1639,7 @@ async fn send_with_fallback(
                 .map(|r| format!("{}/{}", r.provider.id, r.model))
                 .collect(),
             agent,
+            &folder,
             crate::rules::local_clock(),
         );
         if kept.is_empty() && !routes.is_empty() {
@@ -1552,9 +1672,63 @@ async fn send_with_fallback(
                 )
             })
             .collect();
-        if let Some(hit) =
-            crate::rules::rule_for(&plan.id, &group.rules, creq, agent, conversation, &windows)
-            && !hit.use_.is_empty()
+        // A rule with an intent waits on what the group's classifier says
+        // the turn's message is — asked once, as the turn begins (the
+        // reference's `ruleFor` classifier call). Within the turn the
+        // stored answer is gone by instead; a compaction is decided on
+        // its own, its classifier never asked. When it cannot say, no
+        // intent matches and the turn goes by the other conditions.
+        let mut intent = String::new();
+        let within_turn = crate::affinity::turn_of(creq).1;
+        if !group.classifier.is_empty() && !within_turn && !crate::rules::compacting(creq) {
+            let query = crate::rules::rule_query(&group.rules, &plan.id, creq, agent, conversation);
+            let intents = crate::rules::intents(&group.rules, &query);
+            if !intents.is_empty() {
+                // A short follow-up carrying on is of its turn's kind.
+                let after = crate::rules::turn_intent(&plan.id, conversation, creq);
+                let after = if intents.iter().any(|i| i == &after) {
+                    after
+                } else {
+                    String::new()
+                };
+                let text = crate::classify::user_text(creq);
+                if !text.is_empty() {
+                    let (user, reply) = crate::classify::turn_before(creq);
+                    let prev = crate::classify::Before {
+                        intent: after.clone(),
+                        user,
+                        reply,
+                    };
+                    let caller: std::sync::Arc<dyn SelfCall> = std::sync::Arc::new(GatewayCaller {
+                        state: state.clone(),
+                    });
+                    let ask: crate::classify::AskFn = Box::new(move |m, i, p, t| {
+                        let c = caller.clone();
+                        Box::pin(ask_classifier(c, m, i, p, t)) as crate::classify::AskFuture
+                    });
+                    let (said, _cached, err) =
+                        crate::classify::classify(ask, &group.classifier, &intents, &prev, &text)
+                            .await;
+                    if said.is_empty() && err.is_some() && !after.is_empty() {
+                        // Timed out, failed or resting — not answered none:
+                        // the turn before's intent, still one of this
+                        // turn's, is a better guess than none (#1826).
+                        intent = after;
+                    } else {
+                        intent = said;
+                    }
+                }
+            }
+        }
+        if let Some(hit) = crate::rules::rule_for(
+            &plan.id,
+            &group.rules,
+            creq,
+            agent,
+            conversation,
+            &windows,
+            &intent,
+        ) && !hit.use_.is_empty()
         {
             // Put the rule's member first, then those the rules after it
             // also name (`then`), each once, the rest behind in order.
@@ -2837,7 +3011,7 @@ async fn proxy(
 /// `bytes` is the exact wire form used for conversation affinity. Keeping it
 /// separate from `body` lets Chat and Gemini read request options without
 /// decoding the same large JSON payload again here.
-async fn proxy_parsed(
+pub(crate) async fn proxy_parsed(
     state: Arc<AppState>,
     headers: HeaderMap,
     body: Value,
@@ -3915,6 +4089,7 @@ mod tests {
                             name: "Daily".into(),
                             routes: vec!["primary/first-model".into(), "spare/second-model".into()],
                             rules: Vec::new(),
+                            classifier: String::new(),
                             weights: Vec::new(),
                             routing: RoutingPolicy::Order,
                             first_token_timeout_ms: 0,

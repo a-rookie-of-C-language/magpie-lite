@@ -321,6 +321,7 @@ impl Fixture {
                             .map(|i| format!("p{i}/up-model"))
                             .collect(),
                         rules: Vec::new(),
+                        classifier: String::new(),
                         weights: Vec::new(),
                         routing: RoutingPolicy::Order,
                         first_token_timeout_ms: 0,

@@ -170,11 +170,11 @@ fn a_pause_rule_leaves_its_member_out_for_now() {
     let routes = members.clone();
     // paused for claude, not for codex
     assert_eq!(
-        paused_out(&[pause.clone()], routes.clone(), "claude", None),
+        paused_out(&[pause.clone()], routes.clone(), "claude", "", None),
         vec!["b/two"]
     );
     assert_eq!(
-        paused_out(&[pause], routes, "codex", None),
+        paused_out(&[pause], routes, "codex", "", None),
         vec!["a/one", "b/two"]
     );
 }
@@ -194,7 +194,7 @@ fn a_pause_never_matches_as_a_route() {
         ..Default::default()
     });
     assert!(!pause.matches(&q));
-    assert!(pause.pauses("claude", None));
+    assert!(pause.pauses("claude", "", None));
 }
 
 // ---- time windows ---------------------------------------------------------
@@ -365,6 +365,7 @@ fn group_validation_cleans_rules_and_refuses_bad_ones() {
         name: String::new(),
         routes: routes.clone(),
         rules: Vec::new(),
+        classifier: String::new(),
         weights: Vec::new(),
         routing: RoutingPolicy::Order,
         first_token_timeout_ms: 0,
@@ -504,6 +505,7 @@ async fn gateway(rules: Vec<Rule>) -> Gateway {
             name: "G".into(),
             routes: vec!["a/one".into(), "b/two".into()],
             rules,
+            classifier: String::new(),
             weights: Vec::new(),
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,

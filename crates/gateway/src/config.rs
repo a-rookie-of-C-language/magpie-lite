@@ -892,6 +892,11 @@ pub struct GroupConfig {
     /// group while it holds.
     #[serde(default)]
     pub rules: Vec<crate::rules::Rule>,
+    /// The model asked which of the rules' intents a turn's message is
+    /// (`provider/model`); a rule with an intent needs it, and it cannot
+    /// be the group itself. Cleared when no rule waits on an intent.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub classifier: String,
     /// Process-local route selection policy.
     #[serde(default)]
     pub routing: RoutingPolicy,
@@ -941,6 +946,57 @@ impl GroupConfig {
         for (index, rule) in self.rules.iter_mut().enumerate() {
             rule.clean(&self.routes, index + 1)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        self.classifier = self.classifier.trim().to_owned();
+        let intents = self.rules.iter().any(|r| !r.intent.is_empty());
+        if self.classifier == format!("group/{}", self.id) {
+            anyhow::bail!(
+                "group/{} can't be its own classifier: asking it would ask it again",
+                self.id
+            );
+        }
+        if intents && self.classifier.is_empty() {
+            anyhow::bail!(
+                "a rule with an intent needs the group's classifier: the model that tells which intent a message is"
+            );
+        }
+        if !intents {
+            self.classifier.clear(); // nothing to ask it
+        }
+        Ok(())
+    }
+
+    /// The classifier names a model lite can ask through itself
+    /// (`provider/model`); a group would ask forever, and an unknown
+    /// provider answers nothing. The reference also allows decision groups
+    /// and decision providers there; lite has neither.
+    pub fn check_classifier(&self, config: &Config) -> anyhow::Result<()> {
+        if self.classifier.is_empty() {
+            return Ok(());
+        }
+        if self.classifier.starts_with("group/") {
+            anyhow::bail!(
+                "lite asks a model to classify, not a group: {}",
+                self.classifier
+            );
+        }
+        let Some((provider, model)) = self.classifier.split_once('/') else {
+            anyhow::bail!(
+                "the classifier must be provider/model, not {:?}",
+                self.classifier
+            );
+        };
+        if provider.is_empty() || model.is_empty() {
+            anyhow::bail!(
+                "the classifier must be provider/model, not {:?}",
+                self.classifier
+            );
+        }
+        if config.provider(provider).is_none() {
+            anyhow::bail!(
+                "magpie knows no model {:?} to classify with",
+                self.classifier
+            );
         }
         Ok(())
     }
@@ -1036,6 +1092,9 @@ pub struct GroupConfigSnapshot {
     /// The group's routing rules.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<crate::rules::Rule>,
+    /// The model judging the rules' intents, when one waits on them.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub classifier: String,
     /// Per-route weights, parallel to the route chain, for the `weight` policy.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub weights: Vec<u32>,
@@ -1375,6 +1434,7 @@ impl Config {
                     name: g.label().to_owned(),
                     routes: g.routes.clone(),
                     rules: g.rules.clone(),
+                    classifier: g.classifier.clone(),
                     weights: g.route_weights(),
                     routing: g.routing,
                     first_token_timeout_ms: g.first_token_timeout_ms,
@@ -1961,6 +2021,7 @@ base_url = "http://127.0.0.1:1/v1"
             name: "Daily coding".into(),
             routes: vec!["mock/mock-model".into(), "backup/other".into()],
             rules: Vec::new(),
+            classifier: String::new(),
             weights: Vec::new(),
             routing: RoutingPolicy::default(),
             first_token_timeout_ms: 0,
@@ -1993,6 +2054,7 @@ base_url = "http://127.0.0.1:1/v1"
             name: String::new(),
             routes: vec!["mock/model-a".into(), "mock/model-b".into()],
             rules: Vec::new(),
+            classifier: String::new(),
             weights: Vec::new(),
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
@@ -2099,6 +2161,7 @@ affinity = "session"
             name: String::new(),
             routes: vec!["mock/model".into()],
             rules: Vec::new(),
+            classifier: String::new(),
             weights: Vec::new(),
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
@@ -2187,6 +2250,7 @@ affinity = "session"
             name: String::new(),
             routes: vec!["mock/one".into(), "mock/two".into()],
             rules: Vec::new(),
+            classifier: String::new(),
             weights: vec![3],
             routing: RoutingPolicy::Weighted,
             first_token_timeout_ms: 0,

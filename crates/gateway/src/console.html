@@ -706,7 +706,8 @@
                 <div id="group-weights-field" class="field" hidden><label for="group-weights">Route weights</label><textarea id="group-weights" class="token-input" placeholder="3&#10;1&#10;4" aria-describedby="group-weights-help"></textarea><p id="group-weights-help" class="group-help">One weight per route, in route order, each a whole number from 0 to 1000. A missing weight counts as 1; 0 makes the route fallback-only.</p></div>
                 <div class="field"><label for="group-affinity">Conversation affinity</label><select id="group-affinity" class="token-input" aria-describedby="group-affinity-help"><option value="auto">Auto</option><option value="session">Whole session</option><option value="turn">Within a turn</option><option value="off">Off</option></select><p id="group-affinity-help" class="group-help">Keep a conversation on the route that answered it so the vendor's prompt cache keeps hitting. Auto follows the route policy: rotate spreads load, everything else sticks by conversation.</p></div>
                 <div class="field"><label for="group-first-token">First-content timeout (ms)</label><input id="group-first-token" class="token-input" type="number" min="0" max="9007199254740991" step="1" value="0" required aria-describedby="group-first-token-help"><p id="group-first-token-help" class="group-help">0 disables this group limit. Streaming requests only: a slow non-final route switches to the next candidate before any reply is released. The final route still obeys gateway-wide limits.</p></div>
-                <div class="field"><label for="group-rules">Routing rules (optional JSON)</label><textarea id="group-rules" class="token-input" placeholder='[{"use":"deepseek/deepseek-chat","images":true}]' aria-describedby="group-rules-help" spellcheck="false"></textarea><p id="group-rules-help" class="group-help">A JSON array of routing rules. A rule sends the requests it matches to its member first; a rule with "pause": true leaves its member out instead while its hours, days or agents hold. Conditions: tokens, images, effort, agents, intent, compact, time, folders. Leave blank for no rules.</p></div>
+                <div class="field"><label for="group-classifier">Classifier model (optional)</label><input id="group-classifier" class="token-input" list="agent-model-options" placeholder="deepseek/deepseek-chat" aria-describedby="group-classifier-help" spellcheck="false"><p id="group-classifier-help" class="group-help">The model asked which of the rules' intents a turn's message is, as the turn begins. Needed when a rule has an intent; leave blank otherwise.</p></div>
+                <div class="field"><label for="group-rules">Routing rules (optional JSON)</label><textarea id="group-rules" class="token-input" placeholder='[{"use":"deepseek/deepseek-chat","images":true}]' aria-describedby="group-rules-help" spellcheck="false"></textarea><p id="group-rules-help" class="group-help">A JSON array of routing rules. A rule sends the requests it matches to its member first; a rule with "pause": true leaves its member out instead while its hours, days, agents or folders hold. Conditions: tokens, images, effort, agents, intent, compact, time, folders, exceptFolders; an intent rule needs the classifier model above. Leave blank for no rules.</p></div>
                 <div class="group-actions"><button id="group-save" class="button" type="submit">Save group</button><button id="group-cancel" class="button secondary" type="button">Cancel</button></div>
               </form>
               <p id="group-message" class="console-message" role="status" aria-live="polite" aria-atomic="true"></p>
@@ -821,6 +822,7 @@
       groupWeights: document.getElementById("group-weights"),
       groupAffinity: document.getElementById("group-affinity"),
       groupFirstToken: document.getElementById("group-first-token"),
+      groupClassifier: document.getElementById("group-classifier"),
       groupRules: document.getElementById("group-rules"),
       groupProviders: document.getElementById("group-providers"),
       groupNew: document.getElementById("group-new"),
@@ -1324,6 +1326,7 @@
         const weights = group.routing === "weight" ? ` · weights: ${(group.weights || []).join(", ")}` : "";
         const policy = text("span", `Policy: ${group.routing || "order"}${weights} · affinity: ${group.affinity || "auto"}`, "model-owner");
         const rules = text("span", ruleSummary(group.rules || []), "model-owner");
+        if (group.classifier) rules.textContent += ` · classifier: ${group.classifier}`;
         const actions = document.createElement("div");
         actions.className = "group-actions";
         const edit = text("button", "Edit", "button secondary");
@@ -1391,6 +1394,7 @@
           conds.push(`time ${span}`);
         }
         if (rule.folders?.length) conds.push(`folder ${rule.folders.join("|")}`);
+        if (rule.exceptFolders?.length) conds.push(`not folder ${rule.exceptFolders.join("|")}`);
         const what = conds.length ? ` when ${conds.join(", ")}` : "";
         const kind = rule.pause ? "pauses" : "sends first to";
         return `Rule ${index + 1} ${kind} ${rule.use}${what}`;
@@ -1720,6 +1724,7 @@
       elements.groupWeights.value = (group?.weights || []).join("\n");
       elements.groupAffinity.value = group?.affinity || "auto";
       elements.groupFirstToken.value = group?.first_token_timeout_ms ?? 0;
+      elements.groupClassifier.value = group?.classifier || "";
       elements.groupRules.value = group?.rules?.length ? JSON.stringify(group.rules, null, 2) : "";
       groupRoutingChanged();
       elements.groupMessage.textContent = "";
@@ -1829,6 +1834,7 @@
         }
       }
       body.rules = rules;
+      body.classifier = elements.groupClassifier.value.trim();
       if (!Number.isSafeInteger(body.first_token_timeout_ms) || body.first_token_timeout_ms < 0) {
         elements.groupMessage.textContent = "Enter a non-negative whole-number timeout in milliseconds (0 disables).";
         elements.groupFirstToken.focus();
