@@ -58,6 +58,7 @@ async fn server(enabled: bool) -> Server {
             routes: vec!["mock/model".into()],
             rules: Vec::new(),
             classifier: String::new(),
+            effort: String::new(),
             weights: Vec::new(),
             routing: RoutingPolicy::default(),
             first_token_timeout_ms: 0,

@@ -14,9 +14,12 @@ use std::sync::{
 use magpie_core::ir::{CompletionRequest, Message, Part, PartKind, Role};
 use magpie_gateway::classify::{
     AskError, AskFn, AskFuture, Before, Verdict, classifier_failure, classify, classify_body,
-    cut_middle, read_intent, turn_before, user_said, user_text, user_words,
+    cut_middle, effort_body, read_effort, read_intent, turn_before, user_said, user_text,
+    user_words,
 };
-use magpie_gateway::rules::{Rule, RuleRequest, intents, rule_for, turn_intent};
+use magpie_gateway::rules::{
+    Rule, RuleRequest, fit_level, intents, keeps_effort, rule_for, turn_intent,
+};
 
 fn text(s: &str) -> Part {
     Part {
@@ -83,6 +86,7 @@ fn classify_body_asks_for_the_number_only() {
     let intents = vec!["a quick question".to_owned(), "debugging".to_owned()];
     let prev = Before {
         intent: "debugging".to_owned(),
+        effort: String::new(),
         user: "why does this panic".to_owned(),
         reply: "because".to_owned(),
     };
@@ -255,20 +259,24 @@ fn turn_before_without_words_is_nothing() {
 
 fn counting_ask(calls: &Arc<AtomicUsize>, out: Result<Verdict, AskError>) -> AskFn {
     let calls = calls.clone();
-    Box::new(move |_m: String, _i: Vec<String>, _p: Before, _t: String| {
-        let calls = calls.clone();
-        let out = match &out {
-            Ok(v) => Ok(Verdict {
-                intent: v.intent.clone(),
-            }),
-            Err(AskError::Failed(e)) => Err(AskError::Failed(e.clone())),
-            Err(AskError::Answered(e)) => Err(AskError::Answered(e.clone())),
-        };
-        Box::pin(async move {
-            calls.fetch_add(1, Ordering::SeqCst);
-            out
-        }) as AskFuture
-    })
+    Box::new(
+        move |_m: String, _i: Vec<String>, _p: Before, _e: bool, _t: String| {
+            let calls = calls.clone();
+            let out = match &out {
+                Ok(v) => Ok(Verdict {
+                    intent: v.intent.clone(),
+                    effort: v.effort.clone(),
+                    score: v.score,
+                }),
+                Err(AskError::Failed(e)) => Err(AskError::Failed(e.clone())),
+                Err(AskError::Answered(e)) => Err(AskError::Answered(e.clone())),
+            };
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                out
+            }) as AskFuture
+        },
+    )
 }
 
 fn intents_of(names: &[&str]) -> Vec<String> {
@@ -282,6 +290,8 @@ async fn classify_asks_once_for_the_same_message() {
         &calls,
         Ok(Verdict {
             intent: "bug".into(),
+            effort: String::new(),
+            score: 0.0,
         }),
     );
     let intents = intents_of(&["bug", "refactor"]);
@@ -290,14 +300,17 @@ async fn classify_asks_once_for_the_same_message() {
         "cache-model-asks-once",
         &intents,
         &Before::default(),
+        false,
         "it panics",
     )
     .await;
-    assert_eq!((said.as_str(), cached, err), ("bug", false, None));
+    assert_eq!((said.intent.as_str(), cached, err), ("bug", false, None));
     let ask = counting_ask(
         &calls,
         Ok(Verdict {
             intent: "bug".into(),
+            effort: String::new(),
+            score: 0.0,
         }),
     );
     let (said, cached, _) = classify(
@@ -305,10 +318,11 @@ async fn classify_asks_once_for_the_same_message() {
         "cache-model-asks-once",
         &intents,
         &Before::default(),
+        false,
         "it panics",
     )
     .await;
-    assert_eq!((said.as_str(), cached), ("bug", true));
+    assert_eq!((said.intent.as_str(), cached), ("bug", true));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     // a failed answer is told, not cached
     assert!(classifier_failure("cache-model-asks-once").is_none());
@@ -323,10 +337,11 @@ async fn classify_rests_a_failed_classifier() {
         "rest-model-rests",
         &intents,
         &Before::default(),
+        false,
         "rename this",
     )
     .await;
-    assert_eq!(said, "");
+    assert_eq!(said.intent, "");
     assert!(!cached);
     assert!(err.unwrap().contains("classifier down"));
     // still within its rest: not asked again
@@ -335,10 +350,11 @@ async fn classify_rests_a_failed_classifier() {
         "rest-model-rests",
         &intents,
         &Before::default(),
+        false,
         "rename that",
     )
     .await;
-    assert_eq!(said, "");
+    assert_eq!(said.intent, "");
     assert!(err.unwrap().contains("not asked again"));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     // told on the group's card until it answers
@@ -356,10 +372,11 @@ async fn classify_asks_again_after_an_answer_that_is_no_number() {
             "odd-model-answers-oddly",
             &intents,
             &Before::default(),
+            false,
             "rename this",
         )
         .await;
-        assert_eq!(said, "");
+        assert_eq!(said.intent, "");
         assert!(!cached);
         // the odd answer itself is the error; the point is it rests nothing
         assert_eq!(err.unwrap(), "maybe?");
@@ -415,7 +432,7 @@ fn a_turn_keeps_the_intent_it_began_with() {
     let windows = HashMap::new();
     let started = req_with(vec![user_msg(&["it panics"])]);
     let hit = rule_for(
-        "keep-g", &rules, &started, "codex", "keep-c", &windows, "bug",
+        "keep-g", &rules, &started, "codex", "keep-c", &windows, "bug", "",
     )
     .unwrap();
     assert_eq!(hit.use_, "b/two");
@@ -445,7 +462,10 @@ fn a_turn_keeps_the_intent_it_began_with() {
             parts: vec![result],
         },
     ]);
-    let hit = rule_for("keep-g", &rules, &within, "codex", "keep-c", &windows, "").unwrap();
+    let hit = rule_for(
+        "keep-g", &rules, &within, "codex", "keep-c", &windows, "", "",
+    )
+    .unwrap();
     assert!(hit.held);
     assert_eq!(hit.use_, "b/two");
     assert_eq!(hit.then, vec!["a/one".to_owned()]);
@@ -561,6 +581,7 @@ async fn gateway(
     group: &str,
     judge: &str,
     rules: Vec<Rule>,
+    effort: &str,
     cls: Arc<Mutex<ClsAnswer>>,
 ) -> Gateway {
     let a_bodies = Arc::new(Mutex::new(Vec::new()));
@@ -581,6 +602,7 @@ async fn gateway(
             routes: vec!["a/one".into(), "b/two".into()],
             rules,
             classifier: format!("c/{judge}"),
+            effort: effort.into(),
             weights: Vec::new(),
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
@@ -656,6 +678,7 @@ fn an_intent_rule_needs_its_group_classifier() {
         routes: vec!["a/one".into(), "b/two".into()],
         rules: vec![intent_rule("b/two", "bug", &members)],
         classifier: String::new(),
+        effort: String::new(),
         weights: Vec::new(),
         routing: RoutingPolicy::Order,
         first_token_timeout_ms: 0,
@@ -683,6 +706,7 @@ fn a_classifier_names_a_model_not_a_group() {
         routes: vec!["c/judge".into()],
         rules: Vec::new(),
         classifier: "group/g".into(),
+        effort: String::new(),
         weights: Vec::new(),
         routing: RoutingPolicy::Order,
         first_token_timeout_ms: 0,
@@ -704,6 +728,7 @@ async fn a_turn_goes_by_what_the_classifier_says_once() {
         "g-verdict",
         "judge-verdict",
         vec![intent_group_rule(&members)],
+        "",
         Arc::new(Mutex::new(ClsAnswer {
             status: 200,
             text: "1".into(),
@@ -772,6 +797,9 @@ fn classified_keeps_only_what_was_asked_and_said() {
         intents: vec!["bug".into()],
         intent: "bug".into(),
         after: String::new(),
+        effort: "high".into(),
+        score: 2.0,
+        after_effort: "medium".into(),
         cached: true,
         ms: 12,
         error: String::new(),
@@ -780,7 +808,9 @@ fn classified_keeps_only_what_was_asked_and_said() {
     let value = serde_json::to_value(&full).unwrap();
     assert_eq!(
         value,
-        json!({"by": "c/judge", "intents": ["bug"], "intent": "bug", "cached": true, "ms": 12})
+        json!({"by": "c/judge", "intents": ["bug"], "intent": "bug",
+               "effort": "high", "score": 2.0, "after_effort": "medium",
+               "cached": true, "ms": 12})
     );
     // older history lines predate it
     let record: magpie_gateway::usage::RequestRecord = serde_json::from_value(json!({
@@ -800,6 +830,7 @@ async fn a_failed_classifier_leaves_the_turn_to_the_rest_of_the_rules() {
         "g-down",
         "judge-down",
         vec![intent_group_rule(&members)],
+        "",
         Arc::new(Mutex::new(ClsAnswer {
             status: 500,
             text: String::new(),
@@ -848,6 +879,7 @@ async fn a_failed_classifier_keeps_the_turn_before_intent() {
         "g-keep",
         "judge-keep",
         vec![intent_group_rule(&members)],
+        "",
         Arc::new(Mutex::new(ClsAnswer {
             status: 200,
             text: "1".into(),
@@ -883,5 +915,291 @@ async fn a_failed_classifier_keeps_the_turn_before_intent() {
             .unwrap()
             .contains("classifier down"),
         "{record}"
+    );
+}
+
+// ---- effort -------------------------------------------------------------------
+
+#[test]
+fn read_effort_names_the_numbered_level() {
+    assert_eq!(read_effort("3"), Ok(("high".to_owned(), 2.0)));
+    assert_eq!(read_effort("1"), Ok(("low".to_owned(), 0.0)));
+    // words around the number are read too
+    assert_eq!(
+        read_effort("Level 4 needs deep thought."),
+        Ok(("xhigh".to_owned(), 3.0))
+    );
+    // out of range, or no number at all, is the classifier not answering
+    let err = read_effort("5").unwrap_err();
+    assert!(err.contains("not a level from 1 to 4"), "{err}");
+    let err = read_effort("no idea").unwrap_err();
+    assert!(err.contains("not a level from 1 to 4"), "{err}");
+}
+
+#[test]
+fn effort_body_asks_for_the_level_number_only() {
+    let body = effort_body("c/judge", "medium", "redesign the scheduler");
+    assert_eq!(body["model"], "c/judge");
+    assert_eq!(body["stream"], false);
+    assert_eq!(body["temperature"], 0);
+    let words = body["messages"][1]["content"].as_str().unwrap();
+    assert!(words.contains("1. low:"), "{words}");
+    assert!(words.contains("4. xhigh:"), "{words}");
+    // the turn before's level: a follow-up carrying on needs it too
+    assert!(words.contains("needed level 2"), "{words}");
+    assert!(
+        words.contains("<message>\nredesign the scheduler\n</message>"),
+        "{words}"
+    );
+    assert!(
+        words.ends_with("The number of the level it needs:"),
+        "{words}"
+    );
+    // no reasoning ask rides along: lite knows no per-model levels to ask
+    // least with, so the classifier reasons at its default
+    assert!(body.get("reasoning_effort").is_none(), "{body}");
+    // without a level before, nothing is told of the turn before
+    let plain = effort_body("c/judge", "", "hi");
+    let words = plain["messages"][1]["content"].as_str().unwrap();
+    assert!(!words.contains("needed level"), "{words}");
+}
+
+#[test]
+fn fit_level_caps_what_no_vendor_takes_without_levels() {
+    // lite knows no per-model levels, so the pick goes as judged — except
+    // what no vendor takes under an unknown name (fitLevel)
+    assert_eq!(fit_level("ultra"), "max");
+    assert_eq!(fit_level("xhigh"), "high");
+    assert_eq!(fit_level("high"), "high");
+    assert_eq!(fit_level("low"), "low");
+}
+
+#[test]
+fn an_easier_pick_waits_for_a_cold_cache() {
+    use std::time::{Duration, Instant};
+
+    let now = Instant::now();
+    let warm = now - Duration::from_secs(33);
+    let cold = now - Duration::from_secs(6 * 60);
+    // lower and warm: the conversation keeps the higher one it had
+    assert!(keeps_effort(
+        "xhigh", warm, 234_000, warm, "high", 234_000, now
+    ));
+    // higher: the turn takes what it wants
+    assert!(!keeps_effort(
+        "medium", warm, 1_000, warm, "high", 1_000, now
+    ));
+    // same: nothing to keep
+    assert!(!keeps_effort(
+        "xhigh", warm, 234_000, warm, "xhigh", 234_000, now
+    ));
+    // cold: the pick is taken
+    assert!(!keeps_effort(
+        "xhigh", cold, 234_000, cold, "high", 234_000, now
+    ));
+    // answered since: warm
+    assert!(keeps_effort(
+        "xhigh",
+        cold,
+        1_000,
+        now - Duration::from_secs(120),
+        "low",
+        1_000,
+        now
+    ));
+    // compacted: the conversation is under half as long, the pick is taken
+    assert!(!keeps_effort(
+        "xhigh", warm, 234_000, warm, "high", 40_000, now
+    ));
+    // nothing before, or no pick: nothing to keep
+    assert!(!keeps_effort("", warm, 1_000, warm, "high", 1_000, now));
+    assert!(!keeps_effort("xhigh", warm, 1_000, warm, "", 1_000, now));
+    // past what levels say: the pick is taken
+    assert!(!keeps_effort(
+        "xhigh", warm, 1_000, warm, "ultra", 1_000, now
+    ));
+}
+
+#[test]
+fn effort_auto_needs_its_group_classifier() {
+    let mut group = GroupConfig {
+        id: "g".into(),
+        name: "G".into(),
+        routes: vec!["a/one".into(), "b/two".into()],
+        rules: Vec::new(),
+        classifier: String::new(),
+        effort: "auto".into(),
+        weights: Vec::new(),
+        routing: RoutingPolicy::Order,
+        first_token_timeout_ms: 0,
+        affinity: Default::default(),
+    };
+    let err = group.validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("effort auto needs the group's classifier"),
+        "{err:?}"
+    );
+    // answered: the classifier is kept, something waits on it
+    group.classifier = "c/judge".into();
+    group.validate().unwrap();
+    assert_eq!(group.classifier, "c/judge");
+    // blank stays blank, and other words are refused
+    group.effort = "  ".into();
+    group.validate().unwrap();
+    assert_eq!(group.effort, "");
+    group.effort = "high".into();
+    assert!(group.validate().is_err());
+    // cased spellings are put the one way
+    group.classifier = "c/judge".into();
+    group.effort = "AUTO".into();
+    group.validate().unwrap();
+    assert_eq!(group.effort, "auto");
+}
+
+async fn ask_body(gw: &Gateway, session: &str, body: Value) -> StatusCode {
+    Client::new()
+        .post(format!("{}/v1/chat/completions", gw.url))
+        .bearer_auth("magpie-lite")
+        .header("user-agent", "codex/1.0")
+        .header("x-session-id", session)
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+fn effort_turn(group: &str, effort: &str, messages: Value) -> Value {
+    let mut body = json!({
+        "model": format!("group/{group}"), "stream": false,
+        "messages": messages,
+    });
+    if !effort.is_empty() {
+        body["reasoning_effort"] = effort.into();
+    }
+    body
+}
+
+#[tokio::test]
+async fn an_auto_group_sends_the_turns_pick() {
+    let gw = gateway(
+        "g-auto",
+        "judge-auto",
+        Vec::new(),
+        "auto",
+        Arc::new(Mutex::new(ClsAnswer {
+            status: 200,
+            text: "3".into(),
+        })),
+    )
+    .await;
+    // the agent asks for reasoning: the turn is judged once, for effort
+    // alone — the bare group has no intents to ask about
+    let first = effort_turn(
+        "g-auto",
+        "medium",
+        json!([{"role": "user", "content": "redesign the scheduler"}]),
+    );
+    assert_eq!(ask_body(&gw, "s-auto", first).await, StatusCode::OK);
+    assert_eq!(cls_asked(&gw), 1);
+    // the judge is asked for a level by number, told no level before
+    let judged = gw.cls_bodies.lock().unwrap()[0].clone();
+    assert!(
+        judged["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("1. low:"),
+        "{judged}"
+    );
+    // judged high, sent high — not the medium asked for
+    assert_eq!(gw.bodies[0].lock().unwrap()[0]["reasoning_effort"], "high");
+    assert_eq!(gw.bodies[0].lock().unwrap()[0]["model"], "one");
+    // what was asked and said goes on the request's record
+    let recent = stats(&gw).await;
+    let agent: Vec<_> = recent["recent_requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["requested_model"] == "group/g-auto")
+        .collect();
+    assert_eq!(agent.len(), 1);
+    assert_eq!(agent[0]["classified"]["by"], "c/judge-auto");
+    assert_eq!(agent[0]["classified"]["effort"], "high");
+    assert_eq!(agent[0]["classified"]["score"], json!(2.0));
+    assert!(agent[0]["classified"].get("after_effort").is_none());
+    // the next turn of the same conversation judges again, told the level
+    // the turn before had
+    gw.cls.lock().unwrap().text = "2".into();
+    let second = effort_turn(
+        "g-auto",
+        "medium",
+        json!([
+            {"role": "user", "content": "redesign the scheduler"},
+            {"role": "user", "content": "rename the helper"},
+        ]),
+    );
+    assert_eq!(ask_body(&gw, "s-auto", second).await, StatusCode::OK);
+    assert_eq!(cls_asked(&gw), 2);
+    let judged = gw.cls_bodies.lock().unwrap()[1].clone();
+    assert!(
+        judged["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("needed level 3"),
+        "{judged}"
+    );
+    // the easier pick waits for a cold cache: the turn keeps high
+    assert_eq!(gw.bodies[0].lock().unwrap()[1]["reasoning_effort"], "high");
+    let recent = stats(&gw).await;
+    let agent: Vec<_> = recent["recent_requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["requested_model"] == "group/g-auto")
+        .collect();
+    assert_eq!(agent.len(), 2);
+    assert_eq!(agent[1]["classified"]["effort"], "medium");
+    assert_eq!(agent[1]["classified"]["after_effort"], "high");
+}
+
+#[tokio::test]
+async fn an_auto_group_asks_nothing_without_reasoning() {
+    let gw = gateway(
+        "g-quiet",
+        "judge-quiet",
+        Vec::new(),
+        "auto",
+        Arc::new(Mutex::new(ClsAnswer {
+            status: 200,
+            text: "4".into(),
+        })),
+    )
+    .await;
+    // the agent asks for no reasoning: nothing is judged, nothing overridden
+    let body = effort_turn(
+        "g-quiet",
+        "",
+        json!([{"role": "user", "content": "redesign the scheduler"}]),
+    );
+    assert_eq!(ask_body(&gw, "s-quiet", body).await, StatusCode::OK);
+    assert_eq!(cls_asked(&gw), 0);
+    assert!(
+        gw.bodies[0].lock().unwrap()[0]
+            .get("reasoning_effort")
+            .is_none()
+    );
+    let recent = stats(&gw).await;
+    let agent: Vec<_> = recent["recent_requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["requested_model"] == "group/g-quiet")
+        .collect();
+    assert_eq!(agent.len(), 1);
+    assert!(
+        agent[0]["classified"].is_null(),
+        "{}",
+        agent[0]["classified"]
     );
 }

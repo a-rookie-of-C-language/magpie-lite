@@ -897,6 +897,12 @@ pub struct GroupConfig {
     /// be the group itself. Cleared when no rule waits on an intent.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub classifier: String,
+    /// How the turn's reasoning is picked: `""` leaves what the agent asked
+    /// for, `auto` has the group's classifier judge how hard the turn is
+    /// as it begins (the reference's `Group.Effort`), and the turn's
+    /// requests ask their model for it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub effort: String,
     /// Process-local route selection policy.
     #[serde(default)]
     pub routing: RoutingPolicy,
@@ -947,6 +953,10 @@ impl GroupConfig {
             rule.clean(&self.routes, index + 1)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
+        self.effort = self.effort.trim().to_ascii_lowercase();
+        if !self.effort.is_empty() && self.effort != "auto" {
+            anyhow::bail!("effort is \"auto\" or blank, not {:?}", self.effort);
+        }
         self.classifier = self.classifier.trim().to_owned();
         let intents = self.rules.iter().any(|r| !r.intent.is_empty());
         if self.classifier == format!("group/{}", self.id) {
@@ -960,7 +970,12 @@ impl GroupConfig {
                 "a rule with an intent needs the group's classifier: the model that tells which intent a message is"
             );
         }
-        if !intents {
+        if self.effort == "auto" && self.classifier.is_empty() {
+            anyhow::bail!(
+                "effort auto needs the group's classifier: the model that tells how hard a turn is"
+            );
+        }
+        if !intents && self.effort != "auto" {
             self.classifier.clear(); // nothing to ask it
         }
         Ok(())
@@ -1095,6 +1110,9 @@ pub struct GroupConfigSnapshot {
     /// The model judging the rules' intents, when one waits on them.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub classifier: String,
+    /// How the turn's reasoning is picked: `auto` or blank.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub effort: String,
     /// Per-route weights, parallel to the route chain, for the `weight` policy.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub weights: Vec<u32>,
@@ -1435,6 +1453,7 @@ impl Config {
                     routes: g.routes.clone(),
                     rules: g.rules.clone(),
                     classifier: g.classifier.clone(),
+                    effort: g.effort.clone(),
                     weights: g.route_weights(),
                     routing: g.routing,
                     first_token_timeout_ms: g.first_token_timeout_ms,
@@ -2022,6 +2041,7 @@ base_url = "http://127.0.0.1:1/v1"
             routes: vec!["mock/mock-model".into(), "backup/other".into()],
             rules: Vec::new(),
             classifier: String::new(),
+            effort: String::new(),
             weights: Vec::new(),
             routing: RoutingPolicy::default(),
             first_token_timeout_ms: 0,
@@ -2055,6 +2075,7 @@ base_url = "http://127.0.0.1:1/v1"
             routes: vec!["mock/model-a".into(), "mock/model-b".into()],
             rules: Vec::new(),
             classifier: String::new(),
+            effort: String::new(),
             weights: Vec::new(),
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
@@ -2162,6 +2183,7 @@ affinity = "session"
             routes: vec!["mock/model".into()],
             rules: Vec::new(),
             classifier: String::new(),
+            effort: String::new(),
             weights: Vec::new(),
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
@@ -2251,6 +2273,7 @@ affinity = "session"
             routes: vec!["mock/one".into(), "mock/two".into()],
             rules: Vec::new(),
             classifier: String::new(),
+            effort: String::new(),
             weights: vec![3],
             routing: RoutingPolicy::Weighted,
             first_token_timeout_ms: 0,

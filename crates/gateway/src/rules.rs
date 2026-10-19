@@ -12,8 +12,9 @@
 //!
 //! The classifier is any model lite serves, asked through lite itself (see
 //! `classify.rs`); when it cannot say, no intent matches. Lite has no
-//! decision providers or decision groups, no per-turn effort judging
-//! (`effort: auto`), and no `useEffort` pairing of model and reasoning.
+//! decision providers or decision groups, and no `useEffort` pairing of
+//! model and reasoning; a group with `effort: auto` has the classifier
+//! judge the turn's reasoning instead, through the gateway itself.
 
 use magpie_core::ir::{CompletionRequest, PartKind, Role};
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,11 @@ use std::time::Duration;
 /// The reasoning levels a rule can ask for, lowest first (the reference's
 /// `Efforts`).
 pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// How long a conversation's reasoning is the vendor's cache warmth worth
+/// keeping it for: a lower pick waits for a turn the cache is lost to
+/// anyway (the reference's `cacheCold`).
+const CACHE_COLD: Duration = Duration::from_secs(5 * 60);
 
 /// How long an intent may be, in characters (the reference's `MaxIntent`).
 pub const MAX_INTENT: usize = 200;
@@ -957,6 +963,11 @@ struct TurnRule {
     /// What the classifier said the turn's message is, for a follow-up
     /// carrying on from it.
     intent: String,
+    /// The reasoning picked for the turn, for a follow-up carrying on
+    /// from it — and for [`keeps_effort`] holding a higher one.
+    effort: String,
+    /// What the pick would have been, kept from a higher one (`wanted`).
+    wanted: String,
     at: std::time::Instant,
     /// The tokens the vendor counted the conversation's last request as.
     input: u64,
@@ -999,9 +1010,15 @@ pub struct RuleHit {
     /// The members the rules after it that match too send to (`Then`).
     pub then: Vec<String>,
     /// What the group's classifier was asked as the turn began, and said
-    /// (the reference's `Classified`, without effort — lite never judges
-    /// it — and without the decision models' confidence).
+    /// (the reference's `Classified`, without the decision models'
+    /// confidence).
     pub classified: Option<Classified>,
+    /// The reasoning picked for the turn, which its requests ask their
+    /// model for (a group with `effort: auto`).
+    pub pick: String,
+    /// What the pick would have been, when the conversation kept a higher
+    /// one for the vendor's cache of it ([`keeps_effort`]).
+    pub wanted: String,
     /// The request is the agent compacting its conversation.
     pub compact: bool,
     /// The members of rules it matched that take less than it is long,
@@ -1025,6 +1042,15 @@ pub struct Classified {
     /// What it said the turn before was, which it was told; "" for none.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub after: String,
+    /// The reasoning it said the turn wants; "" when not asked or not said.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub effort: String,
+    /// How hard it took the turn to be, 0 (`low`) to 3 (`xhigh`).
+    #[serde(default, skip_serializing_if = "is_zero_score")]
+    pub score: f64,
+    /// The reasoning picked for the turn before, which it was told; "" for none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub after_effort: String,
     /// Said before, for the same message.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cached: bool,
@@ -1042,6 +1068,10 @@ pub struct Classified {
 
 fn is_zero(ms: &u64) -> bool {
     *ms == 0
+}
+
+fn is_zero_score(score: &f64) -> bool {
+    *score == 0.0
 }
 
 fn is_false(cached: &bool) -> bool {
@@ -1122,6 +1152,72 @@ pub fn turn_intent(group_id: &str, conversation: &str, req: &CompletionRequest) 
         .unwrap_or_default()
 }
 
+/// The reasoning picked for the conversation's turn, "" when none was
+/// judged: a short follow-up carrying on from it is judged as needing the
+/// same (`turnRule.effort`, told as `previous_message_reasoning`).
+pub fn turn_effort(group_id: &str, conversation: &str, req: &CompletionRequest) -> String {
+    let key = rule_key(group_id, conversation, req);
+    let map = TURN_RULES.lock().unwrap();
+    map.get(&key)
+        .filter(|tr| tr.at.elapsed() <= STICK_KEEP)
+        .map(|tr| tr.effort.clone())
+        .unwrap_or_default()
+}
+
+/// Where `effort` stands, weakest first (`effortRank` over lite's levels).
+fn effort_rank(effort: &str) -> Option<usize> {
+    EFFORTS.iter().position(|e| *e == effort)
+}
+
+/// The level a picked reasoning is sent at: lite knows no per-model levels
+/// to fit to, so the pick goes as judged — except `xhigh`, which no vendor
+/// is known to take under an unknown name, capped to `high` the way the
+/// reference fits to unknown levels (`fitLevel`), and `ultra`, sent as
+/// `max`.
+pub fn fit_level(want: &str) -> String {
+    match want {
+        "ultra" => "max".to_owned(),
+        "xhigh" => "high".to_owned(),
+        _ => want.to_owned(),
+    }
+}
+
+/// Whether a new turn of a conversation keeps the reasoning its turn before
+/// was asked for, rather than the lower one picked for it now (the
+/// reference's `keepsEffort`, #617). The reasoning is part of what the
+/// vendor caches a conversation under: while the cache is warm the effort
+/// only goes up, and a lower pick waits for a turn the cache is lost to
+/// anyway — one after [`CACHE_COLD`] without an answer, or after the agent
+/// compacted the conversation (it is now under half as long).
+pub fn keeps_effort(
+    prev_effort: &str,
+    prev_at: std::time::Instant,
+    prev_size: u64,
+    answered: std::time::Instant,
+    pick: &str,
+    size: u64,
+    now: std::time::Instant,
+) -> bool {
+    if prev_effort.is_empty() || pick.is_empty() || pick == prev_effort {
+        return false;
+    }
+    match (effort_rank(pick), effort_rank(prev_effort)) {
+        (Some(p), Some(t)) if p < t => {}
+        _ => return false, // up, or past what levels say: the pick is taken
+    }
+    let mut last = prev_at;
+    if answered > last {
+        last = answered;
+    }
+    if now.duration_since(last) > CACHE_COLD {
+        return false;
+    }
+    if prev_size > 0 && size < prev_size / 2 {
+        return false;
+    }
+    true
+}
+
 /// What the group's rules look at in `req`: the estimate floored by what
 /// the vendor counted last, images anywhere in it, the folder when a rule
 /// holds by folder, and a compaction as its own match (`q` in ruleFor).
@@ -1182,7 +1278,9 @@ pub fn rule_query(
 /// when it could not say or was not asked; a rule with an intent of its
 /// own only matches that. Within the turn the stored intent is gone by —
 /// the classifier is only asked as the turn begins — whatever `intent`
-/// says.
+/// says. `pick` is the reasoning the classifier said the turn wants, ""
+/// when not judged; a new turn keeps a higher one it had for the vendor's
+/// cache ([`keeps_effort`]), and the requests within the turn ask for it.
 pub fn rule_for(
     group_id: &str,
     rules: &[Rule],
@@ -1191,8 +1289,12 @@ pub fn rule_for(
     conversation: &str,
     windows: &HashMap<String, u64>,
     intent: &str,
+    pick: &str,
 ) -> Option<RuleHit> {
-    if rules.is_empty() {
+    if rules.is_empty() && pick.is_empty() {
+        // Nothing to put first and no reasoning judged: a group with no
+        // rules only decides when its effort is auto (the reference's
+        // `Bare`).
         return None;
     }
     let (turn, within) = crate::affinity::turn_of(req);
@@ -1265,6 +1367,14 @@ pub fn rule_for(
             }
             Some(_) => hit.waits = true,
         }
+        if !hit.waits && !hit.effort.is_empty() {
+            // the turn's pick goes with its requests — the higher one it
+            // kept, when it kept one (`RuleHit.Pick`/`Wanted`).
+            if let Some(tr) = &tr {
+                hit.pick = tr.effort.clone();
+                hit.wanted = tr.wanted.clone();
+            }
+        }
         // grown past the model the turn is on: the one time a turn moves
         let limit = if !hit.use_.is_empty() {
             windows.get(&hit.use_).copied().unwrap_or(0)
@@ -1295,6 +1405,8 @@ pub fn rule_for(
                     use_: hit.use_.clone(),
                     n: hit.n,
                     intent: q.intent.clone(),
+                    effort: tr.as_ref().map(|t| t.effort.clone()).unwrap_or_default(),
+                    wanted: tr.as_ref().map(|t| t.wanted.clone()).unwrap_or_default(),
                     at: now,
                     input: tr.as_ref().map(|t| t.input).unwrap_or(0),
                     size,
@@ -1317,6 +1429,17 @@ pub fn rule_for(
         hit.use_ = rules[i].use_.clone();
         hit.when = rules[i].conditions();
     }
+    if !pick.is_empty() {
+        // the turn's reasoning: a lower pick waits for a turn the cache is
+        // lost to anyway, and the conversation keeps the higher one it had.
+        hit.pick = pick.to_owned();
+        if let Some(tr) = &tr
+            && keeps_effort(&tr.effort, tr.at, tr.size, tr.answered, pick, q.tokens, now)
+        {
+            hit.pick = tr.effort.clone();
+            hit.wanted = pick.to_owned();
+        }
+    }
     map.insert(
         key.clone(),
         TurnRule {
@@ -1324,6 +1447,8 @@ pub fn rule_for(
             use_: hit.use_.clone(),
             n: hit.n,
             intent: q.intent.clone(),
+            effort: hit.pick.clone(),
+            wanted: hit.wanted.clone(),
             at: now,
             input: tr.as_ref().map(|t| t.input).unwrap_or(0),
             size,

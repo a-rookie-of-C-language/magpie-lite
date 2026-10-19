@@ -1,13 +1,15 @@
 //! A rule with an intent is for a kind of message: as a user's turn begins,
 //! the group's classifier model is asked which of the intents the user's
 //! message is — once, before the turn goes anywhere, and never again within
-//! it. The call goes through lite itself, so the classifier is any model
-//! lite serves, with its failover and usage; it shows in the usage as
-//! lite's own call. When it cannot say (it fails, is slow, or answers
-//! something else) no intent matches. Ports the reference's
+//! it — and, for a group with `effort: auto`, how hard the turn is to think
+//! about, in the same call. The call goes through lite itself, so the
+//! classifier is any model lite serves, with its failover and usage; it
+//! shows in the usage as lite's own call. When it cannot say (it fails, is
+//! slow, or answers something else) no intent matches and the turn keeps
+//! the reasoning the agent asked for. Ports the reference's
 //! `internal/gateway/classify.go` without its decision providers: lite has
-//! no Jev/System One models, so there is no per-turn effort judging, only
-//! the intent question through the gateway itself.
+//! no Jev/System One models, so both questions go through the gateway
+//! itself as numbered Chat asks.
 //!
 //! The cache, failure rest, and "said once in the log" bookkeeping are the
 //! reference's (`classifyKeep`, `classifyRest`); concurrent asks for the
@@ -43,22 +45,28 @@ const PRIOR_CAP: usize = 1000;
 /// What the turn before was said to be, and what was said in it: a short
 /// follow-up (go on, fix that) says little of its own, and is judged with
 /// what it follows (the reference's `before`, without `Effort` — lite
-/// never judges effort).
+/// never judged effort until groups grew an `effort: auto` setting).
 #[derive(Debug, Clone, Default)]
 pub struct Before {
     /// One of the intents asked about now, or "".
     pub intent: String,
+    /// The reasoning picked for the turn before, or "".
+    pub effort: String,
     /// The user's message before this one, cut short; "" for none.
     pub user: String,
     /// The assistant's last reply before this message, its text alone,
     /// its end kept; "" for none.
     pub reply: String,
 }
-/// What the classifier said (the reference's `verdict`, without effort).
+/// What the classifier said (the reference's `verdict`).
 #[derive(Debug, Clone, Default)]
 pub struct Verdict {
     /// "" for none of the intents.
     pub intent: String,
+    /// The reasoning the turn wants (`low` … `xhigh`); "" when not asked.
+    pub effort: String,
+    /// How hard the classifier took the turn to be, 0 (`low`) to 3 (`xhigh`).
+    pub score: f64,
 }
 /// Why asking failed: the classifier is down (`Failed`, rested before the
 /// next ask) or answered but not with one of the numbers (`Answered`, up,
@@ -135,39 +143,43 @@ fn wall_ms() -> u64 {
         .unwrap_or(0)
 }
 /// Ask which of `intents` the message is, from what was asked before when
-/// it can be: the same message and intents within `CLASSIFY_KEEP`. A
-/// classifier that failed rests for `CLASSIFY_REST` rather than making
-/// every turn wait out its timeout. Returns the intent ("" for none),
-/// whether it came from the cache, and why not when it could not say.
-/// `ask` is boxed so the gateway asking itself never names the caller's
-/// future type: an in-process classifier call through `proxy_parsed`
-/// reaches `send_with_fallback`, which reaches this call — naming the
-/// concrete future on both sides is an unprovable `Send` cycle (E0391).
+/// it can be: the same message and intents within `CLASSIFY_KEEP` — and,
+/// when `effort`, how hard the turn is, in the same call (the reference's
+/// `askClassifier` asks both at once). A classifier that failed rests for
+/// `CLASSIFY_REST` rather than making every turn wait out its timeout.
+/// Returns what it said (the intent, "" for none, and the effort, "" when
+/// not asked or not said), whether it came from the cache, and why not
+/// when it could not say. `ask` is boxed so the gateway asking itself never
+/// names the caller's future type: an in-process classifier call through
+/// `proxy_parsed` reaches `send_with_fallback`, which reaches this call —
+/// naming the concrete future on both sides is an unprovable `Send` cycle
+/// (E0391).
 pub type AskFuture = Pin<Box<dyn Future<Output = Result<Verdict, AskError>> + Send>>;
 /// How the gateway answers: any model through itself, boxed with its
 /// future. It takes an owned `Arc` so the closure is `'static`.
-pub type AskFn = Box<dyn Fn(String, Vec<String>, Before, String) -> AskFuture + Send>;
+pub type AskFn = Box<dyn Fn(String, Vec<String>, Before, bool, String) -> AskFuture + Send>;
 pub async fn classify(
     ask: AskFn,
     model: &str,
     intents: &[String],
     prev: &Before,
+    effort: bool,
     text: &str,
-) -> (String, bool, Option<String>) {
-    let key = cache_key(model, intents, prev, text);
+) -> (Verdict, bool, Option<String>) {
+    let key = cache_key(model, intents, prev, effort, text);
     let now = Instant::now();
     {
         let map = CLASSIFIED.lock().unwrap();
         if let Some(c) = map.m.get(&key)
             && now.duration_since(c.at) < CLASSIFY_KEEP
         {
-            return (c.v.intent.clone(), true, None);
+            return (c.v.clone(), true, None);
         }
         if let Some(f) = map.failed.get(model)
             && now.duration_since(f.at) < CLASSIFY_REST
         {
             return (
-                String::new(),
+                Verdict::default(),
                 false,
                 Some(format!(
                     "{} failed {} ago ({}); not asked again for now",
@@ -182,13 +194,14 @@ pub async fn classify(
         model.to_owned(),
         intents.to_vec(),
         prev.clone(),
+        effort,
         text.to_owned(),
     )
     .await;
     let mut map = CLASSIFIED.lock().unwrap();
     match out {
         Ok(v) => {
-            let intent = v.intent.clone();
+            let said = v.clone();
             map.m.insert(
                 key,
                 ClassifiedAs {
@@ -202,7 +215,7 @@ pub async fn classify(
                 map.m
                     .retain(|_, c| now.duration_since(c.at) < CLASSIFY_KEEP);
             }
-            (intent, false, None)
+            (said, false, None)
         }
         Err(AskError::Answered(err)) => {
             // Up, but its answer was no number: said once in the log, not
@@ -218,7 +231,7 @@ pub async fn classify(
                     at_ms: wall_ms(),
                 },
             );
-            (String::new(), false, Some(err))
+            (Verdict::default(), false, Some(err))
         }
         Err(AskError::Failed(err)) => {
             if map.last.get(model).is_none_or(|was| was.err != err) {
@@ -241,7 +254,7 @@ pub async fn classify(
                     at_ms: wall_ms(),
                 },
             );
-            (String::new(), false, Some(err))
+            (Verdict::default(), false, Some(err))
         }
     }
 }
@@ -252,7 +265,7 @@ fn humane_age(d: Duration) -> String {
         format!("{}s", d.as_secs())
     }
 }
-fn cache_key(model: &str, intents: &[String], prev: &Before, text: &str) -> String {
+fn cache_key(model: &str, intents: &[String], prev: &Before, effort: bool, text: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(model.as_bytes());
@@ -263,6 +276,10 @@ fn cache_key(model: &str, intents: &[String], prev: &Before, text: &str) -> Stri
     }
     h.update(b"\x00");
     h.update(prev.intent.as_bytes());
+    h.update(b"\x00");
+    h.update(prev.effort.as_bytes());
+    h.update(b"\x00");
+    h.update([u8::from(effort)]);
     h.update(b"\x00");
     h.update(prev.user.as_bytes());
     h.update(b"\x00");
@@ -550,4 +567,88 @@ fn first_number(answer: &str) -> Option<String> {
         .take_while(|b| b.is_ascii_digit())
         .count();
     Some(answer[start..start + len].to_owned())
+}
+
+/// The efforts the classifier judges among, lowest first, with what each
+/// is for (the reference's `jevLevels`, without its decision-provider
+/// asking: lite asks through the gateway itself, as a numbered Chat ask
+/// like the intent one).
+pub const EFFORT_LEVELS: [(&str, &str); 4] = [
+    (
+        "low",
+        "Little to think about: a greeting, a question answered from what is already known, a mechanical or one-line change, running a command",
+    ),
+    (
+        "medium",
+        "Some thought: an ordinary bug fix or a small feature in code already understood",
+    ),
+    (
+        "high",
+        "Careful thought: a change across several files, a bug whose cause is not known yet, a design choice with trade-offs",
+    ),
+    (
+        "xhigh",
+        "Deep thought: a subtle bug (concurrency, performance, security), an architecture or algorithm to design, a long multi-step plan",
+    ),
+];
+
+const EFFORT_PROMPT: &str = "You judge how much reasoning a coding assistant needs to handle a user's message well. Given numbered levels and the user's message, answer with the number of the level it needs. Answer with the number only.";
+
+/// The Chat request asking `model` how hard `text` is to think about, one
+/// of [`EFFORT_LEVELS`] by number (the reference's `effortBody`). When the
+/// turn before was given a level (`prev`), a message that only carries on
+/// from it needs that one. Unlike the reference, no `reasoning_effort`
+/// rides along: lite knows no per-model levels to ask least with, so the
+/// classifier reasons at its default.
+pub fn effort_body(model: &str, prev: &str, text: &str) -> Value {
+    let mut b = String::from("Levels:\n");
+    let mut was = 0;
+    for (i, (effort, what)) in EFFORT_LEVELS.iter().enumerate() {
+        b.push_str(&format!("{}. {effort}: {what}\n", i + 1));
+        if *effort == prev {
+            was = i + 1;
+        }
+    }
+    if was > 0 {
+        b.push_str(&format!(
+            "\nThe user's message before this one, in the same conversation, needed level {was}. \
+             A message that only carries on from it — go on, yes, do it — needs level {was} too.\n"
+        ));
+    }
+    b.push_str("\nThe user's message:\n<message>\n");
+    b.push_str(text);
+    b.push_str("\n</message>\n\nThe number of the level it needs:");
+    serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": EFFORT_PROMPT},
+            {"role": "user", "content": b},
+        ],
+        "stream": false,
+        "temperature": 0,
+        "max_tokens": 2048,
+    })
+}
+
+/// The level a classifier's answer names by number, and its score as the
+/// reference gives one: 0 for `low` to 3 for `xhigh` (the reference's
+/// `readEffort`).
+pub fn read_effort(answer: &str) -> Result<(String, f64), String> {
+    let n = first_number(answer).and_then(|n| n.parse::<usize>().ok());
+    match n {
+        Some(n) if (1..=EFFORT_LEVELS.len()).contains(&n) => {
+            Ok((EFFORT_LEVELS[n - 1].0.to_owned(), (n - 1) as f64))
+        }
+        _ => {
+            let trimmed = answer.trim();
+            let mut short: String = trimmed.chars().take(80).collect();
+            if trimmed.chars().count() > 80 {
+                short.push('…');
+            }
+            Err(format!(
+                "it answered {short:?}, not a level from 1 to {}",
+                EFFORT_LEVELS.len()
+            ))
+        }
+    }
 }

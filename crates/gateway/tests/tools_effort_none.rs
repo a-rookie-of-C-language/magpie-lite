@@ -173,6 +173,7 @@ async fn gateway(
             },
             rules: Vec::new(),
             classifier: String::new(),
+            effort: String::new(),
             weights: Vec::new(),
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,

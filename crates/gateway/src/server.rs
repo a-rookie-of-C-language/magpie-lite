@@ -1488,11 +1488,12 @@ impl From<StreamEvent> for UpstreamEvent {
 /// routing decisions happen before a successful response body is streamed, so
 /// an agent never receives a half-finished answer from an abandoned provider.
 /// Ask a classifier model through the gateway itself which of `intents` a
-/// message is, as a client would. Every model goes through the gateway —
-/// lite has no decision providers answering a separate protocol — with the
-/// router's User-Agent, so the call shows in the usage as lite's own.
-/// Anything but a numbered answer is the classifier being up but
-/// unanswering, never rested for.
+/// message is — or, when `effort`, how hard the turn is to think about —
+/// as a client would. Every model goes through the gateway — lite has no
+/// decision providers answering a separate protocol — with the router's
+/// User-Agent, so the call shows in the usage as lite's own. Anything but
+/// a numbered answer is the classifier being up but unanswering, never
+/// rested for.
 ///
 /// The gateway asking itself cannot name `proxy_parsed` here: its future
 /// reaches `send_with_fallback`, which reaches this call — naming the
@@ -1529,10 +1530,15 @@ async fn ask_classifier(
     model: String,
     intents: Vec<String>,
     prev: crate::classify::Before,
+    effort: bool,
     text: String,
 ) -> Result<crate::classify::Verdict, crate::classify::AskError> {
     use crate::classify::{AskError, CLASSIFY_TIMEOUT, Verdict};
-    let body = crate::classify::classify_body(&model, &intents, &prev, &text);
+    let body = if effort {
+        crate::classify::effort_body(&model, &prev.effort, &text)
+    } else {
+        crate::classify::classify_body(&model, &intents, &prev, &text)
+    };
     let bytes =
         Bytes::from(serde_json::to_vec(&body).map_err(|e| AskError::Failed(e.to_string()))?);
     let mut headers = HeaderMap::new();
@@ -1589,9 +1595,22 @@ async fn ask_classifier(
             )));
         }
     };
-    crate::classify::read_intent(&answer, &intents)
-        .map(|intent| Verdict { intent })
-        .map_err(AskError::Answered)
+    if effort {
+        crate::classify::read_effort(&answer)
+            .map(|(effort, score)| Verdict {
+                effort,
+                score,
+                ..Default::default()
+            })
+            .map_err(AskError::Answered)
+    } else {
+        crate::classify::read_intent(&answer, &intents)
+            .map(|intent| Verdict {
+                intent,
+                ..Default::default()
+            })
+            .map_err(AskError::Answered)
+    }
 }
 async fn send_with_fallback(
     state: &Arc<AppState>,
@@ -1619,9 +1638,12 @@ async fn send_with_fallback(
     // behind it, before the group's others (the reference's `ruleFor` /
     // `applyRule`). The decision is made as a user's turn begins and held
     // for the requests within it.
+    // The reasoning picked for the turn, sent by the requests the agent
+    // asked to reason for (a group with `effort: auto`).
+    let mut turn_pick = String::new();
     if let Some(plan) = group_plan
         && let Some(group) = config.group(&plan.id)
-        && !group.rules.is_empty()
+        && (!group.rules.is_empty() || group.effort == "auto")
     {
         // A pause by folder needs the folder the request says it is from.
         let by_folder = group
@@ -1686,11 +1708,21 @@ async fn send_with_fallback(
         if !group.classifier.is_empty() && !within_turn && !crate::rules::compacting(creq) {
             let query = crate::rules::rule_query(&group.rules, &plan.id, creq, agent, conversation);
             let intents = crate::rules::intents(&group.rules, &query);
-            if !intents.is_empty() {
+            // A group with `effort: auto` has the classifier judge the turn
+            // when the agent asked for reasoning; its requests then ask
+            // their model for the pick (the reference's `ruleFor` effort).
+            let want_effort = group.effort == "auto" && !query.effort.is_empty();
+            if !intents.is_empty() || want_effort {
                 // A short follow-up carrying on is of its turn's kind.
                 let after = crate::rules::turn_intent(&plan.id, conversation, creq);
                 let after = if intents.iter().any(|i| i == &after) {
                     after
+                } else {
+                    String::new()
+                };
+                // ... and needs the reasoning its turn before had.
+                let after_effort = if want_effort {
+                    crate::rules::turn_effort(&plan.id, conversation, creq)
                 } else {
                     String::new()
                 };
@@ -1699,39 +1731,113 @@ async fn send_with_fallback(
                     let (user, reply) = crate::classify::turn_before(creq);
                     let prev = crate::classify::Before {
                         intent: after.clone(),
+                        effort: after_effort.clone(),
                         user,
                         reply,
                     };
                     let caller: std::sync::Arc<dyn SelfCall> = std::sync::Arc::new(GatewayCaller {
                         state: state.clone(),
                     });
-                    let ask: crate::classify::AskFn = Box::new(move |m, i, p, t| {
-                        let c = caller.clone();
-                        Box::pin(ask_classifier(c, m, i, p, t)) as crate::classify::AskFuture
+                    let ask_intent: crate::classify::AskFn = Box::new({
+                        let caller = caller.clone();
+                        move |m, i, p, _, t| {
+                            let c = caller.clone();
+                            Box::pin(ask_classifier(c, m, i, p, false, t))
+                                as crate::classify::AskFuture
+                        }
+                    });
+                    let ask_effort: crate::classify::AskFn = Box::new({
+                        let caller = caller.clone();
+                        move |m, _, p, _, t| {
+                            let c = caller.clone();
+                            Box::pin(ask_classifier(c, m, Vec::new(), p, true, t))
+                                as crate::classify::AskFuture
+                        }
                     });
                     let asked_at = std::time::Instant::now();
-                    let (said, cached, err) =
-                        crate::classify::classify(ask, &group.classifier, &intents, &prev, &text)
-                            .await;
+                    // The two questions go at once, as the reference's
+                    // `askClassifier` asks them; either rests the
+                    // classifier on its own failure.
+                    let (intent_out, effort_out) = tokio::join!(
+                        async {
+                            if intents.is_empty() {
+                                None
+                            } else {
+                                Some(
+                                    crate::classify::classify(
+                                        ask_intent,
+                                        &group.classifier,
+                                        &intents,
+                                        &prev,
+                                        false,
+                                        &text,
+                                    )
+                                    .await,
+                                )
+                            }
+                        },
+                        async {
+                            if !want_effort {
+                                None
+                            } else {
+                                let none: Vec<String> = Vec::new();
+                                Some(
+                                    crate::classify::classify(
+                                        ask_effort,
+                                        &group.classifier,
+                                        &none,
+                                        &prev,
+                                        true,
+                                        &text,
+                                    )
+                                    .await,
+                                )
+                            }
+                        },
+                    );
                     let ms = asked_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                    let mut cached = true;
+                    let mut error = String::new();
+                    let mut intent_err: Option<String> = None;
+                    if let Some((v, asked_cached, err)) = intent_out {
+                        cached &= asked_cached;
+                        if let Some(err) = err {
+                            intent_err = Some(err.clone());
+                            error = err;
+                        }
+                        intent = v.intent;
+                    }
+                    let mut score = 0.0;
+                    if let Some((v, asked_cached, err)) = effort_out {
+                        cached &= asked_cached;
+                        if let Some(err) = err {
+                            if !error.is_empty() {
+                                error.push_str("; ");
+                            }
+                            error.push_str(&err);
+                        }
+                        turn_pick = v.effort;
+                        score = v.score;
+                    }
                     let mut fallback = String::new();
-                    if said.is_empty() && err.is_some() && !after.is_empty() {
+                    if intent.is_empty() && intent_err.is_some() && !after.is_empty() {
                         // Timed out, failed or resting — not answered none:
                         // the turn before's intent, still one of this
                         // turn's, is a better guess than none (#1826).
                         intent = after.clone();
                         fallback = "previous".to_owned();
-                    } else {
-                        intent = said;
                     }
                     classified = Some(crate::rules::Classified {
                         by: group.classifier.clone(),
                         intents: intents.clone(),
                         intent: intent.clone(),
                         after,
+                        effort: turn_pick.clone(),
+                        score,
+                        after_effort,
                         cached,
                         ms,
-                        error: err.unwrap_or_default(),
+                        error,
                         fallback,
                     });
                 } else {
@@ -1753,23 +1859,45 @@ async fn send_with_fallback(
             conversation,
             &windows,
             &intent,
-        ) && !hit.use_.is_empty()
-        {
+            &turn_pick,
+        ) {
             hit.classified = classified;
-            // Put the rule's member first, then those the rules after it
-            // also name (`then`), each once, the rest behind in order.
-            let mut rank: HashMap<String, usize> = HashMap::new();
-            rank.insert(hit.use_.clone(), 0);
-            for (i, id) in hit.then.iter().enumerate() {
-                rank.entry(id.clone()).or_insert(i + 1);
+            // The turn's pick rides with the requests within it, whether or
+            // not a rule put a member first.
+            if !hit.pick.is_empty() {
+                turn_pick = hit.pick.clone();
             }
-            routes.sort_by_key(|r| {
-                rank.get(&format!("{}/{}", r.provider.id, r.model))
-                    .copied()
-                    .unwrap_or(usize::MAX)
-            });
+            if !hit.use_.is_empty() {
+                // Put the rule's member first, then those the rules after it
+                // also name (`then`), each once, the rest behind in order.
+                let mut rank: HashMap<String, usize> = HashMap::new();
+                rank.insert(hit.use_.clone(), 0);
+                for (i, id) in hit.then.iter().enumerate() {
+                    rank.entry(id.clone()).or_insert(i + 1);
+                }
+                routes.sort_by_key(|r| {
+                    rank.get(&format!("{}/{}", r.provider.id, r.model))
+                        .copied()
+                        .unwrap_or(usize::MAX)
+                });
+            }
         }
     }
+    // The turn's requests ask their model for its pick, where the agent
+    // asked for reasoning at all — fitted to what a model is known to take,
+    // as the reference sends its pick (withEffort/fitLevel). Within the
+    // turn the stored pick rides along with the tool rounds going back.
+    let picked_req: Option<CompletionRequest> =
+        if !turn_pick.is_empty() && creq.effort.is_some_and(|e| e.asked()) {
+            magpie_core::effort::Effort::parse(&crate::rules::fit_level(&turn_pick)).map(|level| {
+                let mut owned = (*creq).clone();
+                owned.effort = Some(level);
+                owned
+            })
+        } else {
+            None
+        };
+    let creq: &CompletionRequest = picked_req.as_ref().unwrap_or(creq);
     let mut decision = None;
     if let Some(decided) = {
         let (scope, mode, rotate) = affinity_scope.clone();
@@ -4116,6 +4244,7 @@ mod tests {
                             routes: vec!["primary/first-model".into(), "spare/second-model".into()],
                             rules: Vec::new(),
                             classifier: String::new(),
+                            effort: String::new(),
                             weights: Vec::new(),
                             routing: RoutingPolicy::Order,
                             first_token_timeout_ms: 0,

@@ -156,6 +156,11 @@ enum GroupCommand {
         /// with an intent needs it.
         #[arg(long, default_value = "")]
         classifier: String,
+        /// How the turn's reasoning is picked: blank leaves what the agent
+        /// asked for, `auto` has the group's classifier judge how hard the
+        /// turn is as it begins.
+        #[arg(long, default_value = "")]
+        effort: String,
     },
     /// List configured groups.
     List,
@@ -431,6 +436,7 @@ async fn main() -> Result<()> {
                     affinity,
                     rules,
                     classifier,
+                    effort,
                 } => {
                     let path = provider_path(&cli.config)?;
                     let mut cfg = Config::load(&path)?;
@@ -447,6 +453,7 @@ async fn main() -> Result<()> {
                         routes,
                         rules: parsed,
                         classifier: classifier.trim().to_owned(),
+                        effort: effort.trim().to_owned(),
                         weights: route_weights,
                         routing,
                         first_token_timeout_ms,
@@ -497,6 +504,9 @@ async fn main() -> Result<()> {
                         }
                         if !g.classifier.is_empty() {
                             println!("{:<26} classifier {}", "", g.classifier);
+                        }
+                        if !g.effort.is_empty() {
+                            println!("{:<26} effort {}", "", g.effort);
                         }
                         for (i, rule) in g.rules.iter().enumerate() {
                             let kind = if rule.pause { "rule (pause)" } else { "rule" };
