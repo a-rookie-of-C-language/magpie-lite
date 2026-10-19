@@ -1583,6 +1583,51 @@ async fn spawn_internal_error_mock() -> (String, Arc<Mutex<Vec<String>>>) {
     (format!("http://{addr}"), seen_keys)
 }
 
+/// A vendor that answers every request with the same 403 — `message` sets
+/// the wording, so a quota-worded one is told apart from a plain one.
+#[derive(Clone)]
+struct ForbiddenMock {
+    seen_keys: Arc<Mutex<Vec<String>>>,
+    message: &'static str,
+}
+
+async fn forbidden_chat_completions(
+    State(mock): State<ForbiddenMock>,
+    headers: HeaderMap,
+) -> Response {
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let key = authorization
+        .strip_prefix("Bearer ")
+        .unwrap_or_default()
+        .to_owned();
+    mock.seen_keys.lock().unwrap().push(key);
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({"error": {"message": mock.message}})),
+    )
+        .into_response()
+}
+
+async fn spawn_forbidden_mock(message: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+    let seen_keys = Arc::new(Mutex::new(Vec::new()));
+    let mock = ForbiddenMock {
+        seen_keys: seen_keys.clone(),
+        message,
+    };
+    let app = Router::new()
+        .route("/v1/chat/completions", post(forbidden_chat_completions))
+        .with_state(mock);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), seen_keys)
+}
+
 async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) -> String {
     let mut fallback = Vec::new();
     let mut providers = vec![ProviderConfig {
@@ -2453,6 +2498,64 @@ async fn provider_level_failure_skips_the_rest_of_the_key_pool() {
     assert_eq!(stats["providers"]["primary"]["keys"]["0"]["errors"], 1);
     assert_eq!(stats["providers"]["backup"]["keys"]["0"]["attempts"], 1);
     assert_eq!(stats["providers"]["backup"]["keys"]["0"]["successes"], 1);
+}
+
+/// Two keys of one provider answering one request with the same plain 403
+/// is the request refused, not each key: the pool stops after the second
+/// alike answer, and nothing rests (the reference's `forbiddenAlike`,
+/// d5bc9f00 / plugins#243).
+#[tokio::test]
+async fn two_mates_alike_plain_403_is_the_request_refused_not_each_key() {
+    let (upstream, seen_keys) = spawn_forbidden_mock("Forbidden").await;
+    let gw = spawn_gateway_with_key_pool(upstream, None).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "primary/mock-model",
+            "messages": [{"role": "user", "content": "Weather?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // The first key's 403 moved to the second; the second's alike 403 ended
+    // it — no third key was spent on the same refusal.
+    assert_eq!(
+        *seen_keys.lock().unwrap(),
+        vec!["first-key".to_owned(), "second-key".to_owned()]
+    );
+}
+
+/// A 403 that says why — quota wording — is the key's own failure, not the
+/// request's: the next key is still asked.
+#[tokio::test]
+async fn a_403_that_names_quota_still_moves_to_the_next_key() {
+    let (upstream, seen_keys) =
+        spawn_forbidden_mock("Your usage limit is reached for this billing cycle").await;
+    let gw = spawn_gateway_with_key_pool(upstream, None).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "primary/mock-model",
+            "messages": [{"role": "user", "content": "Weather?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Both keys were asked: a quota-worded 403 rests each in turn.
+    assert_eq!(
+        *seen_keys.lock().unwrap(),
+        vec!["first-key".to_owned(), "second-key".to_owned()]
+    );
 }
 
 #[tokio::test]

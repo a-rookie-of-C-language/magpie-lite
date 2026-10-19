@@ -882,11 +882,29 @@ are a small `Vec` scanned in place. `224ea7d5` invalidates that same Go
 catalog cache. `b641868e` only fixes a Go test's clock.
 ### Still open from this refresh
 
-Rest granularity, RPM and concurrency queues, sink ordering, Cline pinning,
-Devin's Gemini schema sanitizer (`1530c5ef`) and HTTP/2 transport health
-(`94919109`) remain future work. Cline pinning and the Qoder mover minimum
-(`dd70c5e6`, `d44d81d9`) do not map onto lite: it has no presets and no
-plugin movers.
+Rest granularity, sink ordering, Cline pinning, Devin's Gemini schema
+sanitizer (`1530c5ef`) and HTTP/2 transport health (`94919109`) remain
+future work. RPM and concurrency queues were ported (`crates/gateway/src/
+lanes.rs`). Cline pinning and the Qoder mover minimum (`dd70c5e6`,
+`d44d81d9`) do not map onto lite: it has no presets and no plugin movers.
+
+### Upstream refresh, second pass (`dd70c5e6..afa5f74b`)
+
+`d5bc9f00` is ported: two keys of one provider answering one request with
+the same plain 403 — one that names no quota, credit, rate, restriction or
+refusal — is the request refused, not each key (`plain_forbidden` in
+`model_gone.rs`, the `forbade` set in `send_with_fallback`). The pool stops
+after the second alike answer so one refused request cannot walk every key
+into cooldown. Lite has no account/windows rest ladder, so the commit's
+first half (a plain 401/403 never infers a window rest) has nothing to
+attach to: lite only cools keys down on 402/429. The remainder — GUI model
+chips/filters (`084c2275`, `a77ecbf8`, `f7337836`), group window reporting
+to Codex (`be6a74f1`, lite writes no per-model `context_window` into agent
+configs), image-generation timeout setting (`197849ad`, no draw endpoints
+in lite), plugin pick persistence (`8febe3a5`), Cline pinning (`dd70c5e6`),
+the Factory mover minimum (`afa5f74b`) and the Qoder mover minimum
+(`d44d81d9`) — has no lite surface: no presets, plugin movers, GUI or
+drawing routes exist to port them to.
 The last does not map onto lite as it stands: lite's client asks for
 HTTP/1.1 (`reqwest` is built without its `http2` feature), so there is no
 shared HTTP/2 connection to a vendor that can go silent. The

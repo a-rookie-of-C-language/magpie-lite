@@ -30,8 +30,8 @@ use crate::cooldown::quota_cooldown;
 use crate::edge_block::{BLOCKED_HINT, edge_blocked, edge_blocked_text};
 use crate::lanes;
 use crate::model_gone::{
-    context_overflowed, model_refused, model_retired, prompt_refused, protection_refused,
-    shape_refused,
+    context_overflowed, model_refused, model_retired, plain_forbidden, prompt_refused,
+    protection_refused, shape_refused,
 };
 use crate::object_root;
 use crate::optional_fields;
@@ -1413,6 +1413,12 @@ async fn send_with_fallback(
             UpstreamCandidate::new(route, key_slot)
         })
         .expect("initial route");
+    // Providers that already answered this request with a plain 403 — one
+    // that says nothing of why. A second key of the same provider answering
+    // alike means the request itself is refused, not each key (d5bc9f00,
+    // plugins#243): stop walking its pool so one refusal doesn't bench every
+    // key in turn.
+    let mut forbade: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     'routes: for (route_index, route) in routes.into_iter().enumerate() {
         if let (Some(group_id), Some(group_route_index)) =
@@ -1848,6 +1854,18 @@ async fn send_with_fallback(
                                 cooldown,
                             );
                         }
+                        // A mate key of this provider already gave a plain
+                        // 403 on this request: it is the request refused,
+                        // not each key — stop the pool without resting this
+                        // one either. On the last key of the last route its
+                        // own 403 is the answer.
+                        if plain_forbidden(failure.status.as_u16(), &failure.body)
+                            && !forbade.insert(route.provider.id.clone())
+                            && (attempt + 1 < route.api_keys.len() || route_index != last_route)
+                        {
+                            drop(events);
+                            break 'keys;
+                        }
                         if attempt + 1 < route.api_keys.len()
                             && (failure.kind == FailureKind::EmptyReply
                                 || key_retryable_status(failure.status))
@@ -2043,6 +2061,16 @@ async fn send_with_fallback(
                     route.provider.id,
                     key_slot + 1
                 );
+                // A mate key of this provider already gave a plain 403 on
+                // this request: it is the request refused, not each key —
+                // stop the pool without resting this one either. On the
+                // last key of the last route its own 403 is the answer.
+                if plain_forbidden(status.as_u16(), &error.body)
+                    && !forbade.insert(route.provider.id.clone())
+                    && (attempt + 1 < route.api_keys.len() || route_index != last_route)
+                {
+                    break 'keys;
+                }
                 if attempt + 1 < route.api_keys.len() && key_retryable_status(status) {
                     continue 'keys;
                 }

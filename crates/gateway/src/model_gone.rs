@@ -209,6 +209,22 @@ pub(crate) fn protection_refused(status: u16, body: &Value) -> bool {
     status >= 400 && protection_words().is_match(&body.to_string())
 }
 
+/// A 403 that says nothing of why: no quota, credit, rate, verification,
+/// restriction, a model not served, or an outright refusal (the
+/// reference's `plainForbidden`, d5bc9f00 / plugins#243). Such a 403 may
+/// be the key's or the request's; when two keys of one provider answer
+/// one request alike, it is the request that is refused, not each key.
+pub(crate) fn plain_forbidden(status: u16, body: &Value) -> bool {
+    if status != 403 {
+        return false;
+    }
+    let text = error_text(body);
+    !quota_words().is_match(&text)
+        && !model_refused(status, body)
+        && !prompt_refused(status, body)
+        && !protection_refused(status, body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
