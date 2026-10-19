@@ -2,7 +2,7 @@
 //! the SSE event shapes Codex expects.
 
 use magpie_core::ir::StopReason;
-use magpie_core::responses::ResponsesStreamEncoder;
+use magpie_core::responses::{ResponsesStreamDecoder, ResponsesStreamEncoder};
 use magpie_core::stream::{SseParser, StreamEvent};
 use magpie_core::{anthropic, chat, gemini, responses};
 use serde_json::{Value, json};
@@ -302,4 +302,220 @@ fn responses_stream_namespace_errors_are_fail_closed() {
                 .any(|event| matches!(event, StreamEvent::ToolCallStart { .. }))
         );
     }
+}
+
+fn stream_frames(wire: &str) -> Vec<Value> {
+    let mut parser = SseParser::new();
+    let mut remaining = wire.as_bytes();
+    let mut events = Vec::new();
+    while let Some(data) = parser.feed(&mut remaining).unwrap() {
+        events.push(serde_json::from_str::<Value>(&data).unwrap());
+    }
+    events
+}
+
+#[test]
+fn custom_tool_input_streams_through_function_arguments() {
+    let patch = "*** Begin Patch\n+\"quoted\" \\ é 😀\n*** End Patch\n";
+    let arguments = json!({"input": patch}).to_string();
+    let mut mid = arguments.len() / 2;
+    while !arguments.is_char_boundary(mid) {
+        mid += 1;
+    }
+    let events = [
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "apply_patch",
+                "arguments": ""
+            }
+        }),
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "delta": &arguments[..mid]
+        }),
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "delta": &arguments[mid..]
+        }),
+        json!({
+            "type": "response.function_call_arguments.done",
+            "output_index": 0,
+            "arguments": arguments
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "apply_patch",
+                "arguments": arguments
+            }
+        }),
+        json!({"type":"response.completed","response":{"model":"m","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}),
+    ];
+
+    let request = responses::decode_request(&json!({
+        "model": "m",
+        "input": "edit",
+        "tools": [{
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Patch files"
+        }]
+    }))
+    .unwrap();
+    let mut decoder = ResponsesStreamDecoder::new();
+    let mut encoder = ResponsesStreamEncoder::for_request("m", &request);
+    let mut wire = String::new();
+    for event in events {
+        for decoded in decoder.decode(&event) {
+            if let Some(frame) = encoder.encode(&decoded) {
+                wire.push_str(&frame);
+            }
+        }
+    }
+    wire.push_str(&encoder.encode(&StreamEvent::Done).unwrap_or_default());
+    let frames = stream_frames(&wire);
+
+    let deltas: String = frames
+        .iter()
+        .filter(|frame| frame["type"] == "response.custom_tool_call_input.delta")
+        .filter_map(|frame| frame["delta"].as_str())
+        .collect();
+    assert_eq!(deltas, patch);
+
+    let input_done = frames
+        .iter()
+        .find(|frame| frame["type"] == "response.custom_tool_call_input.done")
+        .expect("custom input done");
+    assert_eq!(input_done["input"], patch);
+    let item_done = frames
+        .iter()
+        .find(|frame| {
+            frame["type"] == "response.output_item.done"
+                && frame["item"]["type"] == "custom_tool_call"
+        })
+        .expect("custom item done");
+    assert_eq!(item_done["item"]["input"], patch);
+}
+
+#[test]
+fn argument_deltas_that_complete_json_wait_for_done() {
+    fn collect(got: &mut Vec<String>, events: Vec<StreamEvent>) {
+        got.extend(events.into_iter().filter_map(|event| match event {
+            StreamEvent::ToolCallDelta { args, .. } => Some(args),
+            _ => None,
+        }));
+    }
+    let mut decoder = ResponsesStreamDecoder::new();
+    let mut got = Vec::new();
+    collect(
+        &mut got,
+        decoder.decode(&json!({
+            "type":"response.output_item.added",
+            "item":{"type":"function_call","call_id":"c1","name":"f"}
+        })),
+    );
+    for delta in [r#"{"cmd":"a}"#, r#"\"]{","#, r#""n":[1,{}]"#] {
+        collect(
+            &mut got,
+            decoder.decode(&json!({
+                "type":"response.function_call_arguments.delta",
+                "delta":delta
+            })),
+        );
+    }
+    assert_eq!(got.concat(), r#"{"cmd":"a}\"]{","n":[1,{}]"#);
+    collect(
+        &mut got,
+        decoder.decode(&json!({
+            "type":"response.function_call_arguments.delta",
+            "delta":"}"
+        })),
+    );
+    assert_eq!(got.concat(), r#"{"cmd":"a}\"]{","n":[1,{}]"#);
+    collect(
+        &mut got,
+        decoder.decode(&json!({
+            "type":"response.output_item.done",
+            "item":{
+                "type":"function_call",
+                "call_id":"c1",
+                "name":"f",
+                "arguments":"{\"cmd\":\"a}\\\"]{\",\"n\":[1,{}],\"more\":true}"
+            }
+        })),
+    );
+    assert_eq!(got.concat(), r#"{"cmd":"a}\"]{","n":[1,{}],"more":true}"#);
+}
+
+#[test]
+fn native_custom_input_events_are_translated_and_streamed() {
+    let request = responses::decode_request(&json!({
+        "model":"m",
+        "input":"edit",
+        "tools":[{"type":"custom","name":"apply_patch"}]
+    }))
+    .unwrap();
+    let patch = "*** Begin Patch\n+é 😀\n*** End Patch\n";
+    let (a, b) = patch.split_at(12);
+    let events = [
+        json!({
+            "type":"response.output_item.added",
+            "output_index":0,
+            "item":{"type":"custom_tool_call","id":"ctc_1","call_id":"call_1","name":"apply_patch","input":""}
+        }),
+        json!({
+            "type":"response.custom_tool_call_input.delta",
+            "output_index":0,
+            "item_id":"ctc_1",
+            "delta":a
+        }),
+        json!({
+            "type":"response.custom_tool_call_input.delta",
+            "output_index":0,
+            "item_id":"ctc_1",
+            "delta":b
+        }),
+        json!({
+            "type":"response.custom_tool_call_input.done",
+            "output_index":0,
+            "item_id":"ctc_1",
+            "input":patch
+        }),
+        json!({
+            "type":"response.output_item.done",
+            "output_index":0,
+            "item":{"type":"custom_tool_call","id":"ctc_1","call_id":"call_1","name":"apply_patch","input":patch}
+        }),
+    ];
+    let mut decoder = ResponsesStreamDecoder::new();
+    let mut encoder = ResponsesStreamEncoder::for_request("m", &request);
+    let mut wire = String::new();
+    for event in events {
+        for decoded in decoder.decode(&event) {
+            if let Some(frame) = encoder.encode(&decoded) {
+                wire.push_str(&frame);
+            }
+        }
+    }
+    let frames = stream_frames(&wire);
+    let deltas: String = frames
+        .iter()
+        .filter(|frame| frame["type"] == "response.custom_tool_call_input.delta")
+        .filter_map(|frame| frame["delta"].as_str())
+        .collect();
+    assert_eq!(deltas, patch);
+    assert!(frames.iter().any(
+        |frame| frame["type"] == "response.custom_tool_call_input.done" && frame["input"] == patch
+    ));
 }

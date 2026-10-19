@@ -58,6 +58,324 @@ fn custom_input(args: &Value) -> String {
     args.to_string()
 }
 
+/// Incrementally reads a custom tool's free-form input out of the JSON
+/// arguments a translated function call streams.
+///
+/// A custom tool is offered to foreign dialects as a function taking one
+/// string argument, `{"input":"..."}`. The model's argument deltas are
+/// arbitrary slices of that JSON, including escapes, surrogate pairs and
+/// UTF-8 characters cut across chunks. This reader gives the decoded text
+/// as soon as it is unambiguous and holds incomplete trailing escapes.
+#[derive(Debug, Default)]
+struct CustomInputStream {
+    pending: Vec<u8>,
+    depth: usize,
+    in_string: bool,
+    escaped: bool,
+    key: Vec<u8>,
+    in_key: bool,
+    want_key: bool,
+    last_key: String,
+    value_is_input: bool,
+    in_input: bool,
+    over: bool,
+}
+
+impl CustomInputStream {
+    /// Feed the next argument fragment and return newly readable input text.
+    fn feed(&mut self, fragment: &str) -> String {
+        if self.over {
+            return String::new();
+        }
+        if self.in_input {
+            self.pending.extend_from_slice(fragment.as_bytes());
+            return self.take();
+        }
+        let bytes = fragment.as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            if self.in_string {
+                if self.in_key {
+                    self.key.push(b);
+                }
+                if self.escaped {
+                    self.escaped = false;
+                } else if b == b'\\' {
+                    self.escaped = true;
+                } else if b == b'"' {
+                    self.in_string = false;
+                    if self.in_key {
+                        self.in_key = false;
+                        self.last_key = String::new();
+                        // `key` still holds the closing quote it ended on.
+                        if let Ok(key) = serde_json::from_slice::<String>(
+                            &[&[b'"'][..], self.key.as_slice()].concat(),
+                        ) {
+                            self.last_key = key;
+                        }
+                    }
+                }
+                continue;
+            }
+            match b {
+                b'"' if self.depth == 0 || (self.depth == 1 && self.value_is_input) => {
+                    self.in_input = true;
+                    self.pending.extend_from_slice(&bytes[i + 1..]);
+                    return self.take();
+                }
+                b'"' => {
+                    self.in_string = true;
+                    if self.depth == 1 && self.want_key {
+                        self.in_key = true;
+                        self.key.clear();
+                        self.want_key = false;
+                    }
+                }
+                b'{' | b'[' => {
+                    self.depth += 1;
+                    if self.depth == 1 && b == b'{' {
+                        self.want_key = true;
+                    }
+                }
+                b'}' | b']' => {
+                    self.depth = self.depth.saturating_sub(1);
+                    if self.depth == 0 {
+                        self.over = true;
+                        return String::new();
+                    }
+                }
+                b':' if self.depth == 1 => {
+                    self.value_is_input = self.last_key == "input";
+                }
+                b',' if self.depth == 1 => {
+                    self.want_key = true;
+                    self.value_is_input = false;
+                }
+                b' ' | b'\t' | b'\n' | b'\r' => {}
+                _ if self.depth == 0 => {
+                    self.over = true;
+                    return String::new();
+                }
+                _ if self.depth == 1 => self.value_is_input = false,
+                _ => {}
+            }
+        }
+        String::new()
+    }
+
+    /// Decode the longest complete prefix of the pending JSON string. An
+    /// escape or a multi-byte character cut off by the fragment boundary
+    /// waits for the rest.
+    fn take(&mut self) -> String {
+        let mut text = String::new();
+        let mut n = 0;
+        let mut end = false;
+        while n < self.pending.len() {
+            if self.pending[n] == b'"' {
+                end = true;
+                n += 1;
+                break;
+            }
+            let Some((decoded, used)) = unescape(&self.pending[n..]) else {
+                break;
+            };
+            text.push_str(&decoded);
+            n += used;
+        }
+        self.pending.drain(..n);
+        if end {
+            self.over = true;
+            self.pending.clear();
+        }
+        text
+    }
+}
+
+/// Decode one JSON string escape (or one whole character) at the start of
+/// `bytes`, returning its text and how many bytes it took. `None` when the
+/// escape or character is cut off and more bytes are needed.
+fn unescape(bytes: &[u8]) -> Option<(String, usize)> {
+    match bytes[0] {
+        b'\\' => {
+            let kind = *bytes.get(1)?;
+            if kind == b'u' {
+                if bytes.len() < 6 {
+                    return None;
+                }
+                let first = hex4(&bytes[2..6])?;
+                if (0xD800..0xDC00).contains(&first) {
+                    // A high half needs its low half; a lone half reads as
+                    // U+FFFD, as JSON reads it. Whether a low half follows
+                    // cannot be told until two more bytes have arrived.
+                    if bytes.len() < 8 {
+                        return None;
+                    }
+                    if bytes[6] != b'\\' || bytes[7] != b'u' {
+                        return Some(("\u{FFFD}".to_owned(), 6));
+                    }
+                    if bytes.len() < 12 {
+                        return None;
+                    }
+                    let Some(second) = hex4(&bytes[8..12]) else {
+                        return None;
+                    };
+                    if !(0xDC00..0xE000).contains(&second) {
+                        return Some(("\u{FFFD}".to_owned(), 6));
+                    }
+                    let code = 0x10000 + ((first - 0xD800) << 10) + (second - 0xDC00);
+                    return Some((char::from_u32(code)?.to_string(), 12));
+                }
+                if (0xDC00..0xE000).contains(&first) {
+                    return Some(("\u{FFFD}".to_owned(), 6));
+                }
+                return Some((char::from_u32(first)?.to_string(), 6));
+            }
+            let decoded = match kind {
+                b'"' => '"',
+                b'\\' => '\\',
+                b'/' => '/',
+                b'b' => char::from(8u8),
+                b'f' => char::from(12u8),
+                b'n' => '\n',
+                b'r' => '\r',
+                b't' => '\t',
+                _ => return None,
+            };
+            Some((decoded.to_string(), 2))
+        }
+        _ => {
+            // The pending text is valid UTF-8 except, possibly, for a
+            // character cut across fragments at its end.
+            if let Ok(s) = std::str::from_utf8(bytes) {
+                let c = s.chars().next()?;
+                return Some((c.to_string(), c.len_utf8()));
+            }
+            for end in 1..=bytes.len().min(4) {
+                if let Ok(s) = std::str::from_utf8(&bytes[..end]) {
+                    let c = s.chars().next()?;
+                    return Some((c.to_string(), c.len_utf8()));
+                }
+            }
+            None
+        }
+    }
+}
+
+fn hex4(bytes: &[u8]) -> Option<u32> {
+    let s = std::str::from_utf8(bytes).ok()?;
+    (s.len() == 4)
+        .then(|| u32::from_str_radix(s, 16).ok())
+        .flatten()
+}
+
+#[cfg(test)]
+mod custom_input_tests {
+    use super::CustomInputStream;
+
+    /// Read `arguments` through a `CustomInputStream` in pieces of `size`.
+    fn pieces(arguments: &str, size: usize) -> String {
+        let mut stream = CustomInputStream::default();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < arguments.len() {
+            // Fragments are strings on the wire, so a piece never splits a
+            // multi-byte character; it may split an escape or a surrogate
+            // pair, which is what this exercises.
+            let mut end = (i + size).min(arguments.len());
+            while end < arguments.len() && !arguments.is_char_boundary(end) {
+                end += 1;
+            }
+            out.push_str(&stream.feed(&arguments[i..end]));
+            i = end;
+        }
+        out
+    }
+
+    #[test]
+    fn reads_input_out_of_function_shaped_arguments_at_any_split() {
+        let patch = "*** Begin Patch\n+\"q\" \\ é 😀 <a>&\t\n*** End Patch\n";
+        let whole = serde_json::json!({ "input": patch }).to_string();
+        for cases in [
+            (whole.as_str(), patch),
+            (r#"{"input":"\ud83d\ude00 \u00e9\u0041\/\n"}"#, "😀 éA/\n"),
+            (r#"{"path":"a.go","input":"x\"y"}"#, "x\"y"),
+            (
+                r#"{"meta":{"input":"no","list":["input"]},"input":"yes"}"#,
+                "yes",
+            ),
+            (r#"{ "input" : "spaced" }"#, "spaced"),
+            (r#""a lone string""#, "a lone string"),
+            (r#"{"input":"lone \ud83d half"}"#, "lone \u{FFFD} half"),
+            (r#"{"input":5}"#, ""),
+            (r#"{"other":"x"}"#, ""),
+            ("not json", ""),
+        ] {
+            let (arguments, want) = cases;
+            for size in [1, 2, 3, 5, 7, arguments.len().max(1)] {
+                assert_eq!(
+                    pieces(arguments, size),
+                    want,
+                    "{arguments} in pieces of {size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn holds_an_escape_until_the_fragment_completes_it() {
+        let mut stream = CustomInputStream::default();
+        assert_eq!(stream.feed(r#"{"input":"\u"#), "");
+        assert_eq!(stream.feed("d83d"), "");
+        assert_eq!(stream.feed(r#"\ude0"#), "");
+        assert_eq!(stream.feed("0!"), "😀!");
+    }
+}
+
+/// Tracks whether a stream of argument text has become a complete JSON
+/// object or array. Such a delta is held until the call's done event,
+/// because the upstream's finished arguments may hold more and sent bytes
+/// cannot be retracted.
+#[derive(Debug, Default)]
+struct JsonWhole {
+    depth: isize,
+    in_string: bool,
+    escaped: bool,
+    began: bool,
+}
+
+impl JsonWhole {
+    fn feed(&mut self, text: &str) -> bool {
+        for &b in text.as_bytes() {
+            if self.escaped {
+                self.escaped = false;
+            } else if self.in_string {
+                if b == b'\\' {
+                    self.escaped = true;
+                } else if b == b'"' {
+                    self.in_string = false;
+                }
+            } else {
+                match b {
+                    b'"' => {
+                        self.in_string = true;
+                        if self.depth == 0 {
+                            self.began = false;
+                        }
+                    }
+                    b'{' | b'[' => {
+                        self.depth += 1;
+                        self.began = true;
+                    }
+                    b'}' | b']' => self.depth -= 1,
+                    b' ' | b'\t' | b'\n' | b'\r' => {}
+                    _ if self.depth == 0 => self.began = false,
+                    _ => {}
+                }
+            }
+        }
+        self.began && self.depth == 0 && !self.in_string
+    }
+}
+
 fn missing(field: &'static str) -> CoreError {
     CoreError::MissingField(field)
 }
@@ -1019,9 +1337,299 @@ fn encode_response_with_bindings(
 
 // ---------------------------------------------------------------- streams
 
+/// Stateful decoder for a Responses stream. Argument deltas are kept across
+/// events so a translated custom tool can be streamed without exposing the
+/// function-shaped JSON wrapper to the client.
+#[derive(Debug, Default)]
+pub struct ResponsesStreamDecoder {
+    calls: HashMap<usize, CallStream>,
+}
+
+#[derive(Debug)]
+struct CallStream {
+    call_id: String,
+    /// Argument text already emitted to the client.
+    sent: String,
+    /// Deltas that completed a JSON object/array and wait for the call's done
+    /// event, where the upstream may supply a fuller value.
+    held: String,
+    whole: JsonWhole,
+    /// Full arguments from the call's done events.
+    full: String,
+    /// The upstream called a custom tool: its free-form input arrives as
+    /// text and is translated into function-shaped arguments.
+    native_custom: bool,
+    /// The function-shaped wrapper around a native custom call is open.
+    wrapper_open: bool,
+}
+
+impl ResponsesStreamDecoder {
+    /// A decoder with no open calls.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Decode one Responses SSE payload, retaining call state between events.
+    pub fn decode(&mut self, v: &Value) -> Vec<StreamEvent> {
+        match v.get("type").and_then(Value::as_str).unwrap_or_default() {
+            "response.output_item.added" => self.decode_added(v),
+            "response.output_item.done" => self.decode_done(v),
+            "response.function_call_arguments.delta" => self.decode_args_delta(v),
+            "response.function_call_arguments.done" => {
+                let index = output_index(v);
+                let done = v.get("arguments").and_then(Value::as_str);
+                if let (Some(call), Some(arguments)) = (self.calls.get_mut(&index), done) {
+                    if !arguments.is_empty() {
+                        call.full = arguments.to_owned();
+                    }
+                }
+                Vec::new()
+            }
+            "response.custom_tool_call_input.delta" => self.decode_custom_input_delta(v, false),
+            "response.custom_tool_call_input.done" => self.decode_custom_input_delta(v, true),
+            "response.completed" | "response.incomplete" | "response.failed" => {
+                self.decode_terminal(v)
+            }
+            _ => decode_chunk_legacy(v),
+        }
+    }
+
+    fn decode_added(&mut self, v: &Value) -> Vec<StreamEvent> {
+        let mut out = decode_chunk_legacy(v);
+        out.retain(|event| !matches!(event, StreamEvent::ToolCallStart { .. }));
+        let item = v.get("item").unwrap_or(&Value::Null);
+        let ty = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        if !matches!(ty, "function_call" | "custom_tool_call") {
+            return out;
+        }
+        let Ok((name, namespace)) = stream_tool_identity(item) else {
+            return out;
+        };
+        let index = output_index(v);
+        let call_id = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        self.calls.insert(
+            index,
+            CallStream {
+                call_id: call_id.clone(),
+                sent: String::new(),
+                held: String::new(),
+                whole: JsonWhole::default(),
+                full: String::new(),
+                native_custom: ty == "custom_tool_call",
+                wrapper_open: false,
+            },
+        );
+        out.push(StreamEvent::ToolCallStart {
+            index,
+            id: call_id,
+            name,
+            namespace,
+        });
+        out
+    }
+
+    /// A native custom-tool call's input is already free-form text. Translate
+    /// it into the same function-shaped `{"input":"..."}` arguments used by
+    /// foreign dialects, so the encoder has one representation to stream.
+    fn decode_custom_input_delta(&mut self, v: &Value, done: bool) -> Vec<StreamEvent> {
+        let index = output_index(v);
+        let Some(call) = self.calls.get_mut(&index) else {
+            return Vec::new();
+        };
+        let text = v
+            .get(if done { "input" } else { "delta" })
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if done {
+            call.full = json!({"input": text}).to_string();
+            return Vec::new();
+        }
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if !call.wrapper_open {
+            call.wrapper_open = true;
+            call.sent.push_str(r#"{"input":""#);
+            out.push(StreamEvent::ToolCallDelta {
+                index,
+                args: r#"{"input":""#.to_owned(),
+            });
+        }
+        let escaped = json_string_content(text);
+        call.sent.push_str(&escaped);
+        out.push(StreamEvent::ToolCallDelta {
+            index,
+            args: escaped,
+        });
+        out
+    }
+
+    fn decode_args_delta(&mut self, v: &Value) -> Vec<StreamEvent> {
+        let index = output_index(v);
+        let Some(delta) = v.get("delta").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let Some(call) = self.calls.get_mut(&index) else {
+            return if delta.is_empty() {
+                Vec::new()
+            } else {
+                vec![StreamEvent::ToolCallDelta {
+                    index,
+                    args: delta.to_owned(),
+                }]
+            };
+        };
+        if call.whole.feed(delta) {
+            call.held.push_str(delta);
+            Vec::new()
+        } else {
+            let text = std::mem::take(&mut call.held) + delta;
+            call.sent.push_str(&text);
+            (!text.is_empty())
+                .then_some(StreamEvent::ToolCallDelta { index, args: text })
+                .into_iter()
+                .collect()
+        }
+    }
+
+    fn decode_done(&mut self, v: &Value) -> Vec<StreamEvent> {
+        let mut out = decode_chunk_legacy(v);
+        out.retain(|event| !matches!(event, StreamEvent::ToolCallEnd { .. }));
+        let item = v.get("item").unwrap_or(&Value::Null);
+        let ty = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        if !matches!(ty, "function_call" | "custom_tool_call") {
+            return out;
+        }
+        if stream_tool_identity(item).is_err() {
+            return out;
+        }
+        let index = output_index(v);
+        let Some(call) = self.calls.remove(&index) else {
+            out.push(StreamEvent::ToolCallEnd { index });
+            return out;
+        };
+        let args = if call.native_custom {
+            json!({"input": item.get("input").and_then(Value::as_str).unwrap_or("")}).to_string()
+        } else {
+            item.get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned()
+        };
+        self.close_args(index, call, &args, &mut out);
+        out
+    }
+
+    fn close_args(&self, index: usize, call: CallStream, done: &str, out: &mut Vec<StreamEvent>) {
+        let streamed = call.sent.clone() + &call.held;
+        let full = if done.is_empty() {
+            call.full.clone()
+        } else {
+            done.to_owned()
+        };
+        let args = pick_args(&streamed, &full);
+        let mut close = false;
+        let complete = serde_json::from_str::<Value>(args.trim()).is_ok();
+        if call.native_custom && !complete {
+            // A custom-tool input translated from native deltas needs its
+            // JSON wrapper closed before the encoder sees the call end.
+            close = true;
+        }
+        let rest = if args.starts_with(&call.sent) {
+            args[call.sent.len()..].to_owned()
+        } else {
+            call.held
+        };
+        if !rest.is_empty() {
+            out.push(StreamEvent::ToolCallDelta { index, args: rest });
+        }
+        if close {
+            out.push(StreamEvent::ToolCallDelta {
+                index,
+                args: r#""}"#.to_owned(),
+            });
+        }
+        out.push(StreamEvent::ToolCallEnd { index });
+    }
+
+    fn decode_terminal(&mut self, v: &Value) -> Vec<StreamEvent> {
+        let base = decode_chunk_legacy(v);
+        let mut out = Vec::new();
+        let terminal_items = v
+            .pointer("/response/output")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut indexes: Vec<usize> = self.calls.keys().copied().collect();
+        indexes.sort_unstable();
+        for index in indexes {
+            let Some(call) = self.calls.remove(&index) else {
+                continue;
+            };
+            let item = terminal_items.iter().find(|item| {
+                item.get("call_id").and_then(Value::as_str) == Some(call.call_id.as_str())
+            });
+            let done = item.map(|item| {
+                if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
+                    json!({"input": item.get("input").and_then(Value::as_str).unwrap_or("")})
+                        .to_string()
+                } else {
+                    item.get("arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned()
+                }
+            });
+            self.close_args(index, call, done.as_deref().unwrap_or(""), &mut out);
+        }
+        out.extend(base);
+        out
+    }
+}
+
+fn output_index(v: &Value) -> usize {
+    v.get("output_index").and_then(Value::as_u64).unwrap_or(0) as usize
+}
+
+fn json_string_content(text: &str) -> String {
+    serde_json::to_string(text)
+        .unwrap_or_else(|_| "\"\"".to_owned())
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// Pick the fuller of streamed and finished call arguments.
+fn pick_args(streamed: &str, done: &str) -> String {
+    let s = streamed.trim();
+    let f = done.trim();
+    let sv = serde_json::from_str::<Value>(s).is_ok();
+    let fv = serde_json::from_str::<Value>(f).is_ok();
+    if fv && (!sv || f.len() > s.len()) {
+        done.to_owned()
+    } else if sv || f.is_empty() {
+        streamed.to_owned()
+    } else {
+        done.to_owned()
+    }
+}
+
 /// Decode one streamed event from a Responses upstream into IR events.
 /// `[DONE]` never appears: the terminal `response.completed` event is it.
+///
+/// This stateless entry point remains for callers that decode a single event;
+/// gateway streams use [`ResponsesStreamDecoder`] to retain call state.
 pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
+    ResponsesStreamDecoder::new().decode(v)
+}
+
+fn decode_chunk_legacy(v: &Value) -> Vec<StreamEvent> {
     let mut out = Vec::new();
     if let Some(error) = v.get("error") {
         out.push(StreamEvent::Error {
@@ -1236,6 +1844,10 @@ struct ToolItem {
     /// Whether this call belongs to a declared custom (free-form) tool.
     custom: bool,
     args: String,
+    /// Reads a custom tool's input out of its function-shaped arguments.
+    input: CustomInputStream,
+    /// Custom-tool input already sent as deltas.
+    input_sent: String,
     output_index: usize,
 }
 
@@ -1591,14 +2203,20 @@ impl ResponsesStreamEncoder {
                         namespace: valid_namespace.clone(),
                         custom,
                         args: String::new(),
+                        input: CustomInputStream::default(),
+                        input_sent: String::new(),
                         output_index,
                     },
                 );
                 let item = if custom {
-                    json!({
+                    let mut item = json!({
                         "id": item_id, "type": "custom_tool_call", "call_id": id,
                         "name": wire, "input": "", "status": "in_progress"
-                    })
+                    });
+                    if let Some(namespace) = valid_namespace {
+                        set_call_namespace(&mut item, &namespace);
+                    }
+                    item
                 } else {
                     let mut item = json!({
                         "id": item_id, "type": "function_call", "call_id": id,
@@ -1619,9 +2237,14 @@ impl ResponsesStreamEncoder {
                 let tool = self.tools.get_mut(index)?;
                 tool.args.push_str(args);
                 if tool.custom {
+                    let input = tool.input.feed(args);
+                    if input.is_empty() {
+                        return None;
+                    }
+                    tool.input_sent.push_str(&input);
                     return Some(event(
                         "response.custom_tool_call_input.delta",
-                        json!({"item_id": tool.id, "output_index": tool.output_index, "delta": args}),
+                        json!({"item_id": tool.id, "output_index": tool.output_index, "delta": input}),
                     ));
                 }
                 Some(event(
@@ -1631,26 +2254,60 @@ impl ResponsesStreamEncoder {
             }
             StreamEvent::ToolCallEnd { index } => {
                 let tool = self.tools.remove(index)?;
-                let done = if tool.custom {
-                    json!({
+                let (done, input_done) = if tool.custom {
+                    let input = serde_json::from_str::<Value>(&tool.args)
+                        .map(|args| custom_input(&args))
+                        .unwrap_or_else(|_| tool.args.clone());
+                    let done = json!({
                         "id": tool.id, "type": "custom_tool_call", "call_id": tool.call_id,
-                        "name": tool.name, "input": tool.args, "status": "completed",
-                    })
+                        "name": tool.name, "input": input, "status": "completed",
+                    });
+                    (done, Some(input))
                 } else {
                     let mut done = json!({
                         "id": tool.id, "type": "function_call", "call_id": tool.call_id,
                         "name": tool.name, "arguments": tool.args, "status": "completed",
                     });
-                    if let Some(namespace) = tool.namespace {
-                        set_call_namespace(&mut done, &namespace);
+                    if let Some(namespace) = tool.namespace.as_deref() {
+                        set_call_namespace(&mut done, namespace);
                     }
-                    done
+                    (done, None)
                 };
+                let mut done = done;
+                if tool.custom
+                    && let Some(namespace) = tool.namespace.as_deref()
+                {
+                    set_call_namespace(&mut done, namespace);
+                }
                 self.output.push(done.clone());
-                Some(event(
+                let mut out = String::new();
+                if let Some(input) = input_done {
+                    if let Some(rest) = input.strip_prefix(&tool.input_sent)
+                        && !rest.is_empty()
+                    {
+                        out.push_str(&event(
+                            "response.custom_tool_call_input.delta",
+                            json!({
+                                "item_id": tool.id,
+                                "output_index": tool.output_index,
+                                "delta": rest,
+                            }),
+                        ));
+                    }
+                    out.push_str(&event(
+                        "response.custom_tool_call_input.done",
+                        json!({
+                            "item_id": tool.id,
+                            "output_index": tool.output_index,
+                            "input": input,
+                        }),
+                    ));
+                }
+                out.push_str(&event(
                     "response.output_item.done",
                     json!({"output_index": tool.output_index, "item": done}),
-                ))
+                ));
+                Some(out)
             }
             StreamEvent::Usage(u) => {
                 self.usage.merge(u);

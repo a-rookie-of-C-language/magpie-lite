@@ -722,6 +722,7 @@ impl ClientStreamEncoder {
 struct UpstreamDecoders {
     chat: chat::ChatStreamDecoder,
     anthropic: anthropic::AnthropicStreamDecoder,
+    responses: responses::ResponsesStreamDecoder,
     gemini: gemini::GeminiStreamDecoder,
     gemini_reply: GeminiReply,
     gemini_pending_usage: Option<Usage>,
@@ -2132,7 +2133,7 @@ fn decode_upstream_chunk(
     match protocol {
         Protocol::Chat => decoders.chat.decode(data),
         Protocol::Anthropic => decoders.anthropic.decode(data),
-        Protocol::Responses => responses::decode_chunk(data),
+        Protocol::Responses => decoders.responses.decode(data),
         Protocol::Gemini => decoders.gemini.decode(data),
     }
 }
