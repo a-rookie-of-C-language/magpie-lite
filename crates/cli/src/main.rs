@@ -503,8 +503,8 @@ async fn main() -> Result<()> {
                             g.name.as_str()
                         };
                         println!(
-                            "group/{:<18} {} [routing: {}, weights: {:?}, affinity: {}, first-token: {} ms]",
-                            g.id,
+                            "{:<24} {} [routing: {}, weights: {:?}, affinity: {}, first-token: {} ms]",
+                            cfg.group_public_ref(g),
                             label,
                             g.routing.as_str(),
                             g.route_weights(),
@@ -516,7 +516,7 @@ async fn main() -> Result<()> {
                                 "{:<26} found: one model on {} providers; `group rm {}` hides it",
                                 "",
                                 g.routes.len(),
-                                g.id,
+                                cfg.group_public_ref(g),
                             );
                         }
                         for (i, route) in g.routes.iter().enumerate() {
@@ -551,7 +551,11 @@ async fn main() -> Result<()> {
                             .map(|route| format!("--route {route}"))
                             .collect::<Vec<_>>()
                             .join(" ");
-                        println!("group/{:<18} {} [found, hidden]", g.id, g.label());
+                        println!(
+                            "{:<24} {} [found, hidden]",
+                            cfg.group_public_ref(&g),
+                            g.label()
+                        );
                         println!(
                             "{:<26} bring back with: magpie-lite group add {} {bring}",
                             "", g.id
@@ -561,6 +565,8 @@ async fn main() -> Result<()> {
                 GroupCommand::Rm { id } => {
                     let path = provider_path(&cli.config)?;
                     let mut cfg = Config::load(&path)?;
+                    // A found group is addressed by its public ref too.
+                    let id = cfg.group_by_ref(&id).map(|g| g.id).unwrap_or(id);
                     let before = cfg.group.len();
                     cfg.group.retain(|g| g.id != id);
                     if cfg.group.len() != before {

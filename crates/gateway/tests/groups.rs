@@ -710,12 +710,12 @@ async fn found_groups_serve_hide_and_come_back() {
             .await
             .unwrap()
     }
-    async fn ask(gw: &Gateway) -> StatusCode {
+    async fn ask(gw: &Gateway, model: &str) -> StatusCode {
         Client::new()
             .post(format!("{}/v1/chat/completions", gw.url))
             .bearer_auth("magpie-lite")
             .json(&json!({
-                "model": "group/auto-shared",
+                "model": model,
                 "messages": [{"role": "user", "content": "Hi"}],
             }))
             .send()
@@ -728,7 +728,14 @@ async fn found_groups_serve_hide_and_come_back() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|m| m["id"] == "group/auto-shared")
+            .any(|m| m["id"] == "auto/shared")
+    }
+    fn unlisted_old(models: &Value) -> bool {
+        models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["id"] != "group/auto-shared")
     }
     let gw = gateway_with_shared_model().await;
 
@@ -751,7 +758,9 @@ async fn found_groups_serve_hide_and_come_back() {
     assert_eq!(found["routes"], json!(["mock-a/shared", "mock-b/shared"]));
     assert_eq!(found["auto"], true);
     assert!(listed(&models(&gw).await));
-    assert_eq!(ask(&gw).await, StatusCode::OK);
+    assert!(unlisted_old(&models(&gw).await));
+    assert_eq!(ask(&gw, "auto/shared").await, StatusCode::OK);
+    assert_eq!(ask(&gw, "group/auto-shared").await, StatusCode::OK);
     assert!(Config::load(&gw.path).unwrap().group.is_empty());
 
     // Deleting a found group hides it: unlisted, unrouted, kept for
@@ -773,7 +782,8 @@ async fn found_groups_serve_hide_and_come_back() {
         .expect("hidden group in snapshot");
     assert_eq!(hidden["hidden"], true);
     assert!(!listed(&models(&gw).await));
-    assert_eq!(ask(&gw).await, StatusCode::NOT_FOUND);
+    assert_eq!(ask(&gw, "auto/shared").await, StatusCode::NOT_FOUND);
+    assert_eq!(ask(&gw, "group/auto-shared").await, StatusCode::NOT_FOUND);
     assert_eq!(
         Config::load(&gw.path).unwrap().hidden_auto_groups,
         vec!["auto-shared"]
@@ -792,7 +802,7 @@ async fn found_groups_serve_hide_and_come_back() {
         .find(|g| g["id"] == "auto-shared")
         .expect("restored group in snapshot");
     assert_eq!(owned["auto"], Value::Null);
-    assert_eq!(ask(&gw).await, StatusCode::OK);
+    assert_eq!(ask(&gw, "group/auto-shared").await, StatusCode::OK);
     assert!(
         Config::load(&gw.path)
             .unwrap()
@@ -831,7 +841,7 @@ async fn found_groups_serve_hide_and_come_back() {
         .expect("changed group in snapshot");
     assert_eq!(owned["auto"], Value::Null);
     assert_eq!(owned["routes"], json!(["mock-b/shared"]));
-    assert_eq!(ask(&gw).await, StatusCode::OK);
+    assert_eq!(ask(&gw, "group/auto-shared").await, StatusCode::OK);
 }
 
 #[tokio::test]

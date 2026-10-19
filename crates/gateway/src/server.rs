@@ -627,12 +627,38 @@ fn ollama_entries(state: &AppState) -> Vec<(String, String, u64)> {
         .catalog()
         .into_iter()
         .map(|(id, owner)| {
-            // `group/<id>` names no provider's window; `provider/<model>`
-            // asks its provider's contexts map.
+            // `group/<id>` names no provider's window; a found group's
+            // `auto/<model>` takes its members' widest known one.
+            // `provider/<model>` asks its provider's contexts map.
             let window = id
                 .split_once('/')
                 .and_then(|(provider_id, model)| {
-                    config.provider(provider_id).map(|p| p.window_of(model))
+                    config
+                        .provider(provider_id)
+                        .map(|p| p.window_of(model))
+                        .or_else(|| {
+                            if provider_id != "auto" {
+                                return None;
+                            }
+                            config.found_group(model).map(|group| {
+                                group
+                                    .routes
+                                    .iter()
+                                    .map(|route| {
+                                        route
+                                            .split_once('/')
+                                            .map(|(pid, m)| {
+                                                config
+                                                    .provider(pid)
+                                                    .map(|p| p.window_of(m))
+                                                    .unwrap_or(0)
+                                            })
+                                            .unwrap_or(0)
+                                    })
+                                    .max()
+                                    .unwrap_or(0)
+                            })
+                        })
                 })
                 .unwrap_or(0);
             (id, owner, window)
@@ -1069,18 +1095,12 @@ fn prepare(
     })?;
 
     let (provider, upstream_model, fixed_effort, group_plan, group_route_index) =
-        if let Some(group_id) = creq.model.strip_prefix("group/") {
-            let Some(group) = config.group(group_id) else {
-                return Err((
-                    StatusCode::NOT_FOUND,
-                    wire.error_body(
-                        StatusCode::NOT_FOUND,
-                        &format!("no provider serves model `{}`", creq.model),
-                    ),
-                ));
-            };
+        if let Some(group) = config.group_by_ref(&creq.model) {
+            // Both spellings land on the internal id, so rotation,
+            // affinity and usage count them as one group.
+            let group_id = group.id.clone();
             let routes = key_rotation.group_order(
-                group_id,
+                &group_id,
                 group.routing,
                 &group.routes,
                 &group.route_weights(),
@@ -1113,7 +1133,7 @@ fn prepare(
                 upstream_model,
                 effort,
                 Some(GroupRoutePlan {
-                    id: group_id.to_owned(),
+                    id: group_id.clone(),
                     routes,
                 }),
                 Some(route_index),

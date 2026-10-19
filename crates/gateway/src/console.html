@@ -1125,7 +1125,7 @@
       for (const provider of configuration.providers || []) {
         for (const model of provider.models || []) routes.add(provider.id + "/" + model);
       }
-      for (const group of configuration.groups || []) routes.add("group/" + group.id);
+      for (const group of configuration.groups || []) routes.add(group.auto && group.name ? "auto/" + group.name : "group/" + group.id);
       elements.agentModelOptions.replaceChildren(...[...routes].map(route => {
         const option = document.createElement("option"); option.value = route; return option;
       }));
@@ -1352,7 +1352,7 @@
         const li = document.createElement("li");
         li.className = "group-item";
         const id = document.createElement("strong");
-        id.textContent = `group/${group.id}`;
+        id.textContent = group.auto && group.name ? `auto/${group.name}` : `group/${group.id}`;
         if (group.hidden) {
           // Found but removed: kept out of routing and the catalog until
           // brought back (the reference lists removed found groups last).

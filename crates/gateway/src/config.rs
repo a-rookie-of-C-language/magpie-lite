@@ -1602,6 +1602,46 @@ impl Config {
             .or_else(|| self.auto_groups().into_iter().find(|g| g.id == id))
     }
 
+    /// Whether found groups are listed by their public ref: while a
+    /// provider is id'd `auto`, `auto/<x>` is that provider's model, so
+    /// found groups keep their old `group/auto-<slug>` (the reference's
+    /// `AutoRefsOn`).
+    pub fn auto_refs_on(&self) -> bool {
+        !self.provider.iter().any(|p| p.id == "auto")
+    }
+
+    /// The ref agents use for a group: a found one is `auto/<model as its
+    /// vendors spell it>`, a hand-made one `group/<id>`.
+    pub fn group_public_ref(&self, group: &GroupConfig) -> String {
+        if group.auto && self.auto_refs_on() {
+            format!("auto/{}", group.name)
+        } else {
+            format!("group/{}", group.id)
+        }
+    }
+
+    /// The found group for a model id, by the vendors' spelling.
+    pub fn found_group(&self, model: &str) -> Option<GroupConfig> {
+        if !self.auto_refs_on() {
+            return None;
+        }
+        self.auto_groups().into_iter().find(|g| g.name == model)
+    }
+
+    /// Find a routing group by the ref an agent uses: `group/<id>` for a
+    /// hand-made group or a found group's old id, `auto/<model>` for a
+    /// found one. The internal id stays what it was, so both spellings
+    /// route to the same group and count as one.
+    pub fn group_by_ref(&self, reference: &str) -> Option<GroupConfig> {
+        if let Some(id) = reference.strip_prefix("group/") {
+            return self.group(id);
+        }
+        if let Some(model) = reference.strip_prefix("auto/") {
+            return self.found_group(model);
+        }
+        None
+    }
+
     /// The groups magpie found: one model id served by several providers,
     /// in the order the providers were added (the reference's
     /// `autoGroups`, without its cross-vendor spelling — lite merges on
@@ -1694,6 +1734,19 @@ impl Config {
                 .iter()
                 .find_map(|route| self.resolve_provider(&self.member_effort(route).0));
         }
+        if let Some(rest) = model.strip_prefix("auto/") {
+            if self.auto_refs_on() {
+                // A found ref names a found group or nothing: hidden and
+                // single-seat models don't route under it.
+                let group = self.found_group(rest)?;
+                return group
+                    .routes
+                    .iter()
+                    .find_map(|route| self.resolve_provider(&self.member_effort(route).0));
+            }
+            // Otherwise a provider id'd `auto` may serve it as its own
+            // model: resolve below as provider/model.
+        }
         self.resolve_provider(model)
     }
 
@@ -1776,8 +1829,8 @@ impl Config {
     /// `model`. A group owns its whole ordered chain; the provider fallbacks
     /// inside that chain are deliberately not combined with it.
     pub fn fallback_references(&self, model: &str, resolved: &ProviderConfig) -> Vec<String> {
-        if let Some(id) = model.strip_prefix("group/")
-            && let Some(group) = self.group(id)
+        if (model.starts_with("group/") || model.starts_with("auto/"))
+            && let Some(group) = self.group_by_ref(model)
         {
             return group.routes.clone();
         }
@@ -1790,7 +1843,7 @@ impl Config {
         let mut out = Vec::new();
         let auto = self.auto_groups();
         for g in self.group.iter().chain(auto.iter()) {
-            out.push((format!("group/{}", g.id), g.label().to_owned()));
+            out.push((self.group_public_ref(g), g.label().to_owned()));
         }
         for p in &self.provider {
             for m in &p.models {
@@ -2707,13 +2760,53 @@ affinity = "session"
         assert_eq!(found.routing, RoutingPolicy::Order);
         // Served, listed and resolved like a written group.
         assert_eq!(config.group("auto-same").unwrap().routes, found.routes);
+        // Listed by its public ref, resolved by either spelling: the
+        // internal id stays what it was, so both count as one group.
+        assert!(config.catalog().iter().any(|(id, _)| id == "auto/same"));
+        assert!(
+            !config
+                .catalog()
+                .iter()
+                .any(|(id, _)| id == "group/auto-same")
+        );
+        assert!(config.resolve("group/auto-same").is_some());
+        assert!(config.resolve("auto/same").is_some());
+        assert_eq!(config.group_by_ref("auto/same").unwrap().id, "auto-same");
+        assert_eq!(
+            config.group_by_ref("group/auto-same").unwrap().id,
+            "auto-same"
+        );
+        assert!(config.group_by_ref("auto/other").is_none());
+        assert!(config.group_by_ref("daily").is_none());
+        assert_eq!(
+            config.fallback_references("auto/same", &config.provider[0]),
+            vec!["a/same".to_owned(), "b/same".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_provider_named_auto_keeps_the_old_found_refs() {
+        let config = Config {
+            provider: vec![
+                found_provider("auto", &["same"]),
+                found_provider("b", &["same"]),
+            ],
+            ..Config::default()
+        };
+        assert!(!config.auto_refs_on());
+        // Listed by the old id; `auto/<x>` is that provider's model.
         assert!(
             config
                 .catalog()
                 .iter()
                 .any(|(id, _)| id == "group/auto-same")
         );
-        assert!(config.resolve("group/auto-same").is_some());
+        assert!(config.group_by_ref("auto/same").is_none());
+        let (provider, model) = config
+            .resolve("auto/same")
+            .expect("provider auto's own model");
+        assert_eq!(provider.id, "auto");
+        assert_eq!(model, "same");
     }
 
     #[test]
@@ -2763,12 +2856,14 @@ affinity = "session"
         assert!(hidden.auto_groups().is_empty());
         assert!(hidden.group("auto-same").is_none());
         assert!(hidden.resolve("group/auto-same").is_none());
+        assert!(hidden.resolve("auto/same").is_none());
         assert!(
             !hidden
                 .catalog()
                 .iter()
                 .any(|(id, _)| id == "group/auto-same")
         );
+        assert!(!hidden.catalog().iter().any(|(id, _)| id == "auto/same"));
         let back = hidden.hidden_found_groups();
         assert_eq!(back.len(), 1);
         assert!(back[0].auto);
