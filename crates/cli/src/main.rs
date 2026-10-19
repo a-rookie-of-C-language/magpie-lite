@@ -152,7 +152,9 @@ enum GroupCommand {
         affinity: Affinity,
         /// A routing rule as JSON, e.g. `{"use":"deepseek/deepseek-chat","images":true}`;
         /// repeat for each rule. Rules put their member first for the requests
-        /// they match; a `"pause":true` rule leaves its member out instead.
+        /// they match; a `"pause":true` rule leaves its member out instead. A
+        /// `"useEffort":"low"` asks the member for that reasoning when the
+        /// rule matches.
         #[arg(long = "rule", num_args = 1)]
         rules: Vec<String>,
         /// The model judging the rules' intents (`provider/model`); a rule

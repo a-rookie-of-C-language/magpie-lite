@@ -1941,6 +1941,18 @@ async fn send_with_fallback(
                         .copied()
                         .unwrap_or(usize::MAX)
                 });
+                // The rule's effort rides its member first: the member is
+                // asked for it — unless the member fixes its own, and only
+                // the first try (failover members are unaffected). It beats
+                // the turn's pick and what the agent asked, like a fixed
+                // effort does.
+                if !hit.use_effort.is_empty()
+                    && let Some(first) = routes.first_mut()
+                    && first.effort.is_empty()
+                    && member(&hit.use_).0 == format!("{}/{}", first.provider.id, first.model)
+                {
+                    first.effort = crate::rules::fit_level(&hit.use_effort);
+                }
             }
         }
     }

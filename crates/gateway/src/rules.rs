@@ -59,6 +59,13 @@ pub struct Rule {
     /// [`EFFORTS`]), or `on` for any reasoning at all.
     #[serde(default)]
     pub effort: String,
+    /// When the rule matches, its member is asked for this reasoning
+    /// (one of [`EFFORTS`]) — a quick question goes to a cheap model at
+    /// low. A member fixed at an effort still sends its own; failover
+    /// members and the turn's other requests are unaffected. Unset
+    /// changes nothing.
+    #[serde(default, rename = "useEffort")]
+    pub use_effort: String,
     /// The request is from one of these agents (UA-derived ids).
     #[serde(default)]
     pub agents: Vec<String>,
@@ -206,11 +213,16 @@ impl TimeWindow {
 impl Rule {
     /// One line for a list: the member, then what it matches.
     pub fn summary(&self) -> String {
-        let what = self.conditions().join(", ");
-        if what.is_empty() {
+        let member = if self.use_effort.is_empty() {
             self.use_.clone()
         } else {
-            format!("{} when {}", self.use_, what)
+            format!("{} at {}", self.use_, self.use_effort)
+        };
+        let what = self.conditions().join(", ");
+        if what.is_empty() {
+            member
+        } else {
+            format!("{member} when {what}")
         }
     }
 
@@ -319,6 +331,14 @@ impl Rule {
                 self.effort
             ));
         }
+        self.use_effort = self.use_effort.trim().to_ascii_lowercase();
+        if !self.use_effort.is_empty() && !EFFORTS.contains(&self.use_effort.as_str()) {
+            return Err(format!(
+                "rule {n}: useEffort is one of {}, not {:?}",
+                EFFORTS.join(", "),
+                self.use_effort
+            ));
+        }
         if self.intent.chars().count() > MAX_INTENT {
             return Err(format!(
                 "rule {n}: an intent is at most {MAX_INTENT} characters"
@@ -333,6 +353,7 @@ impl Rule {
             && (self.tokens > 0
                 || self.images
                 || !self.effort.is_empty()
+                || !self.use_effort.is_empty()
                 || !self.intent.is_empty()
                 || self.compact)
         {
@@ -989,6 +1010,9 @@ pub struct RuleHit {
     pub n: Option<usize>,
     /// The member it puts first.
     pub use_: String,
+    /// The reasoning the matched rule asks its member for (`useEffort`);
+    /// "" when the rule sets none.
+    pub use_effort: String,
     /// The member's conditions, for the record.
     pub when: Vec<String>,
     /// The request is within the turn the decision was made for.
@@ -1337,6 +1361,7 @@ pub fn rule_for(
             }
             hit.n = Some(i);
             hit.use_ = r.use_.clone();
+            hit.use_effort = r.use_effort.clone();
             hit.when = r.conditions();
             break;
         }
@@ -1363,6 +1388,7 @@ pub fn rule_for(
                 hit.held = true;
                 hit.n = tr.n;
                 hit.use_ = tr.use_.clone();
+                hit.use_effort = rules[tr.n.unwrap()].use_effort.clone();
                 hit.when = rules[tr.n.unwrap()].conditions();
             }
             Some(_) => hit.waits = true,
@@ -1397,6 +1423,7 @@ pub fn rule_for(
             hit.grown = true;
             hit.n = Some(i);
             hit.use_ = rules[i].use_.clone();
+            hit.use_effort = rules[i].use_effort.clone();
             hit.when = rules[i].conditions();
             map.insert(
                 key,
@@ -1427,6 +1454,7 @@ pub fn rule_for(
     if let Some(i) = match_rule(rules, &q) {
         hit.n = Some(i);
         hit.use_ = rules[i].use_.clone();
+        hit.use_effort = rules[i].use_effort.clone();
         hit.when = rules[i].conditions();
     }
     if !pick.is_empty() {

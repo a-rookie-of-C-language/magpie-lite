@@ -1322,3 +1322,110 @@ async fn a_rule_names_its_fixed_member_with_the_suffix() {
     assert_eq!(sent["model"], "one");
     assert_eq!(sent["reasoning_effort"], "high");
 }
+
+#[tokio::test]
+async fn a_rule_sets_the_reasoning_its_member_is_asked_for() {
+    // The agent asks medium; the matching rule's member goes first, at
+    // the rule's low.
+    let members = vec!["b/two".to_owned(), "a/one".to_owned()];
+    let mut rule = Rule {
+        use_: "a/one".into(),
+        tokens: 1,
+        use_effort: "low".into(),
+        ..Default::default()
+    };
+    rule.clean(&members, 1).unwrap();
+    let gw = gateway_with_routes(
+        "g-rule-effort",
+        "judge-rule-effort",
+        vec![rule],
+        "",
+        members,
+        Arc::new(Mutex::new(ClsAnswer {
+            status: 200,
+            text: "1".into(),
+        })),
+    )
+    .await;
+    let body = effort_turn(
+        "g-rule-effort",
+        "medium",
+        json!([{"role": "user", "content": "Hello there, how are you doing today?"}]),
+    );
+    assert_eq!(ask_body(&gw, "s-rule-effort", body).await, StatusCode::OK);
+    assert_eq!(cls_asked(&gw), 0);
+    let sent = gw.bodies[0].lock().unwrap()[0].clone();
+    assert_eq!(sent["model"], "one");
+    assert_eq!(sent["reasoning_effort"], "low");
+}
+
+#[tokio::test]
+async fn a_fixed_member_keeps_its_effort_against_a_rule() {
+    // The rule names the fixed member and asks low; high still goes.
+    let members = vec!["b/two".to_owned(), "a/one:high".to_owned()];
+    let mut rule = Rule {
+        use_: "a/one:high".into(),
+        tokens: 1,
+        use_effort: "low".into(),
+        ..Default::default()
+    };
+    rule.clean(&members, 1).unwrap();
+    let gw = gateway_with_routes(
+        "g-rule-fixed",
+        "judge-rule-fixed",
+        vec![rule],
+        "",
+        members,
+        Arc::new(Mutex::new(ClsAnswer {
+            status: 200,
+            text: "1".into(),
+        })),
+    )
+    .await;
+    let body = effort_turn(
+        "g-rule-fixed",
+        "medium",
+        json!([{"role": "user", "content": "Hello there, how are you doing today?"}]),
+    );
+    assert_eq!(ask_body(&gw, "s-rule-fixed", body).await, StatusCode::OK);
+    assert_eq!(cls_asked(&gw), 0);
+    let sent = gw.bodies[0].lock().unwrap()[0].clone();
+    assert_eq!(sent["model"], "one");
+    assert_eq!(sent["reasoning_effort"], "high");
+}
+
+#[tokio::test]
+async fn a_rule_effort_beats_the_turns_pick() {
+    // Auto judges the turn high, but the matching rule asks its member
+    // for low: low is what goes.
+    let members = vec!["b/two".to_owned(), "a/one".to_owned()];
+    let mut rule = Rule {
+        use_: "a/one".into(),
+        tokens: 1,
+        use_effort: "low".into(),
+        ..Default::default()
+    };
+    rule.clean(&members, 1).unwrap();
+    let gw = gateway_with_routes(
+        "g-rule-pick",
+        "judge-rule-pick",
+        vec![rule],
+        "auto",
+        members,
+        Arc::new(Mutex::new(ClsAnswer {
+            status: 200,
+            text: "3".into(),
+        })),
+    )
+    .await;
+    let body = effort_turn(
+        "g-rule-pick",
+        "medium",
+        json!([{"role": "user", "content": "redesign the scheduler"}]),
+    );
+    assert_eq!(ask_body(&gw, "s-rule-pick", body).await, StatusCode::OK);
+    assert_eq!(cls_asked(&gw), 1);
+    let sent = gw.bodies[0].lock().unwrap()[0].clone();
+    assert_eq!(sent["model"], "one");
+    assert_eq!(sent["reasoning_effort"], "low");
+}

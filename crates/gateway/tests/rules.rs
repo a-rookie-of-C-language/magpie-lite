@@ -399,6 +399,29 @@ fn group_validation_cleans_rules_and_refuses_bad_ones() {
     }];
     assert!(group.validate().is_err());
 
+    // a bad effort to ask for
+    group.rules = vec![Rule {
+        use_: "a/one".into(),
+        tokens: 1,
+        use_effort: "ludicrous".into(),
+        ..Default::default()
+    }];
+    assert!(group.validate().is_err());
+
+    // a pause sets no effort to ask for
+    group.rules = vec![Rule {
+        use_: "a/one".into(),
+        pause: true,
+        time: Some(TimeWindow {
+            from: "09:00".into(),
+            to: "18:00".into(),
+            days: Vec::new(),
+        }),
+        use_effort: "low".into(),
+        ..Default::default()
+    }];
+    assert!(group.validate().is_err());
+
     // a pause may only hold by hours or agents
     group.rules = vec![Rule {
         use_: "a/one".into(),
@@ -425,6 +448,17 @@ fn group_validation_cleans_rules_and_refuses_bad_ones() {
     assert_eq!(r.agents, vec!["claude"]);
     assert_eq!(r.time.as_ref().unwrap().from, "09:00");
     assert_eq!(r.time.as_ref().unwrap().days, vec!["mon", "fri"]);
+
+    // an effort to ask for is cased down and shown on the summary
+    group.rules = vec![Rule {
+        use_: "a/one".into(),
+        tokens: 1,
+        use_effort: "LOW".into(),
+        ..Default::default()
+    }];
+    group.validate().unwrap();
+    assert_eq!(group.rules[0].use_effort, "low");
+    assert_eq!(group.rules[0].summary(), "a/one at low when tokens ≥ 1");
 }
 
 // ---- end to end -------------------------------------------------------------
