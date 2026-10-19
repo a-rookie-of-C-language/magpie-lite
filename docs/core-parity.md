@@ -1,7 +1,7 @@
 # Core parity tracker
 
-Updated: 2026-10-19. Reference checkout: `D:\code\magpie` at `5774c790`
-(1,198 commits past the prior baseline `dde3a31a`); implementation:
+Updated: 2026-10-19. Reference checkout: `D:\code\magpie` at `f76201a8`
+(1,213 commits past the prior baseline `dde3a31a`); implementation:
 `D:\code\magpie-lite`.
 
 Target: multiple coding agents sharing one Rust backend, provider adapters for different services, and an interface managing providers, models, routing and usage. The reference rust-core-refactor-plan.md, rust-core-contracts.md and rust-core-admin-api.md are proposals with broader acceptance gates. This tracker does not claim G1–G16 completion or full Magpie product parity.
