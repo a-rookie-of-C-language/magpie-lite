@@ -540,6 +540,29 @@ async fn chat_client_nonstream_passthrough_shape() {
     assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
 }
 
+#[tokio::test]
+async fn a_chat_clients_max_completion_tokens_reaches_an_openai_chat_upstream() {
+    // The client asks OpenAI's newer way; the gateway's Chat encoder
+    // writes the reply limit as max_tokens, which every Chat vendor reads.
+    let (upstream, last) = spawn_mock().await;
+    let gw = spawn_gateway(upstream).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "mock/mock-model",
+            "messages": [{"role": "user", "content": "Weather?"}],
+            "max_completion_tokens": 900
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sent = last.lock().unwrap().clone().expect("upstream request");
+    assert_eq!(sent["max_tokens"], 900);
+    assert!(sent.get("max_completion_tokens").is_none());
+}
+
 async fn rate_limited_chat() -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,

@@ -12,6 +12,7 @@ use crate::ir::{
 use crate::stream::StreamEvent;
 use serde_json::{Map, Value, json};
 
+mod silent;
 mod tool_pairing;
 
 fn missing(field: &'static str) -> CoreError {
@@ -164,7 +165,13 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
         tool_choice: v.get("tool_choice").filter(|t| !t.is_null()).cloned(),
         parallel_tool_calls: v.get("parallel_tool_calls").and_then(Value::as_bool),
         tool_choice_protocol: Some(crate::ir::ToolChoiceProtocol::Chat),
-        max_tokens: v.get("max_tokens").and_then(Value::as_u64),
+        // OpenAI's newer field names the same reply limit. It is read
+        // beside max_tokens so a Chat upstream that wants the old name
+        // still receives it (#2355).
+        max_tokens: v
+            .get("max_tokens")
+            .or_else(|| v.get("max_completion_tokens"))
+            .and_then(Value::as_u64),
         temperature: v.get("temperature").and_then(Value::as_f64),
         top_p: v.get("top_p").and_then(Value::as_f64),
         stop: v
@@ -282,7 +289,9 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
     out.insert("model".into(), json!(model));
     out.insert(
         "messages".into(),
-        Value::Array(tool_pairing::normalize(messages)?),
+        Value::Array(tool_pairing::normalize(silent::without_silent_assistants(
+            messages,
+        ))?),
     );
     if !req.tools.is_empty() {
         out.insert(

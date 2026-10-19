@@ -6,11 +6,34 @@
 use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::{CoreError, Result};
 
 const INTERRUPTED: &str =
     "[The result of this tool call is unavailable: the turn was interrupted.]";
+
+/// The id a call that came with none gets, from its place in the request
+/// and what it says — never at random, so the next turn sends the same
+/// history and the upstream's prompt cache still holds (#2611).
+fn placed_call_id(message: usize, index: usize, name: &str, args: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut hasher = Sha256::new();
+    hasher.update(message.to_string().as_bytes());
+    hasher.update(b".");
+    hasher.update(index.to_string().as_bytes());
+    hasher.update([0u8]);
+    hasher.update(name.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(args.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::from("call_");
+    for byte in &digest[..12] {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
 
 struct PendingCall {
     wire_id: String,
@@ -27,10 +50,14 @@ struct Pairing {
     used: HashSet<String>,
     next_id: usize,
     visuals: Vec<Value>,
+    /// Calls the upstream left without an id, in the order they were
+    /// made: the tool messages that name no id either answer them.
+    open: Vec<String>,
 }
 
 impl Pairing {
     fn flush(&mut self) {
+        self.open.clear();
         for call in self.pending.drain(..) {
             let mut answer = call.answer.unwrap_or_else(
                 || json!({"role":"tool", "tool_call_id":call.wire_id, "content":INTERRUPTED}),
@@ -208,7 +235,7 @@ pub(super) fn normalize(messages: Vec<Value>) -> Result<Vec<Value>> {
         reserved,
         ..Default::default()
     };
-    for mut message in messages {
+    for (at, mut message) in messages.into_iter().enumerate() {
         match message["role"].as_str() {
             Some("assistant") => {
                 if !pairing.pending.is_empty()
@@ -224,7 +251,7 @@ pub(super) fn normalize(messages: Vec<Value>) -> Result<Vec<Value>> {
                 pairing.flush();
                 pairing.emit_visuals(None);
                 if let Some(calls) = message["tool_calls"].as_array_mut() {
-                    for call in calls {
+                    for (i, call) in calls.iter_mut().enumerate() {
                         let original = call["id"].as_str().unwrap_or_default();
                         // Two simultaneous calls with the same nonempty id are
                         // ambiguous: don't silently attach a result to either.
@@ -236,12 +263,28 @@ pub(super) fn normalize(messages: Vec<Value>) -> Result<Vec<Value>> {
                                         .into(),
                             });
                         }
-                        let wire_id = pairing.wire_id(original);
-                        if !original.is_empty() {
+                        let wire_id = if original.is_empty() {
+                            // From its place in the request and what it says,
+                            // so the next turn sends the same history.
+                            let name = call["function"]["name"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_owned();
+                            let args = call["function"]["arguments"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_owned();
+                            let made = placed_call_id(at, i, &name, &args);
+                            pairing.reserved.insert(made.clone());
+                            pairing.open.push(made.clone());
+                            made
+                        } else {
+                            let wire_id = pairing.wire_id(original);
                             pairing
                                 .indices
                                 .insert(original.to_owned(), pairing.pending.len());
-                        }
+                            wire_id
+                        };
                         call["id"] = json!(wire_id);
                         pairing.pending.push(PendingCall {
                             wire_id,
@@ -256,6 +299,25 @@ pub(super) fn normalize(messages: Vec<Value>) -> Result<Vec<Value>> {
                 pairing.output.push(message);
             }
             Some("tool") => {
+                // A result that names no id answers the earliest call that
+                // came with none, in the calls' order (#2611).
+                if message["tool_call_id"]
+                    .as_str()
+                    .is_none_or(|id| id.is_empty())
+                    && !pairing.open.is_empty()
+                {
+                    let made = pairing.open.remove(0);
+                    if let Some(index) =
+                        pairing.pending.iter().position(|call| call.wire_id == made)
+                    {
+                        let pending = &mut pairing.pending[index];
+                        message["tool_call_id"] = json!(made);
+                        if pending.answer.is_none() {
+                            pending.answer = Some(message);
+                        }
+                        continue;
+                    }
+                }
                 let id = message["tool_call_id"].as_str().unwrap_or_default();
                 if let Some(index) = pairing.indices.get(id).copied() {
                     let pending = &mut pairing.pending[index];

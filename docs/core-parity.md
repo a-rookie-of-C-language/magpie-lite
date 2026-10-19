@@ -1,6 +1,8 @@
 # Core parity tracker
 
-Updated: 2026-10-12. Reference checkout: `D:\code\magpie`; implementation: `D:\code\magpie-lite`.
+Updated: 2026-10-19. Reference checkout: `D:\code\magpie` at `5774c790`
+(1,198 commits past the prior baseline `dde3a31a`); implementation:
+`D:\code\magpie-lite`.
 
 Target: multiple coding agents sharing one Rust backend, provider adapters for different services, and an interface managing providers, models, routing and usage. The reference rust-core-refactor-plan.md, rust-core-contracts.md and rust-core-admin-api.md are proposals with broader acceptance gates. This tracker does not claim G1–G16 completion or full Magpie product parity.
 
@@ -472,3 +474,62 @@ its result continue to pair.
 
 This ports the reference gateway's `6c099edd` behavior. Real Anthropic API
 acceptance remains covered by request-shape tests rather than a live call.
+
+## Upstream refresh, 2026-10-19
+
+The reference checkout moved from `dde3a31a` to `5774c790` (1,198 commits,
+1,065 changed files). GUI, plugin hosting, subscription accounts, cloud sync
+and backup account for most of it and stay outside lite's scope. The core
+gateway and provider changes below are generic and do not depend on a
+subscription-account model.
+
+### Left out: assistant turns that say nothing (`ed0335f7`)
+
+An agent keeps the turn a user cut off before it said anything — only its
+thinking, an empty text, nothing — and sends it again on every later turn.
+DeepSeek, Kimi and the like turn the whole request away over it:
+"Invalid assistant message: content or tool_calls must be set" (#2599).
+`crates/core/src/chat/silent.rs` now drops such an assistant turn wherever
+it stood and joins the user messages it stood between, because some chat
+templates refuse two user messages in a row. A prefill (`prefix`/`partial`),
+a refusal, an audio reply, a tool call and a non-text part all keep the turn.
+A request with no silent turn comes back unchanged. This runs on the Chat
+encoder, so it covers both translated and Chat-native requests.
+
+### Empty Chat tool-call ids (`a69cd070`)
+
+A streamed call the upstream left without an id reached the agent as `""`
+and a strict upstream then refused every later turn (WorkBuddy AI's 400
+code 11133, #2611). `tool_pairing.rs` now gives each such call an id derived
+from its message position, call index, name and arguments — never random, so
+the next turn sends the same history and the prompt cache still holds. A
+tool result that names no id answers the earliest such call in order.
+Non-empty ids keep the existing remapping, including the duplicate-id
+refusal.
+
+### DeepSeek's reply limit (`62020b9c`)
+
+DeepSeek's Chat API has no `max_completion_tokens` and ignores one, so a
+client asking OpenAI's way got DeepSeek's 8K default (#2355). Lite dropped
+the field at Chat decode before this change, so the fix is in two places:
+`chat::decode_request` now reads it beside `max_tokens` (an explicit
+`max_tokens` wins), and `upstream.rs` writes `max_tokens` for
+`api.deepseek.com` Chat. OpenAI, Azure and lookalike hosts keep their own
+field, and a body that already names `max_tokens` is left alone.
+
+### A relay's own input cap (`7fefbc61`)
+
+`Input token exceed the limit` is a cap on one request's input, not an
+unknown shape. `model_gone.rs` now classifies it as too-long so a routing
+group can hand the turn to a member with room.
+
+### Still open from this refresh
+
+Room-aware group selection (`0f398c48`) needs per-model window metadata that
+lite does not carry; it is not implemented. Rest granularity, RPM and
+concurrency queues, sink ordering, the streaming-whole-reply retry
+(`df341e76`), bare-400 group fallback (`75035fa2`), the Chat-tool-shape
+normalizer (`72d6103e`), provider-specific schema rewrites (`97b4174a`,
+`1530c5ef`) and HTTP/2 transport health (`94919109`) remain future work.
+These fixtures are local unit and workspace tests, not live-vendor or
+real-agent evidence.

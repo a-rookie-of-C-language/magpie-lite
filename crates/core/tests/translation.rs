@@ -35,6 +35,21 @@ fn chat_request() -> Value {
 }
 
 #[test]
+fn a_chat_clients_max_completion_tokens_is_kept() {
+    // OpenAI's newer field names the same reply limit. Dropping it at
+    // decode let DeepSeek fall back to its 8K default (#2355).
+    let ir = chat::decode_request(&json!({"model":"m",
+        "messages":[{"role":"user","content":"hi"}], "max_completion_tokens":900}))
+    .unwrap();
+    assert_eq!(ir.max_tokens, Some(900));
+    // An explicit max_tokens wins when both are sent.
+    let both = chat::decode_request(&json!({"model":"m", "messages":[],
+        "max_tokens":700, "max_completion_tokens":900}))
+    .unwrap();
+    assert_eq!(both.max_tokens, Some(700));
+}
+
+#[test]
 fn chat_request_decodes_into_ir() {
     let ir = chat::decode_request(&chat_request()).expect("decode");
     assert_eq!(ir.model, "deepseek/deepseek-chat");

@@ -140,7 +140,7 @@ fn protection_words() -> &'static Regex {
 fn too_long_words() -> &'static Regex {
     static TOO_LONG: OnceLock<Regex> = OnceLock::new();
     TOO_LONG.get_or_init(|| {
-        Regex::new(r#"(?i)context_length_exceeded|prompt is too long|input is too long|(exceeds?|exceeded|over|beyond)( the)?( model'?s?)?( maximum)? context|context (length|limit|window) (exceeded|is exceeded)|maximum context length|too many (input |prompt )?tokens|上下文(长度)?(超|过长)|超(过|出)(了)?(模型)?(的)?(最大)?上下文|input token count.*exceeds the maximum|maximum prompt length is \d|reduce the length of the messages|maximum allowed input length|longer than the model'?s context length|available context size|greater than the context length|prompt token count of [\d,]+ exceeds the limit|context window exceeds limit|exceeded model token limit|configured context size|prompt too long|prompt exceeds max length|context_window_exceeded|exceeded (max |maximum )?context length|range of input length should be|token limit exceeded"#)
+        Regex::new(r#"(?i)context_length_exceeded|prompt is too long|input is too long|(exceeds?|exceeded|over|beyond)( the)?( model'?s?)?( maximum)? context|context (length|limit|window) (exceeded|is exceeded)|maximum context length|too many (input |prompt )?tokens|上下文(长度)?(超|过长)|超(过|出)(了)?(模型)?(的)?(最大)?上下文|input token count.*exceeds the maximum|maximum prompt length is \d|reduce the length of the messages|maximum allowed input length|longer than the model'?s context length|available context size|greater than the context length|prompt token count of [\d,]+ exceeds the limit|context window exceeds limit|exceeded model token limit|configured context size|prompt too long|prompt exceeds max length|context_window_exceeded|exceeded (max |maximum )?context length|range of input length should be|token limit exceeded|input tokens? (count )?(exceeds?|exceeded) (the )?(max(imum)? )?limit"#)
             .expect("too long words regex")
     })
 }
@@ -261,6 +261,10 @@ mod tests {
             "exceeded maximum context length",
             "range of input length should be between 1 and 131072",
             "token limit exceeded",
+            // A relay's own cap on one request's input, under the
+            // model's window, which another group member holds (#2445).
+            "Input token exceed the limit",
+            "Input tokens exceeded the maximum limit",
             "上下文过长",
             "超出模型最大上下文",
         ] {

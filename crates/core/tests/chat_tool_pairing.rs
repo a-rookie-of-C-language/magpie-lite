@@ -199,12 +199,16 @@ fn empty_thinking_turn_does_not_split_pending_calls() {
     ]);
     assert_eq!(trace(&out), ["assistant(A)", "tool(A)"]);
     assert_eq!(out[1]["content"], "real");
+    // A turn with nothing but thinking says nothing: it is left out
+    // wherever it stood, and the user messages it stood between join
+    // (#2599).
     let outside = encode(vec![
         user(vec![text("hi")]),
         assistant(vec![thinking]),
         user(vec![text("continue")]),
     ]);
-    assert_eq!(trace(&outside), ["user", "assistant", "user"]);
+    assert_eq!(trace(&outside), ["user"]);
+    assert_eq!(outside[0]["content"], "hi\n\ncontinue");
     assert_complete(&out);
 }
 
@@ -273,18 +277,66 @@ fn reused_call_ids_are_remapped_per_exchange_without_cross_wiring_results() {
 }
 
 #[test]
-fn missing_call_ids_are_generated_without_colliding_with_later_native_ids() {
-    let out = encode(vec![
+fn missing_call_ids_are_given_their_place_and_stay_the_same() {
+    let messages = vec![
         assistant(vec![call("")]),
         user(vec![text("interrupted")]),
         assistant(vec![call("call_magpie_lite_0")]),
         user(vec![result("call_magpie_lite_0", "real")]),
-    ]);
-    assert_eq!(out[0]["tool_calls"][0]["id"], "call_magpie_lite_1");
-    assert_eq!(out[1]["tool_call_id"], "call_magpie_lite_1");
+    ];
+    let out = encode(messages.clone());
+    let made = out[0]["tool_calls"][0]["id"].as_str().unwrap().to_owned();
+    assert!(made.starts_with("call_"), "{made}");
+    assert_ne!(made, "call_magpie_lite_0");
+    assert_eq!(out[1]["tool_call_id"], made);
     assert!(out[1]["content"].as_str().unwrap().contains("unavailable"));
     assert_eq!(out[3]["tool_calls"][0]["id"], "call_magpie_lite_0");
     assert_eq!(out[4]["content"], "real");
+    assert_complete(&out);
+    // From its place in the request and what it says, never at random:
+    // the next turn sends the same history.
+    let again = encode(messages);
+    assert_eq!(again[0]["tool_calls"][0]["id"], made);
+}
+
+#[test]
+fn an_empty_result_id_answers_the_calls_that_came_with_none() {
+    let out = encode(vec![
+        assistant(vec![call(""), call("")]),
+        user(vec![result("", "first")]),
+        user(vec![result("", "second")]),
+    ]);
+    let first = out[0]["tool_calls"][0]["id"].as_str().unwrap().to_owned();
+    let second = out[0]["tool_calls"][1]["id"].as_str().unwrap().to_owned();
+    assert_ne!(first, second);
+    assert_eq!(out[1]["tool_call_id"], first);
+    assert_eq!(out[1]["content"], "first");
+    assert_eq!(out[2]["tool_call_id"], second);
+    assert_eq!(out[2]["content"], "second");
+    assert_complete(&out);
+}
+
+#[test]
+fn a_later_turn_does_not_claim_an_earlier_calls_result() {
+    // The first call was answered by name; the second turn's call has no
+    // id. A result that names no id must answer the second turn's call,
+    // not reopen the first.
+    let out = encode(vec![
+        assistant(vec![call("")]),
+        user(vec![result("", "first")]),
+        assistant(vec![call("call_kept")]),
+        user(vec![result("call_kept", "second")]),
+        assistant(vec![call("")]),
+        user(vec![result("", "third")]),
+    ]);
+    let first = out[0]["tool_calls"][0]["id"].as_str().unwrap().to_owned();
+    let kept = out[2]["tool_calls"][0]["id"].as_str().unwrap().to_owned();
+    let last = out[4]["tool_calls"][0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(out[1]["tool_call_id"], first);
+    assert_eq!(out[3]["tool_call_id"], kept);
+    assert_ne!(first, last);
+    assert_eq!(out[5]["tool_call_id"], last);
+    assert_eq!(out[5]["content"], "third");
     assert_complete(&out);
 }
 

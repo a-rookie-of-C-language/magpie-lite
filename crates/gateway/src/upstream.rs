@@ -44,6 +44,13 @@ pub fn build_request(
             .remove("web_search_options");
         body["plugins"] = json!([{"id":"web"}]);
     }
+    // DeepSeek's chat API has no max_completion_tokens and ignores one,
+    // so a client that asks OpenAI's way gets DeepSeek's 8K default. A
+    // request that names max_tokens too goes as it is, since DeepSeek
+    // reads that one. OpenAI's and Azure's APIs want the OpenAI field.
+    if p.protocol == Protocol::Chat && host.as_deref() == Some("api.deepseek.com") {
+        body = deepseek_reply_limit(body);
+    }
     if p.protocol == Protocol::Responses
         && host.as_deref() == Some("api.x.ai")
         && let Some(include) = body.get_mut("include").and_then(Value::as_array_mut)
@@ -62,6 +69,25 @@ pub fn build_request(
         object.remove("model");
     }
     Ok(body)
+}
+
+/// DeepSeek's chat API has no `max_completion_tokens` and ignores one, so
+/// a client that asks OpenAI's way gets DeepSeek's 8K default. Rename it
+/// in place; a request that names `max_tokens` too goes as it is, since
+/// DeepSeek reads that one. OpenAI's and Azure's APIs want OpenAI's field,
+/// so no other host is touched.
+fn deepseek_reply_limit(mut body: Value) -> Value {
+    if body.get("max_tokens").is_some() {
+        return body;
+    }
+    let Some(max) = body.get("max_completion_tokens").cloned() else {
+        return body;
+    };
+    if let Some(object) = body.as_object_mut() {
+        object.remove("max_completion_tokens");
+        object.insert("max_tokens".into(), max);
+    }
+    body
 }
 
 /// POST the body upstream; the URL shape and auth follow the protocol.
@@ -287,6 +313,36 @@ mod search_tests {
         }
     }
 
+    #[test]
+    fn deepseek_reads_openais_reply_limit_as_max_tokens() {
+        // A body naming only OpenAI's field: DeepSeek would ignore it and
+        // fall back to its 8K default.
+        let renamed = deepseek_reply_limit(json!({"model":"m", "max_completion_tokens":700}));
+        assert_eq!(renamed["max_tokens"], 700);
+        assert!(renamed.get("max_completion_tokens").is_none());
+        // A body that already names max_tokens keeps it, and drops nothing
+        // else it was sent.
+        let both = deepseek_reply_limit(json!({"model":"m", "max_tokens":900,
+            "max_completion_tokens":700, "temperature":0.2}));
+        assert_eq!(both["max_tokens"], 900);
+        assert_eq!(both["max_completion_tokens"], 700);
+        assert_eq!(both["temperature"], 0.2);
+        // Nothing to rename comes back as it was.
+        let plain = deepseek_reply_limit(json!({"model":"m", "messages":[]}));
+        assert_eq!(plain, json!({"model":"m", "messages":[]}));
+        // The rule is wired to DeepSeek's Chat API alone: OpenAI's, a
+        // lookalike host and a non-Chat protocol keep OpenAI's field.
+        let request = chat::decode_request(&json!({"model":"m",
+            "messages":[{"role":"user","content":"hi"}], "max_tokens":700}))
+        .unwrap();
+        for host in [
+            "https://api.openai.com/v1",
+            "https://api.deepseek.com.evil.invalid/v1",
+        ] {
+            let out = build_request(&provider(Protocol::Chat, host), &request, "up").unwrap();
+            assert_eq!(out["max_tokens"], 700);
+        }
+    }
     #[test]
     fn disabled_search_never_enables_openrouter_plugin_or_search_include() {
         let request = responses::decode_request(
