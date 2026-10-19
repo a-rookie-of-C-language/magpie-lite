@@ -1,6 +1,6 @@
 # Core parity tracker
 
-Updated: 2026-10-19. Reference checkout: `D:\code\magpie` at `c483fead`
+Updated: 2026-10-19. Reference checkout: `D:\code\magpie` at `b641868e`
 (1,214 commits past the prior baseline `dde3a31a`); implementation:
 `D:\code\magpie-lite`.
 
@@ -810,6 +810,57 @@ stream encoders to the same rule for an overflow and a rate limit.
 test. These are local loopback fixtures, not live-vendor evidence, and no
 agent's compactor has been observed reacting to them.
 
+### The window's reply room (`b749cffb`)
+
+A reply asked for past what the context window leaves is asked again for
+what the window leaves, not failed as too long. DeepSeek counts the reply
+asked for (`max_tokens`) in its 1M window with the prompt: "maximum
+context length is 1000000 tokens. However, you requested N tokens (P in
+the messages, C in the completion)". A turn asking the model's whole 384K
+on a ~620K+ conversation was refused there and read as "too long for its
+model", where every other member of its group answered. An endpoint
+speaking Anthropic's API words the same refusal its own way ("input length
+and `max_tokens` exceed context limit: P + C > W").
+
+`crates/gateway/src/reply_room.rs` reads the window and the prompt from
+that refusal, in DeepSeek's/vLLM's words or Anthropic's, and asks the same
+candidate once more for `W-P`: same provider, same model, same key, no key
+cooldown and no route switch. The reply field is lowered in the protocol's
+own words (`max_tokens`, `max_output_tokens`, or
+`generationConfig.maxOutputTokens`), or set where the body named none; an
+Anthropic thinking budget above the new cap comes down with it. Room under
+8192 is left alone, so the agent is told it overflowed and compacts.
+`crates/gateway/tests/reply_room.rs` is the loopback evidence, in
+DeepSeek's and Anthropic's wordings and with a prompt leaving under 8K.
+
+### Kimi `$ref` targets (`129d8b08`)
+
+Moonshot expands a local `$ref` in a tool schema and refuses a target that
+names no type ("detected infinite recursion without termination
+condition"). Codex sends zod `$defs` whose `oneOf` or `allOf` targets are
+untyped, so the whole request failed though the tool was never called.
+`kimi_schema::kimi_tool_ref_types` gives each untyped target the type its
+enum, keywords or branches imply, or every JSON Schema type when they say
+nothing. A `{}` target, an `anyOf` (which Moonshot refuses a type beside),
+and a `$ref` with only notes beside it are left as they were. It runs on
+Kimi's hosts only, on every upstream dialect.
+
+### Affinity written behind the answer (`a1118187`)
+
+A conversation's answerer is in memory at once, but `affinity.json` now
+follows within 2s: what is answered meanwhile goes in one write, instead
+of marshalling, writing and renaming up to 512 conversations on every
+answer. The gateway flushes what waits on Ctrl-C, so a restart or a
+handover reads every answer.
+
+### Left out from this refresh
+
+`2a27fb8d` (byte-slice search lookups), `ec6fba47` (a memoized JSON member
+splitter) and `9b72add5` (a Go zstd coder pool) are Go-specific
+allocations: lite already decodes each client body once and has no zstd
+encoder. `627e8e7d` caches Go's catalog-wide group builds; lite's groups
+are a small `Vec` scanned in place. `224ea7d5` invalidates that same Go
+catalog cache. `b641868e` only fixes a Go test's clock.
 ### Still open from this refresh
 
 Room-aware group selection (`0f398c48`) needs per-model window metadata that
