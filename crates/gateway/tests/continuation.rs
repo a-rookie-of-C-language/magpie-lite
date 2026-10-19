@@ -66,6 +66,7 @@ async fn chat(
     uri: axum::http::Uri,
     Json(body): Json<Value>,
 ) -> Response {
+    let streaming = body["stream"] == true;
     let call = {
         let mut bodies = f.journal.bodies.lock().unwrap();
         f.journal.paths.lock().unwrap().push(uri.path().to_owned());
@@ -85,6 +86,21 @@ async fn chat(
     } else {
         (f.whole.clone(), false)
     };
+    if !streaming {
+        // A non-stream ask answers the whole reply at once.
+        return Json(json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion",
+            "model": "mock-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "answer"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }))
+        .into_response();
+    }
     let stream = async_stream::stream! {
         for ev in events {
             yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("data: {ev}\n\n")));
@@ -709,4 +725,124 @@ async fn a_plain_chat_upstream_is_never_asked_to_go_on() {
         "Go's garbage collector is a concurrent, tri-color"
     );
     assert_eq!(anthropic_counts(&body).2, 1, "{body}");
+}
+
+/// A model that turned the trailing assistant message away is remembered:
+/// its conversation is asked once more with a user turn after it, and a
+/// later request goes out that way from the start.
+#[tokio::test]
+async fn a_prefill_refusal_is_answered_with_a_user_turn_and_remembered() {
+    let f = Arc::new(CutChat {
+        journal: Journal::default(),
+        cuts: vec![],
+        whole: vec![chat_text_ev("m", "ok"), chat_stop("m")],
+        fails: vec![
+            (
+                400,
+                r#"{"error":{"message":"This model does not support assistant message prefill."}}"#
+                    .into(),
+            ),
+            (0, String::new()),
+            (0, String::new()),
+        ],
+    });
+    let up = serve(
+        Router::new()
+            .route("/{*p}", post(chat))
+            .with_state(f.clone()),
+    )
+    .await;
+    let gw = gateway(provider(Protocol::Chat, format!("{}/v1", up.url), "m")).await;
+
+    let ask = || {
+        let url = gw.url.clone();
+        async move {
+            reqwest::Client::new()
+                .post(format!("{url}/v1/chat/completions"))
+                .bearer_auth(TOKEN)
+                .json(&json!({
+                    "model": "up/m",
+                    "messages": [
+                        {"role": "user", "content": "hi"},
+                        {"role": "assistant", "content": "a beginning"},
+                    ]
+                }))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    let first = ask().await;
+    let status = first.status();
+    let text = first.text().await.unwrap();
+    assert!(status.is_success(), "{status}: {text}");
+    assert_eq!(f.journal.calls(), 2, "the refused ask is sent once more");
+    assert_eq!(
+        f.journal.body(1)["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["content"],
+        "Continue."
+    );
+
+    // The refusal is remembered: the next ask goes out with the turn
+    // already after the assistant's message.
+    let second = ask().await;
+    assert!(second.status().is_success());
+    assert_eq!(f.journal.calls(), 3);
+    assert_eq!(
+        f.journal.body(2)["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["content"],
+        "Continue."
+    );
+}
+
+/// An Anthropic client's own trailing assistant message is its prefill,
+/// not a turn said: nothing is added after it, and a refusal is the
+/// client's own ask's answer.
+#[tokio::test]
+async fn an_anthropic_clients_prefill_is_its_own_ask() {
+    let f = Arc::new(CutChat {
+        journal: Journal::default(),
+        cuts: vec![],
+        whole: vec![chat_text_ev("m", "ok"), chat_stop("m")],
+        fails: vec![],
+    });
+    let up = serve(
+        Router::new()
+            .route("/{*p}", post(chat))
+            .with_state(f.clone()),
+    )
+    .await;
+    let gw = gateway(provider(Protocol::Chat, format!("{}/v1", up.url), "m")).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/messages", gw.url))
+        .bearer_auth(TOKEN)
+        .json(&json!({
+            "model": "up/m",
+            "max_tokens": 32000,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "a beginning"},
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    assert_eq!(f.journal.calls(), 1);
+    let body0 = f.journal.body(0);
+    let messages = body0["messages"].as_array().unwrap();
+    assert_eq!(
+        messages.last().unwrap()["role"],
+        "assistant",
+        "an Anthropic client's prefill got a user turn after it: {messages:?}"
+    );
 }

@@ -1487,6 +1487,7 @@ async fn send_with_fallback(
     state: &AppState,
     config: &Config,
     creq: &CompletionRequest,
+    wire: ClientWire,
     initial: UpstreamRoute,
     group_plan: Option<&GroupRoutePlan>,
     tracker: &mut RequestTracker,
@@ -1650,6 +1651,14 @@ async fn send_with_fallback(
             // is refused too, that refusal stands as the answer (#2670).
             let mut tools_without_effort_retry = false;
             let mut tools_refusal: Option<Value> = None;
+            // The client's own Chat/Responses conversation ends with the
+            // assistant's message: a turn already said, not one to go on
+            // from — an upstream model that takes no prefill is asked with
+            // a user turn after it (the reference's `userLast`, #1447).
+            let client_last_is_turn =
+                matches!(wire, ClientWire::Chat { .. } | ClientWire::Responses)
+                    && crate::continuation::ends_with_assistant(creq);
+            let mut turn_after = false;
             'candidate: loop {
                 liveness.activity.attempt();
                 let mut body = match upstream::build_request(&route.provider, creq, &route.model) {
@@ -1718,6 +1727,25 @@ async fn send_with_fallback(
                         model = %route.model,
                         "folding tool roots to an object"
                     );
+                }
+                if matches!(
+                    route.provider.protocol,
+                    Protocol::Chat | Protocol::Responses
+                ) && client_last_is_turn
+                    && (turn_after
+                        || unfit_fields::unfit(
+                            &route.provider.id,
+                            &route.model,
+                            route.provider.protocol.as_str(),
+                            &crate::continuation::prefill_refused_field(&route.model),
+                        ))
+                {
+                    if let Some(next) =
+                        crate::continuation::user_last_body(route.provider.protocol, &body)
+                    {
+                        body = next;
+                        turn_after = true;
+                    }
                 }
                 if let Some(room) = room_cap {
                     // The reply asked for with the prompt passed the
@@ -2161,6 +2189,31 @@ async fn send_with_fallback(
                     {
                         tools_refusal = Some(error.body.clone());
                         tools_without_effort_retry = true;
+                        continue 'candidate;
+                    }
+                }
+                // A model that takes no prefill — it refuses a
+                // conversation ending with the assistant's message —
+                // is remembered for it alone, and the client's own such
+                // conversation is asked once more with a user turn after
+                // it (the reference's `refusesPrefill`/`userLast`, #1447).
+                if crate::continuation::refuses_prefill(status.as_u16(), &error.body)
+                    && crate::continuation::ends_with_assistant(creq)
+                {
+                    unfit_fields::refuse(
+                        &route.provider.id,
+                        &route.model,
+                        route.provider.protocol.as_str(),
+                        &crate::continuation::prefill_refused_field(&route.model),
+                    );
+                    if client_last_is_turn
+                        && !turn_after
+                        && matches!(
+                            route.provider.protocol,
+                            Protocol::Chat | Protocol::Responses
+                        )
+                    {
+                        turn_after = true;
                         continue 'candidate;
                     }
                 }
@@ -2767,6 +2820,7 @@ async fn proxy_parsed(
             &state,
             &config,
             &creq,
+            wire,
             initial,
             group_plan.as_ref(),
             &mut tracker,

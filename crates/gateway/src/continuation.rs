@@ -32,6 +32,64 @@ pub(crate) const STREAM_RETRIES: usize = 2;
 /// away: the caller ends the reply with what cut it, not with this.
 pub(crate) const PREFILL_REFUSED: &str = "prefill refused";
 
+/// The user turn asked after a conversation the client ended with the
+/// assistant's message, for a model that takes no prefill
+/// (the reference's `continueText`, #1447): OpenAI's Chat and Responses
+/// APIs read such a conversation as a turn already said, not one to go
+/// on from, so the model is asked to answer after it.
+pub(crate) const CONTINUE_TEXT: &str = "Continue.";
+
+/// Whether `req`'s conversation ends with the assistant's message rather
+/// than a call it made: what a prefill is (the reference's
+/// `endsWithAssistant`).
+pub(crate) fn ends_with_assistant(req: &CompletionRequest) -> bool {
+    let Some(last) = req.messages.last() else {
+        return false;
+    };
+    last.role == Role::Assistant
+        && !last.parts.iter().any(|p| {
+            matches!(
+                p.kind(),
+                magpie_core::ir::PartKind::ToolCall | magpie_core::ir::PartKind::ToolResult
+            )
+        })
+}
+
+/// A Chat or Responses request body with a user turn after its last
+/// message when that is the assistant's; `None` when it isn't (the
+/// reference's `userLastBody`). A call the assistant made last still
+/// waits on its results — nothing is added after it.
+pub(crate) fn user_last_body(protocol: Protocol, body: &Value) -> Option<Value> {
+    let chat = protocol == Protocol::Chat;
+    if !chat && protocol != Protocol::Responses {
+        return None;
+    }
+    let field = if chat { "messages" } else { "input" };
+    let mut out = body.clone();
+    let items = out.get_mut(field)?.as_array_mut()?;
+    let last = items.last()?;
+    let role = last.get("role").and_then(Value::as_str);
+    let ty = last.get("type").and_then(Value::as_str);
+    let has_calls = last
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .is_some_and(|calls| !calls.is_empty());
+    if role != Some("assistant") || ty.is_some_and(|t| t != "message") || has_calls {
+        return None;
+    }
+    let turn = if chat {
+        serde_json::json!({"role": "user", "content": CONTINUE_TEXT})
+    } else {
+        serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": CONTINUE_TEXT}],
+        })
+    };
+    items.push(turn);
+    Some(out)
+}
+
 /// How unfit remembers a provider's model refusing a conversation ending
 /// with the assistant's message (the reference's `prefillRefused`): keyed
 /// on the model, so one model's refusal doesn't tar the provider's
