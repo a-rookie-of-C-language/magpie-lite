@@ -237,19 +237,48 @@ pub fn chat_error(status: reqwest::StatusCode, message: &str) -> Value {
     } else {
         "upstream_error"
     };
-    json!({"error": {"message": message, "type": kind, "code": status.as_u16()}})
+    chat_error_kind(status, message, kind)
+}
+
+/// A Chat-shaped error with the type the client sees, not the status's
+/// default. The reference's `writeErrorSaid` names the type for each
+/// status (a 413 is `request_too_large`, an overflow a 400
+/// `context_length_exceeded`) and says it in every client shape.
+pub fn chat_error_kind(status: reqwest::StatusCode, message: &str, kind: &str) -> Value {
+    let code = if magpie_core::stream_error::overflow_words(message) {
+        json!("context_length_exceeded")
+    } else {
+        json!(status.as_u16())
+    };
+    json!({"error": {"message": message, "type": kind, "code": code}})
 }
 
 /// An error body in the Gemini generateContent shape.
 pub fn gemini_error(status: reqwest::StatusCode, message: &str) -> Value {
-    let reason = match status.as_u16() {
+    gemini_error_reason(status, message, gemini_reason(status.as_u16()))
+}
+
+pub fn gemini_reason(status: u16) -> &'static str {
+    match status {
         400 => "INVALID_ARGUMENT",
-        401 | 403 => "PERMISSION_DENIED",
+        401 => "UNAUTHENTICATED",
+        403 => "PERMISSION_DENIED",
         404 => "NOT_FOUND",
+        408 => "DEADLINE_EXCEEDED",
+        413 => "INVALID_ARGUMENT",
         429 => "RESOURCE_EXHAUSTED",
-        500 | 502 | 503 | 504 => "UNAVAILABLE",
+        500 => "INTERNAL",
+        502 | 503 | 529 => "UNAVAILABLE",
         _ => "UNKNOWN",
-    };
+    }
+}
+
+/// A Gemini-shaped error with the reason the client sees.
+pub fn gemini_error_reason(
+    status: reqwest::StatusCode,
+    message: &str,
+    reason: &'static str,
+) -> Value {
     json!({"error": {"code": status.as_u16(), "message": message, "status": reason}})
 }
 
@@ -257,11 +286,19 @@ pub fn gemini_error(status: reqwest::StatusCode, message: &str) -> Value {
 pub fn anthropic_error(status: reqwest::StatusCode, message: &str) -> Value {
     let kind = match status.as_u16() {
         400 => "invalid_request_error",
-        401 | 403 => "authentication_error",
-        429 => "rate_limit_error",
+        401 => "authentication_error",
+        403 => "permission_error",
         404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        529 => "overloaded_error",
         _ => "api_error",
     };
+    anthropic_error_kind(message, kind)
+}
+
+/// An Anthropic-shaped error with the type the client sees.
+pub fn anthropic_error_kind(message: &str, kind: &str) -> Value {
     json!({"type": "error", "error": {"type": kind, "message": message}})
 }
 /// Percent-encode a model for one path segment.
@@ -284,7 +321,12 @@ pub fn responses_error(status: reqwest::StatusCode, message: &str) -> Value {
     } else {
         "upstream_error"
     };
-    json!({"error": {"message": message, "type": kind, "code": status.as_u16()}})
+    responses_error_kind(status, message, kind)
+}
+
+/// A Responses-shaped error with the type the client sees.
+pub fn responses_error_kind(status: reqwest::StatusCode, message: &str, kind: &str) -> Value {
+    chat_error_kind(status, message, kind)
 }
 
 #[cfg(test)]

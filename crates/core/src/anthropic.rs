@@ -668,6 +668,7 @@ impl AnthropicStreamDecoder {
         self.search_failed = true;
         vec![StreamEvent::Error {
             message: message.into(),
+            code: None,
         }]
     }
 
@@ -938,6 +939,11 @@ impl AnthropicStreamDecoder {
                     .unwrap_or("anthropic upstream error");
                 out.push(StreamEvent::Error {
                     message: detail.to_owned(),
+                    code: v
+                        .pointer("/error/type")
+                        .or_else(|| v.pointer("/error/code"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
                 });
             }
             _ => {}
@@ -1299,10 +1305,24 @@ impl AnthropicStreamEncoder {
                 out.push_str(&sse("message_stop", &json!({"type": "message_stop"})));
                 Some(out)
             }
-            StreamEvent::Error { message } => Some(sse(
-                "error",
-                &json!({"type": "error", "error": {"type": "api_error", "message": message}}),
-            )),
+            StreamEvent::Error { message, code } => {
+                // Anthropic's streamed error keeps its own closed `type` set
+                // and puts the vendor's kind in `code`, as the reference
+                // does; an overflow is the one it names instead.
+                let overflow = crate::stream_error::overflow_words(message);
+                let kind = if overflow {
+                    "invalid_request_error"
+                } else {
+                    "api_error"
+                };
+                let mut error = json!({"type": kind, "message": message});
+                if overflow {
+                    error["code"] = json!("context_length_exceeded");
+                } else if let Some(code) = code.as_deref() {
+                    error["code"] = json!(code);
+                }
+                Some(sse("error", &json!({"type": "error", "error": error})))
+            }
         }
     }
 }

@@ -1107,6 +1107,11 @@ impl GeminiStreamDecoder {
                     .and_then(Value::as_str)
                     .unwrap_or("Gemini upstream error")
                     .to_owned(),
+                code: error
+                    .get("status")
+                    .or_else(|| error.get("code"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
             });
             return out;
         }
@@ -1434,12 +1439,18 @@ impl GeminiStreamEncoder {
                 out.push_str(&self.sse(json!([]), Some(stop_to_gemini(reason)), true));
                 Some(out)
             }
-            StreamEvent::Error { message } => {
+            StreamEvent::Error { message, code } => {
+                let overflow = crate::stream_error::overflow_words(message);
+                let (status, reason) = if overflow {
+                    ("INVALID_ARGUMENT", 400)
+                } else {
+                    (code.as_deref().unwrap_or("UNAVAILABLE"), 502)
+                };
                 let error = json!({
                     "error": {
-                        "code": 502,
+                        "code": reason,
                         "message": message,
-                        "status": "UNAVAILABLE",
+                        "status": status,
                     }
                 });
                 Some(format!("data: {error}\n\n"))

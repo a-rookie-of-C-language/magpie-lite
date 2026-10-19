@@ -710,6 +710,76 @@ same code path here, since Lite always rebuilds the upstream body from the
 IR. These are local loopback fixtures, not the reporter's real relay or
 live-vendor evidence.
 
+### The error a client can act on (`97f264c7`, `writeErrorSaid`)
+
+An agent decides what to do next from an error's *type*, not its message.
+The reference gateway's `writeErrorSaid` names that type from the upstream
+status in every client shape, and rewrites a conversation that no longer
+fits as a 400 `context_length_exceeded`, so pi (and Codex, and Claude
+Code) compact instead of stopping. `97f264c7` is the same rule reached
+from the OpenAI routes: a 413 must read `request_too_large`, because that
+is what pi's compactor looks for.
+
+What lite now says, once the upstream status and body are known:
+
+| status | client-visible type |
+| -- | -- |
+| 400 | `invalid_request_error` |
+| 401 | `authentication_error` |
+| 403 | `permission_error` |
+| 404 | `not_found_error` |
+| 413 | `request_too_large` |
+| 429 | `rate_limit_error` |
+| 529 | `overloaded_error` |
+| anything else | `api_error` |
+
+The same table drives all four client shapes — a Chat or Responses body
+carries it in `error.type`, an Anthropic body in `error.error.type`, and a
+Gemini body in `error.status`, where a 401 is `UNAUTHENTICATED` and a 413
+`INVALID_ARGUMENT` (Gemini's own names, not the shared ones). A Chat or
+Responses `code` is the status number, except that an overflow's `code`
+is the string `context_length_exceeded` rather than a number, which is
+what a compactor reads.
+
+Two messages are rewritten on the way out:
+
+- **An overflow the vendor worded.** A 400/413/422 whose body says the
+  conversation is too long (the reference's `tooLongRe`, reusing
+  `model_gone::context_overflowed`) leaves as a 400
+  `context_length_exceeded` whatever status it arrived as. Anthropic's
+  shape also gains a `prompt is too long: ` prefix, which is the phrase
+  Claude Code looks for. A refusal about `max_tokens` is the reply's
+  allowance and is left alone, as is a paced one.
+- **A 413 body-byte limit.** The body is a request-size limit, not the
+  model's context, so the message gets the reference's hint: compact the
+  conversation, or start a new one, or fewer images and smaller tool
+  results. This is the one that reaches agents that only read the type.
+
+The gateway's own refusals (missing token, unknown model, malformed
+request) keep the reasons they have always said; only upstream failures
+go through this path.
+
+Streamed replies say the same thing. `StreamEvent::Error` gained a
+`code: Option<String>`, decoded from the vendor's own `error.code` /
+`error.type` (Chat and Responses), `error.type` (Anthropic) or
+`error.status` (Gemini, falling back to its numeric `code`). Each client
+encoder then writes that code — or, when the message is a worded
+overflow, `context_length_exceeded` as a 400 in Chat, Responses and
+Anthropic and `400 INVALID_ARGUMENT` in Gemini. A `response.failed` frame
+no longer reports its own envelope name (`response.failed`, `error`) as
+the code; only a real vendor kind is carried, which is what a client can
+act on.
+
+`crates/gateway/tests/error_shapes.rs` is the loopback evidence: a 413
+that reads `request_too_large` with the byte-limit hint in Chat, Responses
+and Anthropic; a 422 worded overflow that reads 400
+`context_length_exceeded`; and an Anthropic overflow prefixed with
+`prompt is too long:`. `crates/core/tests/stream_accounting.rs` holds the
+stream encoders to the same rule for an overflow and a rate limit.
+`crates/core/src/stream_error.rs` carries the wording matcher and its unit
+test. These are local loopback fixtures, not live-vendor evidence, and no
+agent's compactor has been observed reacting to them.
+
 ### Still open from this refresh
 
 Room-aware group selection (`0f398c48`) needs per-model window metadata that

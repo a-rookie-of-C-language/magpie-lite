@@ -158,7 +158,14 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 fn auth_error_body(uri: &Uri, status: StatusCode) -> Value {
     let path = uri.path();
     if path.starts_with("/v1beta") {
-        upstream::gemini_error(status, "missing or invalid magpie-lite token")
+        // The gateway's own auth refusal keeps the Gemini reason it has
+        // always said (a 401 reads PERMISSION_DENIED here), not the
+        // reference's UNAUTHENTICATED mapping for upstream errors.
+        upstream::gemini_error_reason(
+            status,
+            "missing or invalid magpie-lite token",
+            "PERMISSION_DENIED",
+        )
     } else if path == "/v1/messages" {
         upstream::anthropic_error(status, "missing or invalid magpie-lite token")
     } else if path == "/v1/responses" {
@@ -606,7 +613,7 @@ impl UpstreamCandidate {
 
 /// The agent-facing protocol a request arrived in. Beside decoding, this
 /// chooses the reply encoder and the error body.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClientWire {
     Chat { include_usage: bool },
     Anthropic,
@@ -616,11 +623,20 @@ enum ClientWire {
 
 impl ClientWire {
     fn error_body(self, status: StatusCode, message: &str) -> Value {
+        let kind = error_kind(status.as_u16());
+        self.error_body_kind(status, message, kind)
+    }
+
+    fn error_body_kind(self, status: StatusCode, message: &str, kind: &str) -> Value {
         match self {
-            Self::Chat { .. } => upstream::chat_error(status, message),
-            Self::Anthropic => upstream::anthropic_error(status, message),
-            Self::Responses => upstream::responses_error(status, message),
-            Self::Gemini => upstream::gemini_error(status, message),
+            Self::Chat { .. } => upstream::chat_error_kind(status, message, kind),
+            Self::Anthropic => upstream::anthropic_error_kind(message, kind),
+            Self::Responses => upstream::responses_error_kind(status, message, kind),
+            Self::Gemini => upstream::gemini_error_reason(
+                status,
+                message,
+                upstream::gemini_reason(status.as_u16()),
+            ),
         }
     }
 
@@ -1905,7 +1921,56 @@ impl ProxyFailure {
     }
 
     fn response(self, wire: ClientWire) -> Response {
-        err_response(self.status, wire.error_body(self.status, &self.message))
+        let (status, kind, message) = client_error(self.status, &self.message, wire);
+        err_response(status, wire.error_body_kind(status, &message, kind))
+    }
+}
+
+/// The status, error type and message a client sees for an upstream
+/// failure, as the reference's `writeErrorSaid` says them.
+///
+/// An overflow the vendor worded reaches an agent as a 400
+/// `context_length_exceeded`, whatever status it came in (a 413 body
+/// limit or a 422), so it compacts and tries again rather than stopping.
+/// Anthropic's own 400 gets its "prompt is too long" prefix. A 413 is
+/// `request_too_large` in every shape, which pi reads as an overflow; it
+/// also says this was a request-body byte limit, not the model's context.
+fn client_error(
+    status: StatusCode,
+    message: &str,
+    wire: ClientWire,
+) -> (StatusCode, &'static str, String) {
+    let kind = error_kind(status.as_u16());
+    if crate::model_gone::context_overflowed(status.as_u16(), &json!({"message": message})) {
+        let mut message = message.to_owned();
+        if wire == ClientWire::Anthropic && !message.to_lowercase().contains("prompt is too long") {
+            message = format!("prompt is too long: {message}");
+        }
+        return (StatusCode::BAD_REQUEST, "invalid_request_error", message);
+    }
+    let mut message = message.to_owned();
+    if status == StatusCode::PAYLOAD_TOO_LARGE {
+        const HINT: &str = "This is a request-body byte limit, not the model's context: compact the conversation (/compact in Codex or Claude Code), or start a new one with a short summary; fewer images or smaller tool results also help.";
+        if !message.contains(HINT) {
+            message.push_str(" — ");
+            message.push_str(HINT);
+        }
+    }
+    (status, kind, message)
+}
+
+/// The error type a client sees for an upstream status, as the
+/// reference's `writeErrorSaid` names it. Every client shape carries it.
+fn error_kind(status: u16) -> &'static str {
+    match status {
+        400 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        529 => "overloaded_error",
+        _ => "api_error",
     }
 }
 
@@ -2265,7 +2330,10 @@ async fn proxy(
                             }
                             Err(message) => {
                                 tracker.finish("upstream_stream_error", &Usage::default());
-                                let error = StreamEvent::Error { message };
+                                let error = StreamEvent::Error {
+                                    message,
+                                    code: None,
+                                };
                                 if let Some(frame) = encoder.encode(&error) {
                                     yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                                 }
@@ -2379,7 +2447,10 @@ async fn keepalive_response(
             Err(error) => {
                 // Headers already say 200/SSE. Report exactly one stream error,
                 // not a JSON HTTP error or a fabricated completion marker.
-                let event = StreamEvent::Error { message: error.message };
+                let event = StreamEvent::Error {
+                    message: error.message,
+                    code: None,
+                };
                 if let Some(frame) = ClientStreamEncoder::new(wire, &model).encode(&event) {
                     yield Ok(Bytes::from(frame));
                 }
@@ -2432,6 +2503,7 @@ fn decode_upstream_data(
             vec![
                 StreamEvent::Error {
                     message: "bad Gemini upstream stream payload".into(),
+                    code: None,
                 }
                 .into(),
             ]
@@ -2466,6 +2538,7 @@ fn decode_upstream_data(
         );
         let mut error = UpstreamEvent::from(StreamEvent::Error {
             message: REFUSAL.into(),
+            code: None,
         });
         error.failure = Some(StreamFailure {
             kind: FailureKind::Refusal,
@@ -2594,6 +2667,7 @@ fn empty_reply_event() -> UpstreamEvent {
     UpstreamEvent {
         event: StreamEvent::Error {
             message: EMPTY_REPLY.into(),
+            code: None,
         },
         failure: Some(StreamFailure {
             kind: FailureKind::EmptyReply,
@@ -2611,6 +2685,7 @@ fn stream_timeout_event(timeout: StreamTimeout) -> UpstreamEvent {
     UpstreamEvent {
         event: StreamEvent::Error {
             message: timeout.message().into(),
+            code: None,
         },
         failure: Some(StreamFailure {
             kind: FailureKind::Upstream,
@@ -2664,7 +2739,11 @@ fn upstream_events(
                 Ok(chunk) => chunk,
                 Err(error) => {
                     tracing::warn!("upstream stream read failed: {error}");
-                    yield StreamEvent::Error { message: "upstream stream read failed".into() }.into();
+                    yield StreamEvent::Error {
+                        message: "upstream stream read failed".into(),
+                        code: None,
+                    }
+                    .into();
                     return;
                 }
             };
@@ -2675,7 +2754,11 @@ fn upstream_events(
                     Ok(Some(data)) => data,
                     Ok(None) => break,
                     Err(error) => {
-                        yield StreamEvent::Error { message: error.to_string() }.into();
+                        yield StreamEvent::Error {
+                            message: error.to_string(),
+                            code: None,
+                        }
+                        .into();
                         return;
                     }
                 };
@@ -2692,7 +2775,10 @@ fn upstream_events(
                     yield event.into();
                     if let Some(trip) = trip {
                         yield UpstreamEvent {
-                            event: StreamEvent::Error { message: trip.message().into() },
+                            event: StreamEvent::Error {
+                                message: trip.message().into(),
+                                code: None,
+                            },
                             failure: Some(StreamFailure {
                                 kind: FailureKind::Upstream,
                                 status: StatusCode::BAD_GATEWAY,
@@ -2717,7 +2803,10 @@ fn upstream_events(
                     yield event.into();
                     if let Some(trip) = trip {
                         yield UpstreamEvent {
-                            event: StreamEvent::Error { message: trip.message().into() },
+                            event: StreamEvent::Error {
+                                message: trip.message().into(),
+                                code: None,
+                            },
                             failure: Some(StreamFailure {
                                 kind: FailureKind::Upstream,
                                 status: StatusCode::BAD_GATEWAY,
@@ -2734,7 +2823,11 @@ fn upstream_events(
             }
             Ok(None) => {}
             Err(error) => {
-                yield StreamEvent::Error { message: error.to_string() }.into();
+                yield StreamEvent::Error {
+                    message: error.to_string(),
+                    code: None,
+                }
+                .into();
                 return;
             }
         }
@@ -2751,6 +2844,7 @@ fn upstream_events(
         } else {
             yield StreamEvent::Error {
                 message: "upstream stream ended before a completion marker".into(),
+                code: None,
             }.into();
         }
     }

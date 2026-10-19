@@ -50,6 +50,7 @@ impl GroundingState {
         self.failed = true;
         StreamEvent::Error {
             message: "upstream grounding state exceeds its budget".into(),
+            code: None,
         }
     }
 
@@ -131,7 +132,7 @@ mod tests {
             "groundingChunks":[{"web":{"uri":"https://example.invalid/private"}}]})
     }
     fn assert_failed(state: &GroundingState, event: Option<StreamEvent>) {
-        assert!(matches!(event, Some(StreamEvent::Error { ref message })
+        assert!(matches!(event, Some(StreamEvent::Error { ref message, .. })
             if message == "upstream grounding state exceeds its budget"));
         assert!(state.failed());
         assert!(state.last.is_none());

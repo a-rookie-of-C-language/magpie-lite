@@ -570,6 +570,11 @@ pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
                 .and_then(Value::as_str)
                 .unwrap_or("chat upstream error")
                 .to_owned(),
+            code: error
+                .get("code")
+                .or_else(|| error.get("type"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         });
         return out;
     }
@@ -789,9 +794,30 @@ impl ChatChunkEncoder {
                 out.push_str("data: [DONE]\n\n");
                 Some(out)
             }
-            StreamEvent::Error { message } => Some(sse(&json!({
-                "error": {"message": message, "type": "upstream_error"}
-            }))),
+            StreamEvent::Error { message, code } => {
+                // A streamed error has no HTTP status to name it by, only
+                // the vendor's own words. A conversation that no longer
+                // fits is said as OpenAI's own API says it, so a
+                // compactor reads it; anything else keeps Lite's generic
+                // type and carries the vendor's own kind in `code`, as
+                // the reference's streamed error preserves it.
+                let overflow = crate::stream_error::overflow_words(message);
+                let kind = if overflow {
+                    "invalid_request_error"
+                } else {
+                    "upstream_error"
+                };
+                let mut error = json!({"message": message, "type": kind});
+                let code = if overflow {
+                    Some("context_length_exceeded")
+                } else {
+                    code.as_deref()
+                };
+                if let Some(code) = code {
+                    error["code"] = json!(code);
+                }
+                Some(sse(&json!({"error": error})))
+            }
         }
     }
 }

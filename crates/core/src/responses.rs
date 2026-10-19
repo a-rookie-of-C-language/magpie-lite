@@ -1030,6 +1030,11 @@ pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
                 .and_then(Value::as_str)
                 .unwrap_or("responses upstream error")
                 .to_owned(),
+            code: error
+                .get("code")
+                .or_else(|| error.get("type"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         });
         return out;
     }
@@ -1071,6 +1076,7 @@ pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
                     }),
                     Err(_) => out.push(StreamEvent::Error {
                         message: "invalid namespaced function call".into(),
+                        code: None,
                     }),
                 }
             }
@@ -1091,6 +1097,7 @@ pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
                 } else {
                     out.push(StreamEvent::Error {
                         message: "invalid namespaced function call".into(),
+                        code: None,
                     });
                 }
             }
@@ -1168,6 +1175,23 @@ pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
                 .unwrap_or("responses upstream error");
             out.push(StreamEvent::Error {
                 message: detail.to_owned(),
+                code: v
+                    .pointer("/response/error/code")
+                    .or_else(|| v.pointer("/response/error/type"))
+                    .or_else(|| v.get("code"))
+                    .or_else(|| {
+                        // `type: "error"` names the envelope, not the
+                        // vendor's error kind; a failed response carries
+                        // its kind inside `response.error`.
+                        v.get("type").filter(|kind| {
+                            !matches!(
+                                kind.as_str(),
+                                Some("error" | "response.failed" | "response.incomplete")
+                            )
+                        })
+                    })
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
             });
         }
         _ => {}
@@ -1645,13 +1669,20 @@ impl ResponsesStreamEncoder {
                 let reason = self.stop_reason.take().unwrap_or(StopReason::EndTurn);
                 Some(self.complete(reason))
             }
-            StreamEvent::Error { message } => {
+            StreamEvent::Error { message, code } => {
                 let mut out = self.ensure_created();
                 let mut response = self.response_skeleton("failed");
-                response.insert(
-                    "error".into(),
-                    json!({"code": "upstream_error", "message": message}),
-                );
+                let code = if crate::stream_error::overflow_words(message) {
+                    "context_length_exceeded"
+                } else if code.as_deref() == Some("upstream_error") {
+                    // Lite's own fallback kind, not a vendor's; the
+                    // reference says a streamed server failure as
+                    // `server_error`.
+                    "server_error"
+                } else {
+                    code.as_deref().unwrap_or("server_error")
+                };
+                response.insert("error".into(), json!({"code": code, "message": message}));
                 out.push_str(&event("response.failed", json!({"response": response})));
                 Some(out)
             }

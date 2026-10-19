@@ -14,6 +14,7 @@ pub mod ir;
 pub mod responses;
 pub mod search;
 pub mod stream;
+pub mod stream_error;
 
 mod tool_choice;
 mod tool_output;

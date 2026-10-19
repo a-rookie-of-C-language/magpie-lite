@@ -101,6 +101,10 @@ pub enum StreamEvent {
     Error {
         /// Human-readable detail.
         message: String,
+        /// The upstream's own error code or type, when it named one
+        /// (`context_length_exceeded`, `rate_limit`, `server_error`). The
+        /// client encoder says an overflow with it, so an agent compacts.
+        code: Option<String>,
     },
 }
 

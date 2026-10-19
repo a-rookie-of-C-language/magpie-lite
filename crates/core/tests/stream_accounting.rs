@@ -1,4 +1,6 @@
-use magpie_core::{chat, chat::usage_to_chat_json, ir::Usage, responses, stream::StreamEvent};
+use magpie_core::{
+    anthropic, chat, chat::usage_to_chat_json, gemini, ir::Usage, responses, stream::StreamEvent,
+};
 use serde_json::json;
 
 #[test]
@@ -75,13 +77,15 @@ fn chat_stream_error_retains_usage_and_does_not_decode_answer_fields() {
     assert_eq!(
         &events[1..],
         &[StreamEvent::Error {
-            message: "rate limited".into()
+            message: "rate limited".into(),
+            code: None,
         }]
     );
     assert_eq!(
         chat::decode_chunk(&json!({"error": {}})),
         vec![StreamEvent::Error {
-            message: "chat upstream error".into()
+            message: "chat upstream error".into(),
+            code: None,
         }]
     );
 }
@@ -97,7 +101,8 @@ fn responses_stream_errors_decode_supported_envelopes_without_success() {
         assert_eq!(
             responses::decode_chunk(&frame),
             vec![StreamEvent::Error {
-                message: "rate limited".into()
+                message: "rate limited".into(),
+                code: None,
             }]
         );
     }
@@ -110,15 +115,61 @@ fn responses_stream_errors_decode_supported_envelopes_without_success() {
     assert_eq!(
         &events[1..],
         &[StreamEvent::Error {
-            message: "rate limited".into()
+            message: "rate limited".into(),
+            code: None,
         }]
     );
     assert_eq!(
         responses::decode_chunk(&json!({"type": "error"})),
         vec![StreamEvent::Error {
-            message: "responses upstream error".into()
+            message: "responses upstream error".into(),
+            code: None,
         }]
     );
+}
+
+#[test]
+fn streamed_errors_keep_the_kind_a_client_compacts_on() {
+    // A vendor error inside an HTTP-200 stream has no status to name it
+    // by. The vendor's own kind travels; an overflow is said as the
+    // conversation being too long, whatever the vendor called it.
+    let overflow = StreamEvent::Error {
+        message: "This model's maximum context length is 8192 tokens".into(),
+        code: Some("invalid_request_error".into()),
+    };
+    let rate = StreamEvent::Error {
+        message: "slow down".into(),
+        code: Some("rate_limit_error".into()),
+    };
+
+    let mut chat_encoder = chat::ChatChunkEncoder::new("m", false);
+    let chat_overflow = chat_encoder.encode(&overflow).unwrap();
+    assert!(chat_overflow.contains(r#""type":"invalid_request_error""#));
+    assert!(chat_overflow.contains(r#""code":"context_length_exceeded""#));
+    let chat_rate = chat_encoder.encode(&rate).unwrap();
+    assert!(chat_rate.contains(r#""type":"upstream_error""#));
+    assert!(chat_rate.contains(r#""code":"rate_limit_error""#));
+
+    let mut anthropic_encoder = anthropic::AnthropicStreamEncoder::new("m");
+    let anthropic_overflow = anthropic_encoder.encode(&overflow).unwrap();
+    assert!(anthropic_overflow.contains(r#""type":"invalid_request_error""#));
+    assert!(anthropic_overflow.contains(r#""code":"context_length_exceeded""#));
+    let anthropic_rate = anthropic_encoder.encode(&rate).unwrap();
+    assert!(anthropic_rate.contains(r#""type":"api_error""#));
+    assert!(anthropic_rate.contains(r#""code":"rate_limit_error""#));
+
+    let mut responses_encoder = responses::ResponsesStreamEncoder::new("m");
+    let responses_overflow = responses_encoder.encode(&overflow).unwrap();
+    assert!(responses_overflow.contains(r#""code":"context_length_exceeded""#));
+    let responses_rate = responses_encoder.encode(&rate).unwrap();
+    assert!(responses_rate.contains(r#""code":"rate_limit_error""#));
+
+    let mut gemini_encoder = gemini::GeminiStreamEncoder::new("m");
+    let gemini_overflow = gemini_encoder.encode(&overflow).unwrap();
+    assert!(gemini_overflow.contains(r#""code":400"#));
+    assert!(gemini_overflow.contains(r#""status":"INVALID_ARGUMENT""#));
+    let gemini_rate = gemini_encoder.encode(&rate).unwrap();
+    assert!(gemini_rate.contains(r#""status":"rate_limit_error""#));
 }
 
 #[test]
