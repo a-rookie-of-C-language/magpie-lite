@@ -628,6 +628,22 @@ union is what either said. Every other host keeps `oneOf`.
 The reference also names its Cline and Kilo presets; lite has no preset
 concept, so only the host OpenRouter itself is rewritten.
 
+### A huge error body does not hold the client (`7ac20247`)
+
+`upstream::error_detail` reads a non-2xx upstream body to give the agent a
+readable message, and it read the whole thing. A vendor that answers an
+error with a page (or a whole reply) held the client while it was read.
+The reference's `7ac20247` reads the body for why only once the try is
+known to have failed; lite already reads it only on a non-2xx response, so
+the remaining gap was the size.
+
+`error_detail` now stops at 1 MiB: a `Content-Length` past it, or a stream
+that outgrows it while being read, is dropped and the message is the
+status alone (`upstream 400 Bad Request`). A normal error body still gives
+its readable message and parsed JSON. The two call sites already run the
+read under the configured header timeout, so the cap bounds the work
+without changing which responses are errors.
+
 ### Still open from this refresh
 
 Room-aware group selection (`0f398c48`) needs per-model window metadata that

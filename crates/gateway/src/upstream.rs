@@ -170,12 +170,46 @@ pub struct UpstreamError {
     pub body: Value,
 }
 
+/// The most of an upstream error body worth reading. A vendor that answers
+/// an error with a whole page (or a reply) must not hold the client while
+/// it is read; past this the status alone is the message.
+const MAX_ERROR_BODY: usize = 1 << 20;
+
 /// Pull a readable message out of an upstream error body. Takes the
 /// response: reading its body consumes it, and callers only want the
-/// status after this.
-pub async fn error_detail(resp: reqwest::Response) -> UpstreamError {
+/// status after this. At most `MAX_ERROR_BODY` bytes are read; a longer
+/// body is dropped, as its head is not worth holding a client for.
+pub async fn error_detail(mut resp: reqwest::Response) -> UpstreamError {
     let status = resp.status();
-    let bytes = resp.bytes().await.unwrap_or_default();
+    let mut bytes = Vec::new();
+    if resp
+        .content_length()
+        .is_some_and(|length| length > MAX_ERROR_BODY as u64)
+    {
+        return UpstreamError {
+            message: format!("upstream {status}"),
+            body: Value::Null,
+        };
+    }
+    loop {
+        let chunk = match resp.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(_) => {
+                return UpstreamError {
+                    message: format!("upstream {status}"),
+                    body: Value::Null,
+                };
+            }
+        };
+        if bytes.len() + chunk.len() > MAX_ERROR_BODY {
+            return UpstreamError {
+                message: format!("upstream {status}"),
+                body: Value::Null,
+            };
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     if bytes.is_empty() {
         return UpstreamError {
             message: format!("upstream {status}"),
@@ -266,6 +300,56 @@ mod search_tests {
             &json!({"model":"client", "input":"hello", "tools":[{"type":"web_search"}]}),
         )
         .unwrap()
+    }
+
+    /// Serve one error body on a loopback port, and hand back the
+    /// response as the gateway would read it.
+    async fn error_response(body: Vec<u8>, length: Option<usize>) -> reqwest::Response {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let length = match length {
+                Some(length) => format!("Content-Length: {length}\r\n"),
+                None => String::new(),
+            };
+            let head = format!("HTTP/1.1 400 Bad Request\r\n{length}Connection: close\r\n\r\n");
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(&body).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        reqwest::Client::new()
+            .post(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_error_body_past_the_limit_is_reported_by_status_alone() {
+        // A Content-Length that already says it is too long is not read.
+        let resp = error_response(vec![b'x'; 8], Some(MAX_ERROR_BODY + 1)).await;
+        let error = error_detail(resp).await;
+        assert_eq!(error.message, "upstream 400 Bad Request");
+        assert_eq!(error.body, Value::Null);
+        // A body that only outgrows the limit while it is read is dropped
+        // too, and the stream ends without a hang.
+        let resp = error_response(vec![b'x'; MAX_ERROR_BODY + 1], None).await;
+        let error = error_detail(resp).await;
+        assert_eq!(error.message, "upstream 400 Bad Request");
+        assert_eq!(error.body, Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_normal_error_body_keeps_its_readable_message() {
+        let body = br#"{"error":{"message":"model is gone"}}"#.to_vec();
+        let resp = error_response(body.clone(), Some(body.len())).await;
+        let error = error_detail(resp).await;
+        assert_eq!(error.message, "upstream 400 Bad Request: model is gone");
+        assert_eq!(error.body["error"]["message"], "model is gone");
     }
 
     #[test]
