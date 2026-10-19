@@ -6,6 +6,7 @@ pub mod config;
 pub mod config_store;
 pub mod cooldown;
 mod edge_block;
+mod grok_schema;
 mod model_gone;
 mod optional_fields;
 mod provider_tools;

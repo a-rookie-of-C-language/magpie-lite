@@ -51,6 +51,10 @@ pub fn build_request(
     if p.protocol == Protocol::Chat && host.as_deref() == Some("api.deepseek.com") {
         body = deepseek_reply_limit(body);
     }
+    // xAI turns away a tool whose `pattern` Rust's regex syntax can't
+    // parse, where ECMAScript reads the same pattern fine. Every protocol
+    // carries tool schemas, so this runs wherever the tools are.
+    body = crate::grok_schema::grok_tool_patterns(body, model, host.as_deref());
     if p.protocol == Protocol::Responses
         && host.as_deref() == Some("api.x.ai")
         && let Some(include) = body.get_mut("include").and_then(Value::as_array_mut)
@@ -357,6 +361,50 @@ mod search_tests {
             for key in ["plugins", "tools", "web_search_options", "include"] {
                 assert!(out.get(key).is_none());
             }
+        }
+    }
+
+    #[test]
+    fn a_grok_tool_pattern_is_respelled_before_it_goes_upstream() {
+        let request = anthropic::decode_request(&json!({"model":"client", "max_tokens":16,
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"name":"t","input_schema":{"type":"object","properties":{
+                "x":{"type":"string","pattern":"^[^\\s[\\]]+$"}}}}]}))
+        .unwrap();
+        // A relay that serves Grok under its own model name.
+        let out = build_request(
+            &provider(Protocol::Anthropic, "https://relay.example/v1"),
+            &request,
+            "grok-4.6",
+        )
+        .unwrap();
+        assert_eq!(
+            out["tools"][0]["input_schema"]["properties"]["x"]["pattern"],
+            r"^[^\s\[\]]+$"
+        );
+        // xAI's own API counts by its host, whatever the model is called.
+        let xai = build_request(
+            &provider(Protocol::Anthropic, "https://api.x.ai/v1"),
+            &request,
+            "my-alias",
+        )
+        .unwrap();
+        assert_eq!(
+            xai["tools"][0]["input_schema"]["properties"]["x"]["pattern"],
+            r"^[^\s\[\]]+$"
+        );
+        // Another model's tools go as they came, on a relay or on a
+        // lookalike host.
+        for (url, model) in [
+            ("https://relay.example/v1", "claude-sonnet-5"),
+            ("https://api.x.ai.evil.invalid/v1", "claude-sonnet-5"),
+        ] {
+            let other =
+                build_request(&provider(Protocol::Anthropic, url), &request, model).unwrap();
+            assert_eq!(
+                other["tools"][0]["input_schema"]["properties"]["x"]["pattern"],
+                r"^[^\s[\]]+$"
+            );
         }
     }
 }

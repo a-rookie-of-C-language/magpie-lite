@@ -546,13 +546,42 @@ function object, a hosted tool, a nameless one and a request with no tools
 are unchanged; other fields stay beside the function, and `parameters` wins
 over `inputSchema`/`input_schema`.
 
+### A Grok tool pattern Rust's regex can't read (`97b4174a`)
+
+xAI turns away a tool whose schema `pattern` Rust's regex syntax can't
+parse: `…pattern: "^[^\\s[\\]]+$" is not a "regex"` (#2317). The pattern is
+valid ECMAScript, which is what JSON Schema's `pattern` is — there a `[`
+inside a character class is a plain character — but in Rust's syntax it
+opens a nested class that never closes; `&&`, `--` and `~~` inside a class
+are set operations there too. A Claude Code session on Windows sends
+`^[^\s[\]]+$` for a breakpoint's class name and selector, so a Grok model
+was turned away on every turn.
+
+`crates/gateway/src/grok_schema.rs` escapes such a character inside a
+class, which is the same character to ECMAScript, and `upstream.rs` runs
+it for every protocol's request body — a tool schema travels on Chat,
+Anthropic, Responses and Gemini alike. It applies when the model named in
+the body is Grok's (`grok-*`, `xai/grok-*`, `x-ai/grok-*`) or the provider
+is xAI's own API, and every other model's tools go as they came.
+
+The walk is the reference's whitelist: a tool is entered through
+`function`, `functionDeclarations`, `parameters`, `input_schema` or a
+namespace's nested `tools`, and a schema only through the keywords that
+hold another schema, so sample data under `enum`, `const`, `default` or
+`examples` is left alone. The reference splices each pattern into the raw
+body to keep the rest byte for byte and hold a prompt cache's prefix; lite
+re-encodes its body from the IR anyway, and `preserve_order` keeps the key
+order, so the rewrite is in the value tree instead. Lite walks that tree
+and so also reaches Gemini's `functionDeclarations` and a Responses
+namespace's `tools`, which the reference's walker does not.
+
 ### Still open from this refresh
 
 Room-aware group selection (`0f398c48`) needs per-model window metadata that
 lite does not carry; it is not implemented. Rest granularity, RPM and
-concurrency queues, sink ordering, provider-specific schema rewrites
-(`97b4174a`, `1530c5ef`) and HTTP/2 transport health (`94919109`) remain
-future work. The streaming-whole-reply retry (`df341e76`) does not apply:
+concurrency queues, sink ordering, Devin's Gemini schema sanitizer
+(`1530c5ef`) and HTTP/2 transport health (`94919109`) remain future work.
+The streaming-whole-reply retry (`df341e76`) does not apply:
 lite already replays a whole upstream answer as the client's stream and
 never asks that member again for the same turn. These fixtures are local
 unit, loopback HTTP and workspace tests, not live-vendor or real-agent
