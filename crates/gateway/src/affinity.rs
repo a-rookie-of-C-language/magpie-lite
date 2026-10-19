@@ -90,6 +90,19 @@ pub fn who_of(provider_id: &str, key: &str) -> String {
 /// own session id when it sends one; otherwise it is derived from the
 /// conversation's first user message, which every later turn repeats.
 pub fn conversation_id(headers: &HeaderMap, body: &[u8]) -> String {
+    // An undecodable body still gets an id: the hash of the whole body.
+    let value: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+    conversation_id_from_value(headers, &value, body)
+}
+
+/// The same conversation id, using a body its caller already decoded.
+///
+/// `body` is only the fallback hash when the request names no user turn.
+pub(crate) fn conversation_id_from_value(
+    headers: &HeaderMap,
+    value: &serde_json::Value,
+    body: &[u8],
+) -> String {
     for name in SESSION_HEADERS {
         if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
             let trimmed = value.trim();
@@ -98,8 +111,6 @@ pub fn conversation_id(headers: &HeaderMap, body: &[u8]) -> String {
             }
         }
     }
-    // An undecodable body still gets an id: the hash of the whole body.
-    let value: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
     let items_of = |key: &str| {
         value
             .get(key)
@@ -508,7 +519,22 @@ impl AffinityStore {
         request: &CompletionRequest,
         seats: &[Seat],
     ) -> Decision {
-        let key = format!("{scope}|{}", conversation_id(headers, body));
+        let conversation = conversation_id(headers, body);
+        self.affine_conversation(scope, mode, rotate, &conversation, request, seats)
+    }
+
+    /// Affinity for a caller that already derived the conversation id from a
+    /// decoded request body.
+    pub(crate) fn affine_conversation(
+        &self,
+        scope: &str,
+        mode: Affinity,
+        rotate: bool,
+        conversation: &str,
+        request: &CompletionRequest,
+        seats: &[Seat],
+    ) -> Decision {
+        let key = format!("{scope}|{conversation}");
         let (turn, within) = turn_of(request);
         let now = now_ms();
         let stick = {

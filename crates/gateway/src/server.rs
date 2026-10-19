@@ -1154,8 +1154,7 @@ async fn send_with_fallback(
     group_plan: Option<&GroupRoutePlan>,
     tracker: &mut RequestTracker,
     liveness: &StreamLiveness,
-    headers: &HeaderMap,
-    body_bytes: &[u8],
+    conversation: &str,
     affinity_scope: (String, Affinity, bool),
 ) -> Result<(UpstreamReply, UpstreamCandidate, Decision), (ProxyFailure, UpstreamCandidate, Decision)>
 {
@@ -1192,9 +1191,14 @@ async fn send_with_fallback(
             })
             .collect::<Vec<_>>();
         if !seats.is_empty() {
-            let decided = state
-                .affinity
-                .affine(&scope, mode, rotate, headers, body_bytes, creq, &seats);
+            let decided = state.affinity.affine_conversation(
+                &scope,
+                mode,
+                rotate,
+                conversation,
+                creq,
+                &seats,
+            );
             apply_affinity(&mut routes, &decided);
             Some(decided)
         } else {
@@ -2019,6 +2023,35 @@ fn err_response(status: StatusCode, body: Value) -> Response {
     (status, Json(body)).into_response()
 }
 
+#[cfg(test)]
+std::thread_local! {
+    // Counts client request bodies decoded by this crate's handlers, so a test
+    // can prove one request decodes its body once.
+    static CLIENT_BODY_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn client_body_decodes() -> usize {
+    CLIENT_BODY_DECODES.with(|count| count.get())
+}
+
+#[cfg(test)]
+fn reset_client_body_decodes() {
+    CLIENT_BODY_DECODES.with(|count| count.set(0));
+}
+
+/// Decode one client request body.
+///
+/// Every entry point decodes through here so a request body is parsed once on
+/// its way in. A Chat or Gemini request used to parse the same payload twice:
+/// once for a request option and once in the shared proxy, which at a couple
+/// of megabytes costs real CPU per request.
+fn decode_client_body(bytes: &[u8]) -> Result<Value, serde_json::Error> {
+    #[cfg(test)]
+    CLIENT_BODY_DECODES.with(|count| count.set(count.get() + 1));
+    serde_json::from_slice(bytes)
+}
+
 fn ok_json(v: Value) -> Response {
     Json(v).into_response()
 }
@@ -2158,16 +2191,30 @@ async fn proxy(
     bytes: Bytes,
     wire: ClientWire,
 ) -> Response {
-    let body: Value = match serde_json::from_slice(&bytes) {
-        Ok(v) => v,
+    match decode_client_body(&bytes) {
+        Ok(body) => proxy_parsed(state, headers, body, bytes, wire).await,
         Err(e) => {
             let message = format!("invalid JSON: {e}");
-            return err_response(
+            err_response(
                 StatusCode::BAD_REQUEST,
                 wire.error_body(StatusCode::BAD_REQUEST, &message),
-            );
+            )
         }
-    };
+    }
+}
+
+/// The shared proxy for a request body that its handler already decoded.
+///
+/// `bytes` is the exact wire form used for conversation affinity. Keeping it
+/// separate from `body` lets Chat and Gemini read request options without
+/// decoding the same large JSON payload again here.
+async fn proxy_parsed(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    body: Value,
+    bytes: Bytes,
+    wire: ClientWire,
+) -> Response {
     let config = state.config.current();
     let (creq, initial, group_plan, affinity_scope) =
         match prepare(&config, &state.key_rotation, &body, wire) {
@@ -2195,7 +2242,7 @@ async fn proxy(
     };
     let model = creq.model.clone();
     let body_bytes = bytes.to_vec();
-    let request_headers = headers;
+    let conversation = crate::affinity::conversation_id_from_value(&headers, &body, &body_bytes);
     // Keep ownership through both header waiting and body polling. Dropping
     // either stage cancels the same work and finalizes the same tracker.
     let execute = async move {
@@ -2215,8 +2262,7 @@ async fn proxy(
             group_plan.as_ref(),
             &mut tracker,
             &liveness,
-            &request_headers,
-            &body_bytes,
+            &conversation,
             affinity_scope.clone(),
         )
         .await
@@ -2897,14 +2943,31 @@ async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let include_usage = serde_json::from_slice::<Value>(&body)
-        .ok()
-        .and_then(|v| {
-            v.pointer("/stream_options/include_usage")
-                .and_then(Value::as_bool)
-        })
+    let value: Value = match decode_client_body(&body) {
+        Ok(value) => value,
+        Err(e) => {
+            let message = format!("invalid JSON: {e}");
+            let wire = ClientWire::Chat {
+                include_usage: false,
+            };
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                wire.error_body(StatusCode::BAD_REQUEST, &message),
+            );
+        }
+    };
+    let include_usage = value
+        .pointer("/stream_options/include_usage")
+        .and_then(Value::as_bool)
         .unwrap_or(false);
-    proxy(state, headers, body, ClientWire::Chat { include_usage }).await
+    proxy_parsed(
+        state,
+        headers,
+        value,
+        body,
+        ClientWire::Chat { include_usage },
+    )
+    .await
 }
 
 /// POST /v1/messages — the Anthropic Messages dialect.
@@ -2954,7 +3017,7 @@ async fn gemini_generate(
         }
     };
 
-    let mut value: Value = match serde_json::from_slice(&body) {
+    let mut value: Value = match decode_client_body(&body) {
         Ok(v) => v,
         Err(e) => {
             let message = format!("invalid JSON: {e}");
@@ -2975,8 +3038,10 @@ async fn gemini_generate(
     }
     value["model"] = json!(model);
     value["stream"] = json!(stream);
-    let bytes = Bytes::from(value.to_string());
-    proxy(state, headers, bytes, wire).await
+    // The proxy no longer re-encodes the decoded body; serialize the edited
+    // value once for conversation affinity.
+    let bytes = Bytes::from(serde_json::to_vec(&value).expect("JSON values always serialize"));
+    proxy_parsed(state, headers, value, bytes, wire).await
 }
 
 #[cfg(test)]
@@ -3128,5 +3193,96 @@ mod tests {
                 assert!(!persisted.contains("private"));
             }
         }
+    }
+
+    /// A state with no provider for the model, so a decoded request is refused
+    /// after routing and no upstream is contacted.
+    fn decode_counting_state() -> Arc<AppState> {
+        Arc::new(AppState {
+            agents: None,
+            config: ConfigStore::new(Config::default(), None),
+            http: upstream::http_client().unwrap(),
+            requests: Arc::new(Mutex::new(crate::usage::RequestLog::default())),
+            key_rotation: Default::default(),
+            affinity: AffinityStore::default(),
+        })
+    }
+
+    /// A Chat or Gemini handler reads a request option from the body and then
+    /// hands the same value to the shared proxy. The body used to be parsed
+    /// once for the option and again in the proxy, which on a multi-megabyte
+    /// prompt is real CPU per request.
+    #[tokio::test]
+    async fn a_client_request_body_is_decoded_once() {
+        let state = decode_counting_state();
+
+        reset_client_body_decodes();
+        let chat = chat_completions(
+            State(state.clone()),
+            HeaderMap::default(),
+            Bytes::from_static(
+                br#"{"model":"missing/model","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+        )
+        .await;
+        assert_eq!(chat.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            client_body_decodes(),
+            1,
+            "a Chat request body was decoded more than once"
+        );
+
+        reset_client_body_decodes();
+        let gemini = gemini_generate(
+            State(state),
+            Path("missing/model:generateContent".to_owned()),
+            HeaderMap::default(),
+            Bytes::from_static(br#"{"contents":[{"parts":[{"text":"hi"}]}]}"#),
+        )
+        .await;
+        assert_eq!(gemini.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            client_body_decodes(),
+            1,
+            "a Gemini request body was decoded more than once"
+        );
+    }
+
+    /// Decoding a body in the handler must keep each protocol's malformed-JSON
+    /// shape, not fall back to a shared Chat-shaped refusal.
+    #[tokio::test]
+    async fn malformed_client_bodies_keep_their_protocol_error_shape() {
+        let state = decode_counting_state();
+
+        let chat = chat_completions(
+            State(state.clone()),
+            HeaderMap::default(),
+            Bytes::from_static(b"{"),
+        )
+        .await;
+        assert_eq!(chat.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(chat.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("invalid JSON:"))
+        );
+
+        let gemini = gemini_generate(
+            State(state),
+            Path("mock/mock-model:generateContent".to_owned()),
+            HeaderMap::default(),
+            Bytes::from_static(b"{"),
+        )
+        .await;
+        assert_eq!(gemini.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(gemini.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["status"], "INVALID_ARGUMENT");
     }
 }
