@@ -62,98 +62,6 @@ pub(crate) fn grok_model(model: &str) -> bool {
         .is_some_and(|name| name.starts_with("grok"))
 }
 
-/// Keywords whose value is an object of schemas, one per name.
-const SCHEMA_MAP_KEYS: [&str; 5] = [
-    "properties",
-    "$defs",
-    "definitions",
-    "dependentSchemas",
-    "patternProperties",
-];
-
-/// Keywords whose value is itself a schema, or an array of them.
-const SCHEMA_KEYS: [&str; 15] = [
-    "items",
-    "additionalProperties",
-    "contains",
-    "propertyNames",
-    "not",
-    "if",
-    "then",
-    "else",
-    "allOf",
-    "anyOf",
-    "oneOf",
-    "prefixItems",
-    "unevaluatedProperties",
-    "unevaluatedItems",
-    "contentSchema",
-];
-
-/// Rewrite every `pattern` of a tool's schema in place, and report
-/// whether anything changed.
-///
-/// The walk is a whitelist, as the reference gateway's is: a tool is
-/// entered through `function`, `functionDeclarations`, `parameters`,
-/// `input_schema` or a namespace's nested `tools`, and a schema only
-/// through the keywords that hold another schema. Sample data — `enum`,
-/// `const`, `default`, `examples` — is not a schema, so a value that
-/// happens to be named `pattern` there keeps its text. Lite walks the
-/// value tree it just built, so unlike the reference it also reaches
-/// Gemini's `functionDeclarations` and a Responses namespace's `tools`.
-fn rewrite(value: &mut Value, in_schema: bool) -> bool {
-    match value {
-        Value::Object(object) => {
-            let mut changed = false;
-            if in_schema {
-                if let Some(Value::String(pattern)) = object.get_mut("pattern") {
-                    let rewritten = ecma_class_for_rust(pattern);
-                    if rewritten != *pattern {
-                        *pattern = rewritten;
-                        changed = true;
-                    }
-                }
-                for key in SCHEMA_MAP_KEYS {
-                    if let Some(Value::Object(schemas)) = object.get_mut(key) {
-                        for schema in schemas.values_mut() {
-                            changed |= rewrite(schema, true);
-                        }
-                    }
-                }
-                for key in SCHEMA_KEYS {
-                    if let Some(child) = object.get_mut(key) {
-                        changed |= rewrite(child, true);
-                    }
-                }
-            } else {
-                // A schema, wherever this dialect puts one.
-                for key in ["input_schema", "parameters"] {
-                    if let Some(child) = object.get_mut(key) {
-                        changed |= rewrite(child, true);
-                    }
-                }
-                // A container of tools: Chat's `function` object, Gemini's
-                // `functionDeclarations` array and a Responses namespace's
-                // nested `tools`.
-                for key in ["function", "functionDeclarations", "tools"] {
-                    if let Some(child) = object.get_mut(key) {
-                        changed |= rewrite(child, false);
-                    }
-                }
-            }
-            changed
-        }
-        Value::Array(items) => {
-            let mut changed = false;
-            for item in items {
-                changed |= rewrite(item, in_schema);
-            }
-            changed
-        }
-        _ => false,
-    }
-}
-
 /// A request body with Grok's tool patterns spelled for its regex, or
 /// the body as it came when it is not Grok's or has no tool pattern.
 pub(crate) fn grok_tool_patterns(mut body: Value, model: &str, host: Option<&str>) -> Value {
@@ -163,8 +71,15 @@ pub(crate) fn grok_tool_patterns(mut body: Value, model: &str, host: Option<&str
     let Some(tools) = body.get_mut("tools") else {
         return body;
     };
-    rewrite(tools, false);
+    crate::tool_schema::rewrite_patterns(tools, false, ecma_class);
     body
+}
+
+/// `ecma_class_for_rust` as the walker wants it: `None` when the pattern
+/// already reads the same to Rust's regex.
+fn ecma_class(pattern: &str) -> Option<String> {
+    let rewritten = ecma_class_for_rust(pattern);
+    (rewritten != pattern).then_some(rewritten)
 }
 
 #[cfg(test)]

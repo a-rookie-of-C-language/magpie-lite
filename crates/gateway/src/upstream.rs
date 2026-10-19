@@ -51,6 +51,9 @@ pub fn build_request(
     if p.protocol == Protocol::Chat && host.as_deref() == Some("api.deepseek.com") {
         body = deepseek_reply_limit(body);
     }
+    // DeepSeek's validator takes a tool pattern's null escape as `\u0000`,
+    // not ECMAScript's `\0` (#370).
+    body = crate::deepseek_schema::deepseek_tool_patterns(body, host.as_deref());
     // xAI turns away a tool whose `pattern` Rust's regex syntax can't
     // parse, where ECMAScript reads the same pattern fine. Every protocol
     // carries tool schemas, so this runs wherever the tools are.
@@ -404,6 +407,37 @@ mod search_tests {
             assert_eq!(
                 other["tools"][0]["input_schema"]["properties"]["x"]["pattern"],
                 r"^[^\s[\]]+$"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deepseek_tool_pattern_gets_its_null_escape_respelled() {
+        let request = chat::decode_request(&json!({"model":"client",
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"Artifact","parameters":{
+                "type":"object","properties":{
+                    "content":{"type":"string","pattern":"^[^\\0]*$"}}}}}]}))
+        .unwrap();
+        let out = build_request(
+            &provider(Protocol::Chat, "https://api.deepseek.com/v1"),
+            &request,
+            "up",
+        )
+        .unwrap();
+        assert_eq!(
+            out["tools"][0]["function"]["parameters"]["properties"]["content"]["pattern"],
+            r"^[^\u0000]*$"
+        );
+        // Every other host keeps ECMAScript's own spelling.
+        for url in [
+            "https://api.openai.com/v1",
+            "https://api.deepseek.com.evil.invalid/v1",
+        ] {
+            let other = build_request(&provider(Protocol::Chat, url), &request, "up").unwrap();
+            assert_eq!(
+                other["tools"][0]["function"]["parameters"]["properties"]["content"]["pattern"],
+                r"^[^\0]*$"
             );
         }
     }

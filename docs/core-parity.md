@@ -8,7 +8,7 @@ Target: multiple coding agents sharing one Rust backend, provider adapters for d
 
 | Area | Current evidence | Remaining work |
 |---|---|---|
-| Shared Rust gateway | Tool-returned image ownership and four-client/four-upstream translation with a 64-request real loopback JSON/SSE direct/group matrix (docs/tool-transcripts.md); Chat-bound split/parallel/interrupted/orphan tool-history repair with request-local ID normalization (docs/tool-transcripts.md); core wire codecs; real local HTTP/SSE terminal/error/EOF and after-header disconnect fixtures across four adapters; incremental 32 MiB raw-event bounds, BOM/CR/UTF-8 handling, opening event/metadata-byte budgets, early stream-error key/fallback/group retry, no ordinary fallback after text/reasoning/tool output, configurable per-attempt first-content/read-idle deadlines with timeout fallback, group non-final first-content switching, request-wide Responses opening release, downstream pre-header/mid-answer SSE comments with safe fallback, protocol error conversion, bounded upstream-silence windows and activity-driven cadence, bounded per-channel text/reasoning repetition protection with no answer/tool replay and one same-candidate reasoning-only reask plus bounded Gemini empty-reply reasks with combined client/history usage, and real HTTP/1.1 before/after-header cancellation with persisted accounting; see docs/stream-lifecycle.md | Recorded real-agent fixtures, broader multimodal/tool/stream conformance, queue/slow-final-route behavior, cross-protocol search-option translation and cross-client image rendering, provider-specific prefill continuation, optional post-content progress policies, HTTP/2 cancellation conformance, provider-specific tool-schema rewrites, and RPM/concurrency queues |
+| Shared Rust gateway | Tool-returned image ownership and four-client/four-upstream translation with a 64-request real loopback JSON/SSE direct/group matrix (docs/tool-transcripts.md); Chat-bound split/parallel/interrupted/orphan tool-history repair with request-local ID normalization (docs/tool-transcripts.md); core wire codecs; real local HTTP/SSE terminal/error/EOF and after-header disconnect fixtures across four adapters; incremental 32 MiB raw-event bounds, BOM/CR/UTF-8 handling, opening event/metadata-byte budgets, early stream-error key/fallback/group retry, no ordinary fallback after text/reasoning/tool output, configurable per-attempt first-content/read-idle deadlines with timeout fallback, group non-final first-content switching, request-wide Responses opening release, downstream pre-header/mid-answer SSE comments with safe fallback, protocol error conversion, bounded upstream-silence windows and activity-driven cadence, bounded per-channel text/reasoning repetition protection with no answer/tool replay and one same-candidate reasoning-only reask plus bounded Gemini empty-reply reasks with combined client/history usage, and real HTTP/1.1 before/after-header cancellation with persisted accounting; see docs/stream-lifecycle.md | Recorded real-agent fixtures, broader multimodal/tool/stream conformance, queue/slow-final-route behavior, cross-protocol search-option translation and cross-client image rendering, provider-specific prefill continuation, optional post-content progress policies, HTTP/2 cancellation conformance, the provider-specific tool-schema rewrites left (Kimi's enum types and locked sampling, oneOf->anyOf), and RPM/concurrency queues |
 | Tool-selection policies | Four-dialect auto/none/required/named normalization; reasoning-effort levels (`none`/minimal→low, low/medium/high/xhigh/max, Anthropic budget↔level via the reference's 4096/12000/24000 breaks, Gemini thinkingLevel/thinkingBudget, Anthropic budgets fitted under the client's max_tokens cap) translated in all sixteen source×target directions with no silent drops; Responses/Gemini function subsets; request-local filtering; native-only restrictions; parallel-calls constraints (`parallel_tool_calls` on Chat/Responses, Anthropic `disable_parallel_tool_use` translated to Chat/Responses and rejected on Gemini rather than silently dropped); Responses namespace declarations/calls/tool choices and Responses custom (free-form) tools — decoded as grammar-described input functions, offered to foreign dialects, and restored to `custom_tool_call`/`custom_tool_call_input.delta` events from request-declared tools; namespace declarations/calls/tool choices, streaming namespace preservation, and request-local restoration of flat `ns__tool` names back to Responses namespace calls across Chat/Anthropic/Gemini/Responses upstreams, direct/group routes, JSON/SSE responses and cross-protocol fallback (no historical-name guessing); seven loopback HTTP tests with 576 JSON/SSE direct/group client requests, native compatible fallback without key attempts/cooldowns, search/native-policy bypass regression (docs/tool-choices.md), and dedicated namespace-restoration loopback tests in `crates/gateway/tests/namespaces.rs` | Provider-specific search options, adaptive-only Claude thinking paths, real-Agent and live-vendor evidence |
 | Agent adapters | Shared magpie-agents adapters for Claude Code, Codex, Crush, Gemini CLI, Goose, OpenCode and Zed; private staged preview, revision-checked apply, OS lock, schema-2 journaled selective field restore preserving unrelated edits, disconnect, managed-field drift and explicit recovery. Agent unit, HTTP, sandboxed child CLI and real-gateway console browser tests; Windows ACL/junction checks; recursive duplicate-key JSON/JSONC refusal, format-preserving JSON edits, compact comment-free JSON object additions that preserve single-line layout, native OpenCode/Zed JSONC, shared passive CLI/config discovery with bounded user-prefix/Node-version searches, npmrc prefix and nvm default-alias handling, and PATH/unknown metadata, native absolute config-directory overrides for Claude/Codex/OpenCode/Zed, and seven-Agent selective restore through HTTP/CLI/browser | Native project overrides, login-shell/registry PATH refresh, process/reachability and real-version compatibility evidence; compact layout preservation is intentionally limited to single-line objects without direct comments |
 | Provider metadata and keys | Protected provider CRUD and console; providers.rs covers saved/live edits, secret-free capability metadata (`supported_protocols`, nullable streaming/tools/vision), protocol validation and preserve/clear semantics. provider_tools.rs covers four-protocol catalogs/probes, pagination, saved/draft/no-auth credentials and bounded read-only operations | Capability presets, specialized/stream-only probes and paid/live vendor evidence |
@@ -575,13 +575,35 @@ order, so the rewrite is in the value tree instead. Lite walks that tree
 and so also reaches Gemini's `functionDeclarations` and a Responses
 namespace's `tools`, which the reference's walker does not.
 
+### DeepSeek's null escape in a tool pattern (`f362d755`)
+
+DeepSeek's schema validator refuses a tool whose `pattern` holds the
+ECMAScript null escape `\0`: `Invalid schema for function … is not a
+'regex'`. JSON Schema's `pattern` is an ECMAScript regex, where `\0` is the
+NUL character, and DeepSeek takes `\u0000` for the same character instead.
+Claude Code's Artifact tool carries `^[^\0]*$` (#370).
+
+`crates/gateway/src/deepseek_schema.rs` respells each standalone `\0` in a
+tool's schema as `\u0000`, for `api.deepseek.com` alone, and a lookalike
+host, every other provider and a pattern that holds none keep their own
+spelling. A pair of backslashes (`\\0`) is literal and an octal escape
+(`\01`) has its own meaning, so neither is touched.
+
+The walk itself is now shared: `crates/gateway/src/tool_schema.rs` holds
+the whitelist `rewrite_patterns` that both this and the Grok rewrite
+above use, so a tool schema is read the same way wherever its dialect
+puts it.
+
 ### Still open from this refresh
 
 Room-aware group selection (`0f398c48`) needs per-model window metadata that
 lite does not carry; it is not implemented. Rest granularity, RPM and
 concurrency queues, sink ordering, Devin's Gemini schema sanitizer
 (`1530c5ef`) and HTTP/2 transport health (`94919109`) remain future work.
-The streaming-whole-reply retry (`df341e76`) does not apply:
+The last does not map onto lite as it stands: lite's client asks for
+HTTP/1.1 (`reqwest` is built without its `http2` feature), so there is no
+shared HTTP/2 connection to a vendor that can go silent. The
+streaming-whole-reply retry (`df341e76`) does not apply:
 lite already replays a whole upstream answer as the client's stream and
 never asks that member again for the same turn. These fixtures are local
 unit, loopback HTTP and workspace tests, not live-vendor or real-agent
