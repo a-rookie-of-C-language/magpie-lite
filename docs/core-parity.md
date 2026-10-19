@@ -8,7 +8,7 @@ Target: multiple coding agents sharing one Rust backend, provider adapters for d
 
 | Area | Current evidence | Remaining work |
 |---|---|---|
-| Shared Rust gateway | Tool-returned image ownership and four-client/four-upstream translation with a 64-request real loopback JSON/SSE direct/group matrix (docs/tool-transcripts.md); Chat-bound split/parallel/interrupted/orphan tool-history repair with request-local ID normalization (docs/tool-transcripts.md); core wire codecs; real local HTTP/SSE terminal/error/EOF and after-header disconnect fixtures across four adapters; incremental 32 MiB raw-event bounds, BOM/CR/UTF-8 handling, opening event/metadata-byte budgets, early stream-error key/fallback/group retry, no ordinary fallback after text/reasoning/tool output, configurable per-attempt first-content/read-idle deadlines with timeout fallback, group non-final first-content switching, request-wide Responses opening release, downstream pre-header/mid-answer SSE comments with safe fallback, protocol error conversion, bounded upstream-silence windows and activity-driven cadence, bounded per-channel text/reasoning repetition protection with no answer/tool replay and one same-candidate reasoning-only reask plus bounded Gemini empty-reply reasks with combined client/history usage, and real HTTP/1.1 before/after-header cancellation with persisted accounting; see docs/stream-lifecycle.md | Recorded real-agent fixtures, broader multimodal/tool/stream conformance, queue/slow-final-route behavior, cross-protocol search-option translation and cross-client image rendering, provider-specific prefill continuation, optional post-content progress policies, HTTP/2 cancellation conformance, the provider-specific tool-schema rewrites left (Kimi's enum types and locked sampling, oneOf->anyOf), and RPM/concurrency queues |
+| Shared Rust gateway | Tool-returned image ownership and four-client/four-upstream translation with a 64-request real loopback JSON/SSE direct/group matrix (docs/tool-transcripts.md); Chat-bound split/parallel/interrupted/orphan tool-history repair with request-local ID normalization (docs/tool-transcripts.md); core wire codecs; real local HTTP/SSE terminal/error/EOF and after-header disconnect fixtures across four adapters; incremental 32 MiB raw-event bounds, BOM/CR/UTF-8 handling, opening event/metadata-byte budgets, early stream-error key/fallback/group retry, no ordinary fallback after text/reasoning/tool output, configurable per-attempt first-content/read-idle deadlines with timeout fallback, group non-final first-content switching, request-wide Responses opening release, downstream pre-header/mid-answer SSE comments with safe fallback, protocol error conversion, bounded upstream-silence windows and activity-driven cadence, bounded per-channel text/reasoning repetition protection with no answer/tool replay and one same-candidate reasoning-only reask plus bounded Gemini empty-reply reasks with combined client/history usage, and real HTTP/1.1 before/after-header cancellation with persisted accounting; see docs/stream-lifecycle.md | Recorded real-agent fixtures, broader multimodal/tool/stream conformance, queue/slow-final-route behavior, cross-protocol search-option translation and cross-client image rendering, provider-specific prefill continuation, optional post-content progress policies, HTTP/2 cancellation conformance, the remaining provider-specific rewrites (Cline pinning, Devin's Gemini schema), and RPM/concurrency queues |
 | Tool-selection policies | Four-dialect auto/none/required/named normalization; reasoning-effort levels (`none`/minimal→low, low/medium/high/xhigh/max, Anthropic budget↔level via the reference's 4096/12000/24000 breaks, Gemini thinkingLevel/thinkingBudget, Anthropic budgets fitted under the client's max_tokens cap) translated in all sixteen source×target directions with no silent drops; Responses/Gemini function subsets; request-local filtering; native-only restrictions; parallel-calls constraints (`parallel_tool_calls` on Chat/Responses, Anthropic `disable_parallel_tool_use` translated to Chat/Responses and rejected on Gemini rather than silently dropped); Responses namespace declarations/calls/tool choices and Responses custom (free-form) tools — decoded as grammar-described input functions, offered to foreign dialects, and restored to `custom_tool_call`/`custom_tool_call_input.delta` events from request-declared tools; namespace declarations/calls/tool choices, streaming namespace preservation, and request-local restoration of flat `ns__tool` names back to Responses namespace calls across Chat/Anthropic/Gemini/Responses upstreams, direct/group routes, JSON/SSE responses and cross-protocol fallback (no historical-name guessing); seven loopback HTTP tests with 576 JSON/SSE direct/group client requests, native compatible fallback without key attempts/cooldowns, search/native-policy bypass regression (docs/tool-choices.md), and dedicated namespace-restoration loopback tests in `crates/gateway/tests/namespaces.rs` | Provider-specific search options, adaptive-only Claude thinking paths, real-Agent and live-vendor evidence |
 | Agent adapters | Shared magpie-agents adapters for Claude Code, Codex, Crush, Gemini CLI, Goose, OpenCode and Zed; private staged preview, revision-checked apply, OS lock, schema-2 journaled selective field restore preserving unrelated edits, disconnect, managed-field drift and explicit recovery. Agent unit, HTTP, sandboxed child CLI and real-gateway console browser tests; Windows ACL/junction checks; recursive duplicate-key JSON/JSONC refusal, format-preserving JSON edits, compact comment-free JSON object additions that preserve single-line layout, native OpenCode/Zed JSONC, shared passive CLI/config discovery with bounded user-prefix/Node-version searches, npmrc prefix and nvm default-alias handling, and PATH/unknown metadata, native absolute config-directory overrides for Claude/Codex/OpenCode/Zed, and seven-Agent selective restore through HTTP/CLI/browser | Native project overrides, login-shell/registry PATH refresh, process/reachability and real-version compatibility evidence; compact layout preservation is intentionally limited to single-line objects without direct comments |
 | Provider metadata and keys | Protected provider CRUD and console; providers.rs covers saved/live edits, secret-free capability metadata (`supported_protocols`, nullable streaming/tools/vision), protocol validation and preserve/clear semantics. provider_tools.rs covers four-protocol catalogs/probes, pagination, saved/draft/no-auth credentials and bounded read-only operations | Capability presets, specialized/stream-only probes and paid/live vendor evidence |
@@ -590,16 +590,51 @@ spelling. A pair of backslashes (`\\0`) is literal and an octal escape
 (`\01`) has its own meaning, so neither is touched.
 
 The walk itself is now shared: `crates/gateway/src/tool_schema.rs` holds
-the whitelist `rewrite_patterns` that both this and the Grok rewrite
-above use, so a tool schema is read the same way wherever its dialect
-puts it.
+the whitelist walker that the Grok rewrite above and every rewrite below
+use, so a tool schema is read the same way wherever its dialect puts it.
+
+### Kimi's untyped enum and locked sampling
+
+Moonshot's "flavored JSON Schema" refuses a tool schema whose `enum` or
+`const` names no `type` — 400 "type is not defined" (#886) — and the whole
+request fails though the tool is never called. `kimi_schema.rs` writes the
+type every value has (string, integer, number or boolean) into each such
+schema; mixed values or a `null` among them are left as they were, and
+whole numbers among fractions make the type `number`.
+
+Since kimi-k2.5 the server locks `temperature` and `top_p` to one value, so
+a client sending its own defaults (VS Code Copilot's chat sends 0.1 and 1)
+is refused 400 before any token is read. For `kimi-k2.5` and later, `k3*`
+and `kimi-for-coding*`, both fields are left out and the server fills in
+the value the model and mode want. `kimi-k2-thinking`,
+`kimi-k2-0905-preview` and `moonshot-v1-*` take a range and keep what the
+client sent.
+
+Both apply to Moonshot's and Kimi's own hosts
+(`api.moonshot.ai`, `api.moonshot.cn`, `api.kimi.com`, `api.kimi.ai`) and
+to nothing else; lite has no provider preset, so a relay's Kimi models keep
+their own spelling.
+
+### OpenRouter's oneOf (`toolOneOfAsAnyOf`)
+
+OpenRouter serves some models behind xgrammar, which turns a tool schema's
+`oneOf` away when its branches are not provably disjoint:
+"unsupported schema keyword: oneOf with overlapping or non-provably-
+disjoint branches", 400, and takes `anyOf`. `oneof_schema.rs` renames the
+key on `openrouter.ai` alone, keeping its place among the schema's keys;
+a schema that wrote both has the two merged into one `anyOf`, since the
+union is what either said. Every other host keeps `oneOf`.
+
+The reference also names its Cline and Kilo presets; lite has no preset
+concept, so only the host OpenRouter itself is rewritten.
 
 ### Still open from this refresh
 
 Room-aware group selection (`0f398c48`) needs per-model window metadata that
 lite does not carry; it is not implemented. Rest granularity, RPM and
-concurrency queues, sink ordering, Devin's Gemini schema sanitizer
-(`1530c5ef`) and HTTP/2 transport health (`94919109`) remain future work.
+concurrency queues, sink ordering, Cline pinning, Devin's Gemini schema
+sanitizer (`1530c5ef`) and HTTP/2 transport health (`94919109`) remain
+future work.
 The last does not map onto lite as it stands: lite's client asks for
 HTTP/1.1 (`reqwest` is built without its `http2` feature), so there is no
 shared HTTP/2 connection to a vendor that can go silent. The

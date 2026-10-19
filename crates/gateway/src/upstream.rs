@@ -54,6 +54,13 @@ pub fn build_request(
     // DeepSeek's validator takes a tool pattern's null escape as `\u0000`,
     // not ECMAScript's `\0` (#370).
     body = crate::deepseek_schema::deepseek_tool_patterns(body, host.as_deref());
+    // Moonshot refuses an untyped enum in a tool schema (#886), and since
+    // kimi-k2.5 locks temperature and top_p.
+    body = crate::kimi_schema::kimi_tool_enum_types(body, host.as_deref());
+    body = crate::kimi_schema::kimi_locked_sampling(body, host.as_deref(), model);
+    // OpenRouter's grammar compiler refuses a oneOf whose branches are not
+    // provably disjoint; anyOf holds the same branches.
+    body = crate::oneof_schema::one_of_as_any_of(body, host.as_deref());
     // xAI turns away a tool whose `pattern` Rust's regex syntax can't
     // parse, where ECMAScript reads the same pattern fine. Every protocol
     // carries tool schemas, so this runs wherever the tools are.
@@ -440,5 +447,78 @@ mod search_tests {
                 r"^[^\0]*$"
             );
         }
+    }
+
+    #[test]
+    fn a_kimi_tool_enum_gets_its_type_and_a_locked_model_loses_its_sampling() {
+        let request = chat::decode_request(&json!({"model":"client",
+            "messages":[{"role":"user","content":"hi"}], "temperature":0.1, "top_p":1,
+            "tools":[{"type":"function","function":{"name":"t","parameters":{
+                "type":"object","properties":{"kind":{"enum":["text","icon"]}}}}}]}))
+        .unwrap();
+        let out = build_request(
+            &provider(Protocol::Chat, "https://api.moonshot.ai/v1"),
+            &request,
+            "kimi-k2.5",
+        )
+        .unwrap();
+        assert_eq!(
+            out["tools"][0]["function"]["parameters"]["properties"]["kind"]["type"],
+            "string"
+        );
+        assert!(out.get("temperature").is_none());
+        assert!(out.get("top_p").is_none());
+        // A range model keeps the sampling it was given.
+        let ranged = build_request(
+            &provider(Protocol::Chat, "https://api.moonshot.ai/v1"),
+            &request,
+            "kimi-k2-0905-preview",
+        )
+        .unwrap();
+        assert_eq!(ranged["temperature"], 0.1);
+        assert_eq!(ranged["top_p"], 1.0);
+        // Another host keeps both the untyped enum and the sampling.
+        let other = build_request(
+            &provider(Protocol::Chat, "https://api.openai.com/v1"),
+            &request,
+            "kimi-k2.5",
+        )
+        .unwrap();
+        assert!(
+            other["tools"][0]["function"]["parameters"]["properties"]["kind"]
+                .get("type")
+                .is_none()
+        );
+        assert_eq!(other["temperature"], 0.1);
+    }
+
+    #[test]
+    fn an_openrouter_tool_one_of_reaches_it_as_any_of() {
+        let request = chat::decode_request(&json!({"model":"client",
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"t","parameters":{
+                "type":"object","properties":{"x":{"oneOf":[
+                    {"type":"string"},{"type":"integer"}]}}}}}]}))
+        .unwrap();
+        let out = build_request(
+            &provider(Protocol::Chat, "https://openrouter.ai/api/v1"),
+            &request,
+            "up",
+        )
+        .unwrap();
+        let x = &out["tools"][0]["function"]["parameters"]["properties"]["x"];
+        assert!(x.get("oneOf").is_none());
+        assert_eq!(x["anyOf"], json!([{"type":"string"},{"type":"integer"}]));
+        // Every other host keeps oneOf.
+        let other = build_request(
+            &provider(Protocol::Chat, "https://api.openai.com/v1"),
+            &request,
+            "up",
+        )
+        .unwrap();
+        assert_eq!(
+            other["tools"][0]["function"]["parameters"]["properties"]["x"]["oneOf"],
+            json!([{"type":"string"},{"type":"integer"}])
+        );
     }
 }

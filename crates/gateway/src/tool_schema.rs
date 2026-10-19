@@ -1,6 +1,5 @@
-//! Walk a request's tool schemas to the `pattern` strings inside them, so
-//! a provider that reads one differently than JSON Schema says can be
-//! handed a spelling it takes.
+//! Walk a request's tool schemas, so a provider that reads one differently
+//! than JSON Schema says can be handed a shape it takes.
 //!
 //! A tool's schema sits wherever its dialect puts it — Chat under
 //! `function.parameters`, Anthropic under `input_schema`, Gemini under
@@ -10,7 +9,7 @@
 //! data (`enum`, `const`, `default`, `examples`) is not a schema, so a
 //! value that happens to be called `pattern` there keeps its text.
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Keywords whose value is an object of schemas, one per name.
 const SCHEMA_MAP_KEYS: [&str; 5] = [
@@ -44,6 +43,26 @@ const SCHEMA_KEYS: [&str; 15] = [
 /// and report whether anything changed. `fix` answers `None` when the
 /// pattern needs nothing, so a schema that is already right costs no
 /// allocation.
+pub(crate) fn rewrite_patterns(
+    value: &mut Value,
+    in_schema: bool,
+    fix: fn(&str) -> Option<String>,
+) -> bool {
+    let mut changed = false;
+    walk(value, in_schema, &mut |schema| {
+        if let Some(Value::String(pattern)) = schema.get_mut("pattern") {
+            if let Some(rewritten) = fix(pattern) {
+                *pattern = rewritten;
+                changed = true;
+            }
+        }
+    });
+    changed
+}
+
+/// Visit every schema of the tools in a request body, root first and then
+/// each nested schema, so a caller can change the ones a provider reads
+/// differently. `visit` gets the schema's own object.
 ///
 /// The walk is a whitelist, as the reference gateway's is: a tool is
 /// entered through `function`, `functionDeclarations`, `parameters`,
@@ -51,38 +70,34 @@ const SCHEMA_KEYS: [&str; 15] = [
 /// through the keywords that hold another schema. Lite walks the value
 /// tree it just built, so unlike the reference it also reaches Gemini's
 /// `functionDeclarations` and a Responses namespace's `tools`.
-pub(crate) fn rewrite_patterns(
-    value: &mut Value,
-    in_schema: bool,
-    fix: fn(&str) -> Option<String>,
-) -> bool {
+pub(crate) fn tool_schemas(body: &mut Value, visit: &mut impl FnMut(&mut Map<String, Value>)) {
+    if let Some(tools) = body.get_mut("tools") {
+        walk(tools, false, visit);
+    }
+}
+
+fn walk(value: &mut Value, in_schema: bool, visit: &mut impl FnMut(&mut Map<String, Value>)) {
     match value {
         Value::Object(object) => {
-            let mut changed = false;
             if in_schema {
-                if let Some(Value::String(pattern)) = object.get_mut("pattern") {
-                    if let Some(rewritten) = fix(pattern) {
-                        *pattern = rewritten;
-                        changed = true;
-                    }
-                }
+                visit(object);
                 for key in SCHEMA_MAP_KEYS {
                     if let Some(Value::Object(schemas)) = object.get_mut(key) {
                         for schema in schemas.values_mut() {
-                            changed |= rewrite_patterns(schema, true, fix);
+                            walk(schema, true, visit);
                         }
                     }
                 }
                 for key in SCHEMA_KEYS {
                     if let Some(child) = object.get_mut(key) {
-                        changed |= rewrite_patterns(child, true, fix);
+                        walk(child, true, visit);
                     }
                 }
             } else {
                 // A schema, wherever this dialect puts one.
                 for key in ["input_schema", "parameters"] {
                     if let Some(child) = object.get_mut(key) {
-                        changed |= rewrite_patterns(child, true, fix);
+                        walk(child, true, visit);
                     }
                 }
                 // A container of tools: Chat's `function` object, Gemini's
@@ -90,19 +105,16 @@ pub(crate) fn rewrite_patterns(
                 // nested `tools`.
                 for key in ["function", "functionDeclarations", "tools"] {
                     if let Some(child) = object.get_mut(key) {
-                        changed |= rewrite_patterns(child, false, fix);
+                        walk(child, false, visit);
                     }
                 }
             }
-            changed
         }
         Value::Array(items) => {
-            let mut changed = false;
             for item in items {
-                changed |= rewrite_patterns(item, in_schema, fix);
+                walk(item, in_schema, visit);
             }
-            changed
         }
-        _ => false,
+        _ => {}
     }
 }
