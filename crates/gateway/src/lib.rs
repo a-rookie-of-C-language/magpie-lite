@@ -16,6 +16,7 @@ mod oneof_schema;
 mod optional_fields;
 mod provider_tools;
 mod providers;
+mod reply_room;
 mod retired;
 pub mod server;
 mod stream_empty;

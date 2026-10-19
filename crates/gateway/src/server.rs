@@ -34,6 +34,7 @@ use crate::model_gone::{
 };
 use crate::object_root;
 use crate::optional_fields;
+use crate::reply_room;
 use crate::retired as retired_store;
 use crate::stream_empty::{EMPTY_REPLY, GeminiReply};
 use crate::stream_keepalive::{self, Keepalive, UpstreamActivity};
@@ -1238,6 +1239,10 @@ async fn send_with_fallback(
             let mut optional_retry: Option<Vec<&'static str>> = None;
             let mut sampling_retry = false;
             let mut root_union_retry = false;
+            // The room a window left for the reply, once a refusal has
+            // said it: the same candidate is asked again under it, and it
+            // is asked no more.
+            let mut room_cap: Option<u64> = None;
             let mut original_root_union_refusal: Option<(Value, String)> = None;
             // A Chat endpoint refusing tools with reasoning was asked
             // again with `reasoning_effort: "none"` (#176); when `none`
@@ -1312,6 +1317,12 @@ async fn send_with_fallback(
                         model = %route.model,
                         "folding tool roots to an object"
                     );
+                }
+                if let Some(room) = room_cap {
+                    // The reply asked for with the prompt passed the
+                    // window: ask the same candidate again for what the
+                    // window has left.
+                    reply_room::with_reply_cap(&mut body, route.provider.protocol, room);
                 }
                 tracing::debug!(
                     provider = %route.provider.id,
@@ -1739,6 +1750,30 @@ async fn send_with_fallback(
                         tools_without_effort_retry = true;
                         continue 'candidate;
                     }
+                }
+                // The window held the prompt but not the reply asked for
+                // with it: DeepSeek counts `max_tokens` in its 1M window,
+                // so a client asking its full 384K for a ~700K
+                // conversation was refused there as too long, where every
+                // other member of its group answered. The same candidate
+                // is asked again for what the window has left — same key,
+                // same model, nobody rests. Room too small to be worth a
+                // reply still reaches the agent as the overflow it is.
+                if room_cap.is_none()
+                    && optional_fields::bad_request(status.as_u16())
+                    && let Some(left) = reply_room::reply_left(&error.message)
+                        .or_else(|| reply_room::reply_left(&error.body.to_string()))
+                    && left >= reply_room::LEAST_REPLY_ROOM
+                    && reply_room::with_reply_cap(&mut body, route.provider.protocol, left)
+                {
+                    tracing::debug!(
+                        provider = %route.provider.id,
+                        model = %route.model,
+                        left,
+                        "asking again for the reply the window leaves"
+                    );
+                    room_cap = Some(left);
+                    continue 'candidate;
                 }
                 if quota_limited_status(status) {
                     let cooldown = quota_cooldown(
