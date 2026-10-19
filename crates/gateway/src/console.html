@@ -697,7 +697,8 @@
                 <div class="field"><label for="group-id">Group ID</label><input id="group-id" class="token-input" required pattern="[A-Za-z0-9_-]+" placeholder="daily-coding" aria-describedby="group-id-help"><p id="group-id-help" class="group-help">Letters, digits, hyphens and underscores. Agents use group/&lt;id&gt;.</p></div>
                 <div class="field"><label for="group-name">Display name (optional)</label><input id="group-name" class="token-input" placeholder="Daily coding"></div>
                 <div class="field"><label for="group-routes">Routes in fallback order</label><textarea id="group-routes" class="token-input" required placeholder="deepseek/deepseek-chat&#10;kimi/moonshot-v1-128k" aria-describedby="group-routes-help"></textarea><p id="group-routes-help" class="group-help">One provider/model per line. The selected policy chooses the starting route; remaining routes are fallback candidates.</p><p id="group-providers" class="group-help"></p></div>
-                <div class="field"><label for="group-routing">Route policy</label><select id="group-routing" class="token-input" aria-describedby="group-routing-help"><option value="order">Ordered</option><option value="rotate">Rotate</option><option value="usage">Least used</option></select><p id="group-routing-help" class="group-help">Ordered always starts at the first route. Rotate advances the starting route per request. Least used prefers routes with fewer attempts in this gateway process.</p></div>
+                <div class="field"><label for="group-routing">Route policy</label><select id="group-routing" class="token-input" aria-describedby="group-routing-help"><option value="order">Ordered</option><option value="rotate">Rotate</option><option value="usage">Least used</option><option value="weight">Weighted</option></select><p id="group-routing-help" class="group-help">Ordered always starts at the first route. Rotate advances the starting route per request. Least used prefers routes with fewer attempts in this gateway process. Weighted spreads by each route's weight.</p></div>
+                <div id="group-weights-field" class="field" hidden><label for="group-weights">Route weights</label><textarea id="group-weights" class="token-input" placeholder="3&#10;1&#10;4" aria-describedby="group-weights-help"></textarea><p id="group-weights-help" class="group-help">One weight per route, in route order, each a whole number from 0 to 1000. A missing weight counts as 1; 0 makes the route fallback-only.</p></div>
                 <div class="field"><label for="group-affinity">Conversation affinity</label><select id="group-affinity" class="token-input" aria-describedby="group-affinity-help"><option value="auto">Auto</option><option value="session">Whole session</option><option value="turn">Within a turn</option><option value="off">Off</option></select><p id="group-affinity-help" class="group-help">Keep a conversation on the route that answered it so the vendor's prompt cache keeps hitting. Auto follows the route policy: rotate spreads load, everything else sticks by conversation.</p></div>
                 <div class="field"><label for="group-first-token">First-content timeout (ms)</label><input id="group-first-token" class="token-input" type="number" min="0" max="9007199254740991" step="1" value="0" required aria-describedby="group-first-token-help"><p id="group-first-token-help" class="group-help">0 disables this group limit. Streaming requests only: a slow non-final route switches to the next candidate before any reply is released. The final route still obeys gateway-wide limits.</p></div>
                 <div class="group-actions"><button id="group-save" class="button" type="submit">Save group</button><button id="group-cancel" class="button secondary" type="button">Cancel</button></div>
@@ -805,6 +806,8 @@
       groupName: document.getElementById("group-name"),
       groupRoutes: document.getElementById("group-routes"),
       groupRouting: document.getElementById("group-routing"),
+      groupWeightsField: document.getElementById("group-weights-field"),
+      groupWeights: document.getElementById("group-weights"),
       groupAffinity: document.getElementById("group-affinity"),
       groupFirstToken: document.getElementById("group-first-token"),
       groupProviders: document.getElementById("group-providers"),
@@ -1306,7 +1309,8 @@
         route.className = "model-owner";
         route.textContent = (group.routes || []).join(" → ") || "No routes";
         const label = text("span", group.name || group.id, "model-owner");
-        const policy = text("span", `Policy: ${group.routing || "order"} · affinity: ${group.affinity || "auto"}`, "model-owner");
+        const weights = group.routing === "weight" ? ` · weights: ${(group.weights || []).join(", ")}` : "";
+        const policy = text("span", `Policy: ${group.routing || "order"}${weights} · affinity: ${group.affinity || "auto"}`, "model-owner");
         const actions = document.createElement("div");
         actions.className = "group-actions";
         const edit = text("button", "Edit", "button secondary");
@@ -1349,6 +1353,10 @@
       const weights = provider.weights || [];
       const weightsText = weights.length ? `weight: ${weights.join(", ")}` : "weight";
       return `${weightsText} · affinity: ${affinity}`;
+    }
+
+    function groupRoutingChanged() {
+      elements.groupWeightsField.hidden = elements.groupRouting.value !== "weight";
     }
 
     function renderModels(models) {
@@ -1621,8 +1629,10 @@
       elements.groupName.value = group?.name || "";
       elements.groupRoutes.value = (group?.routes || []).join("\n");
       elements.groupRouting.value = group?.routing || "order";
+      elements.groupWeights.value = (group?.weights || []).join("\n");
       elements.groupAffinity.value = group?.affinity || "auto";
       elements.groupFirstToken.value = group?.first_token_timeout_ms ?? 0;
+      groupRoutingChanged();
       elements.groupMessage.textContent = "";
       elements.groupEditor.hidden = false;
       (group ? elements.groupName : elements.groupId).focus();
@@ -1692,6 +1702,7 @@
 
     elements.groupNew.addEventListener("click", () => openGroupEditor());
     elements.groupCancel.addEventListener("click", closeGroupEditor);
+    elements.groupRouting.addEventListener("change", groupRoutingChanged);
     elements.groupEditor.addEventListener("keydown", event => {
       if (event.key === "Escape" && !managementBusy) { event.preventDefault(); closeGroupEditor(); }
     });
@@ -1703,6 +1714,7 @@
         name: elements.groupName.value.trim(),
         routes: elements.groupRoutes.value.split(/\r?\n/).map(route => route.trim()).filter(Boolean),
         routing: elements.groupRouting.value,
+        weights: [],
         affinity: elements.groupAffinity.value,
         first_token_timeout_ms: Number(elements.groupFirstToken.value)
       };
@@ -1715,6 +1727,21 @@
         elements.groupMessage.textContent = "Enter a non-negative whole-number timeout in milliseconds (0 disables).";
         elements.groupFirstToken.focus();
         return;
+      }
+      if (body.routing === "weight") {
+        const raw = elements.groupWeights.value.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+        const weights = raw.map(Number);
+        if (weights.some(weight => !Number.isSafeInteger(weight) || weight < 0 || weight > 1000)) {
+          elements.groupMessage.textContent = "Route weights must be whole numbers from 0 to 1000, one per line.";
+          elements.groupWeights.focus();
+          return;
+        }
+        if (weights.length > body.routes.length) {
+          elements.groupMessage.textContent = "Enter at most one weight per route.";
+          elements.groupWeights.focus();
+          return;
+        }
+        body.weights = weights;
       }
       const path = editingGroup === null ? "/config/groups" : `/config/groups/${encodeURIComponent(editingGroup)}`;
       await mutateGroup(path, editingGroup === null ? "POST" : "PUT", body, "Group saved. New requests use these routes immediately.");

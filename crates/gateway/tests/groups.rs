@@ -125,6 +125,16 @@ fn group(id: &str, model: &str) -> Value {
     json!({"id":id, "name":"Daily coding", "routes":[format!("mock/{model}")]})
 }
 
+fn weighted_group() -> Value {
+    json!({
+        "id": "weighted",
+        "name": "Weighted routes",
+        "routes": ["mock/first", "mock/second", "mock/third"],
+        "weights": [3, 1, 4],
+        "routing": "weight"
+    })
+}
+
 #[tokio::test]
 async fn idempotency_replays_group_create_without_advancing_revision() {
     let gw = gateway(false).await;
@@ -505,4 +515,60 @@ async fn group_affinity_round_trips_and_defaults_on_replace() {
         Config::load(&gw.path).unwrap().group[0].affinity,
         magpie_gateway::Affinity::Auto
     );
+}
+
+#[tokio::test]
+async fn group_weights_round_trip_are_exposed_and_reject_invalid_shapes() {
+    let gw = gateway(false).await;
+    let created = edit(&gw, Method::POST, "/config/groups", weighted_group()).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let snapshot: Value = created.json().await.unwrap();
+    assert_eq!(snapshot["groups"][0]["routing"], "weight");
+    assert_eq!(snapshot["groups"][0]["weights"], json!([3, 1, 4]));
+    assert_eq!(
+        Config::load(&gw.path).unwrap().group[0].route_weights(),
+        vec![3, 1, 4]
+    );
+
+    // A short vector is padded to the route count by the secret-free snapshot.
+    let mut partial = weighted_group();
+    partial["weights"] = json!([2]);
+    let updated = edit(&gw, Method::PUT, "/config/groups/weighted", partial).await;
+    assert_eq!(updated.status(), StatusCode::OK);
+    assert_eq!(
+        updated.json::<Value>().await.unwrap()["groups"][0]["weights"],
+        json!([2, 1, 1])
+    );
+    assert_eq!(
+        Config::load(&gw.path).unwrap().group[0].route_weights(),
+        vec![2, 1, 1]
+    );
+
+    // An explicit empty list clears configured overrides; the snapshot still
+    // materializes the effective default weight for every route.
+    let mut cleared = weighted_group();
+    cleared["weights"] = json!([]);
+    let cleared = edit(&gw, Method::PUT, "/config/groups/weighted", cleared).await;
+    assert_eq!(cleared.status(), StatusCode::OK);
+    assert_eq!(
+        cleared.json::<Value>().await.unwrap()["groups"][0]["weights"],
+        json!([1, 1, 1])
+    );
+    assert!(Config::load(&gw.path).unwrap().group[0].weights.is_empty());
+
+    for weights in [
+        json!([1, 1, 1, 1]),
+        json!([0, 1, 1001]),
+        json!([0, -1]),
+        json!("3"),
+    ] {
+        let mut body = weighted_group();
+        body["weights"] = weights;
+        let response = edit(&gw, Method::PUT, "/config/groups/weighted", body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            Config::load(&gw.path).unwrap().group[0].route_weights(),
+            vec![1, 1, 1]
+        );
+    }
 }

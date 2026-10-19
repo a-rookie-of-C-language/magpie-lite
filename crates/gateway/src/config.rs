@@ -303,8 +303,10 @@ impl TokenUse {
 struct GroupRoutingState {
     policy: RoutingPolicy,
     routes: Vec<String>,
+    weights: Vec<u32>,
     cursor: usize,
     attempts: Vec<u64>,
+    current: Vec<i64>,
 }
 
 /// One active key cooldown. It names only the key's stable slot and when the
@@ -500,6 +502,7 @@ impl KeyRotator {
         group_id: &str,
         policy: RoutingPolicy,
         routes: &[String],
+        weights: &[u32],
     ) -> Vec<(usize, String)> {
         if routes.is_empty() {
             return Vec::new();
@@ -513,28 +516,53 @@ impl KeyRotator {
             .or_insert_with(|| GroupRoutingState {
                 policy,
                 routes: routes.to_vec(),
+                weights: weights.to_vec(),
                 cursor: 0,
                 attempts: vec![0; routes.len()],
+                current: vec![0; routes.len()],
             });
-        if state.policy != policy || state.routes != routes {
+        if state.policy != policy || state.routes != routes || state.weights != weights {
             *state = GroupRoutingState {
                 policy,
                 routes: routes.to_vec(),
+                weights: weights.to_vec(),
                 cursor: 0,
                 attempts: vec![0; routes.len()],
+                current: vec![0; routes.len()],
             };
         }
 
         let indices = match state.policy {
-            // A group has no per-route weights, so a weighted provider
-            // policy takes its configured order here.
-            RoutingPolicy::Order | RoutingPolicy::Weighted => (0..routes.len()).collect::<Vec<_>>(),
+            RoutingPolicy::Order => (0..routes.len()).collect::<Vec<_>>(),
             RoutingPolicy::Rotate => {
                 let start = state.cursor % routes.len();
                 state.cursor = (start + 1) % routes.len();
                 (0..routes.len())
                     .map(|offset| (start + offset) % routes.len())
                     .collect()
+            }
+            RoutingPolicy::Weighted => {
+                let mut total = 0i64;
+                let mut best: Option<usize> = None;
+                for index in 0..routes.len() {
+                    let weight = i64::from(weights.get(index).copied().unwrap_or(1));
+                    if weight == 0 {
+                        continue;
+                    }
+                    state.current[index] += weight;
+                    total += weight;
+                    if best.is_none_or(|best| state.current[index] > state.current[best]) {
+                        best = Some(index);
+                    }
+                }
+                let Some(best) = best else {
+                    return routes.iter().cloned().enumerate().collect::<Vec<_>>();
+                };
+                state.current[best] -= total;
+                let mut indices = Vec::with_capacity(routes.len());
+                indices.push(best);
+                indices.extend((0..routes.len()).filter(|index| *index != best));
+                indices
             }
             RoutingPolicy::Usage => {
                 let mut indices = (0..routes.len()).collect::<Vec<_>>();
@@ -555,6 +583,7 @@ impl KeyRotator {
         group_id: &str,
         policy: RoutingPolicy,
         routes: &[String],
+        weights: &[u32],
         route_index: usize,
     ) {
         if route_index >= routes.len() {
@@ -569,15 +598,19 @@ impl KeyRotator {
             .or_insert_with(|| GroupRoutingState {
                 policy,
                 routes: routes.to_vec(),
+                weights: weights.to_vec(),
                 cursor: 0,
                 attempts: vec![0; routes.len()],
+                current: vec![0; routes.len()],
             });
-        if state.policy != policy || state.routes != routes {
+        if state.policy != policy || state.routes != routes || state.weights != weights {
             *state = GroupRoutingState {
                 policy,
                 routes: routes.to_vec(),
+                weights: weights.to_vec(),
                 cursor: 0,
                 attempts: vec![0; routes.len()],
+                current: vec![0; routes.len()],
             };
         }
         if let Some(attempts) = state.attempts.get_mut(route_index) {
@@ -784,6 +817,11 @@ pub struct GroupConfig {
     /// Ordered model routes. The first available one serves the request;
     /// the rest are fallbacks tried before any reply bytes are streamed.
     pub routes: Vec<String>,
+    /// Per-route weights for the `weight` policy, parallel to `routes`.
+    /// A missing entry weighs 1. An explicit zero disables the route for
+    /// weighted selection while leaving it as a fallback candidate.
+    #[serde(default)]
+    pub weights: Vec<u32>,
     /// Process-local route selection policy.
     #[serde(default)]
     pub routing: RoutingPolicy,
@@ -814,6 +852,12 @@ impl GroupConfig {
         if self.routes.iter().any(|route| route.starts_with("group/")) {
             anyhow::bail!("group routes must name providers directly, not other groups");
         }
+        if self.weights.iter().any(|weight| *weight > MAX_KEY_WEIGHT) {
+            anyhow::bail!("route weights cannot be above {MAX_KEY_WEIGHT}");
+        }
+        if self.weights.len() > self.routes.len() {
+            anyhow::bail!("there are more route weights than routes in the group");
+        }
         for route in &self.routes {
             let Some((provider, model)) = route.split_once('/') else {
                 anyhow::bail!("group routes must use provider/model");
@@ -832,6 +876,14 @@ impl GroupConfig {
         } else {
             &self.name
         }
+    }
+
+    /// One weight per route, in configured order. A missing entry weighs 1;
+    /// explicit zeroes are preserved so a route can be fallback-only.
+    pub fn route_weights(&self) -> Vec<u32> {
+        (0..self.routes.len())
+            .map(|slot| self.weights.get(slot).copied().unwrap_or(1))
+            .collect()
     }
 }
 
@@ -893,6 +945,9 @@ pub struct GroupConfigSnapshot {
     pub name: String,
     /// Ordered route chain.
     pub routes: Vec<String>,
+    /// Per-route weights, parallel to the route chain, for the `weight` policy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub weights: Vec<u32>,
     /// Route selection policy.
     pub routing: RoutingPolicy,
     /// First-content budget for non-final streaming group routes (0 disables).
@@ -1223,6 +1278,7 @@ impl Config {
                     id: g.id.clone(),
                     name: g.label().to_owned(),
                     routes: g.routes.clone(),
+                    weights: g.route_weights(),
                     routing: g.routing,
                     first_token_timeout_ms: g.first_token_timeout_ms,
                     affinity: g.affinity,
@@ -1709,6 +1765,7 @@ base_url = "http://127.0.0.1:1/v1"
             id: "daily".into(),
             name: "Daily coding".into(),
             routes: vec!["mock/mock-model".into(), "backup/other".into()],
+            weights: Vec::new(),
             routing: RoutingPolicy::default(),
             first_token_timeout_ms: 0,
             affinity: Default::default(),
@@ -1739,6 +1796,7 @@ base_url = "http://127.0.0.1:1/v1"
             id: "same-provider".into(),
             name: String::new(),
             routes: vec!["mock/model-a".into(), "mock/model-b".into()],
+            weights: Vec::new(),
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
             affinity: Default::default(),
@@ -1838,6 +1896,7 @@ affinity = "session"
             id: "daily".into(),
             name: String::new(),
             routes: vec!["mock/model".into()],
+            weights: Vec::new(),
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
             affinity: Affinity::Turn,
@@ -1856,7 +1915,7 @@ affinity = "session"
         let scheduler = KeyRotator::default();
         let routes = vec!["a/one".to_owned(), "b/two".to_owned(), "c/three".to_owned()];
         assert_eq!(
-            scheduler.group_order("daily", RoutingPolicy::Rotate, &routes),
+            scheduler.group_order("daily", RoutingPolicy::Rotate, &routes, &[]),
             vec![
                 (0, "a/one".to_owned()),
                 (1, "b/two".to_owned()),
@@ -1864,35 +1923,89 @@ affinity = "session"
             ]
         );
         assert_eq!(
-            scheduler.group_order("daily", RoutingPolicy::Rotate, &routes)[0],
+            scheduler.group_order("daily", RoutingPolicy::Rotate, &routes, &[])[0],
             (1, "b/two".to_owned())
         );
         assert_eq!(
-            scheduler.group_order("daily", RoutingPolicy::Rotate, &routes)[0],
+            scheduler.group_order("daily", RoutingPolicy::Rotate, &routes, &[])[0],
             (2, "c/three".to_owned())
         );
 
         let usage = KeyRotator::default();
         assert_eq!(
-            usage.group_order("daily", RoutingPolicy::Usage, &routes)[0].0,
+            usage.group_order("daily", RoutingPolicy::Usage, &routes, &[])[0].0,
             0
         );
-        usage.record_group_attempt("daily", RoutingPolicy::Usage, &routes, 0);
+        usage.record_group_attempt("daily", RoutingPolicy::Usage, &routes, &[], 0);
         assert_eq!(
-            usage.group_order("daily", RoutingPolicy::Usage, &routes)[0].0,
+            usage.group_order("daily", RoutingPolicy::Usage, &routes, &[])[0].0,
             1
         );
-        usage.record_group_attempt("daily", RoutingPolicy::Usage, &routes, 1);
+        usage.record_group_attempt("daily", RoutingPolicy::Usage, &routes, &[], 1);
         assert_eq!(
-            usage.group_order("daily", RoutingPolicy::Usage, &routes)[0].0,
+            usage.group_order("daily", RoutingPolicy::Usage, &routes, &[])[0].0,
             2
         );
 
         let changed = vec!["new/route".to_owned(), "other/route".to_owned()];
         assert_eq!(
-            usage.group_order("daily", RoutingPolicy::Usage, &changed)[0],
+            usage.group_order("daily", RoutingPolicy::Usage, &changed, &[])[0],
             (0, "new/route".to_owned())
         );
+    }
+
+    #[test]
+    fn weighted_group_routes_keep_their_ratio_and_reset_on_a_weight_change() {
+        let scheduler = KeyRotator::default();
+        let routes = vec!["a/one".to_owned(), "b/two".to_owned(), "c/three".to_owned()];
+        let weights = [3u32, 1, 4];
+        let mut firsts = Vec::new();
+        for _ in 0..8 {
+            firsts.push(
+                scheduler.group_order("daily", RoutingPolicy::Weighted, &routes, &weights)[0].0,
+            );
+        }
+        assert_eq!(firsts.iter().filter(|slot| **slot == 0).count(), 3);
+        assert_eq!(firsts.iter().filter(|slot| **slot == 1).count(), 1);
+        assert_eq!(firsts.iter().filter(|slot| **slot == 2).count(), 4);
+
+        // A changed weight vector starts a fresh schedule, so stale state
+        // from the old ratio never leaks into the new one.
+        assert_eq!(
+            scheduler.group_order("daily", RoutingPolicy::Weighted, &routes, &[1, 1, 1])[0].0,
+            0
+        );
+    }
+
+    #[test]
+    fn group_weights_are_bounded_parallel_and_default_to_one() {
+        let mut group = GroupConfig {
+            id: "daily".into(),
+            name: String::new(),
+            routes: vec!["mock/one".into(), "mock/two".into()],
+            weights: vec![3],
+            routing: RoutingPolicy::Weighted,
+            first_token_timeout_ms: 0,
+            affinity: Default::default(),
+        };
+        assert_eq!(group.route_weights(), vec![3, 1]);
+        assert!(group.validate().is_ok());
+
+        group.weights = vec![0, MAX_KEY_WEIGHT + 1];
+        assert!(group.validate().is_err());
+        group.weights = vec![1, 1, 1];
+        assert!(group.validate().is_err());
+    }
+
+    #[test]
+    fn zero_weighted_group_route_is_fallback_only() {
+        let scheduler = KeyRotator::default();
+        let routes = vec!["a/one".to_owned(), "b/two".to_owned()];
+        for _ in 0..4 {
+            let order = scheduler.group_order("daily", RoutingPolicy::Weighted, &routes, &[1, 0]);
+            assert_eq!(order[0].0, 0);
+            assert_eq!(order[1].0, 1);
+        }
     }
 
     #[test]

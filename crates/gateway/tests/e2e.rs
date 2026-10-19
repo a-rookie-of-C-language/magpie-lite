@@ -1637,6 +1637,7 @@ async fn spawn_gateway_with_same_provider_group(upstream: String) -> String {
             id: "same-provider".into(),
             name: "Same provider models".into(),
             routes: vec!["mock/model-a".into(), "mock/model-b".into()],
+            weights: Vec::new(),
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
             affinity: Default::default(),
@@ -1663,6 +1664,15 @@ async fn spawn_gateway_with_group(
     primary: String,
     backup: String,
     routing: RoutingPolicy,
+) -> String {
+    spawn_gateway_with_group_weights(primary, backup, routing, Vec::new()).await
+}
+
+async fn spawn_gateway_with_group_weights(
+    primary: String,
+    backup: String,
+    routing: RoutingPolicy,
+    weights: Vec<u32>,
 ) -> String {
     let config = Config {
         port: 0,
@@ -1714,6 +1724,7 @@ async fn spawn_gateway_with_group(
             id: "daily-coding".into(),
             name: "Daily coding".into(),
             routes: vec!["primary/mock-model".into(), "backup/mock-model".into()],
+            weights,
             routing,
             first_token_timeout_ms: 0,
             affinity: Default::default(),
@@ -2022,6 +2033,41 @@ async fn routing_groups_rotate_the_starting_route() {
         .unwrap();
     assert_eq!(stats["providers"]["primary"]["requests"], 2);
     assert_eq!(stats["providers"]["backup"]["requests"], 1);
+}
+
+#[tokio::test]
+async fn routing_groups_weight_the_starting_route_smoothly() {
+    let (primary, _) = spawn_mock().await;
+    let (backup, _) = spawn_mock().await;
+    let gw = spawn_gateway_with_group_weights(primary, backup, RoutingPolicy::Weighted, vec![3, 1])
+        .await;
+    let client = reqwest::Client::new();
+
+    for _ in 0..8 {
+        let response = client
+            .post(format!("{gw}/v1/chat/completions"))
+            .bearer_auth("magpie-lite")
+            .json(&json!({
+                "model": "group/daily-coding",
+                "messages": [{"role": "user", "content": "weight"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let stats: Value = client
+        .get(format!("{gw}/stats"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stats["providers"]["primary"]["requests"], 6);
+    assert_eq!(stats["providers"]["backup"]["requests"], 2);
 }
 
 #[tokio::test]

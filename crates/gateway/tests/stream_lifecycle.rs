@@ -897,6 +897,7 @@ async fn early_stream_errors_fall_back_across_protocols_and_groups() {
                                 id: "daily".into(),
                                 name: "Daily".into(),
                                 routes: vec!["mock/up-model".into(), "spare/backup-model".into()],
+                                weights: Vec::new(),
                                 routing: RoutingPolicy::Order,
                                 first_token_timeout_ms: 0,
                                 affinity: Default::default(),
@@ -1062,6 +1063,7 @@ async fn cancelled_fallback_persists_only_selected_provider_and_partial_usage() 
                         id: "daily".into(),
                         name: "".into(),
                         routes: vec!["mock/up-model".into(), "spare/backup-model".into()],
+                        weights: Vec::new(),
                         routing: magpie_gateway::RoutingPolicy::Order,
                         first_token_timeout_ms: 0,
                         affinity: Default::default(),
@@ -1205,6 +1207,7 @@ async fn oversized_opening_frames_fall_back_before_content_for_routes_and_groups
                             id: "daily".into(),
                             name: "".into(),
                             routes: vec!["mock/up-model".into(), "spare/backup-model".into()],
+                            weights: Vec::new(),
                             routing: magpie_gateway::RoutingPolicy::Order,
                             first_token_timeout_ms: 0,
                             affinity: Default::default(),
@@ -1438,6 +1441,7 @@ fn configure_timeout_fallback(config: &mut Config, grouped: bool) {
             id: "daily".into(),
             name: String::new(),
             routes: vec!["mock/up-model".into(), "spare/backup-model".into()],
+            weights: Vec::new(),
             routing: magpie_gateway::RoutingPolicy::Order,
             first_token_timeout_ms: 0,
             affinity: Default::default(),
@@ -2054,6 +2058,7 @@ async fn socket_disconnect_after_fallback_keeps_only_last_attempt_and_persists()
                                         "mock/up-model".into(),
                                         "spare/backup-model".into(),
                                     ],
+                                    weights: Vec::new(),
                                     routing: RoutingPolicy::Order,
                                     first_token_timeout_ms: 0,
                                     affinity: Default::default(),
@@ -3605,6 +3610,7 @@ async fn group_first_token_applies_to_distinct_models_on_one_provider() {
                 id: "daily".into(),
                 name: String::new(),
                 routes: vec!["mock/up-model".into(), "mock/alternate-model".into()],
+                weights: Vec::new(),
                 routing: magpie_gateway::RoutingPolicy::Order,
                 first_token_timeout_ms: 120,
                 affinity: Default::default(),
@@ -3651,12 +3657,15 @@ async fn group_first_token_final_means_last_scheduled_candidate_not_last_configu
         )
         .await;
         let routes = f.state.config.current().group[0].routes.clone();
+        let weights = f.state.config.current().group[0].route_weights();
         if policy == RoutingPolicy::Rotate {
-            f.state.key_rotation.group_order("daily", policy, &routes);
+            f.state
+                .key_rotation
+                .group_order("daily", policy, &routes, &weights);
         } else {
             f.state
                 .key_rotation
-                .record_group_attempt("daily", policy, &routes, 0);
+                .record_group_attempt("daily", policy, &routes, &weights, 0);
         }
         let body = tokio::time::timeout(
             LIMIT,
@@ -4186,6 +4195,7 @@ async fn loop_guard_after_fallback_and_keepalive_persists_only_selected_partial_
                                 id: "daily".into(),
                                 name: "Daily".into(),
                                 routes: vec!["mock/up-model".into(), "spare/backup-model".into()],
+                                weights: Vec::new(),
                                 routing: RoutingPolicy::Order,
                                 first_token_timeout_ms: 0,
                                 affinity: Default::default(),

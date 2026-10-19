@@ -51,6 +51,7 @@ async fn server(enabled: bool) -> Server {
             id: "daily".into(),
             name: "Daily".into(),
             routes: vec!["mock/model".into()],
+            weights: Vec::new(),
             routing: RoutingPolicy::default(),
             first_token_timeout_ms: 0,
             affinity: Default::default(),

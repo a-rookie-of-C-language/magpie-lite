@@ -135,9 +135,12 @@ enum GroupCommand {
         /// Ordered routes: the first available model serves the request.
         #[arg(long = "route")]
         routes: Vec<String>,
-        /// Route policy: order, rotate, or usage.
+        /// Route policy: order, rotate, usage, or weight.
         #[arg(long, default_value = "order")]
         routing: RoutingPolicy,
+        /// Per-route weight for `--routing weight`, in route order; repeat for each route.
+        #[arg(long = "route-weight", num_args = 1)]
+        route_weights: Vec<u32>,
         /// First-content budget (ms) for streaming non-final routes; 0 disables.
         #[arg(long, default_value_t = 0)]
         first_token_timeout_ms: u64,
@@ -367,6 +370,7 @@ async fn main() -> Result<()> {
                 name,
                 routes,
                 routing,
+                route_weights,
                 first_token_timeout_ms,
                 affinity,
             } => {
@@ -376,6 +380,7 @@ async fn main() -> Result<()> {
                     id: id.clone(),
                     name: name.unwrap_or_default(),
                     routes,
+                    weights: route_weights,
                     routing,
                     first_token_timeout_ms,
                     affinity,
@@ -409,16 +414,18 @@ async fn main() -> Result<()> {
                         g.name.as_str()
                     };
                     println!(
-                        "group/{:<18} {} [routing: {}, affinity: {}, first-token: {} ms]",
+                        "group/{:<18} {} [routing: {}, weights: {:?}, affinity: {}, first-token: {} ms]",
                         g.id,
                         label,
                         g.routing.as_str(),
+                        g.route_weights(),
                         g.affinity.as_str(),
                         g.first_token_timeout_ms
                     );
                     for (i, route) in g.routes.iter().enumerate() {
                         let marker = if i == 0 { "route" } else { "fallback" };
-                        println!("{:<26} {marker} {route}", "");
+                        let weight = g.weights.get(i).copied().unwrap_or(1);
+                        println!("{:<26} {marker} {route} (weight: {weight})", "");
                     }
                 }
             }

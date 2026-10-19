@@ -750,7 +750,12 @@ fn prepare(
                     ),
                 ));
             };
-            let routes = key_rotation.group_order(group_id, group.routing, &group.routes);
+            let routes = key_rotation.group_order(
+                group_id,
+                group.routing,
+                &group.routes,
+                &group.route_weights(),
+            );
             let Some((route_index, route)) =
                 routes.first().map(|(index, route)| (*index, route.clone()))
             else {
@@ -1199,6 +1204,7 @@ async fn send_with_fallback(
                 group_id,
                 group.routing,
                 &group.routes,
+                &group.route_weights(),
                 group_route_index,
             );
         }
@@ -2824,6 +2830,7 @@ mod tests {
                             id: "daily".into(),
                             name: "Daily".into(),
                             routes: vec!["primary/first-model".into(), "spare/second-model".into()],
+                            weights: Vec::new(),
                             routing: RoutingPolicy::Order,
                             first_token_timeout_ms: 0,
                             affinity: Default::default(),
