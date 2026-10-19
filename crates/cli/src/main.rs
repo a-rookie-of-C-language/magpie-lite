@@ -5,7 +5,7 @@ use magpie_agents::lifecycle::{Action, AgentId, Gateway, Manager, state_director
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use magpie_gateway::{
-    Affinity, Config, GroupConfig, Protocol, ProviderConfig, RoutingPolicy, config_path,
+    Affinity, Config, GroupConfig, Protocol, ProviderConfig, RoutingPolicy, Rule, config_path,
 };
 
 #[derive(Parser)]
@@ -147,6 +147,11 @@ enum GroupCommand {
         /// How strongly a conversation stays with the key that answered it: auto, session, turn, or off.
         #[arg(long, default_value = "auto")]
         affinity: Affinity,
+        /// A routing rule as JSON, e.g. `{"use":"deepseek/deepseek-chat","images":true}`;
+        /// repeat for each rule. Rules put their member first for the requests
+        /// they match; a `"pause":true` rule leaves its member out instead.
+        #[arg(long = "rule", num_args = 1)]
+        rules: Vec<String>,
     },
     /// List configured groups.
     List,
@@ -410,84 +415,98 @@ async fn main() -> Result<()> {
                 println!("removed provider `{id}`");
             }
         },
-        Command::Group { command } => match command {
-            GroupCommand::Add {
-                id,
-                name,
-                routes,
-                routing,
-                route_weights,
-                first_token_timeout_ms,
-                affinity,
-            } => {
-                let path = provider_path(&cli.config)?;
-                let mut cfg = Config::load(&path)?;
-                let mut group = GroupConfig {
-                    id: id.clone(),
-                    name: name.unwrap_or_default(),
+        Command::Group { command } => {
+            match command {
+                GroupCommand::Add {
+                    id,
+                    name,
                     routes,
-                    rules: Vec::new(),
-                    weights: route_weights,
                     routing,
+                    route_weights,
                     first_token_timeout_ms,
                     affinity,
-                };
-                group.validate()?;
-                for route in &group.routes {
-                    let provider = route.split_once('/').unwrap().0;
-                    if cfg.provider(provider).is_none() {
-                        anyhow::bail!("unknown provider `{provider}`");
+                    rules,
+                } => {
+                    let path = provider_path(&cli.config)?;
+                    let mut cfg = Config::load(&path)?;
+                    let mut parsed = Vec::with_capacity(rules.len());
+                    for (index, raw) in rules.iter().enumerate() {
+                        let rule: Rule = serde_json::from_str(raw).with_context(|| {
+                        format!("rule {} is not a JSON object like {{\"use\":\"provider/model\",...}}", index + 1)
+                    })?;
+                        parsed.push(rule);
                     }
-                }
-                match cfg.group.iter().position(|g| g.id == id) {
-                    Some(i) => cfg.group[i] = group,
-                    None => cfg.group.push(group),
-                }
-                save_config(&path, &cfg)?;
-                println!("saved group `group/{id}` to {}", path.display());
-            }
-            GroupCommand::List => {
-                let cfg = load_config(&cli.config)?;
-                if cfg.group.is_empty() {
-                    println!(
-                        "no groups; add one: magpie-lite group add <id> --route provider/model"
-                    );
-                    return Ok(());
-                }
-                for g in &cfg.group {
-                    let label = if g.name.is_empty() {
-                        g.id.as_str()
-                    } else {
-                        g.name.as_str()
+                    let mut group = GroupConfig {
+                        id: id.clone(),
+                        name: name.unwrap_or_default(),
+                        routes,
+                        rules: parsed,
+                        weights: route_weights,
+                        routing,
+                        first_token_timeout_ms,
+                        affinity,
                     };
-                    println!(
-                        "group/{:<18} {} [routing: {}, weights: {:?}, affinity: {}, first-token: {} ms]",
-                        g.id,
-                        label,
-                        g.routing.as_str(),
-                        g.route_weights(),
-                        g.affinity.as_str(),
-                        g.first_token_timeout_ms
-                    );
-                    for (i, route) in g.routes.iter().enumerate() {
-                        let marker = if i == 0 { "route" } else { "fallback" };
-                        let weight = g.weights.get(i).copied().unwrap_or(1);
-                        println!("{:<26} {marker} {route} (weight: {weight})", "");
+                    group.validate()?;
+                    for route in &group.routes {
+                        let provider = route.split_once('/').unwrap().0;
+                        if cfg.provider(provider).is_none() {
+                            anyhow::bail!("unknown provider `{provider}`");
+                        }
+                    }
+                    match cfg.group.iter().position(|g| g.id == id) {
+                        Some(i) => cfg.group[i] = group,
+                        None => cfg.group.push(group),
+                    }
+                    save_config(&path, &cfg)?;
+                    println!("saved group `group/{id}` to {}", path.display());
+                }
+                GroupCommand::List => {
+                    let cfg = load_config(&cli.config)?;
+                    if cfg.group.is_empty() {
+                        println!(
+                            "no groups; add one: magpie-lite group add <id> --route provider/model"
+                        );
+                        return Ok(());
+                    }
+                    for g in &cfg.group {
+                        let label = if g.name.is_empty() {
+                            g.id.as_str()
+                        } else {
+                            g.name.as_str()
+                        };
+                        println!(
+                            "group/{:<18} {} [routing: {}, weights: {:?}, affinity: {}, first-token: {} ms]",
+                            g.id,
+                            label,
+                            g.routing.as_str(),
+                            g.route_weights(),
+                            g.affinity.as_str(),
+                            g.first_token_timeout_ms
+                        );
+                        for (i, route) in g.routes.iter().enumerate() {
+                            let marker = if i == 0 { "route" } else { "fallback" };
+                            let weight = g.weights.get(i).copied().unwrap_or(1);
+                            println!("{:<26} {marker} {route} (weight: {weight})", "");
+                        }
+                        for (i, rule) in g.rules.iter().enumerate() {
+                            let kind = if rule.pause { "rule (pause)" } else { "rule" };
+                            println!("{:<26} {kind} {}: {}", "", i + 1, rule.summary());
+                        }
                     }
                 }
-            }
-            GroupCommand::Rm { id } => {
-                let path = provider_path(&cli.config)?;
-                let mut cfg = Config::load(&path)?;
-                let before = cfg.group.len();
-                cfg.group.retain(|g| g.id != id);
-                if cfg.group.len() == before {
-                    anyhow::bail!("no group `{id}`");
+                GroupCommand::Rm { id } => {
+                    let path = provider_path(&cli.config)?;
+                    let mut cfg = Config::load(&path)?;
+                    let before = cfg.group.len();
+                    cfg.group.retain(|g| g.id != id);
+                    if cfg.group.len() == before {
+                        anyhow::bail!("no group `{id}`");
+                    }
+                    save_config(&path, &cfg)?;
+                    println!("removed group `{id}`");
                 }
-                save_config(&path, &cfg)?;
-                println!("removed group `{id}`");
             }
-        },
+        }
         Command::Agent { command } => match command {
             AgentCommand::List => {
                 println!(

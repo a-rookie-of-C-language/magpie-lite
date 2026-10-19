@@ -738,3 +738,71 @@ fn group_first_token_cli_roundtrip_and_invalid_values() {
         0
     );
 }
+
+#[test]
+fn group_rules_cli_roundtrip_and_invalid_shapes() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&[
+        "group",
+        "add",
+        "daily",
+        "--route",
+        "mock/model",
+        "--route",
+        "mock/other",
+        "--rule",
+        r#"{"use":"mock/other","images":true}"#,
+        "--rule",
+        r#"{"use":"mock/model","pause":true,"agents":["claude"]}"#,
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rules = &magpie_gateway::Config::load(&sandbox.config).unwrap().group[0].rules;
+    assert_eq!(rules.len(), 2);
+    assert_eq!(rules[0].summary(), "mock/other when images");
+    let listed = sandbox.run(&["group", "list"]);
+    assert!(listed.status.success());
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        stdout.contains("rule 1: mock/other when images"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("rule (pause) 2: mock/model when agent claude"),
+        "{stdout}"
+    );
+    let prior = std::fs::read(&sandbox.config).unwrap();
+    // Broken JSON, a JSON value that is no rule, a member outside the
+    // group, and a rule with no condition all leave the file alone.
+    for rule in [
+        "{broken",
+        r#""mock/other""#,
+        r#"{"use":"mock/elsewhere","images":true}"#,
+        r#"{"use":"mock/model"}"#,
+    ] {
+        let output = sandbox.run(&[
+            "group",
+            "add",
+            "daily",
+            "--route",
+            "mock/model",
+            "--route",
+            "mock/other",
+            "--rule",
+            rule,
+        ]);
+        assert!(!output.status.success(), "{rule}");
+        assert_eq!(std::fs::read(&sandbox.config).unwrap(), prior, "{rule}");
+    }
+    // Re-adding without --rule clears the list, like PUT does.
+    let output = sandbox.run(&["group", "add", "daily", "--route", "mock/model"]);
+    assert!(output.status.success());
+    assert!(
+        magpie_gateway::Config::load(&sandbox.config).unwrap().group[0]
+            .rules
+            .is_empty()
+    );
+}

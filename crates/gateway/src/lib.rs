@@ -43,4 +43,5 @@ pub use config::{
 };
 pub use config_store::ConfigStore;
 pub use retired::{init as init_retired_store, is_retired as model_is_retired};
+pub use rules::Rule;
 pub use server::{AppState, build_router, serve, serve_with_config_path};

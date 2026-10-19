@@ -186,6 +186,16 @@ impl TimeWindow {
 }
 
 impl Rule {
+    /// One line for a list: the member, then what it matches.
+    pub fn summary(&self) -> String {
+        let what = self.conditions().join(", ");
+        if what.is_empty() {
+            self.use_.clone()
+        } else {
+            format!("{} when {}", self.use_, what)
+        }
+    }
+
     /// What a rule matches, for a list (`Conditions`).
     pub fn conditions(&self) -> Vec<String> {
         let mut out = Vec::new();

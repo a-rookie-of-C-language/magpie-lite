@@ -579,3 +579,64 @@ async fn group_weights_round_trip_are_exposed_and_reject_invalid_shapes() {
         );
     }
 }
+
+#[tokio::test]
+async fn group_rules_round_trip_and_reject_bad_shapes() {
+    let gw = gateway(false).await;
+    let mut body = group("ruled", "first");
+    body["routes"] = json!(["mock/first", "mock/second"]);
+    body["rules"] = json!([
+        {"use": "mock/second", "images": true},
+        {"use": "mock/first", "pause": true, "agents": ["claude"]},
+    ]);
+    let created = edit(&gw, Method::POST, "/config/groups", body).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let snapshot: Value = created.json().await.unwrap();
+    assert_eq!(snapshot["groups"][0]["rules"][0]["use"], "mock/second");
+    assert_eq!(snapshot["groups"][0]["rules"][1]["pause"], true);
+    let saved = &Config::load(&gw.path).unwrap().group[0].rules;
+    assert_eq!(saved.len(), 2);
+    assert_eq!(saved[0].summary(), "mock/second when images");
+
+    // A rule naming a route outside the group is refused, naming the rule.
+    let mut foreign = group("foreign", "first");
+    foreign["routes"] = json!(["mock/first"]);
+    foreign["rules"] = json!([{"use": "mock/second", "images": true}]);
+    let response = edit(&gw, Method::POST, "/config/groups", foreign).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("is not in the group")
+    );
+
+    // A rule with no condition, and a pause reaching past hours and agents,
+    // are both refused with what to change.
+    for (name, rules, hint) in [
+        ("bare", json!([{"use": "mock/first"}]), "needs a condition"),
+        (
+            "greedy-pause",
+            json!([{"use": "mock/first", "pause": true, "images": true}]),
+            "hours, days or agents only",
+        ),
+    ] {
+        let mut body = group(name, "first");
+        body["rules"] = rules;
+        let response = edit(&gw, Method::POST, "/config/groups", body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{name}");
+        assert!(response.text().await.unwrap().contains(hint), "{name}");
+    }
+
+    // PUT replaces the rule list, so omitting rules clears them.
+    let cleared = edit(
+        &gw,
+        Method::PUT,
+        "/config/groups/ruled",
+        group("ruled", "first"),
+    )
+    .await;
+    assert_eq!(cleared.status(), StatusCode::OK);
+    assert!(Config::load(&gw.path).unwrap().group[0].rules.is_empty());
+}
