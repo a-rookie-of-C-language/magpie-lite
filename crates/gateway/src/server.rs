@@ -32,6 +32,7 @@ use crate::model_gone::{
     context_overflowed, model_refused, model_retired, prompt_refused, protection_refused,
     shape_refused,
 };
+use crate::object_root;
 use crate::optional_fields;
 use crate::retired as retired_store;
 use crate::stream_empty::{EMPTY_REPLY, GeminiReply};
@@ -1227,9 +1228,12 @@ async fn send_with_fallback(
         'keys: for (attempt, (key_slot, api_key)) in route.api_keys.iter().enumerate() {
             let candidate = UpstreamCandidate::new(&route, *key_slot);
             tracker.begin_attempt(&route.provider.id, &route.model, *key_slot);
+            let folds_roots = object_root::folds_roots(&route.provider, &route.model);
             let mut empty_retries = 0;
             let mut optional_retry: Option<Vec<&'static str>> = None;
             let mut sampling_retry = false;
+            let mut root_union_retry = false;
+            let mut original_root_union_refusal: Option<(Value, String)> = None;
             // A Chat endpoint refusing tools with reasoning was asked
             // again with `reasoning_effort: "none"` (#176); when `none`
             // is refused too, that refusal stands as the answer (#2670).
@@ -1296,6 +1300,13 @@ async fn send_with_fallback(
                 }
                 if tools_without_effort_retry && let Some(object) = body.as_object_mut() {
                     object.insert("reasoning_effort".into(), json!("none"));
+                }
+                if (folds_roots || root_union_retry) && object_root::fold_tool_roots(&mut body) {
+                    tracing::debug!(
+                        provider = %route.provider.id,
+                        model = %route.model,
+                        "folding tool roots to an object"
+                    );
                 }
                 tracing::debug!(
                     provider = %route.provider.id,
@@ -1384,6 +1395,14 @@ async fn send_with_fallback(
                             field,
                         );
                     }
+                }
+                if status.is_success() && root_union_retry {
+                    unfit_fields::refuse(
+                        &route.provider.id,
+                        &route.model,
+                        route.provider.protocol.as_str(),
+                        "root_union",
+                    );
                 }
                 if status.is_success() {
                     // A vendor that ignored `stream: true` answers with a
@@ -1620,6 +1639,17 @@ async fn send_with_fallback(
                     return Err((ProxyFailure::refusal(), candidate, decision.clone()));
                 }
                 tracker.record_attempt(&route.provider.id, *key_slot, &status.as_u16().to_string());
+                // A vendor that names a union at a tool's parameter root
+                // gets one more ask with every root folded to an object.
+                if optional_fields::bad_request(status.as_u16())
+                    && !root_union_retry
+                    && object_root::refusal(&error.body)
+                    && object_root::fold_tool_roots(&mut body)
+                {
+                    original_root_union_refusal = Some((error.body.clone(), error.message.clone()));
+                    root_union_retry = true;
+                    continue 'candidate;
+                }
                 // A vendor that names an optional request field in a 400/422
                 // gets one more ask without it, on the same credential. An
                 // invalid value must reach the client instead.
@@ -1659,6 +1689,16 @@ async fn send_with_fallback(
                 // original tools refusal stands as the answer, a group's
                 // next member is asked and the key doesn't rest.
                 let mut error = error;
+                // If folding the roots exposed a different shape refusal,
+                // the agent still sees the union refusal that made us try.
+                if root_union_retry
+                    && shape_refused(status.as_u16(), &error.body)
+                    && let Some((refusal_body, refusal_message)) =
+                        original_root_union_refusal.take()
+                {
+                    error.body = refusal_body;
+                    error.message = refusal_message;
+                }
                 if status == StatusCode::BAD_REQUEST {
                     if let Some(refusal) = &tools_refusal {
                         if crate::wrong_endpoint::effort_levels_named(&error.body) {

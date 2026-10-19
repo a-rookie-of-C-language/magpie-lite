@@ -628,6 +628,36 @@ union is what either said. Every other host keeps `oneOf`.
 The reference also names its Cline and Kilo presets; lite has no preset
 concept, so only the host OpenRouter itself is rewritten.
 
+### A union at a tool's parameter root (`e9ae12f8`)
+
+Codex desktop's `mcp__codex_app__automation_update` has an `anyOf` at the
+root of its parameters. xAI, Anthropic behind a relay, and OpenAI-style
+validators may refuse that valid JSON Schema with one of four wordings:
+`tool parameter root must be an object type`, Anthropic's
+`input_schema does not support oneOf, allOf, or anyOf at the top level`,
+OpenAI's `schema must have type 'object' and not have ... at the top
+level`, or its `schema must be a JSON Schema of 'type: "object"'`
+message. Unrelated invalid-schema errors do not match.
+
+`crates/gateway/src/object_root.rs` folds each tool parameter root to
+`type: "object"`. It merges every `allOf` property and required field; for
+`anyOf`/`oneOf` it keeps object branches, recursively folds nested branch
+unions up to depth eight, keeps only fields every branch requires, and
+represents differing branch schemas for one property as `anyOf`, with
+identical schemas deduplicated. Local `$ref`s resolve through the root's
+`$defs` or `definitions`. The root-only walk covers Chat, Responses
+namespaces, Anthropic `input_schema` and Gemini `functionDeclarations`
+without rewriting a union nested under a property.
+
+On a 400/422 root-union refusal, the same key is asked once more folded.
+A success records the provider/model/protocol in the process-local
+`unfit_fields` memory, so later requests start folded; a vendor that
+accepts the union receives it unchanged. xAI's own `api.x.ai` host starts
+folded. Lite has no provider-preset layer, so the pre-fold is driven by
+that host and the remembered refusal rather than a preset. Evidence is
+the object-root unit fixtures and `crates/gateway/tests/root_union.rs`
+loopback tests, not live-vendor verification.
+
 ### A huge error body does not hold the client (`7ac20247`)
 
 `upstream::error_detail` reads a non-2xx upstream body to give the agent a

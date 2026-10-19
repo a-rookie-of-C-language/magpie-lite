@@ -76,6 +76,38 @@ pub(crate) fn tool_schemas(body: &mut Value, visit: &mut impl FnMut(&mut Map<Str
     }
 }
 
+/// Visit only the root parameter schemas of the tools in a request body.
+/// This is the walk a whole-schema rewrite uses when it must not turn a
+/// nested property union into an object root.
+pub(crate) fn tool_root_schemas(body: &mut Value, visit: &mut impl FnMut(&mut Map<String, Value>)) {
+    if let Some(tools) = body.get_mut("tools") {
+        walk_tool_roots(tools, visit);
+    }
+}
+
+fn walk_tool_roots(value: &mut Value, visit: &mut impl FnMut(&mut Map<String, Value>)) {
+    match value {
+        Value::Object(object) => {
+            for key in ["input_schema", "parameters"] {
+                if let Some(Value::Object(schema)) = object.get_mut(key) {
+                    visit(schema);
+                }
+            }
+            for key in ["function", "functionDeclarations", "tools"] {
+                if let Some(child) = object.get_mut(key) {
+                    walk_tool_roots(child, visit);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                walk_tool_roots(item, visit);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn walk(value: &mut Value, in_schema: bool, visit: &mut impl FnMut(&mut Map<String, Value>)) {
     match value {
         Value::Object(object) => {

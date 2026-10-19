@@ -11,6 +11,7 @@ mod grok_integral;
 mod grok_schema;
 mod kimi_schema;
 mod model_gone;
+mod object_root;
 mod oneof_schema;
 mod optional_fields;
 mod provider_tools;
