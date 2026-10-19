@@ -702,7 +702,8 @@
                 <div class="field"><label for="group-id">Group ID</label><input id="group-id" class="token-input" required pattern="[A-Za-z0-9_-]+" placeholder="daily-coding" aria-describedby="group-id-help"><p id="group-id-help" class="group-help">Letters, digits, hyphens and underscores. Agents use group/&lt;id&gt;.</p></div>
                 <div class="field"><label for="group-name">Display name (optional)</label><input id="group-name" class="token-input" placeholder="Daily coding"></div>
                 <div class="field"><label for="group-routes">Routes in fallback order</label><textarea id="group-routes" class="token-input" required placeholder="deepseek/deepseek-chat&#10;kimi/moonshot-v1-128k" aria-describedby="group-routes-help"></textarea><p id="group-routes-help" class="group-help">One provider/model per line. The selected policy chooses the starting route; remaining routes are fallback candidates.</p><p id="group-providers" class="group-help"></p></div>
-                <div class="field"><label for="group-routing">Route policy</label><select id="group-routing" class="token-input" aria-describedby="group-routing-help"><option value="order">Ordered</option><option value="rotate">Rotate</option><option value="usage">Least used</option><option value="weight">Weighted</option></select><p id="group-routing-help" class="group-help">Ordered always starts at the first route. Rotate advances the starting route per request. Least used prefers routes with fewer attempts in this gateway process. Weighted spreads by each route's weight.</p></div>
+                <div class="field"><label for="group-routing">Route policy</label><select id="group-routing" class="token-input" aria-describedby="group-routing-help"><option value="order">Ordered</option><option value="rotate">Rotate</option><option value="usage">Least used</option><option value="weight">Weighted</option><option value="manual">Manual</option></select><p id="group-routing-help" class="group-help">Ordered always starts at the first route. Rotate advances the starting route per request. Least used prefers routes with fewer attempts in this gateway process. Weighted spreads by each route's weight. Manual sends every request to the picked member; the others, and the rules, wait until another member is picked.</p></div>
+                <div id="group-pick-field" class="field" hidden><label for="group-pick">Manual pick</label><input id="group-pick" class="token-input" list="agent-model-options" placeholder="deepseek/deepseek-chat" aria-describedby="group-pick-help" spellcheck="false"><p id="group-pick-help" class="group-help">One of the routes above, sent every request while the policy is manual. Blank keeps the first route; changing it later is one click on the group card.</p></div>
                 <div id="group-weights-field" class="field" hidden><label for="group-weights">Route weights</label><textarea id="group-weights" class="token-input" placeholder="3&#10;1&#10;4" aria-describedby="group-weights-help"></textarea><p id="group-weights-help" class="group-help">One weight per route, in route order, each a whole number from 0 to 1000. A missing weight counts as 1; 0 makes the route fallback-only.</p></div>
                 <div class="field"><label for="group-affinity">Conversation affinity</label><select id="group-affinity" class="token-input" aria-describedby="group-affinity-help"><option value="auto">Auto</option><option value="session">Whole session</option><option value="turn">Within a turn</option><option value="off">Off</option></select><p id="group-affinity-help" class="group-help">Keep a conversation on the route that answered it so the vendor's prompt cache keeps hitting. Auto follows the route policy: rotate spreads load, everything else sticks by conversation.</p></div>
                 <div class="field"><label for="group-first-token">First-content timeout (ms)</label><input id="group-first-token" class="token-input" type="number" min="0" max="9007199254740991" step="1" value="0" required aria-describedby="group-first-token-help"><p id="group-first-token-help" class="group-help">0 disables this group limit. Streaming requests only: a slow non-final route switches to the next candidate before any reply is released. The final route still obeys gateway-wide limits.</p></div>
@@ -819,6 +820,8 @@
       groupName: document.getElementById("group-name"),
       groupRoutes: document.getElementById("group-routes"),
       groupRouting: document.getElementById("group-routing"),
+      groupPickField: document.getElementById("group-pick-field"),
+      groupPick: document.getElementById("group-pick"),
       groupWeightsField: document.getElementById("group-weights-field"),
       groupWeights: document.getElementById("group-weights"),
       groupAffinity: document.getElementById("group-affinity"),
@@ -1350,12 +1353,29 @@
         li.className = "group-item";
         const id = document.createElement("strong");
         id.textContent = `group/${group.id}`;
-        const route = document.createElement("span");
-        route.className = "model-owner";
-        route.textContent = (group.routes || []).join(" → ") || "No routes";
+        const route = document.createElement("div");
+        route.className = "group-actions";
+        if (group.routing === "manual") {
+          for (const member of group.routes || []) {
+            const picked = member === (group.pick || (group.routes || [])[0]);
+            const use = text("button", picked ? `✓ ${member}` : member, "button secondary");
+            use.type = "button";
+            use.disabled = managementBusy || picked;
+            use.title = picked ? "This member serves every request" : `Send every request to ${member}`;
+            use.setAttribute("aria-label", `Pick ${member} for group ${group.id}`);
+            use.addEventListener("click", () => pickGroupRoute(group, member));
+            route.append(use);
+          }
+        } else {
+          const routes = document.createElement("span");
+          routes.className = "model-owner";
+          routes.textContent = (group.routes || []).join(" → ") || "No routes";
+          route.append(routes);
+        }
         const label = text("span", group.name || group.id, "model-owner");
         const weights = group.routing === "weight" ? ` · weights: ${(group.weights || []).join(", ")}` : "";
-        const policy = text("span", `Policy: ${group.routing || "order"}${weights} · affinity: ${group.affinity || "auto"}`, "model-owner");
+        const picked = group.routing === "manual" ? ` → ${group.pick || (group.routes || [])[0] || "—"}` : "";
+        const policy = text("span", `Policy: ${group.routing || "order"}${picked}${weights} · affinity: ${group.affinity || "auto"}`, "model-owner");
         const rules = text("span", ruleSummary(group.rules || []), "model-owner");
         if (group.classifier) rules.textContent += ` · classifier: ${group.classifier}`;
         if (group.effort) rules.textContent += ` · effort: ${group.effort}`;
@@ -1415,6 +1435,7 @@
 
     function groupRoutingChanged() {
       elements.groupWeightsField.hidden = elements.groupRouting.value !== "weight";
+      elements.groupPickField.hidden = elements.groupRouting.value !== "manual";
     }
 
     // One line for a group's routing rules, mirroring the server's rule conditions.
@@ -1763,6 +1784,7 @@
       elements.groupName.value = group?.name || "";
       elements.groupRoutes.value = (group?.routes || []).join("\n");
       elements.groupRouting.value = group?.routing || "order";
+      elements.groupPick.value = group?.pick || "";
       elements.groupWeights.value = (group?.weights || []).join("\n");
       elements.groupAffinity.value = group?.affinity || "auto";
       elements.groupFirstToken.value = group?.first_token_timeout_ms ?? 0;
@@ -1837,6 +1859,34 @@
       await mutateGroup(`/config/groups/${encodeURIComponent(group.id)}`, "DELETE", null, "Group deleted and saved.");
     }
 
+    // A manual group's card picks its member in one click: every request
+    // goes to the picked member, the others and the rules waiting (as the
+    // reference changes the pick on the group's card).
+    async function pickGroupRoute(group, member) {
+      const current = group.pick || (group.routes || [])[0];
+      if (managementBusy || !member || member === current) return;
+      const session = sessionRevision;
+      ++dataRevision;
+      invalidateAgentPreview();
+      setManagementBusy(true, "Picking…");
+      elements.groupMessage.textContent = `Picking ${member}…`;
+      try {
+        const snapshot = await authorized(`/config/groups/${encodeURIComponent(group.id)}`, {
+          method: "PUT",
+          body: JSON.stringify({ ...group, pick: member }),
+          headers: configRevision === null ? {} : { "If-Match": String(configRevision) }
+        });
+        if (session !== sessionRevision) return;
+        renderRouting(snapshot);
+        elements.groupMessage.textContent = `group/${group.id} now sends every request to ${member}.`;
+      } catch (error) {
+        if (session !== sessionRevision) return;
+        elements.groupMessage.textContent = `Pick failed: ${error.message || error}`;
+      } finally {
+        if (session === sessionRevision) setManagementBusy(false);
+      }
+    }
+
     elements.groupNew.addEventListener("click", () => openGroupEditor());
     elements.groupCancel.addEventListener("click", closeGroupEditor);
     elements.groupRouting.addEventListener("change", groupRoutingChanged);
@@ -1879,6 +1929,7 @@
       body.rules = rules;
       body.classifier = elements.groupClassifier.value.trim();
       body.effort = elements.groupEffort.value;
+      body.pick = elements.groupPick.value.trim();
       if (!Number.isSafeInteger(body.first_token_timeout_ms) || body.first_token_timeout_ms < 0) {
         elements.groupMessage.textContent = "Enter a non-negative whole-number timeout in milliseconds (0 disables).";
         elements.groupFirstToken.focus();

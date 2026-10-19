@@ -640,3 +640,69 @@ async fn group_rules_round_trip_and_reject_bad_shapes() {
     assert_eq!(cleared.status(), StatusCode::OK);
     assert!(Config::load(&gw.path).unwrap().group[0].rules.is_empty());
 }
+
+#[tokio::test]
+async fn manual_group_sends_every_request_to_its_pick_and_rules_wait() {
+    async fn ask(gw: &Gateway, content: &str) -> StatusCode {
+        Client::new()
+            .post(format!("{}/v1/chat/completions", gw.url))
+            .bearer_auth("magpie-lite")
+            .json(&json!({
+                "model": "group/manual",
+                "messages": [{"role": "user", "content": content}],
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    }
+    fn upstream_model(gw: &Gateway) -> String {
+        gw.last
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("upstream was called")["model"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+    let gw = gateway(false).await;
+    let mut body = group("manual", "first");
+    body["routes"] = json!(["mock/first", "mock/second"]);
+    body["routing"] = json!("manual");
+    body["pick"] = json!("mock/second");
+    // Names the other member, and matches every message: with the group
+    // routed otherwise it would send to mock/first first.
+    body["rules"] = json!([{"use": "mock/first", "tokens": 1}]);
+    let created = edit(&gw, Method::POST, "/config/groups", body).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let snapshot: Value = created.json().await.unwrap();
+    assert_eq!(snapshot["groups"][0]["routing"], "manual");
+    assert_eq!(snapshot["groups"][0]["pick"], "mock/second");
+
+    // Twice, so rotate/order state cannot explain it: the pick alone is
+    // asked, and the matching rule never moves its member first.
+    for _ in 0..2 {
+        assert_eq!(
+            ask(&gw, "Hello there, how are you doing today?").await,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(upstream_model(&gw), "second");
+
+    // One click picks the other member: the next request follows it, and
+    // the pick is kept on disk.
+    let mut again = group("manual", "first");
+    again["routes"] = json!(["mock/first", "mock/second"]);
+    again["routing"] = json!("manual");
+    again["pick"] = json!("mock/first");
+    again["rules"] = json!([{"use": "mock/first", "tokens": 1}]);
+    let updated = edit(&gw, Method::PUT, "/config/groups/manual", again).await;
+    assert_eq!(updated.status(), StatusCode::OK);
+    assert_eq!(
+        ask(&gw, "Hello there, how are you doing today?").await,
+        StatusCode::OK
+    );
+    assert_eq!(upstream_model(&gw), "first");
+    assert_eq!(Config::load(&gw.path).unwrap().group[0].pick, "mock/first");
+}

@@ -576,6 +576,7 @@ async fn fixture(protocol: Protocol) -> Fixture {
             rules: Vec::new(),
             classifier: String::new(),
             effort: String::new(),
+            pick: String::new(),
             weights: Vec::new(),
             routing: RoutingPolicy::Rotate,
             first_token_timeout_ms: 0,

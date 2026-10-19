@@ -135,7 +135,8 @@ enum GroupCommand {
         /// Ordered routes: the first available model serves the request.
         #[arg(long = "route")]
         routes: Vec<String>,
-        /// Route policy: order, rotate, usage, or weight.
+        /// Route policy: order, rotate, usage, weight, or manual (which
+        /// sends every request to `--pick`, defaulting to the first route).
         #[arg(long, default_value = "order")]
         routing: RoutingPolicy,
         /// Per-route weight for `--routing weight`, in route order; repeat for each route.
@@ -161,6 +162,11 @@ enum GroupCommand {
         /// turn is as it begins.
         #[arg(long, default_value = "")]
         effort: String,
+        /// The member a `manual` group sends every request to
+        /// (`provider/model`); the others, and the rules, wait until
+        /// another member is picked.
+        #[arg(long, default_value = "")]
+        pick: String,
     },
     /// List configured groups.
     List,
@@ -437,6 +443,7 @@ async fn main() -> Result<()> {
                     rules,
                     classifier,
                     effort,
+                    pick,
                 } => {
                     let path = provider_path(&cli.config)?;
                     let mut cfg = Config::load(&path)?;
@@ -454,6 +461,7 @@ async fn main() -> Result<()> {
                         rules: parsed,
                         classifier: classifier.trim().to_owned(),
                         effort: effort.trim().to_owned(),
+                        pick: pick.trim().to_owned(),
                         weights: route_weights,
                         routing,
                         first_token_timeout_ms,
@@ -498,12 +506,21 @@ async fn main() -> Result<()> {
                             g.first_token_timeout_ms
                         );
                         for (i, route) in g.routes.iter().enumerate() {
-                            let marker = if i == 0 { "route" } else { "fallback" };
+                            let marker = if g.routing == RoutingPolicy::Manual {
+                                if route == &g.pick { "pick" } else { "waiting" }
+                            } else if i == 0 {
+                                "route"
+                            } else {
+                                "fallback"
+                            };
                             let weight = g.weights.get(i).copied().unwrap_or(1);
                             println!("{:<26} {marker} {route} (weight: {weight})", "");
                         }
                         if !g.classifier.is_empty() {
                             println!("{:<26} classifier {}", "", g.classifier);
+                        }
+                        if !g.pick.is_empty() {
+                            println!("{:<26} pick {}", "", g.pick);
                         }
                         if !g.effort.is_empty() {
                             println!("{:<26} effort {}", "", g.effort);

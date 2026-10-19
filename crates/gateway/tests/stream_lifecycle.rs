@@ -964,6 +964,7 @@ async fn early_stream_errors_fall_back_across_protocols_and_groups() {
                                 rules: Vec::new(),
                                 classifier: String::new(),
                                 effort: String::new(),
+                                pick: String::new(),
                                 weights: Vec::new(),
                                 routing: RoutingPolicy::Order,
                                 first_token_timeout_ms: 0,
@@ -1133,6 +1134,7 @@ async fn cancelled_fallback_persists_only_selected_provider_and_partial_usage() 
                         rules: Vec::new(),
                         classifier: String::new(),
                         effort: String::new(),
+                        pick: String::new(),
                         weights: Vec::new(),
                         routing: magpie_gateway::RoutingPolicy::Order,
                         first_token_timeout_ms: 0,
@@ -1280,6 +1282,7 @@ async fn oversized_opening_frames_fall_back_before_content_for_routes_and_groups
                             rules: Vec::new(),
                             classifier: String::new(),
                             effort: String::new(),
+                            pick: String::new(),
                             weights: Vec::new(),
                             routing: magpie_gateway::RoutingPolicy::Order,
                             first_token_timeout_ms: 0,
@@ -1519,6 +1522,7 @@ fn configure_timeout_fallback(config: &mut Config, grouped: bool) {
             rules: Vec::new(),
             classifier: String::new(),
             effort: String::new(),
+            pick: String::new(),
             weights: Vec::new(),
             routing: magpie_gateway::RoutingPolicy::Order,
             first_token_timeout_ms: 0,
@@ -2141,6 +2145,7 @@ async fn socket_disconnect_after_fallback_keeps_only_last_attempt_and_persists()
                                     rules: Vec::new(),
                                     classifier: String::new(),
                                     effort: String::new(),
+                                    pick: String::new(),
                                     weights: Vec::new(),
                                     routing: RoutingPolicy::Order,
                                     first_token_timeout_ms: 0,
@@ -3708,6 +3713,7 @@ async fn group_first_token_applies_to_distinct_models_on_one_provider() {
                 rules: Vec::new(),
                 classifier: String::new(),
                 effort: String::new(),
+                pick: String::new(),
                 weights: Vec::new(),
                 routing: magpie_gateway::RoutingPolicy::Order,
                 first_token_timeout_ms: 120,
@@ -3759,7 +3765,7 @@ async fn group_first_token_final_means_last_scheduled_candidate_not_last_configu
         if policy == RoutingPolicy::Rotate {
             f.state
                 .key_rotation
-                .group_order("daily", policy, &routes, &weights);
+                .group_order("daily", policy, &routes, &weights, "");
         } else {
             f.state
                 .key_rotation
@@ -4311,6 +4317,7 @@ async fn loop_guard_after_fallback_and_keepalive_persists_only_selected_partial_
                                 rules: Vec::new(),
                                 classifier: String::new(),
                                 effort: String::new(),
+                                pick: String::new(),
                                 weights: Vec::new(),
                                 routing: RoutingPolicy::Order,
                                 first_token_timeout_ms: 0,

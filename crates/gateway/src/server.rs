@@ -1072,6 +1072,7 @@ fn prepare(
                 group.routing,
                 &group.routes,
                 &group.route_weights(),
+                &group.pick,
             );
             let Some((route_index, route)) =
                 routes.first().map(|(index, route)| (*index, route.clone()))
@@ -1702,12 +1703,22 @@ async fn send_with_fallback(
         // its own, its classifier never asked. When it cannot say, no
         // intent matches and the turn goes by the other conditions. What
         // was asked and said goes on the request's record.
+        // A manual group sends every request to its picked member; its
+        // rules wait until another member is picked, though they are kept
+        // (the reference's `Live`: rules nilled, effort kept — a manual
+        // group with `effort: auto` still has the turn judged).
+        let rules: &[crate::rules::Rule] = if group.routing == crate::config::RoutingPolicy::Manual
+        {
+            &[]
+        } else {
+            &group.rules
+        };
         let mut intent = String::new();
         let mut classified: Option<crate::rules::Classified> = None;
         let within_turn = crate::affinity::turn_of(creq).1;
         if !group.classifier.is_empty() && !within_turn && !crate::rules::compacting(creq) {
-            let query = crate::rules::rule_query(&group.rules, &plan.id, creq, agent, conversation);
-            let intents = crate::rules::intents(&group.rules, &query);
+            let query = crate::rules::rule_query(rules, &plan.id, creq, agent, conversation);
+            let intents = crate::rules::intents(rules, &query);
             // A group with `effort: auto` has the classifier judge the turn
             // when the agent asked for reasoning; its requests then ask
             // their model for the pick (the reference's `ruleFor` effort).
@@ -1853,7 +1864,7 @@ async fn send_with_fallback(
         tracker.set_classified(classified.clone());
         if let Some(mut hit) = crate::rules::rule_for(
             &plan.id,
-            &group.rules,
+            rules,
             creq,
             agent,
             conversation,
@@ -4245,6 +4256,7 @@ mod tests {
                             rules: Vec::new(),
                             classifier: String::new(),
                             effort: String::new(),
+                            pick: String::new(),
                             weights: Vec::new(),
                             routing: RoutingPolicy::Order,
                             first_token_timeout_ms: 0,

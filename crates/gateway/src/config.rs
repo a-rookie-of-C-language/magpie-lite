@@ -448,6 +448,9 @@ impl KeyRotator {
 
         let ordered = match routing {
             RoutingPolicy::Order => (0..keys.len()).collect::<Vec<_>>(),
+            // Manual picks a whole group member, never a key: a provider
+            // read as manual still tries its keys in order.
+            RoutingPolicy::Manual => (0..keys.len()).collect::<Vec<_>>(),
             RoutingPolicy::Rotate => {
                 let start = state.cursor % keys.len();
                 state.cursor = (start + 1) % keys.len();
@@ -566,9 +569,18 @@ impl KeyRotator {
         policy: RoutingPolicy,
         routes: &[String],
         weights: &[u32],
+        pick: &str,
     ) -> Vec<(usize, String)> {
         if routes.is_empty() {
             return Vec::new();
+        }
+        if policy == RoutingPolicy::Manual {
+            // A manual group sends every request to its picked member
+            // alone; the others wait. A pick naming nothing in the group
+            // is its first route, as `validate` keeps it (the reference's
+            // `routes` for a manual group, through `Picked`).
+            let index = routes.iter().position(|route| route == pick).unwrap_or(0);
+            return vec![(index, routes[index].clone())];
         }
         let mut states = self
             .group_states
@@ -632,6 +644,9 @@ impl KeyRotator {
                 indices.sort_by_key(|&index| (state.attempts[index], index));
                 indices
             }
+            // Handled before any scheduling state: a manual group sends to
+            // its pick alone, so this never runs.
+            RoutingPolicy::Manual => unreachable!("manual groups return before scheduling"),
         };
         indices
             .into_iter()
@@ -792,6 +807,9 @@ pub enum RoutingPolicy {
     /// so it takes this for `order`.
     #[serde(rename = "weight")]
     Weighted,
+    /// Send every request to the group's picked member; the others, and the
+    /// rules, wait until another member is picked (the reference's `Manual`).
+    Manual,
 }
 
 impl RoutingPolicy {
@@ -802,6 +820,7 @@ impl RoutingPolicy {
             Self::Rotate => "rotate",
             Self::Usage => "usage",
             Self::Weighted => "weight",
+            Self::Manual => "manual",
         }
     }
 }
@@ -815,8 +834,9 @@ impl std::str::FromStr for RoutingPolicy {
             "rotate" | "round_robin" => Ok(Self::Rotate),
             "usage" | "least_used" => Ok(Self::Usage),
             "weight" | "weighted" => Ok(Self::Weighted),
+            "manual" => Ok(Self::Manual),
             _ => Err(format!(
-                "unknown routing policy `{value}`; expected order, rotate, usage or weight"
+                "unknown routing policy `{value}`; expected order, rotate, usage, weight or manual"
             )),
         }
     }
@@ -903,6 +923,12 @@ pub struct GroupConfig {
     /// requests ask their model for it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub effort: String,
+    /// The member a `manual` group sends every request to
+    /// (`provider/model`); the others, and the rules, wait until another
+    /// member is picked (the reference's `Group.Pick`). Kept while the
+    /// group is routed otherwise, and defaults to its first route.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pick: String,
     /// Process-local route selection policy.
     #[serde(default)]
     pub routing: RoutingPolicy,
@@ -948,6 +974,16 @@ impl GroupConfig {
             if provider.is_empty() || model.is_empty() || route.chars().any(char::is_whitespace) {
                 anyhow::bail!("group routes must use non-empty provider/model without whitespace");
             }
+        }
+        // A pick taken out of the group is no pick; a manual group without
+        // one sends to its first route (the reference's `Picked`, through
+        // its validation).
+        self.pick = self.pick.trim().to_owned();
+        if !self.routes.contains(&self.pick) {
+            self.pick.clear();
+        }
+        if self.routing == RoutingPolicy::Manual && self.pick.is_empty() {
+            self.pick = self.routes[0].clone();
         }
         for (index, rule) in self.rules.iter_mut().enumerate() {
             rule.clean(&self.routes, index + 1)
@@ -1113,6 +1149,9 @@ pub struct GroupConfigSnapshot {
     /// How the turn's reasoning is picked: `auto` or blank.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub effort: String,
+    /// The member a `manual` group sends every request to.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pick: String,
     /// Per-route weights, parallel to the route chain, for the `weight` policy.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub weights: Vec<u32>,
@@ -1454,6 +1493,7 @@ impl Config {
                     rules: g.rules.clone(),
                     classifier: g.classifier.clone(),
                     effort: g.effort.clone(),
+                    pick: g.pick.clone(),
                     weights: g.route_weights(),
                     routing: g.routing,
                     first_token_timeout_ms: g.first_token_timeout_ms,
@@ -2042,6 +2082,7 @@ base_url = "http://127.0.0.1:1/v1"
             rules: Vec::new(),
             classifier: String::new(),
             effort: String::new(),
+            pick: String::new(),
             weights: Vec::new(),
             routing: RoutingPolicy::default(),
             first_token_timeout_ms: 0,
@@ -2076,6 +2117,7 @@ base_url = "http://127.0.0.1:1/v1"
             rules: Vec::new(),
             classifier: String::new(),
             effort: String::new(),
+            pick: String::new(),
             weights: Vec::new(),
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
@@ -2184,6 +2226,7 @@ affinity = "session"
             rules: Vec::new(),
             classifier: String::new(),
             effort: String::new(),
+            pick: String::new(),
             weights: Vec::new(),
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
@@ -2203,7 +2246,7 @@ affinity = "session"
         let scheduler = KeyRotator::default();
         let routes = vec!["a/one".to_owned(), "b/two".to_owned(), "c/three".to_owned()];
         assert_eq!(
-            scheduler.group_order("daily", RoutingPolicy::Rotate, &routes, &[]),
+            scheduler.group_order("daily", RoutingPolicy::Rotate, &routes, &[], ""),
             vec![
                 (0, "a/one".to_owned()),
                 (1, "b/two".to_owned()),
@@ -2211,35 +2254,92 @@ affinity = "session"
             ]
         );
         assert_eq!(
-            scheduler.group_order("daily", RoutingPolicy::Rotate, &routes, &[])[0],
+            scheduler.group_order("daily", RoutingPolicy::Rotate, &routes, &[], "")[0],
             (1, "b/two".to_owned())
         );
         assert_eq!(
-            scheduler.group_order("daily", RoutingPolicy::Rotate, &routes, &[])[0],
+            scheduler.group_order("daily", RoutingPolicy::Rotate, &routes, &[], "")[0],
             (2, "c/three".to_owned())
         );
 
         let usage = KeyRotator::default();
         assert_eq!(
-            usage.group_order("daily", RoutingPolicy::Usage, &routes, &[])[0].0,
+            usage.group_order("daily", RoutingPolicy::Usage, &routes, &[], "")[0].0,
             0
         );
         usage.record_group_attempt("daily", RoutingPolicy::Usage, &routes, &[], 0);
         assert_eq!(
-            usage.group_order("daily", RoutingPolicy::Usage, &routes, &[])[0].0,
+            usage.group_order("daily", RoutingPolicy::Usage, &routes, &[], "")[0].0,
             1
         );
         usage.record_group_attempt("daily", RoutingPolicy::Usage, &routes, &[], 1);
         assert_eq!(
-            usage.group_order("daily", RoutingPolicy::Usage, &routes, &[])[0].0,
+            usage.group_order("daily", RoutingPolicy::Usage, &routes, &[], "")[0].0,
             2
         );
 
         let changed = vec!["new/route".to_owned(), "other/route".to_owned()];
         assert_eq!(
-            usage.group_order("daily", RoutingPolicy::Usage, &changed, &[])[0],
+            usage.group_order("daily", RoutingPolicy::Usage, &changed, &[], "")[0],
             (0, "new/route".to_owned())
         );
+    }
+
+    #[test]
+    fn manual_group_sends_to_its_pick_alone() {
+        assert_eq!("manual".parse(), Ok(RoutingPolicy::Manual));
+        assert_eq!(RoutingPolicy::Manual.as_str(), "manual");
+        let scheduler = KeyRotator::default();
+        let routes = vec!["a/one".to_owned(), "b/two".to_owned()];
+        // The pick alone; the other member waits.
+        assert_eq!(
+            scheduler.group_order("daily", RoutingPolicy::Manual, &routes, &[], "b/two"),
+            vec![(1, "b/two".to_owned())]
+        );
+        // A pick naming nothing in the group is its first route, as
+        // `validate` keeps it.
+        assert_eq!(
+            scheduler.group_order("daily", RoutingPolicy::Manual, &routes, &[], "z/gone"),
+            vec![(0, "a/one".to_owned())]
+        );
+        assert!(
+            scheduler
+                .group_order("gone", RoutingPolicy::Manual, &[], &[], "")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn manual_group_pick_defaults_and_cleans() {
+        let mut group = GroupConfig {
+            id: "g".into(),
+            name: String::new(),
+            routes: vec!["a/one".to_owned(), "b/two".to_owned()],
+            rules: Vec::new(),
+            classifier: String::new(),
+            effort: String::new(),
+            pick: String::new(),
+            weights: Vec::new(),
+            routing: RoutingPolicy::Manual,
+            first_token_timeout_ms: 0,
+            affinity: Default::default(),
+        };
+        // Without one, a manual group sends to its first route.
+        group.validate().unwrap();
+        assert_eq!(group.pick, "a/one");
+        // A pick taken out of the group is its first route again.
+        group.pick = "z/gone".into();
+        group.validate().unwrap();
+        assert_eq!(group.pick, "a/one");
+        // Kept while the group is routed otherwise; cleared when it names
+        // nothing in the group.
+        group.routing = RoutingPolicy::Order;
+        group.pick = "b/two".into();
+        group.validate().unwrap();
+        assert_eq!(group.pick, "b/two");
+        group.pick = "z/gone".into();
+        group.validate().unwrap();
+        assert!(group.pick.is_empty());
     }
 
     #[test]
@@ -2250,7 +2350,7 @@ affinity = "session"
         let mut firsts = Vec::new();
         for _ in 0..8 {
             firsts.push(
-                scheduler.group_order("daily", RoutingPolicy::Weighted, &routes, &weights)[0].0,
+                scheduler.group_order("daily", RoutingPolicy::Weighted, &routes, &weights, "")[0].0,
             );
         }
         assert_eq!(firsts.iter().filter(|slot| **slot == 0).count(), 3);
@@ -2260,7 +2360,7 @@ affinity = "session"
         // A changed weight vector starts a fresh schedule, so stale state
         // from the old ratio never leaks into the new one.
         assert_eq!(
-            scheduler.group_order("daily", RoutingPolicy::Weighted, &routes, &[1, 1, 1])[0].0,
+            scheduler.group_order("daily", RoutingPolicy::Weighted, &routes, &[1, 1, 1], "")[0].0,
             0
         );
     }
@@ -2274,6 +2374,7 @@ affinity = "session"
             rules: Vec::new(),
             classifier: String::new(),
             effort: String::new(),
+            pick: String::new(),
             weights: vec![3],
             routing: RoutingPolicy::Weighted,
             first_token_timeout_ms: 0,
@@ -2293,7 +2394,8 @@ affinity = "session"
         let scheduler = KeyRotator::default();
         let routes = vec!["a/one".to_owned(), "b/two".to_owned()];
         for _ in 0..4 {
-            let order = scheduler.group_order("daily", RoutingPolicy::Weighted, &routes, &[1, 0]);
+            let order =
+                scheduler.group_order("daily", RoutingPolicy::Weighted, &routes, &[1, 0], "");
             assert_eq!(order[0].0, 0);
             assert_eq!(order[1].0, 1);
         }
