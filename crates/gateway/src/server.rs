@@ -224,11 +224,19 @@ pub async fn serve_with_config_path(
         key_rotation: crate::config::KeyRotator::default(),
         affinity,
     });
-    let app = build_router(state);
+    let app = build_router(Arc::clone(&state));
 
     tracing::info!("magpie-lite gateway listening on http://{addr}");
     println!("magpie-lite gateway listening on http://{addr}");
-    axum::serve(listener, app).await?;
+    // Stop on Ctrl-C, writing what affinity has waiting so the next start
+    // (or a handover) reads every answer.
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
+    state.affinity.flush();
     Ok(())
 }
 

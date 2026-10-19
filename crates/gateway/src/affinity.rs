@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::http::HeaderMap;
@@ -41,6 +41,13 @@ pub const STICKS_KEPT: usize = 512;
 /// How long after its last answer a conversation still counts as holding the
 /// key that answered it: a session whose user is reading or typing is going.
 pub const HELD_FOR: Duration = Duration::from_secs(30 * 60);
+/// How long an answer waits before `affinity.json` is written: what is
+/// answered meanwhile goes in the same write, so a gateway answering many
+/// requests a second writes it once in a while, not once a request (up to
+/// [`STICKS_KEPT`] conversations marshalled, written and renamed each
+/// time). A crash loses the last moment's; [`AffinityStore::flush`] as the
+/// gateway ends loses nothing.
+pub const WRITE_BEHIND: Duration = Duration::from_secs(2);
 
 /// Headers where agents already name their conversation. OpenCode sends the
 /// first; the rest are what other agents and proxies use.
@@ -223,24 +230,55 @@ struct State {
 /// Who answered which conversation, kept in process and on disk.
 pub struct AffinityStore {
     path: Option<PathBuf>,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
+    /// The write-behind signal: an answer marks the file dirty and wakes
+    /// the writer, which takes a copy within [`WRITE_BEHIND`].
+    writer: Option<Arc<(Mutex<Writer>, Condvar)>>,
+}
+
+/// The write-behind state: whether an answer is waiting, and whether the
+/// store is ending (so the writer writes what waits and exits).
+struct Writer {
+    dirty: bool,
+    stopping: bool,
+    /// Set once the writer has written what waited and ended, so
+    /// [`AffinityStore::flush`] can wait for the file.
+    finished: bool,
 }
 
 impl Default for AffinityStore {
     fn default() -> Self {
-        Self {
-            path: None,
-            state: Mutex::new(State::default()),
-        }
+        Self::new(None)
     }
 }
 
 impl AffinityStore {
     /// A store persisting to `path`, or in memory only when it is `None`.
     pub fn new(path: Option<PathBuf>) -> Self {
+        let Some(path) = path else {
+            return Self {
+                path: None,
+                state: Arc::new(Mutex::new(State::default())),
+                writer: None,
+            };
+        };
+        let state = Arc::new(Mutex::new(State::default()));
+        let writer = Arc::new((
+            Mutex::new(Writer {
+                dirty: false,
+                stopping: false,
+                finished: false,
+            }),
+            Condvar::new(),
+        ));
+        let worker_state = Arc::clone(&state);
+        let worker_path = path.clone();
+        let worker_writer = Arc::clone(&writer);
+        std::thread::spawn(move || writer_loop(worker_path, worker_state, worker_writer));
         Self {
-            path,
-            state: Mutex::new(State::default()),
+            path: Some(path),
+            state,
+            writer: Some(writer),
         }
     }
 
@@ -338,7 +376,7 @@ impl AffinityStore {
                     .retain(|_, stick| now.saturating_sub(stick.at_ms) <= millis(STICK_KEEP));
             }
         }
-        self.save();
+        self.note_save();
     }
 
     /// Forget that a key answered a conversation, when its reply to it broke
@@ -360,7 +398,7 @@ impl AffinityStore {
             matches
         };
         if removed {
-            self.save();
+            self.note_save();
         }
     }
 
@@ -385,69 +423,159 @@ impl AffinityStore {
         held
     }
 
-    /// Write the latest conversations' answerers to the file.
-    fn save(&self) {
-        let Some(path) = &self.path else {
+    /// Have the latest answerers written within [`WRITE_BEHIND`]: what is
+    /// answered meanwhile goes in the same write.
+    fn note_save(&self) {
+        let Some(writer) = &self.writer else {
             return;
         };
-        let now = now_ms();
-        let mut kept: Vec<(String, SavedStick)> = {
-            let state = self.lock();
-            state
-                .answered
-                .iter()
-                .filter(|(_, stick)| now.saturating_sub(stick.at_ms) <= millis(STICK_KEEP))
-                .map(|(key, stick)| {
-                    (
-                        key.clone(),
-                        SavedStick {
-                            who: stick.who.clone(),
-                            model: stick.model.clone(),
-                            turn: stick.turn,
-                            at: stick.at_ms,
-                            cache_read: stick.cache_read,
-                        },
-                    )
-                })
-                .collect()
-        };
-        kept.sort_by(|a, b| b.1.at.cmp(&a.1.at));
-        kept.truncate(STICKS_KEPT);
-        let out: HashMap<String, SavedStick> = kept.into_iter().collect();
-        let Ok(bytes) = serde_json::to_vec(&out) else {
-            return;
-        };
-        if let Some(parent) = path.parent()
-            && std::fs::create_dir_all(parent).is_err()
-        {
-            return;
+        let (lock, wake) = &**writer;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.dirty {
+            state.dirty = true;
+            wake.notify_one();
         }
-        let Ok(mut file) =
-            tempfile::NamedTempFile::new_in(path.parent().unwrap_or_else(|| Path::new(".")))
-        else {
+    }
+
+    /// Write now what [`Self::note_save`] has waiting, then stop the
+    /// writer: the gateway calls it as it ends, so the magpie it hands over
+    /// to, or the next start, reads every answer.
+    pub fn flush(&self) {
+        let Some(writer) = &self.writer else {
             return;
         };
-        use std::io::Write;
-        if file.write_all(&bytes).is_err() || file.flush().is_err() {
-            return;
-        }
-        if file.persist(path).is_err() {
-            return;
-        }
-        // What this store wrote isn't read back as another's.
-        if let Ok(meta) = std::fs::metadata(path)
-            && let Ok(modified) = meta.modified()
-        {
-            let mut state = self.lock();
-            state.from = Some(path.clone());
-            state.read_ms = modified
-                .duration_since(UNIX_EPOCH)
-                .ok()
-                .map(|d| d.as_millis().min(u64::MAX as u128) as u64);
+        let (lock, wake) = &**writer;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.stopping = true;
+        wake.notify_all();
+        while !state.finished {
+            state = wake
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
     }
 }
 
+/// Write a snapshot atomically, through a temporary file beside it.
+fn write_sticks(path: &Path, out: &HashMap<String, SavedStick>) {
+    let Ok(bytes) = serde_json::to_vec(out) else {
+        return;
+    };
+    if let Some(parent) = path.parent()
+        && std::fs::create_dir_all(parent).is_err()
+    {
+        return;
+    }
+    let Ok(mut file) =
+        tempfile::NamedTempFile::new_in(path.parent().unwrap_or_else(|| Path::new(".")))
+    else {
+        return;
+    };
+    use std::io::Write;
+    if file.write_all(&bytes).is_err() || file.flush().is_err() {
+        return;
+    }
+    let _ = file.persist(path);
+}
+
+/// Wait for answers to write, write them once [`WRITE_BEHIND`] has passed,
+/// and write the last of them as the store ends.
+fn writer_loop(path: PathBuf, answers: Arc<Mutex<State>>, writer: Arc<(Mutex<Writer>, Condvar)>) {
+    let (lock, wake) = &*writer;
+    loop {
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !state.dirty && !state.stopping {
+            state = wake
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        let stopping = state.stopping;
+        state.dirty = false;
+        drop(state);
+        if stopping {
+            save_sticks(&path, &answers);
+            finish(writer);
+            return;
+        }
+        let deadline = std::time::Instant::now() + WRITE_BEHIND;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if state.stopping || left.is_zero() {
+                break;
+            }
+            state = wake
+                .wait_timeout(state, left)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+        let stopping = state.stopping;
+        state.dirty = false;
+        drop(state);
+        save_sticks(&path, &answers);
+        if stopping {
+            finish(writer);
+            return;
+        }
+    }
+}
+
+/// Take the latest answerers out of `answers` and write them to `path`,
+/// noting in `answers` that this store wrote it so it isn't read back as
+/// another's.
+fn save_sticks(path: &Path, answers: &Mutex<State>) {
+    let out = {
+        let state = answers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        snapshot(&state)
+    };
+    write_sticks(path, &out);
+    if let Ok(meta) = std::fs::metadata(path)
+        && let Ok(modified) = meta.modified()
+    {
+        let mut state = answers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.from = Some(path.to_owned());
+        state.read_ms = modified
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_millis().min(u64::MAX as u128) as u64);
+    }
+}
+
+/// The latest conversations' answerers, as the file keeps them.
+fn snapshot(state: &State) -> HashMap<String, SavedStick> {
+    let now = now_ms();
+    let mut kept: Vec<(String, SavedStick)> = state
+        .answered
+        .iter()
+        .filter(|(_, stick)| now.saturating_sub(stick.at_ms) <= millis(STICK_KEEP))
+        .map(|(key, stick)| {
+            (
+                key.clone(),
+                SavedStick {
+                    who: stick.who.clone(),
+                    model: stick.model.clone(),
+                    turn: stick.turn,
+                    at: stick.at_ms,
+                    cache_read: stick.cache_read,
+                },
+            )
+        })
+        .collect();
+    kept.sort_by(|a, b| b.1.at.cmp(&a.1.at));
+    kept.truncate(STICKS_KEPT);
+    kept.into_iter().collect()
+}
+/// Mark the write-behind thread ended, waking [`AffinityStore::flush`].
+fn finish(writer: Arc<(Mutex<Writer>, Condvar)>) {
+    let (lock, wake) = &*writer;
+    let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.finished = true;
+    wake.notify_all();
+}
 /// A candidate as one of a route's keys: its key, the model it would answer
 /// as, and its place in the routing order and the key pool.
 #[derive(Debug, Clone)]
@@ -859,6 +987,31 @@ mod tests {
     }
 
     #[test]
+    fn answers_write_behind_and_flush_writes_what_waits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("affinity.json");
+        let seats = vec![seat("mock#a", "model", 0, 0), seat("mock#b", "model", 1, 1)];
+        let store = AffinityStore::new(Some(path.clone()));
+        let decision = affine(Affinity::Auto, true, &seats, &store);
+        for _ in 0..200 {
+            store.answered(&decision.key, "mock#b", "model", 1, 4096);
+        }
+        // Nothing is written on the answers themselves.
+        assert!(!path.exists());
+        // The answer is known in memory at once.
+        assert_eq!(
+            affine(Affinity::Auto, false, &seats, &store).trace.why,
+            "cache"
+        );
+        // Ending the store writes everything that waited.
+        store.flush();
+        assert!(path.exists());
+        let reopened = AffinityStore::new(Some(path));
+        let kept = affine(Affinity::Auto, false, &seats, &reopened);
+        assert_eq!(kept.key, decision.key);
+        assert_eq!(kept.trace.why, "cache");
+    }
+    #[test]
     fn a_stick_survives_a_restart_from_its_file() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("affinity.json");
@@ -867,6 +1020,7 @@ mod tests {
             let store = AffinityStore::new(Some(path.clone()));
             let decision = affine(Affinity::Auto, true, &seats, &store);
             store.answered(&decision.key, "mock#b", "model", 1, 4096);
+            store.flush();
             decision.key
         };
         assert!(path.exists());
