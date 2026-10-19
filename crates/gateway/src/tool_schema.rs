@@ -12,7 +12,7 @@
 use serde_json::{Map, Value};
 
 /// Keywords whose value is an object of schemas, one per name.
-const SCHEMA_MAP_KEYS: [&str; 5] = [
+pub(crate) const SCHEMA_MAP_KEYS: [&str; 5] = [
     "properties",
     "$defs",
     "definitions",
@@ -21,7 +21,7 @@ const SCHEMA_MAP_KEYS: [&str; 5] = [
 ];
 
 /// Keywords whose value is itself a schema, or an array of them.
-const SCHEMA_KEYS: [&str; 15] = [
+pub(crate) const SCHEMA_KEYS: [&str; 15] = [
     "items",
     "additionalProperties",
     "contains",

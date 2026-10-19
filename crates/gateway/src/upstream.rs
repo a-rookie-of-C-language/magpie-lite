@@ -57,6 +57,8 @@ pub fn build_request(
     // Moonshot refuses an untyped enum in a tool schema (#886), and since
     // kimi-k2.5 locks temperature and top_p.
     body = crate::kimi_schema::kimi_tool_enum_types(body, host.as_deref());
+    // Moonshot expands a `$ref` and refuses a target that names no type.
+    body = crate::kimi_schema::kimi_tool_ref_types(body, host.as_deref());
     body = crate::kimi_schema::kimi_locked_sampling(body, host.as_deref(), model);
     // OpenRouter's grammar compiler refuses a oneOf whose branches are not
     // provably disjoint; anyOf holds the same branches.
@@ -616,6 +618,79 @@ mod search_tests {
                 .is_none()
         );
         assert_eq!(other["temperature"], 0.1);
+    }
+
+    #[test]
+    fn a_kimi_ref_target_is_typed_on_every_upstream_dialect() {
+        let schema = json!({
+            "type":"object",
+            "properties":{
+                "a":{"$ref":"#/$defs/oneOf"},
+                "b":{"$ref":"#/$defs/allOf"},
+                "c":{"$ref":"#/$defs/props"},
+                "d":{"$ref":"#/$defs/minLength"},
+                "e":{"$ref":"#/$defs/any"},
+                "f":{"$ref":"#/$defs/empty"}
+            },
+            "$defs":{
+                "oneOf":{"oneOf":[{"type":"string"},{"type":"number"}]},
+                "allOf":{"allOf":[{"type":"string"}]},
+                "props":{"properties":{"x":{"type":"string"}}},
+                "minLength":{"minLength":1},
+                "any":{"anyOf":[{"type":"string"},{"$ref":"#/$defs/any"}]},
+                "empty":{}
+            }
+        });
+        for (protocol, base_url) in [
+            (Protocol::Chat, "https://api.kimi.com/coding/v1"),
+            (Protocol::Anthropic, "https://api.kimi.com/coding"),
+            (Protocol::Responses, "https://api.kimi.com/coding/v1"),
+            (Protocol::Gemini, "https://api.kimi.com/coding/v1beta"),
+        ] {
+            let client = json!({
+                "model":"client",
+                "messages":[{"role":"user","content":"hi"}],
+                "max_tokens":16,
+                "tools":[{"type":"function","function":{"name":"t","parameters":schema}}],
+            });
+            let request = chat::decode_request(&client).unwrap();
+            let out = build_request(&provider(protocol, base_url), &request, "kimi-k3").unwrap();
+            let schema = out
+                .pointer("/tools/0/function/parameters")
+                .or_else(|| out.pointer("/tools/0/parameters"))
+                .or_else(|| out.pointer("/tools/0/input_schema"))
+                .or_else(|| out.pointer("/tools/0/functionDeclarations/0/parameters"))
+                .expect("the tool schema");
+            let defs = &schema["$defs"];
+            assert_eq!(
+                defs["oneOf"]["type"],
+                json!(["string", "number"]),
+                "{protocol:?}"
+            );
+            assert_eq!(defs["allOf"]["type"], "string", "{protocol:?}");
+            assert_eq!(defs["props"]["type"], "object", "{protocol:?}");
+            assert_eq!(defs["minLength"]["type"], "string", "{protocol:?}");
+            assert!(defs["any"].get("type").is_none(), "{protocol:?}");
+            assert!(defs["empty"].get("type").is_none(), "{protocol:?}");
+        }
+
+        // Another provider is sent the schema unchanged.
+        let request = chat::decode_request(&json!({
+            "model":"client","messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"t","parameters":schema}}],
+        }))
+        .unwrap();
+        let other = build_request(
+            &provider(Protocol::Chat, "https://api.openai.com/v1"),
+            &request,
+            "kimi-k3",
+        )
+        .unwrap();
+        assert!(
+            other["tools"][0]["function"]["parameters"]["$defs"]["oneOf"]
+                .get("type")
+                .is_none()
+        );
     }
 
     #[test]
