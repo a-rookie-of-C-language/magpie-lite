@@ -882,11 +882,15 @@ are a small `Vec` scanned in place. `224ea7d5` invalidates that same Go
 catalog cache. `b641868e` only fixes a Go test's clock.
 ### Still open from this refresh
 
-Rest granularity, sink ordering, Cline pinning, Devin's Gemini schema
-sanitizer (`1530c5ef`) and HTTP/2 transport health (`94919109`) remain
-future work. RPM and concurrency queues were ported (`crates/gateway/src/
-lanes.rs`). Cline pinning and the Qoder mover minimum (`dd70c5e6`,
-`d44d81d9`) do not map onto lite: it has no presets and no plugin movers.
+Rest granularity, sink ordering, Cline pinning and HTTP/2 transport health
+(`94919109`) remain future work. RPM and concurrency queues were ported
+(`crates/gateway/src/lanes.rs`), and Devin's Gemini schema sanitizer
+(`1530c5ef`) rides on the Gemini protocol rather than a host
+(`crates/gateway/src/gemini_schema.rs`): a list type becomes one
+type/`nullable`/`anyOf`, an array with no items gets `{}`, an untyped enum
+takes its values' type, and a root with no type is an object. Cline
+pinning and the Qoder mover minimum (`dd70c5e6`, `d44d81d9`) do not map
+onto lite: it has no presets and no plugin movers.
 
 ### Upstream refresh, second pass (`dd70c5e6..afa5f74b`)
 

@@ -67,6 +67,12 @@ pub fn build_request(
     // parse, where ECMAScript reads the same pattern fine. Every protocol
     // carries tool schemas, so this runs wherever the tools are.
     body = crate::grok_schema::grok_tool_patterns(body, model, host.as_deref());
+    // Gemini's function-calling schema is an OpenAPI subset: a list type,
+    // an array with no items, or properties/enum with no type are refused
+    // (the reference's `devinGeminiSchema`, `1530c5ef`). Every Gemini
+    // upstream reads `functionDeclarations[].parameters` the same, so the
+    // fix rides on the protocol rather than a host.
+    body = crate::gemini_schema::gemini_tool_schemas(body, p.protocol == Protocol::Gemini);
     if p.protocol == Protocol::Responses
         && host.as_deref() == Some("api.x.ai")
         && let Some(include) = body.get_mut("include").and_then(Value::as_array_mut)
