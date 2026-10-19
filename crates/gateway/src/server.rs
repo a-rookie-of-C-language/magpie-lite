@@ -425,6 +425,7 @@ fn remove_group(config: &mut crate::config::Config, id: &str) -> Result<(), (Sta
 }
 
 fn validate_group(config: &Config, group: &mut GroupConfig) -> Result<(), (StatusCode, String)> {
+    config.clean_member_efforts(group);
     group
         .validate()
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -747,6 +748,10 @@ fn ollama_digest(id: &str) -> String {
 struct UpstreamRoute {
     provider: Arc<ProviderConfig>,
     model: String,
+    /// The effort fixed on the group member (`mock/m:high`), `""` for
+    /// none: asked for whatever the agent asked and whatever the turn
+    /// picked. The vendor is asked for `model`, the effort riding here.
+    effort: String,
     api_keys: Vec<(usize, String)>,
     group_id: Option<String>,
     group_route_index: Option<usize>,
@@ -1063,7 +1068,7 @@ fn prepare(
         )
     })?;
 
-    let (provider, upstream_model, group_plan, group_route_index) =
+    let (provider, upstream_model, fixed_effort, group_plan, group_route_index) =
         if let Some(group_id) = creq.model.strip_prefix("group/") {
             let Some(group) = config.group(group_id) else {
                 return Err((
@@ -1092,7 +1097,9 @@ fn prepare(
                     ),
                 ));
             };
-            let Some((provider, upstream_model)) = config.resolve(&route) else {
+            // The vendor is asked for the model's own id; a fixed effort
+            // rides the route for the send.
+            let Some((provider, upstream_model, effort)) = config.resolve_member(&route) else {
                 return Err((
                     StatusCode::NOT_FOUND,
                     wire.error_body(
@@ -1104,6 +1111,7 @@ fn prepare(
             (
                 provider,
                 upstream_model,
+                effort,
                 Some(GroupRoutePlan {
                     id: group_id.to_owned(),
                     routes,
@@ -1121,7 +1129,7 @@ fn prepare(
                     wire.error_body(StatusCode::NOT_FOUND, &message),
                 ));
             };
-            (provider, upstream_model, None, None)
+            (provider, upstream_model, String::new(), None, None)
         };
     let affinity = if let Some(plan) = group_plan.as_ref() {
         let group = config.group(&plan.id).expect("group just resolved");
@@ -1143,6 +1151,7 @@ fn prepare(
         UpstreamRoute {
             provider: Arc::new(provider.clone()),
             model: upstream_model,
+            effort: fixed_effort,
             api_keys: provider.api_key_pool().into_iter().enumerate().collect(),
             group_id: group_plan.as_ref().map(|plan| plan.id.clone()),
             group_route_index,
@@ -1185,8 +1194,11 @@ fn upstream_routes(
     // independent route, so one provider can intentionally contribute more
     // than one model to the same group.
     let mut seen_providers = HashSet::from([initial.provider.id.clone()]);
-    let mut seen_group_routes =
-        HashSet::from([(initial.provider.id.clone(), initial.model.clone())]);
+    let mut seen_group_routes = HashSet::from([(
+        initial.provider.id.clone(),
+        initial.model.clone(),
+        initial.effort.clone(),
+    )]);
 
     let mut fallback_references = group_plan
         .map(|plan| {
@@ -1204,12 +1216,14 @@ fn upstream_routes(
                 .collect()
         });
     for (group_route_index, reference) in fallback_references.drain(..) {
-        let Some((provider, model)) = config.resolve(&reference) else {
+        // The vendor is asked for the model's own id; a fixed effort rides
+        // the route for the send, and tells same-model members apart.
+        let Some((provider, model, effort)) = config.resolve_member(&reference) else {
             tracing::warn!("fallback `{reference}` does not resolve; skipping");
             continue;
         };
         if let Some(route_index) = group_route_index {
-            if !seen_group_routes.insert((provider.id.clone(), model.clone())) {
+            if !seen_group_routes.insert((provider.id.clone(), model.clone(), effort.clone())) {
                 continue;
             }
             let api_keys = key_rotation.rotate_routed(
@@ -1222,6 +1236,7 @@ fn upstream_routes(
             out.push(UpstreamRoute {
                 provider: Arc::new(provider.clone()),
                 model,
+                effort,
                 api_keys,
                 group_id: group_plan.map(|plan| plan.id.clone()),
                 group_route_index: Some(route_index),
@@ -1240,6 +1255,7 @@ fn upstream_routes(
             out.push(UpstreamRoute {
                 provider: Arc::new(provider.clone()),
                 model,
+                effort,
                 api_keys,
                 group_id: None,
                 group_route_index: None,
@@ -1888,13 +1904,20 @@ async fn send_with_fallback(
             if !hit.use_.is_empty() {
                 // Put the rule's member first, then those the rules after it
                 // also name (`then`), each once, the rest behind in order.
-                let mut rank: HashMap<String, usize> = HashMap::new();
-                rank.insert(hit.use_.clone(), 0);
+                // Members match as named, effort and all: the same model at
+                // two efforts is two members (parsed both sides, so an
+                // unvalidated file spells them either way).
+                let member = |id: &str| {
+                    let (base, effort) = config.member_effort(id);
+                    (base, effort)
+                };
+                let mut rank: HashMap<(String, String), usize> = HashMap::new();
+                rank.insert(member(&hit.use_), 0);
                 for (i, id) in hit.then.iter().enumerate() {
-                    rank.entry(id.clone()).or_insert(i + 1);
+                    rank.entry(member(id)).or_insert(i + 1);
                 }
                 routes.sort_by_key(|r| {
-                    rank.get(&format!("{}/{}", r.provider.id, r.model))
+                    rank.get(&(format!("{}/{}", r.provider.id, r.model), r.effort.clone()))
                         .copied()
                         .unwrap_or(usize::MAX)
                 });
@@ -2074,7 +2097,22 @@ async fn send_with_fallback(
             let mut turn_after = false;
             'candidate: loop {
                 liveness.activity.attempt();
-                let mut body = match upstream::build_request(&route.provider, creq, &route.model) {
+                // A member fixed at an effort asks for it — whatever the
+                // agent asked and whatever the turn picked (the reference's
+                // `withFixedEffort`), fitted as the turn's pick is.
+                let fixed = if route.effort.is_empty() {
+                    None
+                } else {
+                    magpie_core::effort::Effort::parse(&crate::rules::fit_level(&route.effort)).map(
+                        |level| {
+                            let mut owned = (*creq).clone();
+                            owned.effort = Some(level);
+                            owned
+                        },
+                    )
+                };
+                let send = fixed.as_ref().unwrap_or(creq);
+                let mut body = match upstream::build_request(&route.provider, send, &route.model) {
                     Ok(body) => body,
                     Err(error) => {
                         // A local conversion error is not a bad credential or

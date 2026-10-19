@@ -1692,9 +1692,68 @@ impl Config {
             return group
                 .routes
                 .iter()
-                .find_map(|route| self.resolve_provider(route));
+                .find_map(|route| self.resolve_provider(&self.member_effort(route).0));
         }
         self.resolve_provider(model)
+    }
+
+    /// Split a group route into the model it names and the effort fixed on
+    /// it (`""` for none): `mock/m:high` is mock/m at high. Only a last
+    /// part that is a level's name counts, and only when the whole route
+    /// isn't a model the provider lists — a model's own id may carry a
+    /// colon (`openrouter/…:free`, `qwen:7b`). The effort is the tail
+    /// lowercased (the reference's `MemberEffort`, through the levels lite
+    /// asks for).
+    pub fn member_effort(&self, route: &str) -> (String, String) {
+        let Some(colon) = route.rfind(':') else {
+            return (route.to_owned(), String::new());
+        };
+        if colon == 0 {
+            return (route.to_owned(), String::new());
+        }
+        let level = route[colon + 1..].to_ascii_lowercase();
+        if magpie_core::effort::Effort::parse(&level).is_none() {
+            return (route.to_owned(), String::new());
+        }
+        if let Some((pid, rest)) = route.split_once('/')
+            && self
+                .provider(pid)
+                .is_some_and(|p| p.models.iter().any(|m| m == rest))
+        {
+            return (route.to_owned(), String::new());
+        }
+        (route[..colon].to_owned(), level)
+    }
+
+    /// Resolve a group route to (upstream, upstream model name, fixed
+    /// effort): the vendor is asked for the model's own id, while the
+    /// effort rides the route for the send.
+    pub fn resolve_member(&self, route: &str) -> Option<(&ProviderConfig, String, String)> {
+        let (base, effort) = self.member_effort(route);
+        self.resolve_provider(&base).map(|(p, m)| (p, m, effort))
+    }
+
+    /// Spell a group's members the way sending parses them, before
+    /// validation: each route trimmed, a fixed effort lowercased
+    /// (`mock/m:HIGH` is `mock/m:high`). Rules name their member as
+    /// written, effort and all, so rules stay exact.
+    pub fn clean_member_efforts(&self, group: &mut GroupConfig) {
+        for route in &mut group.routes {
+            let trimmed = route.trim().to_owned();
+            let (base, effort) = self.member_effort(&trimmed);
+            *route = if effort.is_empty() {
+                base
+            } else {
+                format!("{base}:{effort}")
+            };
+        }
+        let trimmed = group.pick.trim().to_owned();
+        let (base, effort) = self.member_effort(&trimmed);
+        group.pick = if effort.is_empty() {
+            base
+        } else {
+            format!("{base}:{effort}")
+        };
     }
 
     /// Resolve an ordinary provider/model or bare model reference.
@@ -2508,6 +2567,97 @@ affinity = "session"
         group.pick = "z/gone".into();
         group.validate().unwrap();
         assert!(group.pick.is_empty());
+    }
+
+    #[test]
+    fn group_members_fix_an_effort_by_suffix() {
+        let config = Config {
+            provider: vec![
+                found_provider("mock", &["a", "b"]),
+                found_provider("caps", &["m:high"]),
+            ],
+            ..Config::default()
+        };
+        // A level name as the tail fixes that effort on the member, spelt
+        // either case.
+        assert_eq!(
+            config.member_effort("mock/a:high"),
+            ("mock/a".to_owned(), "high".to_owned())
+        );
+        assert_eq!(
+            config.member_effort("mock/a:HIGH"),
+            ("mock/a".to_owned(), "high".to_owned())
+        );
+        assert_eq!(
+            config.member_effort("mock/a:xhigh"),
+            ("mock/a".to_owned(), "xhigh".to_owned())
+        );
+        // No tail, or a tail no level is named by, fixes nothing.
+        assert_eq!(
+            config.member_effort("mock/a"),
+            ("mock/a".to_owned(), String::new())
+        );
+        assert_eq!(
+            config.member_effort("mock/a:ludicrous"),
+            ("mock/a:ludicrous".to_owned(), String::new())
+        );
+        // The whole route being a listed model wins: the colon is the
+        // model's own id, not an effort.
+        assert_eq!(
+            config.member_effort("caps/m:high"),
+            ("caps/m:high".to_owned(), String::new())
+        );
+        // Resolving asks the vendor for the model's own id, the effort
+        // riding the route for the send.
+        let (provider, model, effort) = config
+            .resolve_member("mock/a:high")
+            .expect("member resolves");
+        assert_eq!(provider.id, "mock");
+        assert_eq!(model, "a");
+        assert_eq!(effort, "high");
+        // Cleaning spells members the send parses them, before the pick
+        // and the rules are checked against the routes.
+        let mut group = GroupConfig {
+            id: "g".into(),
+            name: String::new(),
+            routes: vec!["mock/a:HIGH".to_owned(), "mock/b".to_owned()],
+            rules: Vec::new(),
+            classifier: String::new(),
+            effort: String::new(),
+            pick: "mock/a:HIGH".into(),
+            auto: false,
+            weights: Vec::new(),
+            routing: RoutingPolicy::Order,
+            first_token_timeout_ms: 0,
+            affinity: Default::default(),
+        };
+        config.clean_member_efforts(&mut group);
+        assert_eq!(group.routes, vec!["mock/a:high", "mock/b"]);
+        assert_eq!(group.pick, "mock/a:high");
+        group.validate().unwrap();
+        // A rule names its member as written, effort and all: the same
+        // model without the suffix is another member, not this one.
+        let mut group = GroupConfig {
+            id: "g".into(),
+            name: String::new(),
+            routes: vec!["mock/a:high".to_owned(), "mock/b".to_owned()],
+            rules: vec![crate::rules::Rule {
+                use_: "mock/a".into(),
+                tokens: 1,
+                ..Default::default()
+            }],
+            classifier: String::new(),
+            effort: String::new(),
+            pick: String::new(),
+            auto: false,
+            weights: Vec::new(),
+            routing: RoutingPolicy::Order,
+            first_token_timeout_ms: 0,
+            affinity: Default::default(),
+        };
+        assert!(group.validate().is_err());
+        group.rules[0].use_ = "mock/a:high".into();
+        group.validate().unwrap();
     }
 
     fn found_provider(id: &str, models: &[&str]) -> ProviderConfig {

@@ -132,7 +132,9 @@ enum GroupCommand {
         /// Display name.
         #[arg(long)]
         name: Option<String>,
-        /// Ordered routes: the first available model serves the request.
+        /// Ordered routes: the first available model serves the request. A
+        /// route ending in `:level` (low, medium, high, ...) fixes that
+        /// effort on the member: `mock/model:high` asks for high.
         #[arg(long = "route")]
         routes: Vec<String>,
         /// Route policy: order, rotate, usage, weight, or manual (which
@@ -468,6 +470,7 @@ async fn main() -> Result<()> {
                         first_token_timeout_ms,
                         affinity,
                     };
+                    cfg.clean_member_efforts(&mut group);
                     group.validate()?;
                     group.check_classifier(&cfg)?;
                     for route in &group.routes {

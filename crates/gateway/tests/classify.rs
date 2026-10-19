@@ -584,6 +584,25 @@ async fn gateway(
     effort: &str,
     cls: Arc<Mutex<ClsAnswer>>,
 ) -> Gateway {
+    gateway_with_routes(
+        group,
+        judge,
+        rules,
+        effort,
+        vec!["a/one".into(), "b/two".into()],
+        cls,
+    )
+    .await
+}
+
+async fn gateway_with_routes(
+    group: &str,
+    judge: &str,
+    rules: Vec<Rule>,
+    effort: &str,
+    routes: Vec<String>,
+    cls: Arc<Mutex<ClsAnswer>>,
+) -> Gateway {
     let a_bodies = Arc::new(Mutex::new(Vec::new()));
     let b_bodies = Arc::new(Mutex::new(Vec::new()));
     let cls_bodies = Arc::new(Mutex::new(Vec::new()));
@@ -599,7 +618,7 @@ async fn gateway(
         group: vec![GroupConfig {
             id: group.into(),
             name: group.into(),
-            routes: vec!["a/one".into(), "b/two".into()],
+            routes,
             rules,
             classifier: format!("c/{judge}"),
             effort: effort.into(),
@@ -1210,4 +1229,96 @@ async fn an_auto_group_asks_nothing_without_reasoning() {
         "{}",
         agent[0]["classified"]
     );
+}
+
+#[tokio::test]
+async fn a_member_fixed_at_an_effort_sends_it_unasked() {
+    // No auto, no rules: the agent asks for no reasoning at all, yet the
+    // fixed member still sends its effort, to its own model.
+    let gw = gateway_with_routes(
+        "g-fixed",
+        "judge-fixed",
+        Vec::new(),
+        "",
+        vec!["a/one:high".into(), "b/two".into()],
+        Arc::new(Mutex::new(ClsAnswer {
+            status: 200,
+            text: "1".into(),
+        })),
+    )
+    .await;
+    let body = effort_turn(
+        "g-fixed",
+        "",
+        json!([{"role": "user", "content": "Hello there, how are you doing today?"}]),
+    );
+    assert_eq!(ask_body(&gw, "s-fixed", body).await, StatusCode::OK);
+    assert_eq!(cls_asked(&gw), 0);
+    let sent = gw.bodies[0].lock().unwrap()[0].clone();
+    assert_eq!(sent["model"], "one");
+    assert_eq!(sent["reasoning_effort"], "high");
+    assert!(gw.bodies[1].lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_member_fixed_at_an_effort_beats_the_turns_pick() {
+    // Auto judges the turn high, but the member is fixed at low: low is
+    // what its model is asked for.
+    let gw = gateway_with_routes(
+        "g-fixed-pick",
+        "judge-fixed-pick",
+        Vec::new(),
+        "auto",
+        vec!["a/one:low".into(), "b/two".into()],
+        Arc::new(Mutex::new(ClsAnswer {
+            status: 200,
+            text: "3".into(),
+        })),
+    )
+    .await;
+    let body = effort_turn(
+        "g-fixed-pick",
+        "medium",
+        json!([{"role": "user", "content": "redesign the scheduler"}]),
+    );
+    assert_eq!(ask_body(&gw, "s-fixed-pick", body).await, StatusCode::OK);
+    assert_eq!(cls_asked(&gw), 1);
+    let sent = gw.bodies[0].lock().unwrap()[0].clone();
+    assert_eq!(sent["model"], "one");
+    assert_eq!(sent["reasoning_effort"], "low");
+}
+
+#[tokio::test]
+async fn a_rule_names_its_fixed_member_with_the_suffix() {
+    // A rule names its member as written, effort and all: the turn goes
+    // to a/one first, at high, though it is listed second.
+    let members = vec!["b/two".to_owned(), "a/one:high".to_owned()];
+    let mut rule = Rule {
+        use_: "a/one:high".into(),
+        tokens: 1,
+        ..Default::default()
+    };
+    rule.clean(&members, 1).unwrap();
+    let gw = gateway_with_routes(
+        "g-fixed-rule",
+        "judge-fixed-rule",
+        vec![rule],
+        "",
+        members,
+        Arc::new(Mutex::new(ClsAnswer {
+            status: 200,
+            text: "1".into(),
+        })),
+    )
+    .await;
+    let body = effort_turn(
+        "g-fixed-rule",
+        "",
+        json!([{"role": "user", "content": "Hello there, how are you doing today?"}]),
+    );
+    assert_eq!(ask_body(&gw, "s-fixed-rule", body).await, StatusCode::OK);
+    assert_eq!(cls_asked(&gw), 0);
+    let sent = gw.bodies[0].lock().unwrap()[0].clone();
+    assert_eq!(sent["model"], "one");
+    assert_eq!(sent["reasoning_effort"], "high");
 }
