@@ -644,6 +644,31 @@ its readable message and parsed JSON. The two call sites already run the
 read under the configured header timeout, so the cap bounds the work
 without changing which responses are errors.
 
+### Grok's whole numbers in tool arguments (`grok_integral.go`)
+
+Grok writes a whole number in a tool call's arguments with a fraction of
+zeros: `"yield_time_ms":2500.0`, `"session_id":17277.0`. Codex reads those
+fields as `u64`, `usize`, `i32` or `i64` even though their schemas say
+`number`, and serde turns the whole call away: "invalid type: floating
+point `2500.0`, expected u64" (#1431, through a relay in front of grok-4.6
+and grok-4.7). Any client that types its arguments strictly does the same.
+
+`crates/gateway/src/grok_integral.rs` drops the zero fraction of a number
+with no exponent: `2500.0` becomes `2500`, `-3.00` becomes `-3`. Other
+fractions (`2.5`, `2.50`), exponents (`1.0e3`) and every string, key and
+other model's reply stay as they came. JSON has one kind of number, so a
+client that took `2500.0` takes `2500`.
+
+The rule is a stream of text, not a parse of each delta: a fraction of
+zeros is held until the next character shows whether the number ends
+there or goes on, so the arguments are the same however the deltas are
+cut. A delta that is nothing but a held fraction is not sent. In
+`server.rs` the rule runs on a whole decoded reply (including one replayed
+as a stream) and on every streamed tool-call delta before the client
+encoder. It applies when either the model the client named or the model the
+route sends to is Grok's, so a group route or a relay's upstream name
+counts too.
+
 ### Still open from this refresh
 
 Room-aware group selection (`0f398c48`) needs per-model window metadata that

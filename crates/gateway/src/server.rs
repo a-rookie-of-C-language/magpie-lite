@@ -1447,7 +1447,7 @@ async fn send_with_fallback(
                                 ));
                             }
                         }
-                        let ir = match decode_upstream_response(protocol, &value) {
+                        let mut ir = match decode_upstream_response(protocol, &value) {
                             Ok(ir) => ir,
                             Err(error) => {
                                 tracker.record_attempt(
@@ -1462,6 +1462,12 @@ async fn send_with_fallback(
                                 ));
                             }
                         };
+                        // Grok writes a whole number in a call's arguments as
+                        // 2500.0; a client that types its arguments strictly
+                        // reads 2500, which is the same value in JSON.
+                        if crate::grok_integral::grok_served(&creq.model, &route.model) {
+                            crate::grok_integral::whole_reply(&mut ir);
+                        }
                         tracker.record_attempt(&route.provider.id, *key_slot, "ok");
                         return Ok((
                             UpstreamReply::Decoded {
@@ -2095,6 +2101,13 @@ async fn proxy(
         };
 
         let reask_candidate = candidate.clone();
+        // Grok writes a whole number in a call's arguments as 2500.0, which a
+        // client that types its arguments strictly turns away. The rule is
+        // per reply, and follows the model the client named or the one the
+        // route actually sends to.
+        let mut integral = crate::grok_integral::GrokIntegral::new(
+            crate::grok_integral::grok_served(&creq.model, &candidate.model),
+        );
         let opening = opening.expect("a stream reply keeps its opening guard");
         let out = async_stream::stream! {
             let _opening = opening;
@@ -2108,6 +2121,9 @@ async fn proxy(
             'attempt: loop {
                 while let Some(item) = events.next().await {
                     let mut event = item.event;
+                    // A delta that held only a fraction of zeros has nothing
+                    // to hand on: the next piece decides what the number is.
+                    let held = !integral.event(&mut event);
                     if let StreamEvent::Usage(usage) = &mut event {
                         if !item.usage_observed {
                             tracker.observe_usage(usage);
@@ -2139,6 +2155,9 @@ async fn proxy(
                         drop(events);
                         reasked = true;
                         continued = true;
+                        // The reasked reply starts its calls over; a fraction
+                        // held from the abandoned one must not leak into it.
+                        integral.reset();
                         usage_since_retry = false;
                         reasoning_reasked |= retry_reasoning;
                         empty_retries += usize::from(retry_empty);
@@ -2215,7 +2234,7 @@ async fn proxy(
                         }
                         return;
                     }
-                    if !item.usage_hidden && !suppress_start && let Some(frame) = encoder.encode(&event) {
+                    if !held && !item.usage_hidden && !suppress_start && let Some(frame) = encoder.encode(&event) {
                         usage_since_retry |= matches!(event, StreamEvent::Usage(_));
                         yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                     }

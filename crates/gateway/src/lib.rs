@@ -7,6 +7,7 @@ pub mod config_store;
 pub mod cooldown;
 mod deepseek_schema;
 mod edge_block;
+mod grok_integral;
 mod grok_schema;
 mod kimi_schema;
 mod model_gone;
