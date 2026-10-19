@@ -170,6 +170,10 @@ async fn gateway(protocol: Protocol, upstream: String) -> String {
             routing: RoutingPolicy::Rotate,
             weights: Vec::new(),
             affinity: Default::default(),
+            max_concurrency: None,
+            max_rpm: None,
+            queue_limit: None,
+            queue_wait_s: None,
             key_generation: 0,
         }],
         group: Vec::new(),
@@ -181,6 +185,8 @@ async fn gateway(protocol: Protocol, upstream: String) -> String {
         requests: Arc::new(Mutex::new(RequestLog::default())),
         key_rotation: KeyRotator::default(),
         affinity: magpie_gateway::AffinityStore::default(),
+        lanes: magpie_gateway::lanes::Lanes::default(),
+        rpms: magpie_gateway::lanes::Rpms::default(),
     });
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))

@@ -292,6 +292,10 @@ async fn spawn_gateway_with_providers_and_groups(
             routing: RoutingPolicy::Rotate,
             weights: Vec::new(),
             affinity: Default::default(),
+            max_concurrency: None,
+            max_rpm: None,
+            queue_limit: None,
+            queue_wait_s: None,
             key_generation: 0,
         });
     }
@@ -330,6 +334,8 @@ async fn spawn_gateway_with_providers_and_groups(
         requests,
         key_rotation: magpie_gateway::KeyRotator::default(),
         affinity: magpie_gateway::AffinityStore::default(),
+        lanes: magpie_gateway::lanes::Lanes::default(),
+        rpms: magpie_gateway::lanes::Rpms::default(),
     });
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -1594,6 +1600,10 @@ async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) ->
         routing: RoutingPolicy::Rotate,
         weights: Vec::new(),
         affinity: Default::default(),
+        max_concurrency: None,
+        max_rpm: None,
+        queue_limit: None,
+        queue_wait_s: None,
         key_generation: 0,
     }];
     if let Some(backup) = backup {
@@ -1613,6 +1623,10 @@ async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) ->
             routing: RoutingPolicy::Rotate,
             weights: Vec::new(),
             affinity: Default::default(),
+            max_concurrency: None,
+            max_rpm: None,
+            queue_limit: None,
+            queue_wait_s: None,
             key_generation: 0,
         });
     }
@@ -1641,6 +1655,8 @@ async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) ->
         requests,
         key_rotation: magpie_gateway::KeyRotator::default(),
         affinity: magpie_gateway::AffinityStore::default(),
+        lanes: magpie_gateway::lanes::Lanes::default(),
+        rpms: magpie_gateway::lanes::Rpms::default(),
     });
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -1688,6 +1704,10 @@ async fn spawn_gateway_with_fallback_named(
                 routing: RoutingPolicy::Rotate,
                 weights: Vec::new(),
                 affinity: Default::default(),
+                max_concurrency: None,
+                max_rpm: None,
+                queue_limit: None,
+                queue_wait_s: None,
                 key_generation: 0,
             },
             ProviderConfig {
@@ -1705,6 +1725,10 @@ async fn spawn_gateway_with_fallback_named(
                 routing: RoutingPolicy::Rotate,
                 weights: Vec::new(),
                 affinity: Default::default(),
+                max_concurrency: None,
+                max_rpm: None,
+                queue_limit: None,
+                queue_wait_s: None,
                 key_generation: 0,
             },
         ],
@@ -1718,6 +1742,8 @@ async fn spawn_gateway_with_fallback_named(
         requests,
         key_rotation: magpie_gateway::KeyRotator::default(),
         affinity: magpie_gateway::AffinityStore::default(),
+        lanes: magpie_gateway::lanes::Lanes::default(),
+        rpms: magpie_gateway::lanes::Rpms::default(),
     });
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -1756,6 +1782,10 @@ async fn spawn_gateway_with_same_provider_group(upstream: String) -> String {
             routing: RoutingPolicy::Rotate,
             weights: Vec::new(),
             affinity: Default::default(),
+            max_concurrency: None,
+            max_rpm: None,
+            queue_limit: None,
+            queue_wait_s: None,
             key_generation: 0,
         }],
         group: vec![GroupConfig {
@@ -1776,6 +1806,8 @@ async fn spawn_gateway_with_same_provider_group(upstream: String) -> String {
         requests,
         key_rotation: magpie_gateway::KeyRotator::default(),
         affinity: magpie_gateway::AffinityStore::default(),
+        lanes: magpie_gateway::lanes::Lanes::default(),
+        rpms: magpie_gateway::lanes::Rpms::default(),
     });
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -1827,6 +1859,10 @@ async fn spawn_gateway_with_group_weights(
                 routing: RoutingPolicy::Rotate,
                 weights: Vec::new(),
                 affinity: Default::default(),
+                max_concurrency: None,
+                max_rpm: None,
+                queue_limit: None,
+                queue_wait_s: None,
                 key_generation: 0,
             },
             ProviderConfig {
@@ -1844,6 +1880,10 @@ async fn spawn_gateway_with_group_weights(
                 routing: RoutingPolicy::Rotate,
                 weights: Vec::new(),
                 affinity: Default::default(),
+                max_concurrency: None,
+                max_rpm: None,
+                queue_limit: None,
+                queue_wait_s: None,
                 key_generation: 0,
             },
         ],
@@ -1865,6 +1905,8 @@ async fn spawn_gateway_with_group_weights(
         requests,
         key_rotation: magpie_gateway::KeyRotator::default(),
         affinity: magpie_gateway::AffinityStore::default(),
+        lanes: magpie_gateway::lanes::Lanes::default(),
+        rpms: magpie_gateway::lanes::Rpms::default(),
     });
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))

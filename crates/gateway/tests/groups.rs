@@ -72,6 +72,10 @@ async fn gateway(referenced: bool) -> Gateway {
             routing: magpie_gateway::RoutingPolicy::Rotate,
             weights: Vec::new(),
             affinity: Default::default(),
+            max_concurrency: None,
+            max_rpm: None,
+            queue_limit: None,
+            queue_wait_s: None,
             key_generation: 0,
         }],
         ..Config::default()
@@ -84,6 +88,8 @@ async fn gateway(referenced: bool) -> Gateway {
         requests: Arc::new(Mutex::new(magpie_gateway::usage::RequestLog::default())),
         key_rotation: magpie_gateway::KeyRotator::default(),
         affinity: magpie_gateway::AffinityStore::default(),
+        lanes: magpie_gateway::lanes::Lanes::default(),
+        rpms: magpie_gateway::lanes::Rpms::default(),
     });
     let (url, gateway_task) = bind(build_router(state)).await;
     Gateway {

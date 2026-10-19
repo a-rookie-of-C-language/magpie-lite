@@ -161,6 +161,8 @@ impl Fixture {
             requests: Arc::new(Mutex::new(magpie_gateway::usage::RequestLog::default())),
             key_rotation: KeyRotator::default(),
             affinity: AffinityStore::default(),
+            lanes: magpie_gateway::lanes::Lanes::default(),
+            rpms: magpie_gateway::lanes::Rpms::default(),
         });
         let (url, task) = bind(build_router(state.clone())).await;
         Self {
@@ -381,6 +383,8 @@ async fn tools_require_authentication_validate_before_network_and_need_no_persis
         requests: Arc::new(Mutex::new(magpie_gateway::usage::RequestLog::default())),
         key_rotation: KeyRotator::default(),
         affinity: AffinityStore::default(),
+        lanes: magpie_gateway::lanes::Lanes::default(),
+        rpms: magpie_gateway::lanes::Rpms::default(),
     });
     let (url, task) = bind(build_router(state)).await;
     let response = reqwest::Client::new()

@@ -158,6 +158,27 @@ pub struct ProviderConfig {
     /// already answered it. `auto` follows the routing policy.
     #[serde(default)]
     pub affinity: Affinity,
+    /// How many requests may be out at the vendor at once on each of its
+    /// keys — the key, else the provider (`who_of`). One more waits in an
+    /// unbounded queue in the order it came, and is sent when one out is
+    /// done. 0 (the default) is no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u32>,
+    /// How many requests each of its keys may send the vendor in any
+    /// rolling 60 seconds. One more waits until the oldest request of the
+    /// minute is a minute old, in the order they came. 0 is no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rpm: Option<u32>,
+    /// How many requests may wait in one key's queue at once; a further
+    /// request is turned away at once with a 429. 0 (the default) is no
+    /// bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_limit: Option<u32>,
+    /// How many seconds a request may wait in the queue or for room in the
+    /// minute before it is turned away with a 429. 0 (the default) waits
+    /// unboundedly in the queue (and up to 2 minutes for the minute).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_wait_s: Option<u32>,
     /// Process-local credential/endpoint version; never saved or disclosed.
     #[serde(skip)]
     pub key_generation: u64,
@@ -277,6 +298,30 @@ impl ProviderConfig {
     /// known. A window may be keyed by the upstream model id or a listed alias.
     pub fn window_of(&self, model: &str) -> u64 {
         self.contexts.get(model).copied().unwrap_or(0)
+    }
+
+    /// How many requests may be out at once on one of its keys, 0 for no
+    /// limit (`max_concurrency`, the reference's `LaneLimit`).
+    pub fn lane_limit(&self) -> u32 {
+        self.max_concurrency.unwrap_or(0)
+    }
+
+    /// How many requests one of its keys may send in a rolling minute, 0
+    /// for no limit (`max_rpm`, the reference's `RPMLimit`).
+    pub fn rpm_limit(&self) -> u32 {
+        self.max_rpm.unwrap_or(0)
+    }
+
+    /// How many requests may wait in one key's queue, 0 for no bound
+    /// (`queue_limit`).
+    pub fn queue_bound(&self) -> u32 {
+        self.queue_limit.unwrap_or(0)
+    }
+
+    /// How long a request may wait in the queue, in seconds, 0 for as long
+    /// as it takes (`queue_wait`).
+    pub fn queue_wait(&self) -> Duration {
+        Duration::from_secs(self.queue_wait_s.unwrap_or(0) as u64)
     }
 }
 
@@ -942,6 +987,14 @@ pub struct ProviderConfigSnapshot {
     pub weights: Vec<u32>,
     /// How much this provider keeps one conversation on the same account.
     pub affinity: Affinity,
+    /// Requests allowed out at once per key; null for no limit.
+    pub max_concurrency: Option<u32>,
+    /// Requests allowed per rolling minute per key; null for no limit.
+    pub max_rpm: Option<u32>,
+    /// Requests allowed to wait in a key's queue; null for no bound.
+    pub queue_limit: Option<u32>,
+    /// Seconds a request may wait in the queue; null for as long as it takes.
+    pub queue_wait_s: Option<u32>,
 }
 
 /// Capability metadata exposed by the secret-free configuration snapshot.
@@ -1292,6 +1345,10 @@ impl Config {
                     routing: p.routing,
                     weights: p.key_weights(),
                     affinity: p.affinity,
+                    max_concurrency: p.max_concurrency,
+                    max_rpm: p.max_rpm,
+                    queue_limit: p.queue_limit,
+                    queue_wait_s: p.queue_wait_s,
                 })
                 .collect(),
             groups: self
@@ -1479,6 +1536,10 @@ base_url = "http://127.0.0.1:1/v1"
             routing: RoutingPolicy::Rotate,
             weights: Vec::new(),
             affinity: Default::default(),
+            max_concurrency: None,
+            max_rpm: None,
+            queue_limit: None,
+            queue_wait_s: None,
             key_generation: 0,
         };
         assert!(provider.validate().is_ok());
@@ -1510,6 +1571,10 @@ base_url = "http://127.0.0.1:1/v1"
             routing: RoutingPolicy::Rotate,
             weights: Vec::new(),
             affinity: Default::default(),
+            max_concurrency: None,
+            max_rpm: None,
+            queue_limit: None,
+            queue_wait_s: None,
             key_generation: 0,
         };
 
@@ -1548,6 +1613,10 @@ base_url = "http://127.0.0.1:1/v1"
             routing: RoutingPolicy::Rotate,
             weights: Vec::new(),
             affinity: Default::default(),
+            max_concurrency: None,
+            max_rpm: None,
+            queue_limit: None,
+            queue_wait_s: None,
             key_generation: 0,
         };
         let encoded = toml::to_string(&provider).unwrap();
@@ -1580,6 +1649,10 @@ base_url = "http://127.0.0.1:1/v1"
             routing: RoutingPolicy::Rotate,
             weights: Vec::new(),
             affinity: Default::default(),
+            max_concurrency: None,
+            max_rpm: None,
+            queue_limit: None,
+            queue_wait_s: None,
             key_generation: 0,
         };
         assert!(provider.validate().is_err());
@@ -1607,6 +1680,10 @@ base_url = "http://127.0.0.1:1/v1"
             routing: RoutingPolicy::Rotate,
             weights: Vec::new(),
             affinity: Default::default(),
+            max_concurrency: None,
+            max_rpm: None,
+            queue_limit: None,
+            queue_wait_s: None,
             key_generation: 0,
         });
         let snapshot = config.snapshot();
@@ -1817,6 +1894,10 @@ base_url = "http://127.0.0.1:1/v1"
                 routing: RoutingPolicy::Rotate,
                 weights: Vec::new(),
                 affinity: Default::default(),
+                max_concurrency: None,
+                max_rpm: None,
+                queue_limit: None,
+                queue_wait_s: None,
                 key_generation: 0,
             }],
             ..Default::default()
@@ -1852,6 +1933,10 @@ base_url = "http://127.0.0.1:1/v1"
             routing: RoutingPolicy::Rotate,
             weights: Vec::new(),
             affinity: Default::default(),
+            max_concurrency: None,
+            max_rpm: None,
+            queue_limit: None,
+            queue_wait_s: None,
             key_generation: 0,
         });
         config.group.push(GroupConfig {
@@ -1984,6 +2069,10 @@ affinity = "session"
             routing: RoutingPolicy::Rotate,
             weights: Vec::new(),
             affinity: Affinity::Session,
+            max_concurrency: None,
+            max_rpm: None,
+            queue_limit: None,
+            queue_wait_s: None,
             key_generation: 0,
         });
         config.group.push(GroupConfig {
@@ -2120,6 +2209,10 @@ affinity = "session"
             routing: RoutingPolicy::Rotate,
             weights: Vec::new(),
             affinity: Default::default(),
+            max_concurrency: None,
+            max_rpm: None,
+            queue_limit: None,
+            queue_wait_s: None,
             key_generation: 0,
         };
 

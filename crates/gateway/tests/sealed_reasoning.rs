@@ -198,6 +198,10 @@ async fn fixture(protocol: Protocol, fail: bool) -> Fixture {
         routing: RoutingPolicy::Rotate,
         weights: Vec::new(),
         affinity: Default::default(),
+        max_concurrency: None,
+        max_rpm: None,
+        queue_limit: None,
+        queue_wait_s: None,
         key_generation: 0,
     };
     let backup = ProviderConfig {
@@ -229,6 +233,8 @@ async fn fixture(protocol: Protocol, fail: bool) -> Fixture {
         requests: log.clone(),
         key_rotation: KeyRotator::default(),
         affinity: AffinityStore::default(),
+        lanes: magpie_gateway::lanes::Lanes::default(),
+        rpms: magpie_gateway::lanes::Rpms::default(),
     })))
     .await;
     Fixture {

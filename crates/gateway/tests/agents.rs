@@ -46,6 +46,10 @@ async fn server(enabled: bool) -> Server {
             routing: RoutingPolicy::Rotate,
             weights: Vec::new(),
             affinity: Default::default(),
+            max_concurrency: None,
+            max_rpm: None,
+            queue_limit: None,
+            queue_wait_s: None,
             key_generation: 0,
         }],
         group: vec![GroupConfig {
@@ -80,6 +84,8 @@ async fn server(enabled: bool) -> Server {
         requests: Arc::new(Mutex::new(magpie_gateway::usage::RequestLog::default())),
         key_rotation: magpie_gateway::KeyRotator::default(),
         affinity: magpie_gateway::AffinityStore::default(),
+        lanes: magpie_gateway::lanes::Lanes::default(),
+        rpms: magpie_gateway::lanes::Rpms::default(),
     });
     let task = tokio::spawn(async move {
         axum::serve(listener, build_router(state)).await.unwrap();

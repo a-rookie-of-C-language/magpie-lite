@@ -198,6 +198,18 @@ enum ProviderCommand {
         /// How strongly a conversation stays with the key that answered it: auto, session, turn, or off.
         #[arg(long, default_value = "auto")]
         affinity: Affinity,
+        /// Requests out at the vendor at once on each key; one more queues in turn.
+        #[arg(long)]
+        max_concurrency: Option<u32>,
+        /// Requests one key may send in a rolling minute.
+        #[arg(long)]
+        max_rpm: Option<u32>,
+        /// How many requests may wait in one key's queue; one more is a 429.
+        #[arg(long)]
+        queue_limit: Option<u32>,
+        /// Seconds a request may wait in a key's queue or for room in its minute.
+        #[arg(long)]
+        queue_wait_s: Option<u32>,
         /// Make this the provider for models that name none.
         #[arg(long)]
         default: bool,
@@ -315,6 +327,10 @@ async fn main() -> Result<()> {
                 routing,
                 key_weights,
                 affinity,
+                max_concurrency,
+                max_rpm,
+                queue_limit,
+                queue_wait_s,
                 default,
             } => {
                 if id == "group" {
@@ -337,6 +353,10 @@ async fn main() -> Result<()> {
                     weights: key_weights,
                     capabilities: Default::default(),
                     affinity,
+                    max_concurrency,
+                    max_rpm,
+                    queue_limit,
+                    queue_wait_s,
                     key_generation: 0,
                 };
                 cfg.set_provider(provider, default)?;

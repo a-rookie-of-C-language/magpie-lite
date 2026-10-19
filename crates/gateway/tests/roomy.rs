@@ -106,6 +106,10 @@ fn provider(id: &str, url: String, window: u64) -> ProviderConfig {
         routing: RoutingPolicy::Order,
         weights: Vec::new(),
         affinity: Default::default(),
+        max_concurrency: None,
+        max_rpm: None,
+        queue_limit: None,
+        queue_wait_s: None,
         key_generation: 0,
     }
 }
@@ -142,6 +146,8 @@ async fn gateway(free: ProviderConfig, paid: ProviderConfig) -> String {
         requests: Arc::new(Mutex::new(RequestLog::default())),
         key_rotation: KeyRotator::default(),
         affinity: magpie_gateway::AffinityStore::default(),
+        lanes: magpie_gateway::lanes::Lanes::default(),
+        rpms: magpie_gateway::lanes::Rpms::default(),
     });
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await

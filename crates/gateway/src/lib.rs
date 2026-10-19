@@ -10,6 +10,7 @@ mod edge_block;
 mod grok_integral;
 mod grok_schema;
 mod kimi_schema;
+pub mod lanes;
 mod model_gone;
 mod object_root;
 mod oneof_schema;

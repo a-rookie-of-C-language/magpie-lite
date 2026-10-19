@@ -115,6 +115,8 @@ async fn gateway() -> Gateway {
         requests: Arc::new(Mutex::new(magpie_gateway::usage::RequestLog::default())),
         key_rotation: KeyRotator::default(),
         affinity: AffinityStore::default(),
+        lanes: magpie_gateway::lanes::Lanes::default(),
+        rpms: magpie_gateway::lanes::Rpms::default(),
     });
     let (url, task) = bind(build_router(state.clone())).await;
     Gateway {
@@ -587,6 +589,8 @@ async fn metadata_edit_preserves_legacy_keys_and_cooldown_then_explicit_clear_re
         requests: Arc::new(Mutex::new(magpie_gateway::usage::RequestLog::default())),
         key_rotation: KeyRotator::default(),
         affinity: AffinityStore::default(),
+        lanes: magpie_gateway::lanes::Lanes::default(),
+        rpms: magpie_gateway::lanes::Rpms::default(),
     });
     let (url, task) = bind(build_router(state.clone())).await;
     let mut gw = gw;

@@ -663,6 +663,10 @@
                   <div class="field"><label for="provider-cap-vision">Vision/multimodal input</label><select id="provider-cap-vision" class="token-input"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></div>
                   <div class="field"><label for="provider-fallback">Fallback routes (optional)</label><textarea id="provider-fallback" class="token-input" placeholder="backup/model&#10;group/daily" aria-describedby="provider-fallback-help"></textarea><p id="provider-fallback-help" class="group-help">One route per line, tried in order. Providers and groups must already exist.</p></div>
                   <div class="field"><label for="provider-cooldown">Key cooldown in milliseconds (optional)</label><input id="provider-cooldown" class="token-input" type="number" min="0" step="1" placeholder="Gateway default" aria-describedby="provider-cooldown-help"><p id="provider-cooldown-help" class="group-help">Leave blank to inherit the gateway default. Use 0 to disable cooldown.</p><label class="switch"><input id="provider-default" type="checkbox">Make default provider</label><p class="group-help">To switch defaults, select this option on the provider you want to use.</p></div>
+                  <div class="field"><label for="provider-max-concurrency">Max concurrency per key (optional)</label><input id="provider-max-concurrency" class="token-input" type="number" min="0" step="1" placeholder="No limit" aria-describedby="provider-max-concurrency-help"><p id="provider-max-concurrency-help" class="group-help">Requests out at the vendor at once on each key. One more queues, in turn, and is never passed to a fallback for want of a slot.</p></div>
+                  <div class="field"><label for="provider-max-rpm">Max requests per minute per key (optional)</label><input id="provider-max-rpm" class="token-input" type="number" min="0" step="1" placeholder="No limit" aria-describedby="provider-max-rpm-help"><p id="provider-max-rpm-help" class="group-help">A rolling 60-second window each key sends in. One more waits until the oldest of the minute is a minute old.</p></div>
+                  <div class="field"><label for="provider-queue-limit">Queue bound per key (optional)</label><input id="provider-queue-limit" class="token-input" type="number" min="0" step="1" placeholder="No bound" aria-describedby="provider-queue-limit-help"><p id="provider-queue-limit-help" class="group-help">How many may wait for one key's slot. One more is turned away at once with a 429.</p></div>
+                  <div class="field"><label for="provider-queue-wait">Queue wait in seconds (optional)</label><input id="provider-queue-wait" class="token-input" type="number" min="0" step="1" placeholder="As long as it takes" aria-describedby="provider-queue-wait-help"><p id="provider-queue-wait-help" class="group-help">How long one waits in a key's queue before a 429, and how long it may wait for room in the minute.</p></div>
                 </div>
                 <div class="field"><label for="provider-test-model">Test model (optional)</label><input id="provider-test-model" class="token-input" list="provider-discovered-models" placeholder="First listed model" aria-describedby="provider-tools-help"><datalist id="provider-discovered-models"></datalist><p id="provider-tools-help" class="group-help">Discovery appends model IDs to this draft. Testing sends a small generation request (up to 64 output tokens) and may incur provider charges. Neither operation saves configuration or changes gateway usage/cooldowns.</p></div>
                 <div class="group-actions"><button id="provider-discover" type="button" class="button secondary">Discover models</button><button id="provider-test" type="button" class="button secondary">Test connection</button></div>
@@ -791,6 +795,10 @@
       providerWeights: document.getElementById("provider-weights"),
       providerFallback: document.getElementById("provider-fallback"),
       providerCooldown: document.getElementById("provider-cooldown"),
+      providerMaxConcurrency: document.getElementById("provider-max-concurrency"),
+      providerMaxRpm: document.getElementById("provider-max-rpm"),
+      providerQueueLimit: document.getElementById("provider-queue-limit"),
+      providerQueueWait: document.getElementById("provider-queue-wait"),
       providerDefault: document.getElementById("provider-default"),
       providerNew: document.getElementById("provider-new"),
       providerSave: document.getElementById("provider-save"),
@@ -1434,6 +1442,10 @@
       elements.providerWeights.value = (provider?.weights || []).join("\n");
       routingChanged();
       elements.providerCooldown.value = provider?.key_cooldown_override_ms ?? "";
+      elements.providerMaxConcurrency.value = provider?.max_concurrency ?? "";
+      elements.providerMaxRpm.value = provider?.max_rpm ?? "";
+      elements.providerQueueLimit.value = provider?.queue_limit ?? "";
+      elements.providerQueueWait.value = provider?.queue_wait_s ?? "";
       elements.providerDefault.checked = provider ? routingSnapshot.default_provider === provider.id : !(routingSnapshot?.providers || []).length;
       elements.providerDefault.disabled = managementBusy;
       elements.providerKeyMode.value = provider ? "keep" : "replace";
@@ -1551,6 +1563,25 @@
         elements.providerCooldown.focus();
         return;
       }
+      const numericField = (input, label) => {
+        const value = input.value;
+        if (value === "") return { ok: true, value: null };
+        const n = Number(value);
+        if (!Number.isSafeInteger(n) || n < 0) {
+          elements.providerMessage.textContent = label + " must be a non-negative whole number.";
+          input.focus();
+          return { ok: false };
+        }
+        return { ok: true, value: n };
+      };
+      const maxConcurrency = numericField(elements.providerMaxConcurrency, "Max concurrency");
+      if (!maxConcurrency.ok) return;
+      const maxRpm = numericField(elements.providerMaxRpm, "Max requests per minute");
+      if (!maxRpm.ok) return;
+      const queueLimit = numericField(elements.providerQueueLimit, "Queue bound");
+      if (!queueLimit.ok) return;
+      const queueWait = numericField(elements.providerQueueWait, "Queue wait");
+      if (!queueWait.ok) return;
       const contexts = contextWindows();
       if (contexts === null) return;
       const body = {
@@ -1568,6 +1599,10 @@
         contexts,
         fallback: lines(elements.providerFallback.value),
         key_cooldown_ms: cooldown === "" ? null : Number(cooldown),
+        max_concurrency: maxConcurrency.value,
+        max_rpm: maxRpm.value,
+        queue_limit: queueLimit.value,
+        queue_wait_s: queueWait.value,
         make_default: elements.providerDefault.checked
       };
       const routing = elements.providerRouting.value;

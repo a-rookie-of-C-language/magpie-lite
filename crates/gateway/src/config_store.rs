@@ -636,6 +636,10 @@ mod tests {
                     routing: RoutingPolicy::Rotate,
                     weights: Vec::new(),
                     affinity: Default::default(),
+                    max_concurrency: None,
+                    max_rpm: None,
+                    queue_limit: None,
+                    queue_wait_s: None,
                     key_generation: 0,
                 };
                 config.set_provider(provider, true).unwrap();
@@ -758,6 +762,10 @@ mod tests {
                             routing: RoutingPolicy::Rotate,
                             weights: Vec::new(),
                             affinity: Default::default(),
+                            max_concurrency: None,
+                            max_rpm: None,
+                            queue_limit: None,
+                            queue_wait_s: None,
                             key_generation: 0,
                         },
                         true,

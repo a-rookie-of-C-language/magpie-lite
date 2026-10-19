@@ -28,6 +28,7 @@ use crate::config::{Affinity, Config, GroupConfig, Protocol, ProviderConfig};
 use crate::config_store::{ConfigStore, IdempotencyRequest};
 use crate::cooldown::quota_cooldown;
 use crate::edge_block::{BLOCKED_HINT, edge_blocked, edge_blocked_text};
+use crate::lanes;
 use crate::model_gone::{
     context_overflowed, model_refused, model_retired, prompt_refused, protection_refused,
     shape_refused,
@@ -65,6 +66,9 @@ pub struct AppState {
     /// Which key answered each conversation, so its prompt cache keeps
     /// hitting.
     pub affinity: AffinityStore,
+    /// Per-key concurrency slots and request-per-minute windows.
+    pub lanes: lanes::Lanes,
+    pub rpms: lanes::Rpms,
 }
 
 /// Build the router around a state; what `serve` runs and tests drive.
@@ -224,6 +228,8 @@ pub async fn serve_with_config_path(
         requests,
         key_rotation: crate::config::KeyRotator::default(),
         affinity,
+        lanes: lanes::Lanes::default(),
+        rpms: lanes::Rpms::default(),
     });
     let app = build_router(Arc::clone(&state));
 
@@ -618,6 +624,140 @@ impl UpstreamCandidate {
                 .find(|(slot, _)| *slot == key_slot)
                 .map(|(_, key)| who_of(&route.provider.id, key))
                 .unwrap_or_else(|| who_of(&route.provider.id, "")),
+        }
+    }
+}
+
+/// The why a request was turned away by a key's queue or minute, worded as
+/// the reference's `laneMessage` words it.
+fn lane_failure(
+    provider: &ProviderConfig,
+    error: impl std::fmt::Display,
+    retry_after: Option<u64>,
+) -> ProxyFailure {
+    let label = format!(
+        "{}/{}",
+        provider.id,
+        provider.models.first().map_or("", |m| m.as_str())
+    );
+    let message = format!("{label}: {error}");
+    ProxyFailure::lane(StatusCode::TOO_MANY_REQUESTS, message, retry_after)
+}
+
+/// Whether a request for `who` under `provider` would go at once: a slot
+/// free in its lane and room in its minute (the reference's `ready`).
+fn candidate_ready(state: &AppState, provider: &ProviderConfig, who: &str) -> bool {
+    lanes::ready(
+        &state.lanes,
+        &state.rpms,
+        who,
+        provider.lane_limit(),
+        provider.rpm_limit(),
+    )
+}
+
+/// Reorder `routes` so that wherever a route's first busy key would queue,
+/// a later route/key with a slot free now goes first — another key of the
+/// same provider, or another member of the same group (the reference's
+/// `laneMate`, #892). Fallback providers are never moved ahead of a full
+/// one; they only answer when the whole first provider refused.
+fn give_way_to_free_lanes(state: &AppState, routes: &mut Vec<UpstreamRoute>) {
+    let mut gave: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Within a route: when its first key's lane is full, a later key of
+    // the same provider with a slot free goes first.
+    for route in routes.iter_mut() {
+        let mut gave_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut i = 0;
+        while i < route.api_keys.len() {
+            let who = who_of(&route.provider.id, &route.api_keys[i].1);
+            if gave_keys.contains(&who) || candidate_ready(state, &route.provider, &who) {
+                i += 1;
+                continue;
+            }
+            let mut found = None;
+            for j in (i + 1)..route.api_keys.len() {
+                let j_who = who_of(&route.provider.id, &route.api_keys[j].1);
+                if j_who != who && candidate_ready(state, &route.provider, &j_who) {
+                    found = Some(j);
+                    break;
+                }
+            }
+            match found {
+                Some(j) => {
+                    gave_keys.insert(who);
+                    let key = route.api_keys.remove(i);
+                    route.api_keys.insert(j, key);
+                }
+                None => i += 1,
+            }
+        }
+    }
+    // Across routes: within a group, a member whose first key is full gives
+    // way to a later member with a slot free.
+    let mut i = 0;
+    while i < routes.len() {
+        let (first_who, first_ready, first_group, first_provider) = {
+            let route = &routes[i];
+            let who = route
+                .api_keys
+                .first()
+                .map(|(_, key)| who_of(&route.provider.id, key))
+                .unwrap_or_else(|| who_of(&route.provider.id, ""));
+            (
+                who,
+                candidate_ready(
+                    state,
+                    &route.provider,
+                    &who_of(
+                        &route.provider.id,
+                        route
+                            .api_keys
+                            .first()
+                            .map(|(_, k)| k.as_str())
+                            .unwrap_or(""),
+                    ),
+                ),
+                route.group_id.is_some(),
+                route.provider.id.clone(),
+            )
+        };
+        if gave.contains(&first_who) || first_ready {
+            i += 1;
+            continue;
+        }
+        let mut found = None;
+        for j in (i + 1)..routes.len() {
+            let (j_who, j_provider, j_group) = {
+                let m = &routes[j];
+                let who = m
+                    .api_keys
+                    .first()
+                    .map(|(_, key)| who_of(&m.provider.id, key))
+                    .unwrap_or_else(|| who_of(&m.provider.id, ""));
+                (who, m.provider.id.clone(), m.group_id.is_some())
+            };
+            if j_who == first_who {
+                continue;
+            }
+            // In a group any member may give way; outside one only another
+            // key of the same provider may.
+            if !first_group && j_provider != first_provider {
+                continue;
+            }
+            let _ = j_group;
+            if candidate_ready(state, &routes[j].provider, &j_who) {
+                found = Some(j);
+                break;
+            }
+        }
+        match found {
+            Some(j) => {
+                gave.insert(first_who);
+                let route = routes.remove(i);
+                routes.insert(j, route);
+                // Do not advance: the moved-in route is asked next.
+            }
+            None => i += 1,
         }
     }
 }
@@ -1260,6 +1400,11 @@ async fn send_with_fallback(
     }
     let mut decision = decision.expect("a route always carries its affinity");
     leave_out_routes_without_room(&mut routes, &mut decision, creq);
+    // A key or account whose lane is full gives way to one with a slot
+    // free now: another key of its provider, or another member of its
+    // routing group (the reference's laneMate, #892). A fallback provider
+    // is never asked for want of a slot.
+    give_way_to_free_lanes(state, &mut routes);
     let last_route = routes.len().saturating_sub(1);
     let no_route = routes
         .first()
@@ -1285,6 +1430,59 @@ async fn send_with_fallback(
         'keys: for (attempt, (key_slot, api_key)) in route.api_keys.iter().enumerate() {
             let candidate = UpstreamCandidate::new(&route, *key_slot);
             tracker.begin_attempt(&route.provider.id, &route.model, *key_slot);
+            // A key or account with `max_concurrency` is asked once one of
+            // its slots is free, in turn; one with `max_rpm` then waits for
+            // room in its minute. Its queue full, or its wait out, nobody
+            // failed and nobody rests: the next key or member is asked,
+            // else the agent is told with a 429 and Retry-After (#892).
+            let who = who_of(&route.provider.id, api_key);
+            let slot = match state
+                .lanes
+                .take(
+                    &who,
+                    route.provider.lane_limit(),
+                    route.provider.queue_bound(),
+                    route.provider.queue_wait(),
+                )
+                .await
+            {
+                Ok(slot) => slot,
+                Err(error) => {
+                    let failure = lane_failure(&route.provider, error, None);
+                    tracker.record_attempt(&route.provider.id, *key_slot, "queue_refused");
+                    if attempt + 1 < route.api_keys.len() {
+                        continue 'keys;
+                    }
+                    if route_index != last_route && route.group_id.is_none() {
+                        break 'keys;
+                    }
+                    if route_index != last_route {
+                        break 'keys;
+                    }
+                    return Err((failure, candidate, decision.clone()));
+                }
+            };
+            if let Err(error) = state
+                .rpms
+                .wait(
+                    &who,
+                    route.provider.rpm_limit(),
+                    lanes::rpm_longest(&route.provider),
+                )
+                .await
+            {
+                drop(slot);
+                let retry_after = error.retry_after();
+                let failure = lane_failure(&route.provider, error, Some(retry_after));
+                tracker.record_attempt(&route.provider.id, *key_slot, "rpm_refused");
+                if attempt + 1 < route.api_keys.len() {
+                    continue 'keys;
+                }
+                if route_index != last_route {
+                    break 'keys;
+                }
+                return Err((failure, candidate, decision.clone()));
+            }
             let folds_roots = object_root::folds_roots(&route.provider, &route.model);
             let mut empty_retries = 0;
             let mut optional_retry: Option<Vec<&'static str>> = None;
@@ -2024,6 +2222,7 @@ struct ProxyFailure {
     kind: FailureKind,
     status: StatusCode,
     message: String,
+    retry_after: Option<u64>,
 }
 
 impl ProxyFailure {
@@ -2032,6 +2231,7 @@ impl ProxyFailure {
             kind: FailureKind::Upstream,
             status,
             message: message.into(),
+            retry_after: None,
         }
     }
 
@@ -2040,6 +2240,18 @@ impl ProxyFailure {
             kind: FailureKind::Refusal,
             status: StatusCode::BAD_REQUEST,
             message: REFUSAL.into(),
+            retry_after: None,
+        }
+    }
+
+    /// A request turned away by a key's queue or minute, telling the agent
+    /// when it may ask again (the reference's `laneMessage` + Retry-After).
+    fn lane(status: StatusCode, message: impl Into<String>, retry_after: Option<u64>) -> Self {
+        Self {
+            kind: FailureKind::Upstream,
+            status,
+            message: message.into(),
+            retry_after,
         }
     }
 
@@ -2053,7 +2265,15 @@ impl ProxyFailure {
 
     fn response(self, wire: ClientWire) -> Response {
         let (status, kind, message) = client_error(self.status, &self.message, wire);
-        err_response(status, wire.error_body_kind(status, &message, kind))
+        let mut response = err_response(status, wire.error_body_kind(status, &message, kind));
+        if let Some(seconds) = self.retry_after {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                header::HeaderValue::from_str(&seconds.to_string())
+                    .unwrap_or_else(|_| header::HeaderValue::from_static("1")),
+            );
+        }
+        response
     }
 }
 
@@ -3171,6 +3391,10 @@ mod tests {
             routing: RoutingPolicy::Rotate,
             weights: Vec::new(),
             affinity: Default::default(),
+            max_concurrency: None,
+            max_rpm: None,
+            queue_limit: None,
+            queue_wait_s: None,
             key_generation: 0,
         }
     }
@@ -3244,6 +3468,8 @@ mod tests {
                     requests: log.clone(),
                     key_rotation: Default::default(),
                     affinity: AffinityStore::default(),
+                    lanes: lanes::Lanes::default(),
+                    rpms: lanes::Rpms::default(),
                 });
                 let requested = if grouped {
                     "group/daily"
@@ -3292,6 +3518,8 @@ mod tests {
             requests: Arc::new(Mutex::new(crate::usage::RequestLog::default())),
             key_rotation: Default::default(),
             affinity: AffinityStore::default(),
+            lanes: lanes::Lanes::default(),
+            rpms: lanes::Rpms::default(),
         })
     }
 

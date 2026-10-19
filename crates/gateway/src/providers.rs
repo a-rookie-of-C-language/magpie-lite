@@ -42,6 +42,11 @@ pub(crate) struct ProviderEdit {
     routing: Option<RoutingPolicy>,
     /// Omitted on update to preserve the existing affinity.
     affinity: Option<Affinity>,
+    /// Omitted on update to preserve the existing limits.
+    max_concurrency: Option<u32>,
+    max_rpm: Option<u32>,
+    queue_limit: Option<u32>,
+    queue_wait_s: Option<u32>,
     /// Omitted on update to preserve the existing weights; `[]` clears them.
     weights: Option<Vec<u32>>,
     #[serde(default)]
@@ -74,6 +79,18 @@ impl ProviderEdit {
         let affinity = self
             .affinity
             .unwrap_or_else(|| existing.map(|p| p.affinity).unwrap_or_default());
+        let max_concurrency = self
+            .max_concurrency
+            .or_else(|| existing.map(|p| p.max_concurrency).unwrap_or_default());
+        let max_rpm = self
+            .max_rpm
+            .or_else(|| existing.map(|p| p.max_rpm).unwrap_or_default());
+        let queue_limit = self
+            .queue_limit
+            .or_else(|| existing.map(|p| p.queue_limit).unwrap_or_default());
+        let queue_wait_s = self
+            .queue_wait_s
+            .or_else(|| existing.map(|p| p.queue_wait_s).unwrap_or_default());
         ProviderConfig {
             id: self.id,
             name: self.name,
@@ -89,6 +106,10 @@ impl ProviderEdit {
             routing,
             weights,
             affinity,
+            max_concurrency,
+            max_rpm,
+            queue_limit,
+            queue_wait_s,
             key_generation: 0,
         }
     }
