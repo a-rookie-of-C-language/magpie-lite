@@ -1,7 +1,7 @@
 # Core parity tracker
 
-Updated: 2026-10-19. Reference checkout: `D:\code\magpie` at `f76201a8`
-(1,213 commits past the prior baseline `dde3a31a`); implementation:
+Updated: 2026-10-19. Reference checkout: `D:\code\magpie` at `c483fead`
+(1,214 commits past the prior baseline `dde3a31a`); implementation:
 `D:\code\magpie-lite`.
 
 Target: multiple coding agents sharing one Rust backend, provider adapters for different services, and an interface managing providers, models, routing and usage. The reference rust-core-refactor-plan.md, rust-core-contracts.md and rust-core-admin-api.md are proposals with broader acceptance gates. This tracker does not claim G1–G16 completion or full Magpie product parity.
@@ -9,7 +9,7 @@ Target: multiple coding agents sharing one Rust backend, provider adapters for d
 | Area | Current evidence | Remaining work |
 |---|---|---|
 | Shared Rust gateway | Tool-returned image ownership and four-client/four-upstream translation with a 64-request real loopback JSON/SSE direct/group matrix (docs/tool-transcripts.md); Chat-bound split/parallel/interrupted/orphan tool-history repair with request-local ID normalization (docs/tool-transcripts.md); core wire codecs; real local HTTP/SSE terminal/error/EOF and after-header disconnect fixtures across four adapters; incremental 32 MiB raw-event bounds, BOM/CR/UTF-8 handling, opening event/metadata-byte budgets, early stream-error key/fallback/group retry, no ordinary fallback after text/reasoning/tool output, configurable per-attempt first-content/read-idle deadlines with timeout fallback, group non-final first-content switching, request-wide Responses opening release, downstream pre-header/mid-answer SSE comments with safe fallback, protocol error conversion, bounded upstream-silence windows and activity-driven cadence, bounded per-channel text/reasoning repetition protection with no answer/tool replay and one same-candidate reasoning-only reask plus bounded Gemini empty-reply reasks with combined client/history usage, and real HTTP/1.1 before/after-header cancellation with persisted accounting; see docs/stream-lifecycle.md | Recorded real-agent fixtures, broader multimodal/tool/stream conformance, queue/slow-final-route behavior, cross-protocol search-option translation and cross-client image rendering, provider-specific prefill continuation, optional post-content progress policies, HTTP/2 cancellation conformance, the remaining provider-specific rewrites (Cline pinning, Devin's Gemini schema), and RPM/concurrency queues |
-| Tool-selection policies | Four-dialect auto/none/required/named normalization; reasoning-effort levels (`none`/minimal→low, low/medium/high/xhigh/max, Anthropic budget↔level via the reference's 4096/12000/24000 breaks, Gemini thinkingLevel/thinkingBudget, Anthropic budgets fitted under the client's max_tokens cap) translated in all sixteen source×target directions with no silent drops; Responses/Gemini function subsets; request-local filtering; native-only restrictions; parallel-calls constraints (`parallel_tool_calls` on Chat/Responses, Anthropic `disable_parallel_tool_use` translated to Chat/Responses and rejected on Gemini rather than silently dropped); Responses namespace declarations/calls/tool choices and Responses custom (free-form) tools — decoded as grammar-described input functions, offered to foreign dialects, and restored to `custom_tool_call`/`custom_tool_call_input.delta` events from request-declared tools; namespace declarations/calls/tool choices, streaming namespace preservation, and request-local restoration of flat `ns__tool` names back to Responses namespace calls across Chat/Anthropic/Gemini/Responses upstreams, direct/group routes, JSON/SSE responses and cross-protocol fallback (no historical-name guessing); seven loopback HTTP tests with 576 JSON/SSE direct/group client requests, native compatible fallback without key attempts/cooldowns, search/native-policy bypass regression (docs/tool-choices.md), and dedicated namespace-restoration loopback tests in `crates/gateway/tests/namespaces.rs` | Provider-specific search options, adaptive-only Claude thinking paths, real-Agent and live-vendor evidence |
+| Tool-selection policies | Four-dialect auto/none/required/named normalization; reasoning-effort levels (`none`/minimal→low, low/medium/high/xhigh/max, Anthropic budget↔level via the reference's 4096/12000/24000 breaks, Gemini thinkingLevel/thinkingBudget, Anthropic budgets fitted under the client's max_tokens cap) translated in all sixteen source×target directions with no silent drops; Responses/Gemini function subsets; request-local filtering; native-only restrictions; parallel-calls constraints (`parallel_tool_calls` on Chat/Responses, Anthropic `disable_parallel_tool_use` translated to Chat/Responses and rejected on Gemini rather than silently dropped); Responses namespace declarations/calls/tool choices and Responses custom (free-form) tools — decoded as grammar-described input functions, offered to foreign dialects, and restored to `custom_tool_call`/`custom_tool_call_input.delta` events from request-declared tools; namespace declarations/calls/tool choices, streaming namespace preservation, and request-local restoration of flat `ns__tool` names back to Responses namespace calls across Chat/Anthropic/Gemini/Responses upstreams, direct/group routes, JSON/SSE responses and cross-protocol fallback (no historical-name guessing); seven loopback HTTP tests with 576 JSON/SSE direct/group client requests, native compatible fallback without key attempts/cooldowns, search/native-policy bypass regression (docs/tool-choices.md), dedicated namespace-restoration loopback tests in `crates/gateway/tests/namespaces.rs`; Chat-only tools-with-reasoning refusal asked once with `none`, a refused `none` returned as the original tools refusal without a lowest-level retry, endpoint refusals handed to a group's next member without resting the key, and the missing Responses URL named in the agent's error (`wrong_endpoint.rs`, `crates/gateway/tests/tools_effort_none.rs`) | Provider-specific search options, adaptive-only Claude thinking paths, real-Agent and live-vendor evidence |
 | Agent adapters | Shared magpie-agents adapters for Claude Code, Codex, Crush, Gemini CLI, Goose, OpenCode and Zed; private staged preview, revision-checked apply, OS lock, schema-2 journaled selective field restore preserving unrelated edits, disconnect, managed-field drift and explicit recovery. Agent unit, HTTP, sandboxed child CLI and real-gateway console browser tests; Windows ACL/junction checks; recursive duplicate-key JSON/JSONC refusal, format-preserving JSON edits, compact comment-free JSON object additions that preserve single-line layout, native OpenCode/Zed JSONC, shared passive CLI/config discovery with bounded user-prefix/Node-version searches, npmrc prefix and nvm default-alias handling, and PATH/unknown metadata, native absolute config-directory overrides for Claude/Codex/OpenCode/Zed, and seven-Agent selective restore through HTTP/CLI/browser | Native project overrides, login-shell/registry PATH refresh, process/reachability and real-version compatibility evidence; compact layout preservation is intentionally limited to single-line objects without direct comments |
 | Provider metadata and keys | Protected provider CRUD and console; providers.rs covers saved/live edits, secret-free capability metadata (`supported_protocols`, nullable streaming/tools/vision), protocol validation and preserve/clear semantics. provider_tools.rs covers four-protocol catalogs/probes, pagination, saved/draft/no-auth credentials and bounded read-only operations | Capability presets, specialized/stream-only probes and paid/live vendor evidence |
 | Hot edits and key rotation | ConfigStore saves before publishing; requests own snapshots. Versioned key schedules ignore stale requests. providers.rs checks an old in-flight request after a smaller pool is saved; config.rs checks stale scheduler calls. Durable config revisions/ETags and optional If-Match checks reject stale provider/group writes across restarts; the revision is committed in the atomically replaced TOML document, store and HTTP tests check unchanged disk/memory and a single winner for concurrent checked edits; gateway writers also serialize through a bounded file lock. Provider/group CRUD and agent apply now have durable idempotency with 256-entry retention, token-keyed HMAC digests, restart replay, pending fail-closed behavior, and secret-free ledgers | Encrypted secret storage with recovery; durable idempotency for any future agent rotate endpoint |
@@ -668,6 +668,47 @@ as a stream) and on every streamed tool-call delta before the client
 encoder. It applies when either the model the client named or the model the
 route sends to is Grok's, so a group route or a relay's upstream name
 counts too.
+
+### A Chat-only relay refusing tools with `none` too (`992f288e`)
+
+Some OpenAI-compatible relays serve a model on Chat Completions alone and
+refuse function tools when `reasoning_effort` is set: "Function tools with
+reasoning_effort are not supported … use /v1/responses or set
+reasoning_effort to 'none'". The reference's #176 retry asks once more with
+`none`. When the relay refuses `none` as well, naming the levels it does
+take ("Supported values are: 'low', 'medium', …"), the reference's
+`992f288e` (#2670) stopped asking the lowest level and treating that as a
+new answer: the tools refusal is the endpoint refusal it is.
+
+`crates/gateway/src/wrong_endpoint.rs` ports the reference's
+`wrongEndpoint`, `asksResponses`, `toolsWithoutEffort` and
+`effortLevelsNamed` matchers. `server.rs` now:
+
+- asks a Chat route once more with `reasoning_effort: "none"` when it
+  refuses tools with reasoning and names `none`;
+- remembers that `none` is refused when that second answer names the
+  supported levels, and hands the *original* tools refusal back as the
+  answer, rather than the confusing `'none' is not supported` one;
+- never asks `none` again for that provider, model and protocol;
+- classifies a 400/422 saying the model is served on another endpoint as a
+  shape refusal, so a group's next member is asked once and the refusing
+  member does not rest;
+- appends the reference's `wrongAPINote` to the agent's error when the
+  upstream names Responses and this provider has no Responses URL: the
+  `/v1/responses` URL to set, not only the vendor's complaint.
+
+`crates/gateway/tests/tools_effort_none.rs` uses the issue's mock relay
+shape over real loopback HTTP: a single member asked `[xhigh none]` then
+`[high]` twice, a Chat client's relayed request, a group that moves on to
+its second member while the first doesn't rest, and a relay that takes
+`none` and answers every tools request. `model_gone.rs` and
+`wrong_endpoint.rs` carry the wording unit tests.
+
+This covers the translated Chat path, which is where Lite's provider
+adapters send every request. The reference's passthrough sibling is the
+same code path here, since Lite always rebuilds the upstream body from the
+IR. These are local loopback fixtures, not the reporter's real relay or
+live-vendor evidence.
 
 ### Still open from this refresh
 

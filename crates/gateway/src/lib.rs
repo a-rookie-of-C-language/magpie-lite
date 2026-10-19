@@ -27,6 +27,7 @@ mod tool_schema;
 mod unfit_fields;
 pub mod upstream;
 pub mod usage;
+mod wrong_endpoint;
 
 pub use affinity::AffinityStore;
 pub use config::{

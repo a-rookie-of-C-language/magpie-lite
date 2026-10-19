@@ -1214,6 +1214,11 @@ async fn send_with_fallback(
             let mut empty_retries = 0;
             let mut optional_retry: Option<Vec<&'static str>> = None;
             let mut sampling_retry = false;
+            // A Chat endpoint refusing tools with reasoning was asked
+            // again with `reasoning_effort: "none"` (#176); when `none`
+            // is refused too, that refusal stands as the answer (#2670).
+            let mut tools_without_effort_retry = false;
+            let mut tools_refusal: Option<Value> = None;
             'candidate: loop {
                 liveness.activity.attempt();
                 let mut body = match upstream::build_request(&route.provider, creq, &route.model) {
@@ -1272,6 +1277,9 @@ async fn send_with_fallback(
                     body.as_object_mut()
                         .expect("request body object")
                         .remove("top_k");
+                }
+                if tools_without_effort_retry && let Some(object) = body.as_object_mut() {
+                    object.insert("reasoning_effort".into(), json!("none"));
                 }
                 tracing::debug!(
                     provider = %route.provider.id,
@@ -1625,6 +1633,52 @@ async fn send_with_fallback(
                     sampling_retry = true;
                     continue 'candidate;
                 }
+                // A Chat endpoint that refuses function tools with
+                // reasoning but names `none` is asked once more that way,
+                // when no Responses route of this member can take them
+                // (#176). When `none` is refused too, naming the levels
+                // the model takes, that refusal is not a retry at the
+                // model's lowest level — the same by the upstream's own
+                // word — but the endpoint refusal it is (#2670): the
+                // original tools refusal stands as the answer, a group's
+                // next member is asked and the key doesn't rest.
+                let mut error = error;
+                if status == StatusCode::BAD_REQUEST {
+                    if let Some(refusal) = &tools_refusal {
+                        if crate::wrong_endpoint::effort_levels_named(&error.body) {
+                            unfit_fields::refuse(
+                                &route.provider.id,
+                                &route.model,
+                                route.provider.protocol.as_str(),
+                                "reasoning_off",
+                            );
+                            error.body = refusal.clone();
+                            if let Some(message) = refusal
+                                .pointer("/error/message")
+                                .or_else(|| refusal.pointer("/message"))
+                                .and_then(Value::as_str)
+                            {
+                                error.message = format!("upstream {status}: {message}");
+                            }
+                        }
+                    } else if !tools_without_effort_retry
+                        && body
+                            .get("reasoning_effort")
+                            .and_then(Value::as_str)
+                            .is_some_and(|level| level != "none")
+                        && crate::wrong_endpoint::tools_without_effort(&error.body)
+                        && !unfit_fields::unfit(
+                            &route.provider.id,
+                            &route.model,
+                            route.provider.protocol.as_str(),
+                            "reasoning_off",
+                        )
+                    {
+                        tools_refusal = Some(error.body.clone());
+                        tools_without_effort_retry = true;
+                        continue 'candidate;
+                    }
+                }
                 if quota_limited_status(status) {
                     let cooldown = quota_cooldown(
                         &headers,
@@ -1660,6 +1714,16 @@ async fn send_with_fallback(
                 }
                 if edge_blocked(&error.body) || edge_blocked_text(&detail) {
                     detail = format!("{detail} — {BLOCKED_HINT}");
+                }
+                if crate::wrong_endpoint::wrong_endpoint(status.as_u16(), &error.body) {
+                    let asked = match route.provider.protocol {
+                        Protocol::Chat => "/v1/chat/completions",
+                        Protocol::Responses => "/v1/responses",
+                        Protocol::Anthropic => "/v1/messages",
+                        Protocol::Gemini => "generateContent",
+                    };
+                    detail =
+                        wrong_api_note(&route.provider, &route.model, &error.body, asked, detail);
                 }
                 let status =
                     StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -1783,6 +1847,30 @@ async fn reask_stream(
         },
     );
     Ok(events)
+}
+
+/// Add the reference gateway's `wrongAPINote` (#1215, #1308, #2670) to an
+/// upstream error that says the model is served on Responses, when this
+/// provider has no Responses URL: the agent is told which URL to set
+/// instead of only the upstream's complaint.
+fn wrong_api_note(
+    provider: &ProviderConfig,
+    model: &str,
+    body: &Value,
+    asked: &str,
+    mut detail: String,
+) -> String {
+    if !crate::wrong_endpoint::wrong_endpoint(400, body)
+        || !crate::wrong_endpoint::asks_responses(body)
+        || provider.protocol == Protocol::Responses
+    {
+        return detail;
+    }
+    detail.push_str(&format!(
+        " (asked at {asked}; {} is served on /v1/responses, which {} has no URL for)",
+        model, provider.name
+    ));
+    detail
 }
 
 struct ProxyFailure {

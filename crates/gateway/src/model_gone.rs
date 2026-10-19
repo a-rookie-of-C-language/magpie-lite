@@ -113,13 +113,18 @@ fn shape_words() -> &'static Regex {
 /// A request failed over its shape alone: the next member is asked, and
 /// this one doesn't rest, as nothing is wrong with it. A request missing
 /// what every API requires ("field required") or too long for the model
-/// isn't one.
+/// isn't one. An upstream saying the model is served on another endpoint
+/// than the one asked is one, once no other route of this member is left
+/// (#2670: a relay with a Chat URL alone, refusing tools with reasoning
+/// and `none` too).
 pub(crate) fn shape_refused(status: u16, body: &Value) -> bool {
     if !matches!(status, 400 | 422) {
         return false;
     }
     let text = error_text(body);
-    (shape_words().is_match(&text) || unsaid_words().is_match(&text))
+    (shape_words().is_match(&text)
+        || unsaid_words().is_match(&text)
+        || crate::wrong_endpoint::wrong_endpoint(status, body))
         && !quota_words().is_match(&text)
         && !unserved_words().is_match(&text)
         && !refused_words().is_match(&text)
@@ -418,6 +423,30 @@ mod tests {
         ] {
             assert!(!shape_refused(status, &body), "{status} {body}");
         }
+    }
+
+    #[test]
+    fn a_model_served_on_another_endpoint_is_a_shape_refusal() {
+        // A relay with a Chat URL alone, refusing tools with reasoning and
+        // `none` too (#2670): the member has no other API to ask, so the
+        // group's next member takes the request and this one doesn't rest.
+        let body = json!({"error": {
+            "message": "Function tools with reasoning_effort are not supported for gpt-6.1-sol in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.",
+            "type": "invalid_request_error"
+        }});
+        for status in [400, 422] {
+            assert!(shape_refused(status, &body), "{status}");
+        }
+        assert!(!shape_refused(500, &body));
+        // A quota or an unserved model still wins: this is neither.
+        assert!(!shape_refused(
+            400,
+            &json!({"error": {"message": "use /v1/responses; your quota is exceeded"}})
+        ));
+        assert!(!shape_refused(
+            400,
+            &json!({"error": {"message": "use /v1/responses; model not found"}})
+        ));
     }
 
     #[test]
