@@ -225,6 +225,26 @@ pub(crate) fn plain_forbidden(status: u16, body: &Value) -> bool {
         && !protection_refused(status, body)
 }
 
+/// Command Code's Zero Data Retention refusal: the error code
+/// `cmd_zdr_no_providers` as the error's `type` or `code`, on a 400 or
+/// 422 (the reference's `zdrRefused`, c8639043 / plugins#246). It is the
+/// request's setting, not the model or the key failing: nothing rests,
+/// the same provider's other keys are not asked (they would be sent the
+/// same header), and another member may serve it.
+pub(crate) fn zdr_refused(status: u16, body: &Value) -> bool {
+    (status == 400 || status == 422) && zdr_coded().is_match(&body.to_string())
+}
+
+/// The code Command Code gives a model no Zero Data Retention upstream
+/// serves, matched where the error names its code or type — not in the
+/// message's words, which read as a model unserved.
+fn zdr_coded() -> &'static Regex {
+    static ZDR: OnceLock<Regex> = OnceLock::new();
+    ZDR.get_or_init(|| {
+        Regex::new(r#""(type|code)"\s*:\s*"cmd_zdr_no_providers""#).expect("zdr coded regex")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

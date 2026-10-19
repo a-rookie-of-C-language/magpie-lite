@@ -22,6 +22,7 @@ use magpie_core::stream::SignatureTarget;
 use magpie_core::stream::{SseParser, StreamEvent};
 use magpie_core::{anthropic, chat, gemini, responses};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::affinity::{AffinityStore, Decision, Seat, who_of};
 use crate::config::{Affinity, Config, GroupConfig, Protocol, ProviderConfig};
@@ -31,7 +32,7 @@ use crate::edge_block::{BLOCKED_HINT, edge_blocked, edge_blocked_text};
 use crate::lanes;
 use crate::model_gone::{
     context_overflowed, model_refused, model_retired, plain_forbidden, prompt_refused,
-    protection_refused, shape_refused,
+    protection_refused, shape_refused, zdr_refused,
 };
 use crate::object_root;
 use crate::optional_fields;
@@ -80,6 +81,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1beta/models", get(gemini_models))
         .route("/v1beta/models/{*model}", post(gemini_generate))
         .route("/v1/models", get(list_models))
+        // An Ollama-shaped server, for a client that takes a custom
+        // endpoint only as one (Visual Studio's and VS Code's Copilot
+        // BYOK; the reference's `ollama.go`, 94df2392).
+        .route("/api/version", get(ollama_version))
+        .route("/api/tags", get(ollama_tags))
+        .route("/api/show", post(ollama_show))
         .route("/agents", get(crate::agents::list))
         .route("/agents/{id}/preview", post(crate::agents::preview))
         .route("/agents/{id}/apply", post(crate::agents::apply))
@@ -583,6 +590,144 @@ async fn gemini_models(State(state): State<Arc<AppState>>) -> Json<Value> {
         })
         .collect();
     Json(json!({"models": models}))
+}
+
+/// The Ollama release lite answers `/api/version` as: one past every
+/// client's minimum (VS Code's Copilot asks for 0.6.4).
+const OLLAMA_VERSION: &str = "0.12.6";
+
+/// The window a client assumes when a model's own isn't told: what VS
+/// Code's Copilot reads without `context_length` in `model_info`.
+const OLLAMA_DEFAULT_CONTEXT: u64 = 32768;
+
+/// The architecture `model_info`'s keys are named after.
+const OLLAMA_ARCH: &str = "magpie";
+
+/// What an entry's modified_at says, since no model here was pulled.
+const OLLAMA_MODIFIED: &str = "2025-01-01T00:00:00Z";
+
+/// The model ids a caller is shown, in the catalog's own order: each id
+/// paired with the owner's label and the window the provider knows, when
+/// it knows one.
+fn ollama_entries(state: &AppState) -> Vec<(String, String, u64)> {
+    let config = state.config.current();
+    config
+        .catalog()
+        .into_iter()
+        .map(|(id, owner)| {
+            // `group/<id>` names no provider's window; `provider/<model>`
+            // asks its provider's contexts map.
+            let window = id
+                .split_once('/')
+                .and_then(|(provider_id, model)| {
+                    config.provider(provider_id).map(|p| p.window_of(model))
+                })
+                .unwrap_or(0);
+            (id, owner, window)
+        })
+        .collect()
+}
+
+/// GET /api/version — Ollama's build number, so a client that requires a
+/// minimum takes the gateway as new enough.
+async fn ollama_version() -> Json<Value> {
+    Json(json!({"version": OLLAMA_VERSION}))
+}
+
+/// GET /api/tags — every model the caller is shown, in Ollama's shape:
+/// `model` is the id it sends back to chat with.
+async fn ollama_tags(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let models: Vec<Value> = ollama_entries(&state)
+        .into_iter()
+        .map(|(id, owner, _)| {
+            json!({
+                "name": id,
+                "model": id,
+                "modified_at": OLLAMA_MODIFIED,
+                "size": 0,
+                "digest": ollama_digest(&id),
+                "details": {"family": OLLAMA_ARCH, "parameter_size": "", "quantization_level": ""},
+                "capabilities": ["completion", "tools"],
+                "display_name": owner,
+            })
+        })
+        .collect();
+    Json(json!({"models": models}))
+}
+
+/// POST /api/show — one model as Ollama tells it: a client reads what it
+/// takes from `capabilities`, its window from
+/// `model_info["<arch>.context_length"]` (32768 without it) and its name
+/// from `general.basename`.
+async fn ollama_show(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let parsed: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": format!("invalid request: {error}")}),
+            );
+        }
+    };
+    // `model` is what current clients send; `name` what clients before
+    // Ollama 0.5 sent.
+    let id = parsed
+        .get("model")
+        .or_else(|| parsed.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_owned();
+    if id.is_empty() {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "model is required"}),
+        );
+    }
+    let Some((_, owner, window)) = ollama_entries(&state)
+        .into_iter()
+        .find(|(entry, _, _)| *entry == id)
+    else {
+        return err_response(
+            StatusCode::NOT_FOUND,
+            json!({"error": format!("model '{id}' not found")}),
+        );
+    };
+    let window = if window == 0 {
+        OLLAMA_DEFAULT_CONTEXT
+    } else {
+        window
+    };
+    // Every key is sent: the ollama CLI before 0.7 reads parameter_count,
+    // context_length and embedding_length without checking and panics on
+    // one missing.
+    Json(json!({
+        "modelfile": "",
+        "parameters": "",
+        "template": "",
+        "details": {"family": OLLAMA_ARCH, "parameter_size": "", "quantization_level": ""},
+        "model_info": {
+            "general.architecture": OLLAMA_ARCH,
+            "general.basename": owner,
+            "general.parameter_count": 0,
+            format!("{OLLAMA_ARCH}.context_length"): window,
+            format!("{OLLAMA_ARCH}.embedding_length"): 0,
+        },
+        "capabilities": ["completion", "tools"],
+        "modified_at": OLLAMA_MODIFIED,
+    }))
+    .into_response()
+}
+
+/// A stable stand-in for a pulled model's digest: the id's own hash, as
+/// Ollama's tags carry.
+fn ollama_digest(id: &str) -> String {
+    let sum = Sha256::digest(id.as_bytes());
+    let mut hex = String::with_capacity(32);
+    for byte in &sum[..16] {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    format!("sha256:{hex}")
 }
 
 /// A resolved route: one provider/model and the ordered key pool to try
@@ -1245,6 +1390,7 @@ fn route_retryable_status(status: reqwest::StatusCode, body: &Value, text: &str)
         || shape_refused(code, body)
         || prompt_refused(code, body)
         || protection_refused(code, body)
+        || zdr_refused(code, body)
         || edge_blocked(body)
         || edge_blocked_text(text)
 }

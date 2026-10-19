@@ -668,11 +668,27 @@ mod search_tests {
                 .or_else(|| out.pointer("/tools/0/functionDeclarations/0/parameters"))
                 .expect("the tool schema");
             let defs = &schema["$defs"];
-            assert_eq!(
-                defs["oneOf"]["type"],
-                json!(["string", "number"]),
-                "{protocol:?}"
-            );
+            if protocol == Protocol::Gemini {
+                // Gemini's OpenAPI subset takes no list type: the union
+                // Kimi's typing wrote is spelled as anyOf branches
+                // (gemini_schema, the reference's devinGeminiSchema).
+                assert!(
+                    !matches!(defs["oneOf"]["type"], Value::Array(_)),
+                    "{protocol:?}"
+                );
+                let branches = defs["oneOf"]["anyOf"].as_array().expect("anyOf branches");
+                assert!(
+                    branches.contains(&json!({"type": "string"}))
+                        && branches.contains(&json!({"type": "number"})),
+                    "{protocol:?}: {branches:?}"
+                );
+            } else {
+                assert_eq!(
+                    defs["oneOf"]["type"],
+                    json!(["string", "number"]),
+                    "{protocol:?}"
+                );
+            }
             assert_eq!(defs["allOf"]["type"], "string", "{protocol:?}");
             assert_eq!(defs["props"]["type"], "object", "{protocol:?}");
             assert_eq!(defs["minLength"]["type"], "string", "{protocol:?}");

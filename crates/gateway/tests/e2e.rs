@@ -642,6 +642,134 @@ async fn a_bare_trace_id_400_hands_a_group_request_to_the_next_member() {
     assert_eq!(*second_calls.lock().unwrap(), 1);
 }
 
+/// Command Code's Zero Data Retention refusal — the error code
+/// `cmd_zdr_no_providers` on a 422 — is the request's setting, not the
+/// model or the key failing: the next group member is asked, and the
+/// refusing provider's other keys are not (the reference's `zdrRefused`,
+/// c8639043 / plugins#246).
+#[tokio::test]
+async fn a_zdr_refusal_goes_to_the_next_member_and_rests_nothing() {
+    let (first, first_calls) = spawn_scripted(vec![(
+        422,
+        json!({"error":{"message":"This model has no zero-data-retention upstream. Remove the x-cmd-zdr header or choose a different model.","type":"invalid_request_error","code":"cmd_zdr_no_providers"}}),
+    )])
+    .await;
+    let (second, second_calls) = spawn_scripted(Vec::new()).await;
+    let gw = spawn_gateway_with_providers_and_groups(
+        vec![(first, Protocol::Chat), (second, Protocol::Chat)],
+        vec!["mock/mock-model".into(), "b/mock-model".into()],
+        None,
+    )
+    .await;
+    let resp = reqwest::Client::new()
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({"model":"group/g",
+            "messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["choices"][0]["message"]["content"],
+        "hello"
+    );
+    assert_eq!(*first_calls.lock().unwrap(), 1);
+    assert_eq!(*second_calls.lock().unwrap(), 1);
+}
+
+/// A plain 422 that names nothing known is not route-retryable: it stays
+/// with its route and reaches the agent as its own error.
+#[tokio::test]
+async fn a_422_that_says_nothing_known_stays_with_its_route() {
+    let (first, first_calls) = spawn_scripted(vec![(
+        422,
+        json!({"error":{"message":"The request could not be processed.","type":"invalid_request_error"}}),
+    )])
+    .await;
+    let (second, second_calls) = spawn_scripted(Vec::new()).await;
+    let gw = spawn_gateway_with_providers_and_groups(
+        vec![(first, Protocol::Chat), (second, Protocol::Chat)],
+        vec!["mock/mock-model".into(), "b/mock-model".into()],
+        None,
+    )
+    .await;
+    let resp = reqwest::Client::new()
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({"model":"group/g",
+            "messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(*first_calls.lock().unwrap(), 1);
+    assert_eq!(*second_calls.lock().unwrap(), 0);
+}
+
+/// The Ollama-shaped surface: a client that takes a custom endpoint only
+/// as an Ollama server (VS/VS Code Copilot BYOK) asks /api/version, lists
+/// /api/tags and shows each model (the reference's `ollama.go`, 94df2392).
+#[tokio::test]
+async fn the_gateway_answers_as_an_ollama_server() {
+    let (upstream, _last) = spawn_mock().await;
+    let gw = spawn_gateway(upstream).await;
+    let client = reqwest::Client::new();
+
+    let version: Value = client
+        .get(format!("{gw}/api/version"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(version["version"], "0.12.6");
+
+    let tags: Value = client
+        .get(format!("{gw}/api/tags"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let models = tags["models"].as_array().unwrap();
+    assert!(
+        models.iter().any(|m| m["model"] == "mock/mock-model"),
+        "{tags}"
+    );
+
+    let show = client
+        .post(format!("{gw}/api/show"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({"model": "mock/mock-model"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(show.status(), StatusCode::OK);
+    let shown: Value = show.json().await.unwrap();
+    assert_eq!(shown["model_info"]["general.architecture"], "magpie");
+    assert_eq!(shown["model_info"]["magpie.context_length"], 32768);
+    assert!(
+        shown["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("completion"))
+    );
+
+    let missing = client
+        .post(format!("{gw}/api/show"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({"model": "mock/no-such-model"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn a_chat_tool_in_another_apis_shape_reaches_the_upstream_named() {
     // A Chat client may send an MCP or Responses tool by mistake. It must

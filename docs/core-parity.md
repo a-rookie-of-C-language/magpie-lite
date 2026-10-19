@@ -909,6 +909,27 @@ in lite), plugin pick persistence (`8febe3a5`), Cline pinning (`dd70c5e6`),
 the Factory mover minimum (`afa5f74b`) and the Qoder mover minimum
 (`d44d81d9`) — has no lite surface: no presets, plugin movers, GUI or
 drawing routes exist to port them to.
+
+### Upstream refresh, third pass (`afa5f74b..94df2392`)
+
+`c8639043` is ported: Command Code's Zero Data Retention refusal — the
+error code `cmd_zdr_no_providers` on a 400/422 — is the request's setting,
+not the model or key failing (`zdr_refused` in `model_gone.rs`, counted in
+`route_retryable_status`). Lite's 422 was not route-retryable before, so a
+group now asks the next member; the refusing provider's other keys are
+skipped as a matter of course since 400/422 are not key-retryable either.
+
+`94df2392` is ported: the gateway answers as an Ollama server —
+`GET /api/version` (0.12.6), `GET /api/tags` (the catalog's ids as
+`model`), `POST /api/show` (`model` or the pre-0.5 `name`; `capabilities`,
+`general.basename`, `magpie.context_length` from the provider's known
+window, 32768 without one) — so a client that takes a custom endpoint only
+as Ollama (VS/VS Code Copilot BYOK) lists and chats with lite's models.
+The routes sit behind the same bearer token as every other route. An
+Ollama client's chat already works on `/v1/chat/completions` unchanged.
+
+`b0b07642` (a GUI rule editor fix) does not map onto lite's console.
+
 The last does not map onto lite as it stands: lite's client asks for
 HTTP/1.1 (`reqwest` is built without its `http2` feature), so there is no
 shared HTTP/2 connection to a vendor that can go silent. The
