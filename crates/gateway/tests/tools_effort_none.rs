@@ -117,6 +117,7 @@ fn provider(id: &str, name: &str, base: &str) -> ProviderConfig {
         api_key: "k".into(),
         api_keys: Vec::new(),
         models: vec!["gpt-6.1-sol".into()],
+        contexts: Default::default(),
         fallback: Vec::new(),
         key_cooldown_ms: None,
         capabilities: Default::default(),

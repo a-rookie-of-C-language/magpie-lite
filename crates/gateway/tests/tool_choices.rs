@@ -288,6 +288,7 @@ impl Fixture {
                 api_key: KEYS[0].into(),
                 api_keys: KEYS.iter().map(|s| (*s).into()).collect(),
                 models: vec!["up-model".into()],
+                contexts: Default::default(),
                 fallback: if index == 0 && protocols.len() > 1 {
                     vec!["p1/up-model".into()]
                 } else {

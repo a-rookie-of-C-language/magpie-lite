@@ -178,6 +178,11 @@ enum ProviderCommand {
         /// Known model ids, for bare-name routing and `models`.
         #[arg(long, num_args = 1..)]
         models: Vec<String>,
+        /// Known context window in tokens, as model=window; repeat for each
+        /// model. A group member whose window cannot hold a request is not
+        /// asked it.
+        #[arg(long = "context", value_parser = parse_context)]
+        contexts: Vec<(String, u64)>,
         /// Fallback routes, tried in order when this provider is rate limited, out of quota, or down.
         #[arg(long = "fallback")]
         fallback: Vec<String>,
@@ -231,6 +236,22 @@ fn provider_path(cli: &Option<std::path::PathBuf>) -> Result<std::path::PathBuf>
         Some(p) => Ok(p.clone()),
         None => config_path(),
     }
+}
+
+/// Parse `model=window`, the shape `provider add --context` takes.
+fn parse_context(value: &str) -> Result<(String, u64)> {
+    let (model, window) = value
+        .rsplit_once('=')
+        .context("--context takes model=window, for example deepseek-chat=131072")?;
+    let window: u64 = window
+        .parse()
+        .context("--context window must be a whole number of tokens")?;
+    if model.is_empty() || model.chars().any(char::is_whitespace) || window == 0 {
+        anyhow::bail!(
+            "--context needs a non-empty model id with no whitespace and a window above zero"
+        );
+    }
+    Ok((model.to_owned(), window))
 }
 
 fn agent_manager(path: &Option<std::path::PathBuf>) -> Result<Manager> {
@@ -288,6 +309,7 @@ async fn main() -> Result<()> {
                 api_keys,
                 name,
                 models,
+                contexts,
                 fallback,
                 key_cooldown_ms,
                 routing,
@@ -308,6 +330,7 @@ async fn main() -> Result<()> {
                     api_key: String::new(),
                     api_keys,
                     models,
+                    contexts: contexts.into_iter().collect(),
                     fallback,
                     key_cooldown_ms,
                     routing,
@@ -350,6 +373,9 @@ async fn main() -> Result<()> {
                     );
                     for m in &p.models {
                         println!("               {}/{}", p.id, m);
+                        if let Some(window) = p.contexts.get(m) {
+                            println!("               ↳ window {window} tokens");
+                        }
                     }
                     for route in &p.fallback {
                         println!("               ↳ fallback {route}");

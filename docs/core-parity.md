@@ -853,6 +853,24 @@ of marshalling, writing and renaming up to 512 conversations on every
 answer. The gateway flushes what waits on Ctrl-C, so a restart or a
 handover reads every answer.
 
+### A member too small for the request (`0f398c48`)
+
+A group member whose model window is known and cannot hold the request is
+left out before anything is sent. Asked, it would only refuse it — and a
+refusal that doesn't say why reached the agent as the vendor's error while
+the next member had room, spending a request against the member's limits.
+
+Providers now carry `contexts: { model = window_tokens }` (`--context
+model=window` on `provider add`, a textarea in the console). The request is
+estimated the reference's way — four bytes a token over text, tool
+arguments and schemas — and `roomy` drops every route whose known window is
+no larger. It leaves the order alone when a window is unknown, when only one
+route is left, or when no route holds the request (the first is asked and its
+overflow told to the agent, to compact). A conversation kept on a small
+member by affinity moves once it outgrows it, because the affinity decision
+is re-pointed as routes are dropped. It is a check before sending, not a
+retry; the reply-room reask still covers the window the estimate misses.
+
 ### Left out from this refresh
 
 `2a27fb8d` (byte-slice search lookups), `ec6fba47` (a memoized JSON member
@@ -863,11 +881,11 @@ are a small `Vec` scanned in place. `224ea7d5` invalidates that same Go
 catalog cache. `b641868e` only fixes a Go test's clock.
 ### Still open from this refresh
 
-Room-aware group selection (`0f398c48`) needs per-model window metadata that
-lite does not carry; it is not implemented. Rest granularity, RPM and
-concurrency queues, sink ordering, Cline pinning, Devin's Gemini schema
-sanitizer (`1530c5ef`) and HTTP/2 transport health (`94919109`) remain
-future work.
+Rest granularity, RPM and concurrency queues, sink ordering, Cline pinning,
+Devin's Gemini schema sanitizer (`1530c5ef`) and HTTP/2 transport health
+(`94919109`) remain future work. Cline pinning and the Qoder mover minimum
+(`dd70c5e6`, `d44d81d9`) do not map onto lite: it has no presets and no
+plugin movers.
 The last does not map onto lite as it stands: lite's client asks for
 HTTP/1.1 (`reqwest` is built without its `http2` feature), so there is no
 shared HTTP/2 connection to a vendor that can go silent. The

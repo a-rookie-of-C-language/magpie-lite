@@ -61,6 +61,7 @@ async fn gateway(referenced: bool) -> Gateway {
             api_key: "secret-provider-key".into(),
             api_keys: Vec::new(),
             models: vec!["original".into()],
+            contexts: Default::default(),
             fallback: if referenced {
                 vec!["group/daily".into()]
             } else {

@@ -192,6 +192,7 @@ async fn fixture(protocol: Protocol, fail: bool) -> Fixture {
         api_key: KEY.into(),
         api_keys: vec![KEY.into(), SECOND_KEY.into()],
         models: vec!["native-model".into()],
+        contexts: Default::default(),
         fallback: vec!["backup/native-model".into()],
         key_cooldown_ms: None,
         routing: RoutingPolicy::Rotate,

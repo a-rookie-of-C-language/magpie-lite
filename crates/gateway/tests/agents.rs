@@ -39,6 +39,7 @@ async fn server(enabled: bool) -> Server {
             api_key: UPSTREAM_KEY.into(),
             api_keys: Vec::new(),
             models: vec!["model".into()],
+            contexts: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),

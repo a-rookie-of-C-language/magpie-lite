@@ -36,6 +36,7 @@ use crate::object_root;
 use crate::optional_fields;
 use crate::reply_room;
 use crate::retired as retired_store;
+use crate::roomy;
 use crate::stream_empty::{EMPTY_REPLY, GeminiReply};
 use crate::stream_keepalive::{self, Keepalive, UpstreamActivity};
 use crate::stream_loop::LoopGuard;
@@ -990,6 +991,47 @@ fn key_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 401 | 402 | 403 | 429)
 }
 
+/// Leave out, before any is asked, the routes whose model is known to take
+/// less than the request (ported from the reference's `0f398c48`). A member
+/// so small would only refuse it, and a refusal that doesn't say why reached
+/// the agent as the vendor's error while the next member had room. This is a
+/// check before sending, not a retry.
+///
+/// The affinity decision names the seat a conversation is stuck to by its
+/// index in this route list (`first_route`) plus that route's pool slot
+/// (`first`). When routes ahead of it are left out its index moves with the
+/// route; when its own route is left out the conversation cannot stay on it
+/// anyway, so the pin is cleared and the remaining order stands.
+fn leave_out_routes_without_room(
+    routes: &mut Vec<UpstreamRoute>,
+    decision: &mut Decision,
+    creq: &CompletionRequest,
+) {
+    let windows: Vec<u64> = routes
+        .iter()
+        .map(|route| route.provider.window_of(&route.model))
+        .collect();
+    let Some(keep) = roomy::holds(&windows, roomy::estimate(creq)) else {
+        return;
+    };
+    let mut index = 0;
+    routes.retain(|_| {
+        let kept = keep[index];
+        index += 1;
+        kept
+    });
+    match decision.first_route {
+        Some(at) if keep.get(at) == Some(&false) => {
+            decision.first = None;
+            decision.first_route = None;
+        }
+        Some(at) => {
+            decision.first_route = Some(keep[..at].iter().filter(|kept| **kept).count());
+        }
+        None => {}
+    }
+}
+
 /// Count what a key just answered against it for the provider's `usage`
 /// policy, and wake it from any cooldown. Providers report cumulative counters
 /// for each attempt, so `tracker.total_usage()` is the whole logical reply; a
@@ -1216,7 +1258,8 @@ async fn send_with_fallback(
     } {
         decision = Some(decided);
     }
-    let decision = decision.expect("a route always carries its affinity");
+    let mut decision = decision.expect("a route always carries its affinity");
+    leave_out_routes_without_room(&mut routes, &mut decision, creq);
     let last_route = routes.len().saturating_sub(1);
     let no_route = routes
         .first()
@@ -3121,6 +3164,7 @@ mod tests {
             api_key: "private-test-key".into(),
             api_keys: vec![],
             models: vec![model.into()],
+            contexts: Default::default(),
             fallback: vec![],
             key_cooldown_ms: None,
             capabilities: Default::default(),

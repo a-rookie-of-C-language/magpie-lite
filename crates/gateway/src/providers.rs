@@ -1,4 +1,5 @@
 //! Token-protected provider edits; responses contain routing metadata only.
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::Json;
@@ -32,6 +33,8 @@ pub(crate) struct ProviderEdit {
     api_keys: Option<Vec<String>>,
     #[serde(default)]
     models: Vec<String>,
+    /// Omitted on update to preserve the existing windows; `{}` clears them.
+    contexts: Option<BTreeMap<String, u64>>,
     #[serde(default)]
     fallback: Vec<String>,
     key_cooldown_ms: Option<u64>,
@@ -65,6 +68,9 @@ impl ProviderEdit {
         let weights = self
             .weights
             .unwrap_or_else(|| existing.map(|p| p.weights.clone()).unwrap_or_default());
+        let contexts = self
+            .contexts
+            .unwrap_or_else(|| existing.map(|p| p.contexts.clone()).unwrap_or_default());
         let affinity = self
             .affinity
             .unwrap_or_else(|| existing.map(|p| p.affinity).unwrap_or_default());
@@ -77,6 +83,7 @@ impl ProviderEdit {
             api_key,
             api_keys,
             models: self.models,
+            contexts,
             fallback: self.fallback,
             key_cooldown_ms: self.key_cooldown_ms,
             routing,

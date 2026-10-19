@@ -131,6 +131,11 @@ pub struct ProviderConfig {
     /// Known model ids, for bare-name routing and the catalog.
     #[serde(default)]
     pub models: Vec<String>,
+    /// Known context windows by model id, in tokens, for room-aware group
+    /// selection: a member whose model cannot hold the request is not asked it.
+    /// A model absent here has no known window.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub contexts: BTreeMap<String, u64>,
     /// Where a request goes when this provider cannot take it — out of
     /// quota, rate limited, overloaded, or down — tried in order, before
     /// any of the reply has been sent: models as agents pick them.
@@ -215,6 +220,13 @@ impl ProviderConfig {
         {
             anyhow::bail!("model ids must be non-empty and contain no whitespace");
         }
+        if self.contexts.iter().any(|(model, window)| {
+            model.is_empty() || model.chars().any(char::is_whitespace) || *window == 0
+        }) {
+            anyhow::bail!(
+                "context windows need a non-empty model id with no whitespace and a window above zero"
+            );
+        }
         if self.weights.iter().any(|weight| *weight > MAX_KEY_WEIGHT) {
             anyhow::bail!("key weights cannot be above {MAX_KEY_WEIGHT}");
         }
@@ -259,6 +271,12 @@ impl ProviderConfig {
         (0..slots)
             .map(|slot| self.weights.get(slot).copied().unwrap_or(0))
             .collect()
+    }
+
+    /// The context window known for `model`, in tokens; zero when none is
+    /// known. A window may be keyed by the upstream model id or a listed alias.
+    pub fn window_of(&self, model: &str) -> u64 {
+        self.contexts.get(model).copied().unwrap_or(0)
     }
 }
 
@@ -903,6 +921,10 @@ pub struct ProviderConfigSnapshot {
     pub base_url: String,
     /// Models explicitly listed for bare-name routing and `/v1/models`.
     pub models: Vec<String>,
+    /// Known context windows by model id, in tokens. A model absent here has
+    /// no known window.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub contexts: BTreeMap<String, u64>,
     /// Number of effective key slots, not the keys themselves.
     pub key_count: usize,
     /// Number of configured credentials (zero means no upstream authentication).
@@ -1256,6 +1278,7 @@ impl Config {
                     },
                     base_url: p.base_url.clone(),
                     models: p.models.clone(),
+                    contexts: p.contexts.clone(),
                     key_count: p.api_key_pool().len(),
                     credential_count: p
                         .api_key_pool()
@@ -1407,6 +1430,70 @@ mod tests {
     }
 
     #[test]
+    fn context_windows_round_trip_are_exposed_and_absent_by_default() {
+        let legacy: ProviderConfig = toml::from_str(
+            r#"id = "legacy"
+protocol = "chat"
+base_url = "http://127.0.0.1:1/v1"
+"#,
+        )
+        .unwrap();
+        assert!(legacy.contexts.is_empty());
+        assert_eq!(legacy.window_of("unknown"), 0);
+
+        let mut provider = legacy;
+        provider.contexts.insert("small".into(), 200_000);
+        provider.contexts.insert("large".into(), 1_000_000);
+        assert_eq!(provider.window_of("small"), 200_000);
+
+        let encoded = toml::to_string(&provider).unwrap();
+        assert!(encoded.contains("small = 200000"), "{encoded}");
+        let restored: ProviderConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(restored.contexts, provider.contexts);
+
+        let config = Config {
+            provider: vec![restored],
+            ..Config::default()
+        };
+        let snapshot = config.snapshot();
+        assert_eq!(
+            snapshot.providers[0].contexts.get("large"),
+            Some(&1_000_000)
+        );
+    }
+
+    #[test]
+    fn context_windows_refuse_a_zero_an_empty_id_and_whitespace() {
+        let mut provider = ProviderConfig {
+            id: "mock".into(),
+            name: String::new(),
+            protocol: Protocol::Chat,
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: "key".into(),
+            api_keys: Vec::new(),
+            models: vec!["mock".into()],
+            contexts: Default::default(),
+            fallback: Vec::new(),
+            key_cooldown_ms: None,
+            capabilities: Default::default(),
+            routing: RoutingPolicy::Rotate,
+            weights: Vec::new(),
+            affinity: Default::default(),
+            key_generation: 0,
+        };
+        assert!(provider.validate().is_ok());
+
+        for (model, window) in [("", 1000), ("has space", 1000), ("mock", 0)] {
+            provider.contexts.clear();
+            provider.contexts.insert(model.into(), window);
+            assert!(
+                provider.validate().is_err(),
+                "{model:?}={window} should be refused"
+            );
+        }
+    }
+
+    #[test]
     fn api_key_pool_keeps_the_legacy_singular_key() {
         let provider = ProviderConfig {
             id: "mock".into(),
@@ -1416,6 +1503,7 @@ mod tests {
             api_key: "legacy-key".into(),
             api_keys: Vec::new(),
             models: Vec::new(),
+            contexts: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),
@@ -1454,6 +1542,7 @@ base_url = "http://127.0.0.1:1/v1"
             api_key: String::new(),
             api_keys: Vec::new(),
             models: Vec::new(),
+            contexts: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             routing: RoutingPolicy::Rotate,
@@ -1485,6 +1574,7 @@ base_url = "http://127.0.0.1:1/v1"
             api_key: String::new(),
             api_keys: Vec::new(),
             models: Vec::new(),
+            contexts: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             routing: RoutingPolicy::Rotate,
@@ -1511,6 +1601,7 @@ base_url = "http://127.0.0.1:1/v1"
             api_key: "super-secret".into(),
             api_keys: Vec::new(),
             models: Vec::new(),
+            contexts: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             routing: RoutingPolicy::Rotate,
@@ -1719,6 +1810,7 @@ base_url = "http://127.0.0.1:1/v1"
                 api_key: String::new(),
                 api_keys: vec![],
                 models: vec![],
+                contexts: Default::default(),
                 fallback: vec![],
                 key_cooldown_ms: None,
                 capabilities: Default::default(),
@@ -1753,6 +1845,7 @@ base_url = "http://127.0.0.1:1/v1"
             api_key: String::new(),
             api_keys: vec!["secret-one".into(), "secret-two".into()],
             models: vec!["mock-model".into()],
+            contexts: Default::default(),
             fallback: vec!["backup/other".into()],
             key_cooldown_ms: Some(1_200),
             capabilities: Default::default(),
@@ -1884,6 +1977,7 @@ affinity = "session"
             api_key: "secret".into(),
             api_keys: Vec::new(),
             models: vec!["model".into()],
+            contexts: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),
@@ -2019,6 +2113,7 @@ affinity = "session"
             api_key: String::new(),
             api_keys: Vec::new(),
             models: Vec::new(),
+            contexts: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),

@@ -317,6 +317,7 @@ impl Fixture {
                         api_key: KEY.into(),
                         api_keys: Vec::new(),
                         models: vec!["grok-4.6".into(), "gpt-5.5".into()],
+                        contexts: Default::default(),
                         fallback: Vec::new(),
                         key_cooldown_ms: None,
                         routing: RoutingPolicy::Rotate,

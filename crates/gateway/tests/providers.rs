@@ -370,6 +370,73 @@ async fn provider_capabilities_round_trip_preserve_and_clear_without_secrets() {
 /// update that omits them, and an update that clears them -- without any key
 /// ever appearing in a response.
 #[tokio::test]
+async fn context_windows_round_trip_preserve_and_clear_without_secrets() {
+    let gw = gateway().await;
+    let mut body = provider(&gw, "windowed");
+    body["contexts"] = json!({"small": 200000, "large": 1000000});
+    let response = edit(&gw, Method::POST, "/config/providers", body.clone()).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let text = response.text().await.unwrap();
+    assert!(!text.contains("private-one"));
+    assert_eq!(
+        snapshot(&gw, "/config").await["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["id"] == "windowed")
+            .unwrap()["contexts"],
+        json!({"small": 200000, "large": 1000000})
+    );
+
+    // Omitted on update: the windows are kept.
+    let mut preserve = body.clone();
+    preserve.as_object_mut().unwrap().remove("contexts");
+    assert_eq!(
+        edit(&gw, Method::PUT, "/config/providers/windowed", preserve)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        snapshot(&gw, "/config").await["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["id"] == "windowed")
+            .unwrap()["contexts"],
+        json!({"small": 200000, "large": 1000000})
+    );
+
+    // Explicit `{}` clears them.
+    let mut clear = provider(&gw, "windowed");
+    clear["contexts"] = json!({});
+    assert_eq!(
+        edit(&gw, Method::PUT, "/config/providers/windowed", clear)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let cleared = snapshot(&gw, "/config").await["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["id"] == "windowed")
+        .unwrap()
+        .clone();
+    assert!(cleared.get("contexts").is_none(), "{cleared}");
+
+    // A zero window or a whitespace-bearing model id is refused.
+    for invalid in [json!({"small": 0}), json!({"has space": 1000})] {
+        let mut invalid_body = provider(&gw, "invalid");
+        invalid_body["contexts"] = invalid;
+        let response = edit(&gw, Method::POST, "/config/providers", invalid_body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let text = response.text().await.unwrap();
+        assert!(!text.contains("private-one"));
+    }
+}
+
+#[tokio::test]
 async fn provider_routing_and_key_weights_round_trip_and_preserve_on_update() {
     let gw = gateway().await;
     let mut body = provider(&gw, "weighted");

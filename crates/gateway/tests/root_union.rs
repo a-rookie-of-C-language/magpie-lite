@@ -175,6 +175,7 @@ impl Fixture {
                         api_key: KEY.into(),
                         api_keys: Vec::new(),
                         models: vec![model.into()],
+                        contexts: Default::default(),
                         fallback: Vec::new(),
                         key_cooldown_ms: None,
                         routing: RoutingPolicy::Rotate,

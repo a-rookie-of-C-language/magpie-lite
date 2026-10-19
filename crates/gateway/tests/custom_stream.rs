@@ -148,6 +148,7 @@ async fn custom_tool_input_streams_before_the_upstream_call_finishes() {
                     api_key: KEY.into(),
                     api_keys: vec![],
                     models: vec!["up-model".into()],
+                    contexts: Default::default(),
                     fallback: vec![],
                     key_cooldown_ms: None,
                     routing: RoutingPolicy::Rotate,
