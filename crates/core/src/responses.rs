@@ -709,7 +709,7 @@ fn decode_input_item(item: &Value, messages: &mut Vec<Message>) -> Result<()> {
                                 }
                             }
                             "input_image" => {
-                                if let Some(u) = b
+                                let Some(u) = b
                                     .get("image_url")
                                     .map(|x| {
                                         x.as_str()
@@ -719,16 +719,27 @@ fn decode_input_item(item: &Value, messages: &mut Vec<Message>) -> Result<()> {
                                     .or_else(|| {
                                         b.get("url").and_then(Value::as_str).map(str::to_owned)
                                     })
+                                    .filter(|u| !u.is_empty())
+                                else {
+                                    // A vendor-hosted reference (a file_id) names an image
+                                    // only its own Responses API can open; translating it
+                                    // as a URL or dropping it would mislead the model. The
+                                    // reference answers 400 on a cross-protocol route
+                                    // (`hasUnportableCurrentImage`); lite cannot carry it
+                                    // on a native route either, so it is refused here.
+                                    return Err(CoreError::Invalid {
+                                        field: "input_image",
+                                        detail: "input_image without image_url is not supported; send an image_url".into(),
+                                    });
+                                };
+                                if let Some(rest) = u.strip_prefix("data:")
+                                    && let Some((meta, data)) = rest.split_once(',')
+                                    && let Some(media) = meta.strip_suffix(";base64")
                                 {
-                                    if let Some(rest) = u.strip_prefix("data:")
-                                        && let Some((meta, data)) = rest.split_once(',')
-                                        && let Some(media) = meta.strip_suffix(";base64")
-                                    {
-                                        parts.push(Part::image(media, data));
-                                        continue;
-                                    }
-                                    parts.push(Part::image_url(u));
+                                    parts.push(Part::image(media, data));
+                                    continue;
                                 }
+                                parts.push(Part::image_url(u));
                             }
                             _ => {}
                         }

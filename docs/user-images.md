@@ -74,3 +74,27 @@ and reach the seeing upstream intact over JSON and SSE.
 These are synthetic loopback fixtures. Per-model vision catalogs, paid
 live-vendor evidence, describe-via-seer fallback and subscription-account
 affinity remain outside this contract.
+
+## Unportable references
+
+Reference: `internal/gateway/image_input.go`
+(`hasUnportableCurrentImage`) and `gateway.go` (`translate`): a Responses
+`input_image` with a `file_id` but no `image_url` is answered 400 on a
+cross-protocol route, since only its own Responses API can open the file.
+Lite refuses the same block at decode with `input_image without image_url
+is not supported; send an image_url`, on every route: lite has no file
+registry, so a native Responses route cannot carry it either (the reference
+passes the `file_id` through natively). Nothing is silently dropped.
+Tool-returned `file_id` images keep the existing lenient behavior — dropped
+with the text kept (`unsupported_file_ids_empty_images...` in
+`crates/core/tests/tool_images.rs` pins it) — matching the reference,
+which only rejects current-turn user images.
+
+### Unportable evidence and limits
+
+`crates/core/tests/responses.rs` has a decode regression (refusal message,
+portable URL/data-URL images still decode).
+`crates/gateway/tests/unportable_images.rs` sends **2 real loopback HTTP
+requests**: a Responses client `file_id` image to a Chat upstream and to a
+native Responses upstream, both answered 400 with neither upstream
+touched.

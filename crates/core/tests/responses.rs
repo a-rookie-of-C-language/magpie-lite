@@ -519,3 +519,28 @@ fn native_custom_input_events_are_translated_and_streamed() {
         |frame| frame["type"] == "response.custom_tool_call_input.done" && frame["input"] == patch
     ));
 }
+
+#[test]
+fn file_id_only_input_image_is_refused_not_silently_dropped() {
+    // A vendor-hosted reference names an image only its own Responses API
+    // can open; the reference answers 400 on a cross-protocol route, and
+    // lite cannot carry it on a native route either.
+    let body = json!({"model":"m","input":[
+        {"role":"user","content":[
+            {"type":"input_text","text":"read"},
+            {"type":"input_image","file_id":"file_private"}
+        ]}
+    ]});
+    let error = responses::decode_request(&body).expect_err("file_id image must not decode");
+    assert!(error.to_string().contains("image_url"), "{error:?}");
+    // Portable images still decode.
+    for image in [
+        json!({"type":"input_image","image_url":"https://example.invalid/shot.jpg"}),
+        json!({"type":"input_image","image_url":"data:image/png;base64,aGVsbG8="}),
+    ] {
+        let body = json!({"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":"read"}, image]}]});
+        let ir = responses::decode_request(&body).expect("portable image decodes");
+        assert_eq!(ir.messages.len(), 1);
+        assert_eq!(ir.messages[0].parts.len(), 2);
+    }
+}
