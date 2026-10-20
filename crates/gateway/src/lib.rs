@@ -10,6 +10,7 @@ pub mod config_store;
 mod continuation;
 pub mod cooldown;
 mod deepseek_schema;
+pub mod describe;
 mod edge_block;
 mod gemini_schema;
 mod grok_integral;

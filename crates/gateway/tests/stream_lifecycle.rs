@@ -332,6 +332,7 @@ impl Fixture {
             default_provider: "mock".into(),
             hidden_auto_groups: Vec::new(),
             no_auto_groups: false,
+            vision: None,
             provider: vec![provider],
             ..Config::default()
         };

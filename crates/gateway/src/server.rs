@@ -113,6 +113,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             put(update_group).delete(delete_group),
         )
         .route("/config/found-groups", put(update_found_groups))
+        .route("/config/vision", put(update_vision))
         // Every route above proves it knows the configured local token
         // before a request can reach a provider or read statistics. The
         // health probe and secret-free login page below are added after
@@ -640,6 +641,67 @@ async fn update_found_groups(
             .config
             .update_if_revision(expected, move |config| {
                 config.no_auto_groups = !on;
+                Ok::<(), (StatusCode, String)>(())
+            })
+            .await
+    };
+    group_update_response(result, StatusCode::OK)
+}
+
+/// Decode an Image recognition body: `{"vision": "provider/model"}`
+/// names the describer, `{"vision": "off"}` or `{"vision": null}` names
+/// none.
+fn decode_vision(bytes: &[u8]) -> Result<Option<String>, &'static str> {
+    let body: Value =
+        serde_json::from_slice(bytes).map_err(|_| "expected JSON with a `vision` model or null")?;
+    match body.get("vision") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.is_empty() || s == "off" => Ok(Some("off".to_owned())),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err("expected JSON with a `vision` model or null"),
+    }
+}
+
+/// Name the Image recognition model: a `provider/model` describes the
+/// images a text-only model is asked about, in their place; `off` or
+/// null describes nothing (the reference's Settings Vision, without its
+/// auto-pick).
+async fn update_vision(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Response {
+    let expected = match expected_config_revision(&headers) {
+        Ok(value) => value,
+        Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
+    };
+    let request = match idempotency_request(&state.config, &headers, "vision.update", &bytes) {
+        Ok(value) => value,
+        Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
+    };
+    let vision = match decode_vision(&bytes) {
+        Ok(value) => value,
+        Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
+    };
+    // The revision is checked against the config before the value, so a
+    // stale writer cannot rename the describer under a newer one.
+    if let Err(error) = crate::config::check_vision(vision.as_deref(), &state.config.current()) {
+        return group_error(StatusCode::BAD_REQUEST, &error.to_string());
+    }
+    let result = if let Some(request) = request {
+        state
+            .config
+            .update_idempotent(expected, request, move |config| {
+                config.vision = vision.clone();
+                Ok::<(), (StatusCode, String)>(())
+            })
+            .await
+            .map(|(snapshot, _)| snapshot)
+    } else {
+        state
+            .config
+            .update_if_revision(expected, move |config| {
+                config.vision = vision.clone();
                 Ok::<(), (StatusCode, String)>(())
             })
             .await
@@ -1846,6 +1908,63 @@ async fn ask_classifier(
             .map_err(AskError::Answered)
     }
 }
+
+/// Ask an Image recognition model through the gateway itself to describe
+/// one image, as a client would. Every model goes through the gateway —
+/// lite has no decision providers answering a separate protocol — with
+/// the vision User-Agent, so the call shows in the usage as lite's own.
+/// Anything but a description is the describer failing, and the request
+/// falls back to the refusal and omission it would have had without one.
+async fn ask_describer(
+    caller: std::sync::Arc<dyn SelfCall>,
+    model: &str,
+    image: &magpie_core::ir::Part,
+) -> Result<String, String> {
+    use crate::describe::{VISION_AGENT, VISION_TIMEOUT};
+    let body = crate::describe::describe_body(model, image);
+    let bytes = Bytes::from(serde_json::to_vec(&body).map_err(|e| format!("{e}"))?);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::USER_AGENT,
+        header::HeaderValue::from_static(VISION_AGENT),
+    );
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/json"),
+    );
+    // The gateway asking itself: the future type would otherwise name
+    // `send_with_fallback` through `proxy_parsed`, which names this call
+    // again — an unprovable `Send` cycle (E0391). Erase it at the box.
+    let response = tokio::time::timeout(
+        VISION_TIMEOUT,
+        caller.call(
+            headers,
+            body,
+            bytes,
+            ClientWire::Chat {
+                include_usage: false,
+            },
+        ),
+    )
+    .await
+    .map_err(|_| format!("the describer {model} took longer than 120s"))?;
+    let (parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, 8 * 1024 * 1024)
+        .await
+        .map_err(|e| format!("the describer {model} gave no body: {e}"))?;
+    if !parts.status.is_success() {
+        let mut short: String = String::from_utf8_lossy(&bytes).chars().take(120).collect();
+        if bytes.len() > 120 {
+            short.push('…');
+        }
+        return Err(format!(
+            "the describer {model} answered {}: {short}",
+            parts.status.as_u16()
+        ));
+    }
+    let value: Value = serde_json::from_slice(&bytes).map_err(|e| format!("{e}"))?;
+    crate::describe::read_description(&value).map_err(|e| format!("the describer {model} {e}"))
+}
 // Eleven independent dispatch inputs and a failure-path triple shared
 // with the success shape; bundling or boxing them would churn the core
 // dispatch, its callers, and every early return for no behavior gain.
@@ -2451,12 +2570,91 @@ async fn send_with_fallback(
                     } else {
                         send
                     };
+                    // An image a text-only member cannot see is described
+                    // first when an Image recognition model is named (the
+                    // reference's `vision.go`): every image goes in its
+                    // place, in the current turn, older turns and tool
+                    // results alike. Only an explicit `provider/model`
+                    // describes — lite has no catalog vision metadata for an
+                    // auto-pick. A description call is lite asking itself, so
+                    // it never describes again. Every image described, the
+                    // request goes on with descriptions; one failure, a
+                    // rested describer, or none named falls back to the
+                    // refusal and omission below.
+                    let mut described: Option<CompletionRequest> = None;
+                    if route.provider.capabilities.vision == Some(false)
+                        && agent != "magpie-vision"
+                        && crate::describe::has_any_image(send)
+                        && let Some((describer_provider, describer_model)) =
+                            crate::describe::resolve(config)
+                    {
+                        let full = format!("{describer_provider}/{describer_model}");
+                        if !crate::describe::rested(&full) {
+                            let images = crate::describe::collect_images(send);
+                            let caller: std::sync::Arc<dyn SelfCall> =
+                                std::sync::Arc::new(GatewayCaller {
+                                    state: (*state).clone(),
+                                });
+                            let mut texts: Vec<Option<String>> = Vec::with_capacity(images.len());
+                            let mut failed = false;
+                            for image in &images {
+                                if let Some(known) = crate::describe::remembered(&full, image) {
+                                    texts.push(Some(known));
+                                    continue;
+                                }
+                                match ask_describer(caller.clone(), &full, image).await {
+                                    Ok(text) => {
+                                        crate::describe::remember(&full, image, text.clone());
+                                        texts.push(Some(text));
+                                    }
+                                    Err(error) => {
+                                        tracing::info!(
+                                            provider = %route.provider.id,
+                                            model = %route.model,
+                                            describer = %full,
+                                            "vision: the describer couldn't say: {error}"
+                                        );
+                                        crate::describe::rest(&full);
+                                        failed = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !failed {
+                                crate::describe::unrest(&full);
+                                let mut by_sight = std::collections::HashMap::new();
+                                for (image, text) in images.iter().zip(texts.iter()) {
+                                    if let Some(text) = text {
+                                        by_sight.insert(
+                                            crate::describe::sight_key(&full, image),
+                                            text.clone(),
+                                        );
+                                    }
+                                }
+                                described =
+                                    Some(crate::describe::with_descriptions(send, |part| {
+                                        by_sight
+                                            .get(&crate::describe::sight_key(&full, part))
+                                            .cloned()
+                                    }));
+                            }
+                        }
+                    }
+                    let described_owned;
+                    let send = if let Some(ref owned) = described {
+                        described_owned = owned;
+                        described_owned
+                    } else {
+                        send
+                    };
                     // A member that takes no images turns a current user
                     // image away before any upstream call (the reference's
                     // `textOnlyBody`); older and tool-returned images go on
                     // as an omission note instead. Groups skip such a member
                     // for an image-carrying request through the same shape
-                    // as a local conversion error below.
+                    // as a local conversion error below. A named Image
+                    // recognition model that no longer resolves is said as
+                    // missing in the refusal rather than silently omitting.
                     if route.provider.capabilities.vision == Some(false)
                         && crate::text_only::has_current_user_image(send)
                     {
@@ -2464,14 +2662,21 @@ async fn send_with_fallback(
                         if route_index != last_route {
                             continue 'routes;
                         }
+                        let mut message = format!(
+                            "model \"{}/{}\" does not support image input",
+                            route.provider.id, route.model
+                        );
+                        if let Some(want) = config.vision.as_deref()
+                            && !want.is_empty()
+                            && want != "off"
+                            && crate::describe::resolve(config).is_none()
+                        {
+                            message.push_str(&format!(
+                                "; image recognition model {want:?} is missing"
+                            ));
+                        }
                         return Err((
-                            ProxyFailure::new(
-                                StatusCode::BAD_REQUEST,
-                                format!(
-                                    "model \"{}/{}\" does not support image input",
-                                    route.provider.id, route.model
-                                ),
-                            ),
+                            ProxyFailure::new(StatusCode::BAD_REQUEST, message),
                             candidate,
                             decision.clone(),
                         ));

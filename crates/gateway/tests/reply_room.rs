@@ -157,6 +157,7 @@ async fn gateway(protocol: Protocol, upstream: String) -> String {
         default_provider: "deepseek".into(),
         hidden_auto_groups: Vec::new(),
         no_auto_groups: false,
+        vision: None,
         provider: vec![ProviderConfig {
             id: "deepseek".into(),
             name: "DeepSeek".into(),

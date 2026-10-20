@@ -1241,6 +1241,36 @@ impl GroupConfig {
     }
 }
 
+/// The Image recognition model names a model lite asks through itself
+/// (`provider/model`); `off` and unset describe nothing. A group would
+/// ask forever, and an unknown provider answers nothing. A missing or
+/// text-only provider is refused here — but one removed later only
+/// stops describing (the request names it as missing).
+pub fn check_vision(vision: Option<&str>, config: &Config) -> anyhow::Result<()> {
+    let Some(want) = vision else {
+        return Ok(());
+    };
+    if want.is_empty() || want == "off" {
+        return Ok(());
+    }
+    if want.starts_with("group/") {
+        anyhow::bail!("lite asks a model to describe images, not a group: {want}");
+    }
+    let Some((provider, model)) = want.split_once('/') else {
+        anyhow::bail!("image recognition must be provider/model or off, not {want:?}");
+    };
+    if provider.is_empty() || model.is_empty() {
+        anyhow::bail!("image recognition must be provider/model or off, not {want:?}");
+    }
+    let Some(found) = config.provider(provider) else {
+        anyhow::bail!("magpie knows no model {want:?} to describe images with");
+    };
+    if found.capabilities.vision == Some(false) {
+        anyhow::bail!("{want:?} cannot describe images: its provider takes text only");
+    }
+    Ok(())
+}
+
 /// One provider as the console may show it: routing metadata only, never an
 /// upstream API key or the gateway token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1395,6 +1425,9 @@ pub struct ConfigSnapshot {
     /// The user turned off the groups magpie finds on its own: none is
     /// listed or served, while the groups made or changed stay.
     pub no_auto_groups: bool,
+    /// The Image recognition model (`provider/model`), `off`, or unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<String>,
 }
 
 /// Whether a switch is off, for fields the file omits when unset.
@@ -1440,6 +1473,13 @@ pub struct Config {
     /// Enabled by default; tool arguments and nonstreaming replies are excluded.
     #[serde(default = "default_stream_loop_guard")]
     pub stream_loop_guard: bool,
+    /// The Image recognition model: `provider/model` describes the images
+    /// a text-only model is asked about, in their place. `off` or unset
+    /// keeps refusing a current user image and omitting the rest (the
+    /// reference's Settings Vision, without its auto-pick: lite has no
+    /// catalog vision metadata to pick from).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<String>,
     /// Optional JSONL file for sanitized request-history metadata. Setting this
     /// makes recent `/stats` records survive gateway restarts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1610,6 +1650,7 @@ impl Default for Config {
             stream_keepalive_max_silence_ms: default_stream_keepalive_max_silence_ms(),
             stream_responses_hold_timeout_ms: default_stream_responses_hold_timeout_ms(),
             stream_loop_guard: default_stream_loop_guard(),
+            vision: None,
             history_path: None,
             provider: Vec::new(),
             group: Vec::new(),
@@ -1769,6 +1810,7 @@ impl Config {
             stream_responses_hold_timeout_ms: self.stream_responses_hold_timeout_ms,
             stream_loop_guard: self.stream_loop_guard,
             no_auto_groups: self.no_auto_groups,
+            vision: self.vision.clone(),
             providers: self
                 .provider
                 .iter()

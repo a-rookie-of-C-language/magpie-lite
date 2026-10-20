@@ -465,6 +465,7 @@ async fn fixture(protocol: Protocol) -> Fixture {
         default_provider: "blind".into(),
         hidden_auto_groups: Vec::new(),
         no_auto_groups: false,
+        vision: None,
         history_path: Some(history.clone()),
         provider: vec![
             ProviderConfig {

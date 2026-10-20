@@ -930,6 +930,7 @@ async fn found_groups_off_serves_the_first_seat_but_lists_nothing() {
     let config = Config {
         provider: vec![peer("mock-a", &upstream_a), peer("mock-b", &upstream_b)],
         no_auto_groups: true,
+        vision: None,
         ..Config::default()
     };
     config.save(&path).unwrap();
