@@ -120,3 +120,14 @@ cargo test -p magpie-gateway --test tool_choices
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+## Codex tool-search relay
+
+Codex's client-execution deferred tool discovery (`tool_search`) is not a
+selection policy: the declaration, its calls, and its results always travel
+as plain functions, and a model call to it returns as the `tool_search_call`
+Codex runs (see docs/tool-search.md). Selection filtering never drops it
+silently — the subset/empty-auto allowlist matrix above covers offered-but-
+excluded search, and `crates/gateway/tests/tool_search.rs` covers the relay
+itself (Responses client x Chat/Anthropic/Gemini/Responses upstreams,
+JSON/SSE, `tsc_` ids with object arguments).
