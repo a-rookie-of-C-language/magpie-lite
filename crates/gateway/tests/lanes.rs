@@ -215,6 +215,57 @@ async fn a_full_lane_queues_the_next_request_until_the_first_is_done() {
     assert_eq!(member.asked(), 2, "both requests reached the one vendor");
 }
 
+/// `/stats` shows live concurrency lanes: while one request holds the
+/// key's only slot and another queues behind it, the lane reads busy and
+/// waiting with its bound; once both are done it is gone.
+#[tokio::test]
+async fn stats_show_live_lanes_while_a_request_queues() {
+    async fn stats(gw: &str) -> Value {
+        reqwest::Client::new()
+            .get(format!("{gw}/stats"))
+            .bearer_auth("magpie-lite")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+    let member = Member::new(Duration::from_millis(300));
+    let mut only = provider("solo", upstream(member.clone()).await);
+    only.max_concurrency = Some(1);
+    let (gw, state) = gateway(vec![only]).await;
+
+    let who = magpie_gateway::affinity::who_of("solo", "fixture-key");
+    let hold = state
+        .lanes
+        .take(&who, 1, 0, Duration::ZERO)
+        .await
+        .expect("hold the lane");
+    let queued = tokio::spawn(ask(gw.clone(), "solo/mock-model"));
+    // Let the queued request arrive before reading `/stats`.
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(
+        stats(&gw).await["lanes"],
+        json!([{"who": &who, "busy": 1, "waiting": 1, "limit": 1}]),
+        "one held, one queued"
+    );
+    drop(hold);
+    let (status, _headers, body) = queued.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The lane is gone once nothing holds or waits on it (an empty lane
+    // list is omitted from `/stats`, like other empty details).
+    let mut lanes = Value::Null;
+    for _ in 0..20 {
+        lanes = stats(&gw).await["lanes"].clone();
+        if lanes.is_null() || lanes == json!([]) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(lanes.is_null() || lanes == json!([]), "{lanes}");
+}
+
 /// Two keys on a provider, the first's lane full: the second is asked first
 /// (the reference's laneMate) instead of the request waiting.
 #[tokio::test]

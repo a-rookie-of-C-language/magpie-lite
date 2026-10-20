@@ -194,6 +194,21 @@ pub struct ProviderStats {
     pub keys: BTreeMap<String, KeyStats>,
 }
 
+/// One key's concurrency lane: who holds slots, who waits, and the bound.
+/// `who` is the provider id, or the provider id plus a stable key
+/// fingerprint (`provider#hex`), never a secret.
+#[derive(Debug, Clone, Serialize)]
+pub struct LaneSnapshot {
+    /// The lane's key: provider id or provider id plus key fingerprint.
+    pub who: String,
+    /// Requests out at the vendor on this lane now.
+    pub busy: usize,
+    /// Requests queued behind them, in turn.
+    pub waiting: usize,
+    /// The lane's `max_concurrency` bound.
+    pub limit: u32,
+}
+
 /// The complete `/stats` response.
 #[derive(Debug, Clone, Serialize)]
 pub struct StatsSnapshot {
@@ -205,6 +220,10 @@ pub struct StatsSnapshot {
     pub providers: BTreeMap<String, ProviderStats>,
     /// Active key cooldowns by provider id and stable slot number.
     pub key_cooldowns: crate::config::KeyCooldownSnapshotMap,
+    /// Live concurrency lanes by key: busy and queued requests with the
+    /// bound. Empty when no lane is held or waited on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lanes: Vec<LaneSnapshot>,
     /// Usage totals over the recent-history window.
     pub recent_usage: RecentUsageSummary,
     /// The most recent records, oldest first.
@@ -328,6 +347,7 @@ impl RequestLog {
             errors: self.errors,
             providers: self.providers.clone(),
             key_cooldowns: BTreeMap::new(),
+            lanes: Vec::new(),
             recent_usage: summarize_recent(&recent_requests),
             recent_requests,
             classifier_status: Vec::new(),

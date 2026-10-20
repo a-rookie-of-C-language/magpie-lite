@@ -293,6 +293,17 @@ async fn stats(State(state): State<Arc<AppState>>, Query(query): Query<StatsQuer
     snapshot.key_cooldowns = state
         .key_rotation
         .cooldown_snapshot(&state.config.current());
+    snapshot.lanes = state
+        .lanes
+        .snapshot()
+        .into_iter()
+        .map(|(who, busy, waiting, limit)| crate::usage::LaneSnapshot {
+            who,
+            busy,
+            waiting,
+            limit,
+        })
+        .collect();
     snapshot.classifier_status = crate::classify::failures();
     Json(snapshot).into_response()
 }

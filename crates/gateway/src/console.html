@@ -586,6 +586,7 @@
                       <th scope="col">Output</th>
                       <th scope="col">Key slots</th>
                       <th scope="col">Cooldowns</th>
+                      <th scope="col">Lanes</th>
                     </tr>
                   </thead>
                   <tbody id="provider-rows"></tbody>
@@ -997,7 +998,7 @@
         ? "—"
         : `${fmt(totals.average_latency_ms)} ms`;
 
-      renderProviders(stats.providers || {}, stats.key_cooldowns || {});
+      renderProviders(stats.providers || {}, stats.key_cooldowns || {}, stats.lanes || []);
       renderRequests(stats.recent_requests || []);
       renderUsage(stats.recent_usage?.by_model || {});
       classifierStatusByModel = {};
@@ -1023,7 +1024,16 @@
       return said ? ` · ${said}` : "";
     }
 
-    function renderProviders(providers, cooldowns) {
+    function laneSummary(lanes, id) {
+      const mine = (lanes || []).filter(lane => lane.who === id || lane.who.startsWith(id + "#"));
+      if (mine.length === 0) return "Idle";
+      return mine.map(lane => {
+        const waiting = lane.waiting ? `, ${lane.waiting} waiting` : "";
+        return `${lane.busy}/${lane.limit} out${waiting}`;
+      }).join("; ");
+    }
+
+    function renderProviders(providers, cooldowns, lanes) {
       clear(elements.providerRows);
       const entries = Object.entries(providers);
       elements.providerEmpty.hidden = entries.length !== 0;
@@ -1035,7 +1045,8 @@
           text("td", fmt(provider.input_tokens)),
           text("td", fmt(provider.output_tokens)),
           text("td", keySummary(provider.keys || {})),
-          text("td", cooldownSummary(cooldowns[id] || {}))
+          text("td", cooldownSummary(cooldowns[id] || {})),
+          text("td", laneSummary(lanes, id))
         ]));
       }
     }
