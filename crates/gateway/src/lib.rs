@@ -19,6 +19,7 @@ mod kimi_schema;
 pub mod lanes;
 mod maxoutput;
 mod model_gone;
+pub mod model_rest;
 mod object_root;
 mod oneof_schema;
 mod optional_fields;

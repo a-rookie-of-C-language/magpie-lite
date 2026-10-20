@@ -13,7 +13,10 @@
 //! carries `providerOptions.gateway.only: ["deepseek"]` so Cline's AI
 //! gateway serves it from DeepSeek's own API.
 
+use regex::{Captures, Regex};
 use serde_json::{Value, json};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 /// The Cline desktop release lite says it is to the Cline API.
 pub const CLINE_VERSION: &str = "3.5.54";
@@ -155,6 +158,77 @@ pub fn unwrap_envelope(base_url: &str, value: Value) -> Value {
             .unwrap_or_else(|| "Cline request failed".to_owned());
         json!({"error": {"message": message}})
     }
+}
+
+/// Cline's refusal of a free model whose day's allowance is used up, 429
+/// "Daily free limit reached on model deepseek/deepseek-v4-flash. Try
+/// again in 23h 59m", as Cline's own clients read it (the reference's
+/// `clineFreeLimit`, #1398): the limit is that model's, and the model
+/// alone rests.
+fn free_limit_words() -> &'static Regex {
+    static FREE_LIMIT: OnceLock<Regex> = OnceLock::new();
+    FREE_LIMIT
+        .get_or_init(|| Regex::new(r"(?i)free limit reached on model").expect("free-limit words"))
+}
+
+/// How long Cline's free-model refusal says until the model is back
+/// ("Try again in 23h 59m"), in days, hours and minutes (the reference's
+/// `tryAgainIn`).
+fn try_again_in() -> &'static Regex {
+    static TRY_AGAIN: OnceLock<Regex> = OnceLock::new();
+    TRY_AGAIN.get_or_init(|| {
+        Regex::new(
+            r"(?i)\btry again in (?:(\d+)\s*d(?:ays?)?\b\s*)?(?:(\d+)\s*h(?:ours?|rs?)?\b\s*)?(?:(\d+)\s*m(?:in(?:utes?|s)?)?\b)?",
+        )
+        .expect("try-again words")
+    })
+}
+
+/// The longest a refusal's named wait is believed: a week, the
+/// reference's `longestWritten`.
+const LONGEST_WRITTEN_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// The days, hours and minutes a `tryAgainIn` match names, held to a
+/// week. Zero when it names none.
+fn span_written(caps: Option<Captures<'_>>) -> Duration {
+    let Some(caps) = caps else {
+        return Duration::ZERO;
+    };
+    let part = |index: usize| {
+        caps.get(index)
+            .and_then(|found| found.as_str().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let secs = part(1) * 24 * 60 * 60 + part(2) * 60 * 60 + part(3) * 60;
+    Duration::from_secs(secs.min(LONGEST_WRITTEN_SECS))
+}
+
+/// How long the model named by Cline's free-model daily-limit refusal is
+/// out: `None` for anything that is not one model's own named limit — a
+/// non-429, another vendor's same words (only a Cline host's refusal
+/// names its model's limit), a Cline 429 that doesn't name the model's
+/// limit, or one that names no wait. A named wait past a week is
+/// believed for a week.
+pub fn free_limit_rest(base_url: &str, status: u16, body: &Value) -> Option<Duration> {
+    if status != 429 || !is_cline_base(base_url) {
+        return None;
+    }
+    let text = body.to_string();
+    if !free_limit_words().is_match(&text) {
+        return None;
+    }
+    let back_in = span_written(try_again_in().captures(&text));
+    (!back_in.is_zero()).then_some(back_in)
+}
+
+/// The refusal's own words for the agent: the vendor's message when it
+/// names one, else the body as it came.
+pub fn refusal_message(body: &Value) -> String {
+    body.pointer("/error/message")
+        .or_else(|| body.pointer("/message"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| body.to_string())
 }
 
 #[cfg(test)]
@@ -392,5 +466,87 @@ mod tests {
             json!({"gateway": {"only": ["other"]}}),
             "client's own options stand"
         );
+    }
+
+    const FREE_LIMIT: &str =
+        "Daily free limit reached on model deepseek/deepseek-v4-flash. Try again in 23h 59m";
+
+    fn free_body(message: &str) -> Value {
+        json!({"error": {"message": message}})
+    }
+
+    #[test]
+    fn free_limit_rest_names_its_wait_on_a_cline_host() {
+        let back_in = free_limit_rest(CLINE_BASE, 429, &free_body(FREE_LIMIT))
+            .expect("one model's own limit");
+        assert_eq!(back_in, Duration::from_secs(23 * 60 * 60 + 59 * 60));
+    }
+
+    #[test]
+    fn free_limit_rest_reads_days_hours_and_minutes() {
+        for (message, secs) in [
+            (
+                "free limit reached on model m. Try again in 1d",
+                24 * 60 * 60,
+            ),
+            (
+                "free limit reached on model m. Try again in 2h 5m",
+                2 * 60 * 60 + 5 * 60,
+            ),
+            (
+                "free limit reached on model m. Try again in 1d 2h 3m",
+                24 * 60 * 60 + 2 * 60 * 60 + 3 * 60,
+            ),
+            // A named wait past a week is believed for a week.
+            (
+                "free limit reached on model m. Try again in 30d",
+                7 * 24 * 60 * 60,
+            ),
+        ] {
+            assert_eq!(
+                free_limit_rest(CLINE_BASE, 429, &free_body(message)),
+                Some(Duration::from_secs(secs)),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn free_limit_rest_needs_the_marker_and_a_wait() {
+        // A Cline 429 that doesn't name the model's limit rests the key.
+        assert_eq!(
+            free_limit_rest(CLINE_BASE, 429, &free_body("Rate limit exceeded")),
+            None
+        );
+        // The marker without a named wait names nothing to believe.
+        assert_eq!(
+            free_limit_rest(CLINE_BASE, 429, &free_body("free limit reached on model m")),
+            None
+        );
+        // The model's limit on another status is not its daily cap.
+        assert_eq!(
+            free_limit_rest(CLINE_BASE, 500, &free_body(FREE_LIMIT)),
+            None
+        );
+    }
+
+    #[test]
+    fn free_limit_rest_ignores_other_vendors() {
+        // Another vendor's same words rest its key as before.
+        assert_eq!(
+            free_limit_rest("https://api.openai.com/v1", 429, &free_body(FREE_LIMIT)),
+            None
+        );
+    }
+
+    #[test]
+    fn refusal_message_prefers_the_vendors_words() {
+        assert_eq!(refusal_message(&free_body(FREE_LIMIT)), FREE_LIMIT);
+        assert_eq!(
+            refusal_message(&json!({"message": "plain refusal"})),
+            "plain refusal"
+        );
+        let body = json!({"success": false});
+        assert_eq!(refusal_message(&body), body.to_string());
     }
 }

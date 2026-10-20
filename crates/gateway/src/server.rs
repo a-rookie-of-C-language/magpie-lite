@@ -2397,6 +2397,26 @@ async fn send_with_fallback(
                     group_route_index,
                 );
             }
+            // A model out of its own named limit is not asked again before
+            // its rest runs out (Cline's daily free-model limit, #1398):
+            // its provider's other models still answer. On the last route
+            // its own refusal answers without asking the vendor again.
+            if let Some(rest) = crate::model_rest::resting(&route.provider.id, &route.model) {
+                round_passing = false;
+                if route_index != last_route {
+                    continue 'routes;
+                }
+                let slot = route.api_keys.first().map(|(slot, _)| *slot).unwrap_or(0);
+                let candidate = UpstreamCandidate::new(&route, slot);
+                let mut failure = ProxyFailure::new(StatusCode::TOO_MANY_REQUESTS, rest.message);
+                failure.retry_after = Some(
+                    rest.until
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_secs()
+                        .max(1),
+                );
+                return Err((failure, candidate, decision.clone()));
+            }
             'keys: for (attempt, (key_slot, api_key)) in route.api_keys.iter().enumerate() {
                 let candidate = UpstreamCandidate::new(&route, *key_slot);
                 tracker.begin_attempt(&route.provider.id, &route.model, *key_slot);
@@ -3093,17 +3113,30 @@ async fn send_with_fallback(
                                 continue 'candidate;
                             }
                             if quota_limited_status(failure.status) {
-                                let cooldown = quota_cooldown(
-                                    &headers,
-                                    Some(&failure.body),
-                                    config.key_cooldown_for(&route.provider),
-                                );
-                                state.key_rotation.cool_down(
-                                    &route.provider.id,
-                                    route.provider.key_generation,
-                                    *key_slot,
-                                    cooldown,
-                                );
+                                if let Some(back_in) = crate::cline::free_limit_rest(
+                                    &route.provider.base_url,
+                                    failure.status.as_u16(),
+                                    &failure.body,
+                                ) {
+                                    crate::model_rest::rest(
+                                        &route.provider.id,
+                                        &route.model,
+                                        back_in,
+                                        crate::cline::refusal_message(&failure.body),
+                                    );
+                                } else {
+                                    let cooldown = quota_cooldown(
+                                        &headers,
+                                        Some(&failure.body),
+                                        config.key_cooldown_for(&route.provider),
+                                    );
+                                    state.key_rotation.cool_down(
+                                        &route.provider.id,
+                                        route.provider.key_generation,
+                                        *key_slot,
+                                        cooldown,
+                                    );
+                                }
                             }
                             // A mate key of this provider already gave a plain
                             // 403 on this request: it is the request refused,
@@ -3356,17 +3389,30 @@ async fn send_with_fallback(
                         continue 'candidate;
                     }
                     if quota_limited_status(status) {
-                        let cooldown = quota_cooldown(
-                            &headers,
-                            Some(&error.body),
-                            config.key_cooldown_for(&route.provider),
-                        );
-                        state.key_rotation.cool_down(
-                            &route.provider.id,
-                            route.provider.key_generation,
-                            *key_slot,
-                            cooldown,
-                        );
+                        if let Some(back_in) = crate::cline::free_limit_rest(
+                            &route.provider.base_url,
+                            status.as_u16(),
+                            &error.body,
+                        ) {
+                            crate::model_rest::rest(
+                                &route.provider.id,
+                                &route.model,
+                                back_in,
+                                error.message.clone(),
+                            );
+                        } else {
+                            let cooldown = quota_cooldown(
+                                &headers,
+                                Some(&error.body),
+                                config.key_cooldown_for(&route.provider),
+                            );
+                            state.key_rotation.cool_down(
+                                &route.provider.id,
+                                route.provider.key_generation,
+                                *key_slot,
+                                cooldown,
+                            );
+                        }
                     }
                     let mut detail = error.message;
                     tracing::warn!(

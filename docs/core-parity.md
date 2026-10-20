@@ -1072,3 +1072,34 @@ annotated (its unit tests already cover `affine_conversation`), and
 `cargo clippy --workspace --all-targets -- -D warnings` is green, and
 `cargo test --workspace` stays green with it (53 result lines,
 0 failures).
+
+### Upstream refresh, fourteenth pass (Cline free-model daily limit, `ff2e6e23`)
+
+Cline answers a free model's spent day with 429 "Daily free limit
+reached on model X. Try again in 23h 59m": the reference rests that
+model alone until the time the refusal names, instead of the whole
+key. Lite ports it as `crates/gateway/src/model_rest.rs` (per-model
+rests with the refusal's own words for replay, `reset` for tests) plus
+a `cline::free_limit_rest` detector (Cline hosts only, 429 only, the
+work it names capped at a week) wired into both quota branches in
+`server.rs` — a named free-model limit rests the model and skips the
+key cooldown, anything else rests the key as before — and a skip at
+the routes loop's head: a resting model is not asked again (other
+routes still answer), and on the last route its stored refusal is
+replayed as the 429 with a `Retry-After`. No per-provider toggle, as
+upstream: an account-wide 429 must not fan out to one rest per model.
+The Cline plugin surface has no lite equivalent, so the gate is the
+Cline host alone (the `clinepass` preset's URL is a `cline.bot` host
+too). Covered by `cline.rs` unit tests (marker, day/hour/minute
+parsing, week cap, no marker, no wait, non-429, other vendors,
+message extraction), `model_rest` unit tests, and a gateway loopback
+test (`crates/gateway/tests/cline_free_limit.rs`): the rested model
+is answered without asking the vendor while its mate still answers,
+another vendor's same words and a plain Cline rate limit lay no model
+rest and still reach the vendor. The host-gated refusal hook itself
+can't run against a loopback fake (it only fires on `cline.bot`
+hosts), so the loopback test drives the gateway with the rest the
+hook would lay down; the gate is covered by the `cline.rs` unit
+tests against the real host names. `cargo clippy --workspace
+--all-targets -- -D warnings` is green and `cargo test --workspace`
+stays green (58 result lines, 0 failures).
