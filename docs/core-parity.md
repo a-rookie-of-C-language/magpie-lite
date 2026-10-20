@@ -1,7 +1,7 @@
 # Core parity tracker
 
-Updated: 2026-10-20. Reference checkout: `D:\code\magpie` at `b641868e`
-(1,214 commits past the prior baseline `dde3a31a`); implementation:
+Updated: 2026-10-20. Reference checkout: `D:\code\magpie` at `79160455`
+(30 commits past the prior baseline `b641868e`); implementation:
 `D:\code\magpie-lite`.
 
 Target: multiple coding agents sharing one Rust backend, provider adapters for different services, and an interface managing providers, models, routing and usage. The reference rust-core-refactor-plan.md, rust-core-contracts.md and rust-core-admin-api.md are proposals with broader acceptance gates. This tracker does not claim G1–G16 completion or full Magpie product parity.
@@ -939,3 +939,36 @@ lite already replays a whole upstream answer as the client's stream and
 never asks that member again for the same turn. These fixtures are local
 unit, loopback HTTP and workspace tests, not live-vendor or real-agent
 evidence.
+
+### Upstream refresh, fourth pass (`94df2392..79160455`)
+
+Of the 16 commits past `94df2392`, the found-group core (`81a24cf8`)
+is ported: groups listed as `auto/<model>`, a bare id reaching its
+found group, vendors spelling one model apart merged on the id they
+agree on, the off switch with first-seat stand-in, and the CLI, HTTP
+and console switch. Its remaining bits — agent SyncCatalog rewrites,
+key model lists, the GUI Routing page, agent reseat, codexcat — have
+no lite surface: lite writes no agent model fields keyed by found
+ids, holds no per-key model lists, and reseats nothing.
+
+The rest has no lite surface either: Hermes `${VAR}`/`.env` key
+expansion (`b9d1cd36`, Hermes agent unsupported); a console reading
+the serving magpie's trace (`ef655acb`, no second process); the
+TestMaxRPM clock hold (`2c3c9039`, test-only — lite's lane tests
+sleep with wide margins and have never gone red); relayed Responses
+item ids (`d155ab16`, lite never relays byte for byte — its encoder
+assigns each item one id, as the reference's translated path does);
+the rule agent picker (`e5b57794`, no GUI rule editor); ZCode's
+native web search switch (`e4ac5e87`, ZCode agent unsupported); the
+readme sponsor spacing (`c12ba4fb`, upstream doc-only); the Windows
+updater antivirus hold (`40dee517`, no updater); Ollama decision
+models through System One (`9588501c`, no decision endpoint or
+Ollama presets — lite's classifiers ask as ordinary chat); the Mac
+login-item note (`5e30d5b5`, desktop app surface); the plugin GitHub
+list (`fb101b0d`, no plugin system); Antigravity's retired-model
+display names (`16327872`, `retired.rs` is id-keyed and keeps no
+vendor display names); the Codex ChatGPT-account relay retry
+(`5f73537f`, no account relay path — overload retry and fallback
+live in the IR routing every request takes); dsh's quarter-window
+reply cap (`822f2b30`, `agents.rs` writes no per-model output caps);
+RTK no-hook tooltip links (`79160455`, plugin library UI strings).
