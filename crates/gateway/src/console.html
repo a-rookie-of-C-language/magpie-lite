@@ -711,6 +711,7 @@
 
             <section class="panel" aria-labelledby="groups-title">
               <div class="panel-header"><h2 id="groups-title">Routing groups</h2><div><button id="group-found" type="button" class="button secondary">Found groups: on</button> <button id="group-new" type="button" class="button secondary">New group</button></div></div>
+              <div class="field vision-row"><label for="vision-model">Image recognition (optional)</label><div class="vision-controls"><input id="vision-model" class="token-input" list="agent-model-options" placeholder="seeing/model or off" spellcheck="false"><button id="vision-save" type="button" class="button secondary">Save vision</button></div><p id="vision-help" class="group-help">A provider/model describing the images a text-only model is asked about, in their place; off or blank keeps refusing a current user image and omitting the rest. A missing model is named in the refusal.</p><p id="vision-message" class="console-message" role="status" aria-live="polite" aria-atomic="true"></p></div>
               <form id="group-editor" class="group-editor" hidden>
                 <h3 id="group-editor-title">New routing group</h3>
                 <div class="field"><label for="group-id">Group ID</label><input id="group-id" class="token-input" required pattern="[A-Za-z0-9_-]+" placeholder="daily-coding" aria-describedby="group-id-help"><p id="group-id-help" class="group-help">Letters, digits, hyphens and underscores. Agents use group/&lt;id&gt;.</p></div>
@@ -872,6 +873,9 @@
       ruleCancel: document.getElementById("rule-cancel"),
       groupProviders: document.getElementById("group-providers"),
       groupFound: document.getElementById("group-found"),
+      visionModel: document.getElementById("vision-model"),
+      visionSave: document.getElementById("vision-save"),
+      visionMessage: document.getElementById("vision-message"),
       groupNew: document.getElementById("group-new"),
       groupSave: document.getElementById("group-save"),
       groupCancel: document.getElementById("group-cancel"),
@@ -1208,6 +1212,27 @@
       renderRoutingProviders(configuration.providers || []);
       foundGroupsOff = configuration.no_auto_groups === true;
       renderRoutingGroups(configuration.groups || [], foundGroupsOff);
+      renderVision(configuration);
+    }
+
+    // The Image recognition model: an explicit provider/model describes the
+    // images a text-only model is asked about, in their place; off or blank
+    // keeps the refusal and omission. A named model whose provider is gone
+    // or text-only is said as missing, and describes nothing.
+    function renderVision(configuration) {
+      const current = configuration.vision || "";
+      if (document.activeElement !== elements.visionModel) elements.visionModel.value = current;
+      const providers = configuration.providers || [];
+      const missing = (() => {
+        if (!current || current === "off") return "";
+        const slash = current.indexOf("/");
+        if (slash <= 0 || slash === current.length - 1) return `Image recognition ${current} is not provider/model.`;
+        const provider = providers.find(p => p.id === current.slice(0, slash));
+        if (!provider) return `Image recognition ${current} is missing.`;
+        if (provider.capabilities && provider.capabilities.vision === false) return `Image recognition ${current} takes text only.`;
+        return "";
+      })();
+      elements.visionMessage.textContent = missing;
     }
 
     function renderAgentModelOptions(configuration) {
@@ -1586,7 +1611,8 @@
         conds.push(`time ${span}`);
       }
       if (rule.folders?.length) conds.push(`folder ${rule.folders.join("|")}`);
-      if (rule.exceptFolders?.length) conds.push(`not folder ${rule.exceptFolders.join("|")}`);
+      if (rule.exceptFolders?.length) conds.push(
+ot folder ${rule.exceptFolders.join("|")}`);
       const what = conds.length ? ` when ${conds.join(", ")}` : "";
       const kind = rule.pause ? "pauses" : "sends first to";
       return `Rule ${index + 1} ${kind} ${member}${what}`;
@@ -2153,6 +2179,8 @@
       for (const control of elements.groupEditor.elements) control.disabled = busy;
       elements.groupNew.disabled = busy;
       elements.groupFound.disabled = busy;
+      elements.visionModel.disabled = busy;
+      elements.visionSave.disabled = busy;
       elements.signOut.disabled = busy;
       for (const button of elements.groupList.querySelectorAll("button")) button.disabled = busy;
       elements.groupSave.textContent = busy ? label : "Save group";
@@ -2208,6 +2236,39 @@
       await mutateGroup("/config/found-groups", "PUT", { on }, on ? "Found groups are on again." : "Found groups are off; only the groups you made or changed are listed.");
     }
 
+    // Name the Image recognition model: a provider/model describes the
+    // images a text-only model is asked about, in their place; off or
+    // blank describes nothing. A stale revision is refused, like the
+    // other config writes.
+    async function saveVision() {
+      if (managementBusy) return;
+      const raw = elements.visionModel.value.trim();
+      const vision = raw === "" ? null : raw;
+      const session = sessionRevision;
+      ++dataRevision;
+      invalidateAgentPreview();
+      setManagementBusy(true, "Saving…");
+      elements.visionMessage.textContent = "Saving…";
+      try {
+        const snapshot = await authorized("/config/vision", {
+          method: "PUT",
+          body: JSON.stringify({ vision }),
+          headers: configRevision === null ? {} : { "If-Match": String(configRevision) }
+        });
+        if (session !== sessionRevision) return;
+        renderRouting(snapshot);
+        elements.visionMessage.textContent = vision === null || vision === "off" ? "Image recognition is off." : `Image recognition is ${vision}.`;
+      } catch (error) {
+        if (session !== sessionRevision) return;
+        if (error.unauthorized) disconnect(true);
+        elements.visionMessage.textContent = error.message;
+        if (error.unauthorized) setMessage(error.message);
+      } finally {
+        if (session === sessionRevision) setManagementBusy(false);
+      }
+      if (session === sessionRevision) await update(true);
+    }
+
     // A removed found group comes back as the user's own: saving it with
     // its id unhides it (a group written with a found id is theirs).
     async function bringBackGroup(group) {
@@ -2249,6 +2310,7 @@
     elements.ruleCancel.addEventListener("click", closeRuleForm);
     elements.groupNew.addEventListener("click", () => openGroupEditor());
     elements.groupFound.addEventListener("click", toggleFoundGroups);
+    elements.visionSave.addEventListener("click", saveVision);
     elements.groupCancel.addEventListener("click", closeGroupEditor);
     elements.groupRouting.addEventListener("change", groupRoutingChanged);
     elements.groupEditor.addEventListener("keydown", event => {

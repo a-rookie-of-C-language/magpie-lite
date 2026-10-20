@@ -92,6 +92,14 @@ enum Command {
     Stats,
     /// List the models the configured providers serve.
     Models,
+    /// Name the Image recognition model, or turn describing off: a
+    /// `provider/model` describes the images a text-only model is asked
+    /// about, in their place; `off` keeps refusing a current user image
+    /// and omitting the rest. Blank just says.
+    Vision {
+        /// `provider/model` or `off`; blank just says.
+        state: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -918,6 +926,34 @@ async fn main() -> Result<()> {
             }
             for (id, owner) in catalog {
                 println!("{:<40} {}", id, owner);
+            }
+        }
+        Command::Vision { state } => {
+            let path = provider_path(&cli.config)?;
+            let mut cfg = Config::load(&path)?;
+            let Some(state) = state else {
+                match cfg.vision.as_deref() {
+                    None | Some("") | Some("off") => println!(
+                        "image recognition is off · a text-only model refuses a current user image and omits the rest; `magpie-lite vision provider/model` describes them instead"
+                    ),
+                    Some(want) => println!(
+                        "image recognition is {want} · a text-only model is answered from its descriptions"
+                    ),
+                }
+                return Ok(());
+            };
+            let vision = if state.eq_ignore_ascii_case("off") {
+                Some("off".to_owned())
+            } else {
+                Some(state.clone())
+            };
+            magpie_gateway::config::check_vision(vision.as_deref(), &cfg)?;
+            cfg.vision = vision.clone();
+            save_config(&path, &cfg)?;
+            match vision.as_deref() {
+                Some("off") => println!("image recognition is off"),
+                Some(want) => println!("image recognition is {want}"),
+                _ => println!("image recognition is off"),
             }
         }
     }
