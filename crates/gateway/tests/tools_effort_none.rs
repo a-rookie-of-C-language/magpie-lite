@@ -130,6 +130,7 @@ fn provider(id: &str, name: &str, base: &str) -> ProviderConfig {
         queue_limit: None,
         queue_wait_s: None,
         key_generation: 0,
+        pin_upstream: false,
         key_limits: Vec::new(),
     }
 }

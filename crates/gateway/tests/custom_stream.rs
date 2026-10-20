@@ -160,6 +160,7 @@ async fn custom_tool_input_streams_before_the_upstream_call_finishes() {
                     queue_limit: None,
                     queue_wait_s: None,
                     key_generation: 0,
+                    pin_upstream: false,
                     key_limits: Vec::new(),
                 }],
                 ..Config::default()

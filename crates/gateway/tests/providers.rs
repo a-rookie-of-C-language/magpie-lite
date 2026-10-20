@@ -1185,6 +1185,50 @@ async fn create_on_a_known_vendor_host_prefills_capabilities() {
 
 /// Explicit capabilities beat the vendor preset, and an update that omits
 /// them keeps the stored metadata instead of reapplying the preset.
+/// A provider can opt into Cline upstream pinning, and an update that
+/// omits it keeps the stored choice.
+#[tokio::test]
+async fn pin_upstream_is_stored_and_preserved_on_update() {
+    let gw = gateway().await;
+    let mut body = provider(&gw, "pinned");
+    body["base_url"] = json!("https://api.cline.bot/api/v1");
+    body["pin_upstream"] = json!(true);
+    assert_eq!(
+        edit(&gw, Method::POST, "/config/providers", body.clone())
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    let stored = snapshot(&gw, "/config").await["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["id"] == "pinned")
+        .unwrap()
+        .clone();
+    assert_eq!(stored["pin_upstream"], json!(true));
+    // An update that says nothing about pinning keeps the stored opt-in.
+    let mut update = body.clone();
+    update.as_object_mut().unwrap().remove("pin_upstream");
+    update["name"] = json!("renamed");
+    assert_eq!(
+        edit(&gw, Method::PUT, "/config/providers/pinned", update)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let kept = snapshot(&gw, "/config").await["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["id"] == "pinned")
+        .unwrap()["pin_upstream"]
+        .clone();
+    assert_eq!(kept, json!(true));
+}
+
+/// Explicit capabilities beat the vendor preset, and an update that omits
+/// them keeps the stored metadata instead of reapplying the preset.
 #[tokio::test]
 async fn explicit_capabilities_beat_the_preset_and_updates_preserve_it() {
     let gw = gateway().await;

@@ -649,6 +649,7 @@ mod tests {
                     queue_limit: None,
                     queue_wait_s: None,
                     key_generation: 0,
+                    pin_upstream: false,
                     key_limits: Vec::new(),
                 };
                 config.set_provider(provider, true).unwrap();
@@ -777,6 +778,7 @@ mod tests {
                             queue_limit: None,
                             queue_wait_s: None,
                             key_generation: 0,
+                            pin_upstream: false,
                             key_limits: Vec::new(),
                         },
                         true,

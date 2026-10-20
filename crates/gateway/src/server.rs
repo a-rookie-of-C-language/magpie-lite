@@ -4740,6 +4740,7 @@ mod tests {
             queue_wait_s: None,
             key_generation: 0,
             key_limits: Vec::new(),
+            pin_upstream: false,
         }
     }
 

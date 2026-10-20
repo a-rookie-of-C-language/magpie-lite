@@ -276,6 +276,10 @@ enum ProviderCommand {
         /// Seconds a request may wait in a key's queue or for room in its minute.
         #[arg(long)]
         queue_wait_s: Option<u32>,
+        /// Pin DeepSeek models to DeepSeek's own API on a Cline host
+        /// (`providerOptions.gateway.only` on the Chat body).
+        #[arg(long)]
+        pin_upstream: bool,
         /// Make this the provider for models that name none.
         #[arg(long)]
         default: bool,
@@ -415,6 +419,7 @@ async fn main() -> Result<()> {
                 max_rpm,
                 queue_limit,
                 queue_wait_s,
+                pin_upstream,
                 default,
             } => {
                 if id == "group" {
@@ -449,6 +454,7 @@ async fn main() -> Result<()> {
                     max_rpm,
                     queue_limit,
                     queue_wait_s,
+                    pin_upstream,
                     key_generation: 0,
                 };
                 cfg.set_provider(provider, default)?;
@@ -499,6 +505,9 @@ async fn main() -> Result<()> {
                     }
                     for route in &p.fallback {
                         println!("               ↳ fallback {route}");
+                    }
+                    if p.pin_upstream {
+                        println!("               ↳ pin DeepSeek models to DeepSeek's API");
                     }
                 }
             }

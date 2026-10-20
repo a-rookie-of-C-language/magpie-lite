@@ -54,6 +54,8 @@ pub(crate) struct ProviderEdit {
     /// Omitted on update to preserve the existing per-key overrides; `[]`
     /// clears them.
     key_limits: Option<Vec<u32>>,
+    /// Omitted on update to preserve the existing pinning.
+    pin_upstream: Option<bool>,
     #[serde(default)]
     make_default: bool,
 }
@@ -87,6 +89,10 @@ impl ProviderEdit {
         let key_limits = self
             .key_limits
             .unwrap_or_else(|| existing.map(|p| p.key_limits.clone()).unwrap_or_default());
+        let pin_upstream = self
+            .pin_upstream
+            .or_else(|| existing.map(|p| p.pin_upstream))
+            .unwrap_or(false);
         let contexts = self
             .contexts
             .unwrap_or_else(|| existing.map(|p| p.contexts.clone()).unwrap_or_default());
@@ -124,6 +130,7 @@ impl ProviderEdit {
             routing,
             weights,
             key_limits,
+            pin_upstream,
             affinity,
             max_concurrency,
             max_rpm,

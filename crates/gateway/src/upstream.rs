@@ -77,6 +77,17 @@ pub fn build_request(
     if p.protocol == Protocol::Chat && host.as_deref() == Some("api.deepseek.com") {
         body = deepseek_reply_limit(body);
     }
+    // A pinning Cline provider serves a DeepSeek model from DeepSeek's
+    // own API: the Chat body names that upstream (the reference's
+    // `clinePin`). Only Chat bodies pin, and only the models Cline
+    // would route elsewhere; everything else passes through.
+    body = crate::cline::pin_to_upstream(
+        body,
+        &p.base_url,
+        p.pin_upstream,
+        p.protocol == Protocol::Chat,
+        model,
+    );
     // DeepSeek's validator takes a tool pattern's null escape as `\u0000`,
     // not ECMAScript's `\0` (#370).
     body = crate::deepseek_schema::deepseek_tool_patterns(body, host.as_deref());
@@ -818,6 +829,95 @@ mod search_tests {
         assert_eq!(
             other["tools"][0]["function"]["parameters"]["properties"]["x"]["oneOf"],
             json!([{"type":"string"},{"type":"integer"}])
+        );
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    fn provider(url: &str, pin_upstream: bool) -> ProviderConfig {
+        serde_json::from_value(
+            json!({"id":"fixture", "protocol":"chat", "base_url":url, "pin_upstream":pin_upstream}),
+        )
+        .unwrap()
+    }
+
+    fn chat_request() -> CompletionRequest {
+        chat::decode_request(&json!({"model":"client",
+            "messages":[{"role":"user","content":"hi"}]}))
+        .unwrap()
+    }
+
+    fn pinned(body: &Value) -> bool {
+        body.get("providerOptions") == Some(&json!({"gateway": {"only": ["deepseek"]}}))
+    }
+
+    #[test]
+    fn a_pinning_cline_provider_pins_deepseek_chat_bodies() {
+        // The Chat body a pinning Cline provider sends for a DeepSeek
+        // model names DeepSeek's own API; the same model through the
+        // same provider unpinned, or through another vendor pinned,
+        // carries no such field.
+        let out = build_request(
+            &provider("https://api.cline.bot/api/v1", true),
+            &chat_request(),
+            "cline-pass/deepseek-v4.1-flash",
+            false,
+        )
+        .unwrap();
+        assert!(pinned(&out), "{out}");
+        let unpinned = build_request(
+            &provider("https://api.cline.bot/api/v1", false),
+            &chat_request(),
+            "cline-pass/deepseek-v4.1-flash",
+            false,
+        )
+        .unwrap();
+        assert!(unpinned.get("providerOptions").is_none(), "{unpinned}");
+        let elsewhere = build_request(
+            &provider("https://api.openai.com/v1", true),
+            &chat_request(),
+            "deepseek-v4-pro",
+            false,
+        )
+        .unwrap();
+        assert!(elsewhere.get("providerOptions").is_none(), "{elsewhere}");
+    }
+
+    #[test]
+    fn pinning_never_touches_free_models_or_client_options() {
+        // Cline's free models are served where Cline puts them, and a
+        // client naming its own providerOptions keeps them.
+        let free = build_request(
+            &provider("https://api.cline.bot/api/v1", true),
+            &chat_request(),
+            "cline-free/deepseek-v4.1-flash",
+            false,
+        )
+        .unwrap();
+        assert!(free.get("providerOptions").is_none(), "{free}");
+        let mut body = build_request(
+            &provider("https://api.cline.bot/api/v1", true),
+            &chat_request(),
+            "deepseek-v4-pro",
+            false,
+        )
+        .unwrap();
+        assert!(pinned(&body), "pinned first, {body}");
+        body["providerOptions"] = json!({"gateway": {"only": ["other"]}});
+        let kept = crate::cline::pin_to_upstream(
+            body,
+            "https://api.cline.bot/api/v1",
+            true,
+            true,
+            "deepseek-v4-pro",
+        );
+        assert_eq!(
+            kept["providerOptions"],
+            json!({"gateway": {"only": ["other"]}}),
+            "client's own options stand, {kept}"
         );
     }
 }

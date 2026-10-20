@@ -196,6 +196,12 @@ pub struct ProviderConfig {
     /// `AccountConcurrency`, #892).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub key_limits: Vec<u32>,
+    /// Ask a Cline API to serve DeepSeek models from DeepSeek's own API:
+    /// a DeepSeek-model Chat request on a Cline host carries
+    /// `providerOptions.gateway.only: ["deepseek"]` (the reference's
+    /// `PinUpstream`/`clinePin`, `cline_pin.go`). Off unless set.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pin_upstream: bool,
     /// Process-local credential/endpoint version; never saved or disclosed.
     #[serde(skip)]
     pub key_generation: u64,
@@ -1283,6 +1289,10 @@ pub struct ProviderConfigSnapshot {
     /// `max_concurrency` when routing (see `lane_limit_for_key`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub key_limits: Vec<u32>,
+    /// Whether a DeepSeek-model Chat request on a Cline host pins to
+    /// DeepSeek's own API.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pin_upstream: bool,
     /// Requests allowed per rolling minute per key; null for no limit.
     pub max_rpm: Option<u32>,
     /// Requests allowed to wait in a key's queue; null for no bound.
@@ -1791,6 +1801,7 @@ impl Config {
                     affinity: p.affinity,
                     max_concurrency: p.max_concurrency,
                     key_limits: p.key_limits.clone(),
+                    pin_upstream: p.pin_upstream,
                     max_rpm: p.max_rpm,
                     queue_limit: p.queue_limit,
                     queue_wait_s: p.queue_wait_s,
@@ -2295,6 +2306,7 @@ base_url = "http://127.0.0.1:1/v1"
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            pin_upstream: false,
             key_limits: Vec::new(),
         };
         assert!(provider.validate().is_ok());
@@ -2332,6 +2344,7 @@ base_url = "http://127.0.0.1:1/v1"
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            pin_upstream: false,
             key_limits: Vec::new(),
         };
         assert_eq!(provider.output_of("unknown"), 0);
@@ -2377,6 +2390,7 @@ base_url = "http://127.0.0.1:1/v1"
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            pin_upstream: false,
             key_limits: Vec::new(),
         };
 
@@ -2421,6 +2435,7 @@ base_url = "http://127.0.0.1:1/v1"
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            pin_upstream: false,
             key_limits: Vec::new(),
         };
         let encoded = toml::to_string(&provider).unwrap();
@@ -2459,6 +2474,7 @@ base_url = "http://127.0.0.1:1/v1"
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            pin_upstream: false,
             key_limits: Vec::new(),
         };
         assert!(provider.validate().is_err());
@@ -2492,6 +2508,7 @@ base_url = "http://127.0.0.1:1/v1"
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            pin_upstream: false,
             key_limits: Vec::new(),
         });
         let snapshot = config.snapshot();
@@ -2787,6 +2804,7 @@ base_url = "http://127.0.0.1:1/v1"
                 queue_limit: None,
                 queue_wait_s: None,
                 key_generation: 0,
+                pin_upstream: false,
                 key_limits: Vec::new(),
             }],
             ..Default::default()
@@ -2830,6 +2848,7 @@ base_url = "http://127.0.0.1:1/v1"
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            pin_upstream: false,
             key_limits: Vec::new(),
         });
         config.group.push(GroupConfig {
@@ -3017,6 +3036,7 @@ affinity = "session"
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            pin_upstream: false,
             key_limits: Vec::new(),
         });
         config.group.push(GroupConfig {
@@ -3265,6 +3285,7 @@ affinity = "session"
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            pin_upstream: false,
             key_limits: Vec::new(),
         }
     }
@@ -3632,6 +3653,7 @@ affinity = "session"
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            pin_upstream: false,
             key_limits: Vec::new(),
         };
 
