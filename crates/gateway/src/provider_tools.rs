@@ -301,54 +301,214 @@ pub async fn test(State(state): State<Arc<AppState>>, bytes: Bytes) -> Response 
         return finish(Err(bad("test model cannot contain provider credentials")));
     }
     let started = Instant::now();
-    finish(bounded(probe(&provider, &model)).await.map(|()| {
+    finish(bounded(probe(&provider, &model)).await.map(|streamed| {
         json!({
             "ok":true, "protocol":provider.protocol, "model":model,
+            "stream":streamed,
             "elapsed_ms":started.elapsed().as_millis()
         })
     }))
 }
 
-async fn probe(provider: &ProviderConfig, model: &str) -> ToolResult<()> {
+/// Ask the vendor for one short reply, streamed: the probe costs a first
+/// event, not a whole reply, and passes a vendor that only serves
+/// streams. A vendor that answers the streamed ask with a whole reply
+/// (its `stream: true` ignored) is read as before, and one that turns
+/// `stream: true` away with a 400 is asked once more plain. Returns
+/// whether the winning answer arrived as a stream.
+async fn probe(provider: &ProviderConfig, model: &str) -> ToolResult<bool> {
     let http = client()?;
-    let request = CompletionRequest {
-        model: model.to_owned(),
-        messages: vec![Message {
-            role: Role::User,
-            parts: vec![Part::text("Reply with OK.")],
-        }],
-        max_tokens: Some(64),
-        ..Default::default()
-    };
     // Probes are synthetic: no agent wire, so no billing line to strip.
-    let body = upstream::build_request(provider, &request, model, false)
-        .map_err(|_| failed("request cannot be encoded for this provider"))?;
+    let stream_body = upstream::build_request(
+        provider,
+        &CompletionRequest {
+            model: model.to_owned(),
+            messages: vec![Message {
+                role: Role::User,
+                parts: vec![Part::text("Reply with OK.")],
+            }],
+            max_tokens: Some(64),
+            stream: true,
+            ..Default::default()
+        },
+        model,
+        false,
+    )
+    .map_err(|_| failed("request cannot be encoded for this provider"))?;
+    let plain_body = upstream::build_request(
+        provider,
+        &CompletionRequest {
+            model: model.to_owned(),
+            messages: vec![Message {
+                role: Role::User,
+                parts: vec![Part::text("Reply with OK.")],
+            }],
+            max_tokens: Some(64),
+            ..Default::default()
+        },
+        model,
+        false,
+    )
+    .map_err(|_| failed("request cannot be encoded for this provider"))?;
     let mut remaining = BYTE_LIMIT;
     let mut last_error = failed("no provider credentials were attempted");
+    let mut stream = true;
     for key in provider.api_key_pool().into_iter().take(KEY_LIMIT) {
-        let response = upstream::send(&http, provider, &key, &body, model, false)
-            .await
-            .map_err(|error| match error.downcast::<reqwest::Error>() {
-                Ok(error) => network(error),
-                Err(_) => failed("could not reach provider"),
-            })?;
-        let status = response.status();
-        if !status.is_success() {
-            last_error = status_error(status);
-            if retry(status) {
+        loop {
+            let body = if stream { &stream_body } else { &plain_body };
+            let response = upstream::send(&http, provider, &key, body, model, stream)
+                .await
+                .map_err(|error| match error.downcast::<reqwest::Error>() {
+                    Ok(error) => network(error),
+                    Err(_) => failed("could not reach provider"),
+                })?;
+            let status = response.status();
+            if status == StatusCode::BAD_REQUEST && stream {
+                // The vendor does not take a streamed ask; the same key
+                // is still worth one plain ask.
+                stream = false;
                 continue;
             }
-            return Err(last_error);
+            if !status.is_success() {
+                last_error = status_error(status);
+                if retry(status) {
+                    break;
+                }
+                return Err(last_error);
+            }
+            let streamed = stream && is_event_stream(&response);
+            if streamed {
+                first_event(provider.protocol, response, &mut remaining).await?;
+                return Ok(true);
+            }
+            let value = json_body(response, &mut remaining).await?;
+            if valid_reply(provider.protocol, &value) {
+                return Ok(false);
+            }
+            return Err(failed(
+                "provider returned an invalid generation response for the selected protocol",
+            ));
         }
-        let value = json_body(response, &mut remaining).await?;
-        if valid_reply(provider.protocol, &value) {
-            return Ok(());
-        }
-        return Err(failed(
-            "provider returned an invalid generation response for the selected protocol",
-        ));
     }
     Err(last_error)
+}
+
+/// Whether an upstream reply arrived as a server-sent event stream.
+fn is_event_stream(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|content| content.to_ascii_lowercase().contains("text/event-stream"))
+}
+
+/// Read a streamed probe reply to its first event proving the vendor
+/// speaks `protocol`, then stop: the connection is dropped, so the probe
+/// costs one first word, not a whole reply. Whole reads stay under the
+/// shared byte limit; a stream that ends with no proving event fails.
+async fn first_event(
+    protocol: Protocol,
+    mut response: reqwest::Response,
+    remaining: &mut usize,
+) -> ToolResult<()> {
+    let mut buffer: Vec<u8> = Vec::new();
+    loop {
+        let Some(chunk) = response.chunk().await.map_err(network)? else {
+            break;
+        };
+        if chunk.len() > *remaining {
+            return Err(failed(
+                "provider response exceeded the 1 MiB operation limit",
+            ));
+        }
+        *remaining -= chunk.len();
+        for byte in chunk.iter() {
+            // Dispatch is on a blank line; normalize its endings first.
+            match byte {
+                b'\r' => {}
+                b'\n' => buffer.push(b'\n'),
+                _ => buffer.push(*byte),
+            }
+        }
+        while let Some(end) = frame_end(&buffer) {
+            let frame: Vec<u8> = buffer.drain(..end).collect();
+            let Some(data) = sse_data(&frame) else {
+                continue;
+            };
+            if data == "[DONE]" {
+                return Err(failed(
+                    "provider returned no streamed events for the selected protocol",
+                ));
+            }
+            if serde_json::from_str::<Value>(&data)
+                .is_ok_and(|value| stream_event_proves(protocol, &value))
+            {
+                return Ok(());
+            }
+        }
+    }
+    Err(failed(
+        "provider returned no streamed events for the selected protocol",
+    ))
+}
+
+/// The end of the first complete SSE frame (`\n\n`), delimiter included.
+fn frame_end(buffer: &[u8]) -> Option<usize> {
+    buffer
+        .windows(2)
+        .position(|pair| pair == b"\n\n")
+        .map(|at| at + 2)
+}
+
+/// A frame's `data:` payload, without the one optional leading space per
+/// line. Comment-only frames have none.
+fn sse_data(frame: &[u8]) -> Option<String> {
+    let mut data: Vec<&str> = Vec::new();
+    for line in std::str::from_utf8(frame).ok()?.lines() {
+        if let Some(payload) = line.strip_prefix("data:") {
+            data.push(payload.strip_prefix(' ').unwrap_or(payload));
+        }
+    }
+    if data.is_empty() {
+        None
+    } else {
+        Some(data.join("\n"))
+    }
+}
+
+/// Whether one streamed `data:` event proves the vendor speaks
+/// `protocol`: a first word, thought or tool call in its own shape, not
+/// a keepalive. Anthropic's `ping` and any error envelope prove
+/// nothing.
+fn stream_event_proves(protocol: Protocol, value: &Value) -> bool {
+    if value.get("error").is_some_and(|error| !error.is_null()) {
+        return false;
+    }
+    match protocol {
+        Protocol::Chat => value
+            .get("choices")
+            .and_then(Value::as_array)
+            .is_some_and(|choices| !choices.is_empty()),
+        Protocol::Anthropic => matches!(
+            value.get("type").and_then(Value::as_str),
+            Some(
+                "message_start"
+                    | "content_block_start"
+                    | "content_block_delta"
+                    | "content_block_stop"
+                    | "message_delta"
+                    | "message_stop"
+            )
+        ),
+        Protocol::Responses => value
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.starts_with("response.")),
+        Protocol::Gemini => value
+            .get("candidates")
+            .and_then(Value::as_array)
+            .is_some_and(|candidates| !candidates.is_empty()),
+    }
 }
 
 fn valid_reply(protocol: Protocol, value: &Value) -> bool {
@@ -450,5 +610,83 @@ mod tests {
             Protocol::Responses,
             &json!({"object":"response","status":"failed","output":[]})
         ));
+    }
+
+    #[test]
+    fn streamed_events_prove_their_own_protocol_only() {
+        let events = [
+            (
+                Protocol::Chat,
+                json!({"choices":[{"index":0,"delta":{"role":"assistant"}}]}),
+            ),
+            (
+                Protocol::Anthropic,
+                json!({"type":"message_start","message":{"role":"assistant"}}),
+            ),
+            (
+                Protocol::Anthropic,
+                json!({"type":"content_block_delta","delta":{"text":"O"}}),
+            ),
+            (
+                Protocol::Responses,
+                json!({"type":"response.output_text.delta","delta":"O"}),
+            ),
+            (
+                Protocol::Responses,
+                json!({"type":"response.created","response":{}}),
+            ),
+            (
+                Protocol::Gemini,
+                json!({"candidates":[{"content":{"parts":[{"text":"O"}]}}]}),
+            ),
+        ];
+        for (expected, event) in &events {
+            for protocol in [
+                Protocol::Chat,
+                Protocol::Responses,
+                Protocol::Anthropic,
+                Protocol::Gemini,
+            ] {
+                assert_eq!(
+                    stream_event_proves(protocol, event),
+                    protocol == *expected,
+                    "{protocol:?} {event}"
+                );
+                let mut error = event.clone();
+                error["error"] = json!({"message":"SECRET"});
+                assert!(!stream_event_proves(protocol, &error));
+            }
+        }
+        // Keepalives and empty turns prove nothing.
+        for protocol in [
+            Protocol::Chat,
+            Protocol::Responses,
+            Protocol::Anthropic,
+            Protocol::Gemini,
+        ] {
+            assert!(!stream_event_proves(protocol, &json!({"type":"ping"})));
+            assert!(!stream_event_proves(protocol, &json!({"choices":[]})));
+            assert!(!stream_event_proves(protocol, &json!({"candidates":[]})));
+        }
+    }
+
+    #[test]
+    fn frames_split_comments_done_and_crlf() {
+        let payload =
+            b": keepalive\n\nevent: message_start\ndata: {\"type\":\"ping\"}\n\ndata: [DONE]\n\n";
+        let mut buffer = payload.to_vec();
+        let mut seen = Vec::new();
+        while let Some(end) = frame_end(&buffer) {
+            let frame: Vec<u8> = buffer.drain(..end).collect();
+            seen.push(sse_data(&frame));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                None,
+                Some("{\"type\":\"ping\"}".to_owned()),
+                Some("[DONE]".to_owned())
+            ]
+        );
     }
 }

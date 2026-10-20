@@ -25,7 +25,7 @@ async fn upstream(State(mock): State<Arc<Mock>>, request: Request) -> Response {
     mock.seen
         .lock()
         .unwrap()
-        .push((uri.clone(), headers.clone(), body));
+        .push((uri.clone(), headers.clone(), body.clone()));
     if uri.starts_with("/slow/") {
         tokio::time::sleep(Duration::from_secs(11)).await;
     }
@@ -44,6 +44,23 @@ async fn upstream(State(mock): State<Arc<Mock>>, request: Request) -> Response {
         .is_some_and(|value| value == "Bearer SECRET-bad-key")
     {
         return (StatusCode::UNAUTHORIZED, "SECRET-bad-key echoed").into_response();
+    }
+    // Gemini carries the streamed ask in the URL, not the body.
+    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false)
+        || uri.contains("streamGenerateContent");
+    if uri.starts_with("/no-stream/") && stream {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":{"message":"streaming is not supported"}})),
+        )
+            .into_response();
+    }
+    if uri.starts_with("/stream-only/") && !stream {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":{"message":"streaming is required"}})),
+        )
+            .into_response();
     }
     if uri.starts_with("/oversize/") {
         return "x".repeat(1024 * 1024 + 1).into_response();
@@ -79,7 +96,10 @@ async fn upstream(State(mock): State<Arc<Mock>>, request: Request) -> Response {
         )
         .into_response();
     }
-    if uri.contains("/models") && !uri.contains(":generateContent") {
+    if uri.contains("/models")
+        && !uri.contains(":generateContent")
+        && !uri.contains("streamGenerateContent")
+    {
         if uri.starts_with("/gemini/") {
             if uri.contains("pageToken=") {
                 return Json(json!({"models":[{"name":"models/gemini-two","supportedGenerationMethods":["generateContent"]}]})).into_response();
@@ -99,6 +119,27 @@ async fn upstream(State(mock): State<Arc<Mock>>, request: Request) -> Response {
         }
         return Json(json!({"data":[{"id":"chat-one"},{"id":"chat-one"},{"id":"chat-two"}]}))
             .into_response();
+    }
+    if stream {
+        let payload = if uri.ends_with("/chat/completions") {
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"O\"}}]}\n\ndata: [DONE]\n\n"
+        } else if uri.ends_with("/responses") {
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"O\"}\n\ndata: [DONE]\n\n"
+        } else if uri.ends_with("/messages") {
+            ": keepalive\n\ndata: {\"type\":\"ping\"}\n\nevent: message_start\ndata: {\"type\":\"message_start\"}\n\ndata: [DONE]\n\n"
+        } else if uri.contains(":streamGenerateContent") {
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"O\"}]}}]}\n\ndata: [DONE]\n\n"
+        } else {
+            ""
+        };
+        if !payload.is_empty() {
+            return (
+                StatusCode::OK,
+                [("content-type", "text/event-stream")],
+                Body::from(payload),
+            )
+                .into_response();
+        }
     }
     let value = if uri.ends_with("/chat/completions") {
         json!({"choices":[{"message":{"role":"assistant","content":"OK"}}]})
@@ -257,6 +298,7 @@ async fn minimal_probes_use_all_four_protocols_and_do_not_advance_rotation_or_us
         assert_eq!(value["ok"], true);
         assert_eq!(value["protocol"], protocol);
         assert_eq!(value["model"], "chosen-model");
+        assert_eq!(value["stream"], true);
     }
     let after = reqwest::Client::new()
         .get(format!("{}/stats", f.url))
@@ -270,6 +312,7 @@ async fn minimal_probes_use_all_four_protocols_and_do_not_advance_rotation_or_us
     assert_eq!(before, after);
     let seen = f.mock.seen.lock().unwrap();
     assert_eq!(seen[0].2["max_tokens"], 64);
+    assert_eq!(seen[0].2["stream"], true);
     assert_eq!(seen[0].2["messages"][0]["content"], "Reply with OK.");
     assert_eq!(seen[1].2["max_output_tokens"], 64);
     assert!(seen[1].2["input"].is_array());
@@ -277,7 +320,42 @@ async fn minimal_probes_use_all_four_protocols_and_do_not_advance_rotation_or_us
     assert!(seen[2].1.get("authorization").is_none());
     assert_eq!(seen[3].2["generationConfig"]["maxOutputTokens"], 64);
     assert!(seen[3].2.get("model").is_none());
-    assert!(seen[3].0.ends_with("/models/chosen-model:generateContent"));
+    assert!(
+        seen[3]
+            .0
+            .ends_with("/models/chosen-model:streamGenerateContent?alt=sse")
+    );
+}
+
+#[tokio::test]
+async fn probes_pass_stream_only_vendors_and_fall_back_when_stream_is_refused() {
+    let f = Fixture::new().await;
+    // A vendor that only serves streams passes on its first event.
+    let response = f
+        .call("test", f.draft("chat", "/stream-only/v1"), Some("m"))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.json::<Value>().await.unwrap()["stream"], true);
+    // A vendor that turns `stream: true` away with a 400 is asked once
+    // more plain, and wins on the whole reply.
+    let response = f
+        .call("test", f.draft("chat", "/no-stream/v1"), Some("m"))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.json::<Value>().await.unwrap()["stream"], false);
+    let seen = f.mock.seen.lock().unwrap();
+    let bodies: Vec<&Value> = seen.iter().map(|(_, _, body)| body).collect();
+    assert!(bodies.iter().any(|body| body["stream"] == true));
+    assert!(
+        bodies
+            .iter()
+            .any(|body| body.get("stream") != Some(&true.into()))
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|(_, _, body)| body.to_string().contains("SECRET"))
+    );
 }
 
 #[tokio::test]

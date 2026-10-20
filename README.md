@@ -288,8 +288,13 @@ The provider editor offers **Discover models** and **Test connection** for both
 saved providers and unsaved drafts. Discovery appends unique IDs to the draft
 model list; it does not remove manually entered IDs. Save explicitly to publish
 that list. Testing uses the chosen test model, or the first draft model, and sends
-`Reply with OK.` as a non-streaming generation request with a 64-output-token
-limit. It may incur provider charges. A successful test checks the selected
+`Reply with OK.` as a short streaming request with a 64-output-token
+limit, stopping at the first event that proves the selected protocol, so it
+passes vendors that only serve streams. A vendor that answers the streamed
+ask with a whole reply still passes on its envelope; one that turns streams
+away with a 400 is asked once more without streaming. The reply names which
+path won (`stream: true/false`). It may incur provider charges. A successful
+test checks the selected
 protocol's response envelope, not model quality or support for tools/images.
 
 Both endpoints require the local gateway token:
@@ -297,7 +302,7 @@ Both endpoints require the local gateway token:
 | Method | Endpoint | Body / response |
 |---|---|---|
 | POST | `/config/provider-tools/models` | `{"provider": <provider-edit-json>}`; 200 with `{"models":["model-id"]}` |
-| POST | `/config/provider-tools/test` | `{"provider": <provider-edit-json>,"model":"model-id"}`; 200 with `ok`, `protocol`, `model` and `elapsed_ms` |
+| POST | `/config/provider-tools/test` | `{"provider": <provider-edit-json>,"model":"model-id"}`; 200 with `ok`, `protocol`, `model`, `stream` and `elapsed_ms` |
 
 The draft uses the provider-edit fields above. An omitted/null `api_keys` reuses
 credentials of the saved provider with the same ID; explicit keys replace them
@@ -415,7 +420,7 @@ Tests are the contract: `crates/core/tests/translation.rs` checks real wire shap
 - A TUI
 - Selective Agent restoration preserving later unrelated edits and richer detection/override semantics
 - Broader provider capability metadata and stream-only/specialized connection probes
-- Stream-only/specialized connection probes (known-vendor capability presets already prefill on add)
+- Specialized (vision/tool-call) connection probes (stream-only vendors already pass the streamed check)
 - More routing policies, versioned admin API and separate management authentication
 
 See [core parity tracker](docs/core-parity.md) for implementation evidence and remaining reference gaps.
