@@ -2253,8 +2253,8 @@ async fn send_with_fallback(
     let mut wait_from: Option<std::time::Instant> = None;
     let mut rounds = 0u32;
     // True at each round's top, false once a member fails in a way that
-    // stands: only an all-passing round is asked again.
-    // Set at each round's top, true unless a member fails finally.
+    // stands: only an all-passing round is asked again. Declared without
+    // an initial value: the loop top assigns it before any read.
     let mut round_passing: bool;
 
     'replan: loop {
@@ -2376,8 +2376,8 @@ async fn send_with_fallback(
                     if route_index != last_route {
                         break 'keys;
                     }
-                    // Every member busy and none asked: wait for a slot to
-                    // free and ask the round again, while the group's patience
+                    // Every member busy and none asked: wait for minute room
+                    // and ask the round again, while the group's patience
                     // lasts (the reference's replan, #1418).
                     if round_passing
                         && rounds < MAX_REPLAN_ROUNDS
