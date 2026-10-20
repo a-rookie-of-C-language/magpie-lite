@@ -938,7 +938,7 @@ async fn found_groups_off_serves_the_first_seat_but_lists_nothing() {
         rpms: magpie_gateway::lanes::Rpms::default(),
     });
     let (url, gateway_task) = bind(build_router(state)).await;
-    let _tasks = vec![upstream_a_task, upstream_b_task, gateway_task];
+    let _tasks = [upstream_a_task, upstream_b_task, gateway_task];
     // Listed nowhere: neither the public ref nor the old id.
     let models: Value = Client::new()
         .get(format!("{url}/v1/models"))
@@ -1040,7 +1040,7 @@ async fn a_bare_model_id_reaches_its_found_group() {
         rpms: magpie_gateway::lanes::Rpms::default(),
     });
     let (url, gateway_task) = bind(build_router(state)).await;
-    let _tasks = vec![down_task, up_task, gateway_task];
+    let _tasks = [down_task, up_task, gateway_task];
     assert_eq!(ask(&url, "shared").await, StatusCode::OK);
     // The down member was tried first, in provider order, and the
     // second member served it.
@@ -1122,7 +1122,7 @@ async fn vendors_spelling_one_model_apart_share_one_served_group() {
         rpms: magpie_gateway::lanes::Rpms::default(),
     });
     let (url, gateway_task) = bind(build_router(state)).await;
-    let _tasks = vec![first_task, second_task, gateway_task];
+    let _tasks = [first_task, second_task, gateway_task];
     // Listed once, under the first spelling; either spelling and the
     // bare one are served, the first vendor asked for its own id.
     let models: Value = Client::new()
@@ -1571,7 +1571,7 @@ async fn found_group_request_level_round_trip() {
         rpms: magpie_gateway::lanes::Rpms::default(),
     });
     let (url, gateway_task) = bind(build_router(state)).await;
-    let _tasks = vec![down_task, up_task, gateway_task];
+    let _tasks = [down_task, up_task, gateway_task];
     assert_eq!(ask(&url, "auto/shared:max").await, StatusCode::OK);
     assert_eq!(
         down.lock().unwrap().as_ref().unwrap()["reasoning_effort"],
