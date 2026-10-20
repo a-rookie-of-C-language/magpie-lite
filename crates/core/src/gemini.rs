@@ -573,6 +573,19 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
         }
     }
     let mut contents = pair_function_turns(contents, &answered, &answered_name, INTERRUPTED_NOTE);
+    // A history opening with the model's turn is turned away ("function
+    // call turn comes immediately after a user turn", what an agent's
+    // compaction can leave): a user turn goes before it, as Gemini CLI's
+    // hardenHistory puts it.
+    if contents.first().and_then(|c| c["role"].as_str()) == Some("model") {
+        contents.insert(
+            0,
+            json!({
+                "role": "user",
+                "parts": [{"text": "[Continuing from previous AI thoughts...]"}],
+            }),
+        );
+    }
     // A conversation ending with the model's turn is turned away
     // ("Requests ending with a model turn are not supported"): a user
     // turn goes after it. When the conversation is an agent compacting

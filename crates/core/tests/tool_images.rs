@@ -165,7 +165,14 @@ fn four_client_tool_images_reach_all_four_upstream_encoders() {
                     assert_eq!(nested, images);
                 }
                 "Gemini" => {
-                    let result = &wire["contents"][1]["parts"][0]["functionResponse"];
+                    // The decoded history opens with the model's turn, so a
+                    // continuing turn goes before it; the response keeps its
+                    // own turn after the call.
+                    assert_eq!(
+                        wire["contents"][0]["parts"][0]["text"],
+                        "[Continuing from previous AI thoughts...]"
+                    );
+                    let result = &wire["contents"][2]["parts"][0]["functionResponse"];
                     assert_eq!(result["name"], "screenshot");
                     assert_eq!(
                         result["response"][if client == "Responses" {

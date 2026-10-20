@@ -162,7 +162,13 @@ fn gemini_native_json_and_history_keep_all_signature_kinds() {
     )
     .unwrap();
     let history = gemini::encode_request(&request, "m").unwrap();
-    for p in history["contents"][0]["parts"]
+    // The decoded history opens with the model's turn, so a continuing
+    // user turn goes before it; the signatures ride the model's own turn.
+    assert_eq!(
+        history["contents"][0]["parts"][0]["text"],
+        "[Continuing from previous AI thoughts...]"
+    );
+    for p in history["contents"][1]["parts"]
         .as_array()
         .unwrap()
         .iter()

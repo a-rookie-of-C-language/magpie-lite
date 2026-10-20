@@ -181,10 +181,20 @@ fn user_text_beside_tool_results_gets_a_turn_of_its_own() {
     };
     let encoded = gemini::encode_request(&ir, "mock-model").unwrap();
     let contents = encoded["contents"].as_array().unwrap();
-    assert_eq!(contents[1]["role"], "user");
-    assert!(contents[1]["parts"][0].get("functionResponse").is_some());
+    // The history opens with the model's turn, so a continuing turn goes
+    // before it; the response and the user's words still go in turns of
+    // their own after the call.
+    assert_eq!(contents.len(), 4);
+    assert_eq!(contents[0]["role"], "user");
+    assert_eq!(
+        contents[0]["parts"][0]["text"],
+        "[Continuing from previous AI thoughts...]"
+    );
+    assert_eq!(contents[1]["role"], "model");
     assert_eq!(contents[2]["role"], "user");
-    assert_eq!(contents[2]["parts"][0]["text"], "and now summarize");
+    assert!(contents[2]["parts"][0].get("functionResponse").is_some());
+    assert_eq!(contents[3]["role"], "user");
+    assert_eq!(contents[3]["parts"][0]["text"], "and now summarize");
 }
 
 #[test]
@@ -408,6 +418,39 @@ fn model_last_request(system: &str) -> magpie_core::ir::CompletionRequest {
         ],
         ..Default::default()
     }
+}
+
+#[test]
+fn model_opening_history_gets_a_continuing_turn_before_it() {
+    // Gemini turns away a history opening with the model's turn
+    // ("function call turn comes immediately after a user turn"), what
+    // an agent's compaction can leave: a user turn goes before it, as
+    // Gemini CLI's hardenHistory puts it.
+    let ir = magpie_core::ir::CompletionRequest {
+        model: "mock/mock-model".into(),
+        messages: vec![
+            magpie_core::ir::Message {
+                role: magpie_core::ir::Role::Assistant,
+                parts: vec![magpie_core::ir::Part::text("the summary so far")],
+            },
+            magpie_core::ir::Message {
+                role: magpie_core::ir::Role::User,
+                parts: vec![magpie_core::ir::Part::text("go on")],
+            },
+        ],
+        ..Default::default()
+    };
+    let encoded = gemini::encode_request(&ir, "mock-model").unwrap();
+    let contents = encoded["contents"].as_array().unwrap();
+    assert_eq!(contents.len(), 3);
+    assert_eq!(contents[0]["role"], "user");
+    assert_eq!(
+        contents[0]["parts"][0]["text"],
+        "[Continuing from previous AI thoughts...]"
+    );
+    assert_eq!(contents[1]["role"], "model");
+    assert_eq!(contents[2]["role"], "user");
+    assert_eq!(contents[2]["parts"][0]["text"], "go on");
 }
 
 #[test]
