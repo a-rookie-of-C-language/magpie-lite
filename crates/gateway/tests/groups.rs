@@ -1349,3 +1349,178 @@ async fn a_manual_pick_can_name_a_bare_model_id() {
     );
     assert_eq!(upstream_model(&gw), "first");
 }
+
+#[tokio::test]
+async fn found_group_request_level_round_trip() {
+    async fn ask(url: &str, model: &str) -> StatusCode {
+        Client::new()
+            .post(format!("{url}/v1/chat/completions"))
+            .bearer_auth("magpie-lite")
+            .json(&json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "Hi"}],
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    }
+    // A found ref may ask for an effort on itself (`auto/<model>:<level>`):
+    // the group serves it at that effort.
+    let gw = gateway_with_shared_model().await;
+    assert_eq!(ask(&gw.url, "auto/shared:high").await, StatusCode::OK);
+    {
+        let body = gw.last.lock().unwrap().clone().expect("upstream was asked");
+        assert_eq!(body["model"], "shared");
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+    assert_eq!(ask(&gw.url, "auto/shared:low").await, StatusCode::OK);
+    {
+        let body = gw.last.lock().unwrap().clone().expect("upstream was asked");
+        assert_eq!(body["reasoning_effort"], "low");
+    }
+    // An unknown level is no found ref: 404, and nothing is written.
+    // (`ultra` is known — it fits to `max` — so the probe uses a level
+    // no dialect names.)
+    assert_eq!(
+        ask(&gw.url, "auto/shared:turbo").await,
+        StatusCode::NOT_FOUND
+    );
+    assert!(Config::load(&gw.path).unwrap().group.is_empty());
+    // A provider's own colon-model stays whole: `openrouter/x:free` is
+    // its model, not a level ask. A provider id'd `auto` owning such a
+    // model keeps `auto/<model>:<level>` for itself the same way.
+    let guard = |id: &str, models: Vec<&str>| ProviderConfig {
+        id: id.into(),
+        name: id.into(),
+        protocol: Protocol::Chat,
+        base_url: "http://127.0.0.1:1/v1".into(),
+        api_key: "secret-provider-key".into(),
+        api_keys: Vec::new(),
+        models: models.into_iter().map(|m| m.to_owned()).collect(),
+        contexts: Default::default(),
+        fallback: Vec::new(),
+        key_cooldown_ms: None,
+        capabilities: Default::default(),
+        routing: magpie_gateway::RoutingPolicy::Rotate,
+        weights: Vec::new(),
+        affinity: Default::default(),
+        max_concurrency: None,
+        max_rpm: None,
+        queue_limit: None,
+        queue_wait_s: None,
+        key_generation: 0,
+    };
+    let colon = Config {
+        provider: vec![guard("openrouter", vec!["x:free"])],
+        ..Config::default()
+    };
+    assert_eq!(
+        colon.member_effort("openrouter/x:free"),
+        ("openrouter/x:free".to_owned(), String::new())
+    );
+    let owned = Config {
+        provider: vec![guard("auto", vec!["shared:high"])],
+        ..Config::default()
+    };
+    assert_eq!(
+        owned.member_effort("auto/shared:high"),
+        ("auto/shared:high".to_owned(), String::new())
+    );
+    // A request-level `:max` does not leak onto failover: the down seat
+    // is tried at `:max`, the second seat serves with no fixed effort.
+    // (Members fixed at their own `:level` keep it mid-chain: covered
+    // below with a written group.)
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let down = Arc::new(Mutex::new(None));
+    let up = Arc::new(Mutex::new(None));
+    let (down_url, down_task) = bind(
+        Router::new()
+            .route("/v1/chat/completions", post(failing))
+            .with_state(down.clone()),
+    )
+    .await;
+    let (up_url, up_task) = bind(
+        Router::new()
+            .route("/v1/chat/completions", post(mock))
+            .with_state(up.clone()),
+    )
+    .await;
+    let peer = |id: &str, upstream: &str| ProviderConfig {
+        id: id.into(),
+        name: id.into(),
+        protocol: Protocol::Chat,
+        base_url: format!("{upstream}/v1"),
+        api_key: "secret-provider-key".into(),
+        api_keys: Vec::new(),
+        models: vec!["shared".into()],
+        contexts: Default::default(),
+        fallback: Vec::new(),
+        key_cooldown_ms: None,
+        capabilities: Default::default(),
+        routing: magpie_gateway::RoutingPolicy::Rotate,
+        weights: Vec::new(),
+        affinity: Default::default(),
+        max_concurrency: None,
+        max_rpm: None,
+        queue_limit: None,
+        queue_wait_s: None,
+        key_generation: 0,
+    };
+    let config = Config {
+        provider: vec![peer("mock-a", &down_url), peer("mock-b", &up_url)],
+        ..Config::default()
+    };
+    config.save(&path).unwrap();
+    let state = Arc::new(AppState {
+        agents: None,
+        config: ConfigStore::new(config, Some(path.clone())),
+        http: magpie_gateway::upstream::http_client().unwrap(),
+        requests: Arc::new(Mutex::new(magpie_gateway::usage::RequestLog::default())),
+        key_rotation: magpie_gateway::KeyRotator::default(),
+        affinity: magpie_gateway::AffinityStore::default(),
+        lanes: magpie_gateway::lanes::Lanes::default(),
+        rpms: magpie_gateway::lanes::Rpms::default(),
+    });
+    let (url, gateway_task) = bind(build_router(state)).await;
+    let _tasks = vec![down_task, up_task, gateway_task];
+    assert_eq!(ask(&url, "auto/shared:max").await, StatusCode::OK);
+    assert_eq!(
+        down.lock().unwrap().as_ref().unwrap()["reasoning_effort"],
+        "max"
+    );
+    {
+        let served = up.lock().unwrap().clone().expect("failover served");
+        assert_eq!(served["model"], "shared");
+        assert!(
+            served.get("reasoning_effort").is_none(),
+            "request :max must not leak onto failover: {served}"
+        );
+    }
+    // Members fixed at their own `:level` keep it mid-chain: the down
+    // seat at `:low` fails, the next seat serves at its own `:high`.
+    let created = Client::new()
+        .request(Method::POST, format!("{url}/config/groups"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "id": "chain",
+            "name": "chain",
+            "routes": ["mock-a/shared:low", "mock-b/shared:high"],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    *down.lock().unwrap() = None;
+    *up.lock().unwrap() = None;
+    assert_eq!(ask(&url, "group/chain").await, StatusCode::OK);
+    assert_eq!(
+        down.lock().unwrap().as_ref().unwrap()["reasoning_effort"],
+        "low"
+    );
+    assert_eq!(
+        up.lock().unwrap().as_ref().unwrap()["reasoning_effort"],
+        "high"
+    );
+}

@@ -1152,8 +1152,18 @@ fn prepare(
         )
     })?;
 
+    // A found ref may ask for an effort on itself (`auto/<model>:<level>`,
+    // the reference's `CanonicalRef`): route the stripped base, send at
+    // the ask. Other refs pass through untouched; a provider's own
+    // colon-model (`openrouter/…:free`) or a provider id'd `auto` owning
+    // such a model stays whole through `member_effort`'s guard.
+    let (request_base, request_level) = if creq.model.starts_with("auto/") {
+        config.member_effort(&creq.model)
+    } else {
+        (creq.model.clone(), String::new())
+    };
     let (provider, upstream_model, fixed_effort, levels, group_plan, group_route_index) =
-        if let Some(group) = config.group_by_ref(&creq.model) {
+        if let Some(group) = config.group_by_ref(&request_base) {
             // Both spellings land on the internal id, so rotation,
             // affinity and usage count them as one group.
             let group_id = group.id.clone();
@@ -1177,7 +1187,9 @@ fn prepare(
                 ));
             };
             // The vendor is asked for the model's own id; a fixed effort
-            // rides the route for the send.
+            // rides the route for the send. A request-level ask beats the
+            // member's own; the group's levels still bound it downstream,
+            // and failover members keep their own.
             let Some((provider, upstream_model, effort)) = config.resolve_member(&route) else {
                 return Err((
                     StatusCode::NOT_FOUND,
@@ -1186,6 +1198,11 @@ fn prepare(
                         &format!("no provider serves model `{}`", creq.model),
                     ),
                 ));
+            };
+            let effort = if request_level.is_empty() {
+                effort
+            } else {
+                request_level.clone()
             };
             (
                 provider,
@@ -1199,7 +1216,7 @@ fn prepare(
                 Some(route_index),
             )
         } else {
-            let Some((provider, upstream_model)) = config.resolve(&creq.model) else {
+            let Some((provider, upstream_model)) = config.resolve(&request_base) else {
                 let message = format!(
                     "no provider serves model `{}`; add one with `magpie-lite provider add`",
                     creq.model
@@ -1212,7 +1229,7 @@ fn prepare(
             (
                 provider,
                 upstream_model,
-                String::new(),
+                request_level.clone(),
                 Vec::new(),
                 None,
                 None,
@@ -1745,11 +1762,19 @@ async fn send_with_fallback(
     affinity_scope: (String, Affinity, bool),
 ) -> Result<(UpstreamReply, UpstreamCandidate, Decision), (ProxyFailure, UpstreamCandidate, Decision)>
 {
+    // Fallback lookups route the stripped base; the usage record keeps
+    // the original `creq.model`, as the reference keeps `:level` in the
+    // canonical ref.
+    let request_base = if creq.model.starts_with("auto/") {
+        config.member_effort(&creq.model).0
+    } else {
+        creq.model.clone()
+    };
     let mut routes = upstream_routes(
         config,
         &state.key_rotation,
         initial,
-        &creq.model,
+        &request_base,
         group_plan,
     );
     // A group's rules: a pause leaves its member out for now; a matching
