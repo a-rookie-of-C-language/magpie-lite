@@ -2,7 +2,7 @@
 
 Updated: 2026-10-20. Reference checkout: `D:\code\magpie` at `79160455`
 (30 commits past the prior baseline `b641868e`); `origin/main`
-triaged through `2374ffe1` (thirteenth pass: origin/main static, nothing portable; magpie-core now `-D warnings` clean under the current clippy; gateway-wide `-D warnings` stays red on pre-existing lints; twelfth pass: Codex client tool-search relay ported (docs/tool-search.md); eleventh pass: no new upstream commits; unportable file_id images refused; tenth pass: no new upstream commits; text-only image gating added; ninth pass: no new upstream commits; user-sent image loopback evidence added; eighth pass: the RPM cancel ordering fix is
+triaged through `2374ffe1` (thirteenth pass: origin/main static, nothing portable; workspace-wide `-D warnings` green — mechanical lints fixed, structural ones scoped-allowed, one dead wrapper removed; twelfth pass: Codex client tool-search relay ported (docs/tool-search.md); eleventh pass: no new upstream commits; unportable file_id images refused; tenth pass: no new upstream commits; text-only image gating added; ninth pass: no new upstream commits; user-sent image loopback evidence added; eighth pass: the RPM cancel ordering fix is
 ported as a drop guard, the rest still nothing portable: two Go gateway
 allocation optimizations and a GUI Routing canvas fix;
 `routing-context-fold` stays GUI-only, `agent-connect`/`ui-previews`
@@ -1053,14 +1053,22 @@ pass keeps the shared core warning-clean under the current toolchain
 `crates/core/src/responses.rs`; `cargo clippy -p magpie-core
 --all-targets -- -D warnings` green, `cargo test -p magpie-core`
 green, `cargo test -p magpie-gateway` green — 29 targets, 0 failures).
-Gateway `-D warnings` went from 21 lib errors to 6: the mechanical,
+Gateway `-D warnings` went from 21 lib errors to zero: the mechanical,
 zero-behavior-change lints are fixed (`collapsible_if`,
 `redundant_field_names`, `needless_borrow`, `needless_lifetimes`,
 `needless_range_loop`, `manual_contains`, `question_mark`,
 `while_let_loop`, `unnecessary_sort_by` across `server.rs`,
 `affinity.rs`, `classify.rs`, `config.rs`, `continuation.rs`,
 `gemini_schema.rs`, `kimi_schema.rs`, `reply_room.rs`, `rules.rs`,
-`tool_schema.rs`). The remaining 6 are structural and pre-existing
-(`too_many_arguments` x4, `type_complexity`, `result_large_err` in
-`server.rs`/`affinity.rs`/`rules.rs`): signature and structural
-refactors with behavior risk, deliberately left alone.
+`tool_schema.rs`, plus two test-only lints). The structural ones stay
+as scoped, justified `#[allow]`s instead of behavior-risk refactors:
+`too_many_arguments` on the core dispatch (`send_with_fallback`),
+the re-ask path (`reask_stream`), and group routing (`rule_for`);
+`result_large_err` on the failure-path triple shared with the success
+shape; `large_enum_variant` on the one-shot CLI arg enum. A dead
+`AffinityStore::affine` wrapper with no callers was removed instead of
+annotated (its unit tests already cover `affine_conversation`), and
+`prepare`'s return shape got a `PreparedRoute` alias. So
+`cargo clippy --workspace --all-targets -- -D warnings` is green, and
+`cargo test --workspace` stays green with it (53 result lines,
+0 failures).

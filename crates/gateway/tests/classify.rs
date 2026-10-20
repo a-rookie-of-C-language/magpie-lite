@@ -527,8 +527,9 @@ async fn mock_classifier(
     bodies: Arc<Mutex<Vec<Value>>>,
     answer: Arc<Mutex<ClsAnswer>>,
 ) -> (String, tokio::task::JoinHandle<()>) {
+    type Shared = (Arc<Mutex<Vec<Value>>>, Arc<Mutex<ClsAnswer>>);
     async fn judge(
-        State((bodies, answer)): State<(Arc<Mutex<Vec<Value>>>, Arc<Mutex<ClsAnswer>>)>,
+        State((bodies, answer)): State<Shared>,
         Json(body): Json<Value>,
     ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
         bodies.lock().unwrap().push(body);

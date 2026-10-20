@@ -39,7 +39,7 @@ struct Upstream {
     seen: Arc<Mutex<Vec<Value>>>,
 }
 
-fn parameters<'a>(body: &'a Value, protocol: Protocol) -> Option<&'a Value> {
+fn parameters(body: &Value, protocol: Protocol) -> Option<&Value> {
     body.get("tools")?
         .as_array()?
         .iter()

@@ -211,6 +211,10 @@ enum GroupCommand {
 }
 
 #[derive(Subcommand)]
+// One-shot CLI arg enum: the Add variant legitimately dwarfs the rest,
+// and boxing it would churn the arg plumbing for a value built once per
+// invocation.
+#[allow(clippy::large_enum_variant)]
 enum ProviderCommand {
     /// Add or update a provider.
     Add {

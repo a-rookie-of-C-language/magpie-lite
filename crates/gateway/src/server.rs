@@ -1231,20 +1231,18 @@ impl UpstreamDecoders {
 }
 
 /// Decode the body and resolve the initial model route.
+type PreparedRoute = (
+    CompletionRequest,
+    UpstreamRoute,
+    Option<GroupRoutePlan>,
+    (String, Affinity, bool),
+);
 fn prepare(
     config: &Config,
     key_rotation: &crate::config::KeyRotator,
     body: &Value,
     wire: ClientWire,
-) -> Result<
-    (
-        CompletionRequest,
-        UpstreamRoute,
-        Option<GroupRoutePlan>,
-        (String, Affinity, bool),
-    ),
-    (StatusCode, Value),
-> {
+) -> Result<PreparedRoute, (StatusCode, Value)> {
     let creq = wire.decode_request(body).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -1848,6 +1846,10 @@ async fn ask_classifier(
             .map_err(AskError::Answered)
     }
 }
+// Eleven independent dispatch inputs and a failure-path triple shared
+// with the success shape; bundling or boxing them would churn the core
+// dispatch, its callers, and every early return for no behavior gain.
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
 async fn send_with_fallback(
     state: &Arc<AppState>,
     config: &Config,
@@ -3249,6 +3251,9 @@ async fn send_with_fallback(
 /// committed the response. This deliberately bypasses fallback and key
 /// rotation: it is a continuation of the same upstream attempt, not a new
 /// routing decision.
+// Nine independent re-ask inputs; bundling them would invent a
+// single-use struct and churn the re-ask call sites.
+#[allow(clippy::too_many_arguments)]
 async fn reask_stream(
     state: &AppState,
     config: &Config,

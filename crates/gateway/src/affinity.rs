@@ -637,6 +637,9 @@ impl AffinityStore {
     /// Put first whoever answered the conversation last, while its affinity
     /// says to keep it there, or spread a brand-new conversation over the
     /// seat holding the fewest.
+    // Eight independent affinity inputs; the unit tests call this
+    // wrapper directly, and bundling would churn them for no gain.
+    #[allow(clippy::too_many_arguments)]
     pub fn affine(
         &self,
         scope: &str,

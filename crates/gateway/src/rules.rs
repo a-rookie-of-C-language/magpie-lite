@@ -1377,6 +1377,9 @@ pub fn rule_query(
 /// says. `pick` is the reasoning the classifier said the turn wants, ""
 /// when not judged; a new turn keeps a higher one it had for the vendor's
 /// cache ([`keeps_effort`]), and the requests within the turn ask for it.
+// Eight independent routing inputs; bundling them would invent a
+// single-use struct and churn the routing call sites and tests.
+#[allow(clippy::too_many_arguments)]
 pub fn rule_for(
     group_id: &str,
     rules: &[Rule],
