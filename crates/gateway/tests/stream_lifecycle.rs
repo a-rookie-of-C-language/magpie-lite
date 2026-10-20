@@ -974,6 +974,7 @@ async fn early_stream_errors_fall_back_across_protocols_and_groups() {
                                 routing: RoutingPolicy::Order,
                                 first_token_timeout_ms: 0,
                                 affinity: Default::default(),
+                                patience_s: None,
                             });
                         } else {
                             config.provider[0].fallback = vec!["spare/backup-model".into()];
@@ -1146,6 +1147,7 @@ async fn cancelled_fallback_persists_only_selected_provider_and_partial_usage() 
                         routing: magpie_gateway::RoutingPolicy::Order,
                         first_token_timeout_ms: 0,
                         affinity: Default::default(),
+                        patience_s: None,
                     });
                 } else {
                     config.provider[0].fallback = vec!["spare/backup-model".into()];
@@ -1296,6 +1298,7 @@ async fn oversized_opening_frames_fall_back_before_content_for_routes_and_groups
                             routing: magpie_gateway::RoutingPolicy::Order,
                             first_token_timeout_ms: 0,
                             affinity: Default::default(),
+                            patience_s: None,
                         });
                     } else {
                         config.provider[0].fallback = vec!["spare/backup-model".into()];
@@ -1538,6 +1541,7 @@ fn configure_timeout_fallback(config: &mut Config, grouped: bool) {
             routing: magpie_gateway::RoutingPolicy::Order,
             first_token_timeout_ms: 0,
             affinity: Default::default(),
+            patience_s: None,
         });
     } else {
         config.provider[0].fallback = vec!["spare/backup-model".into()];
@@ -2163,6 +2167,7 @@ async fn socket_disconnect_after_fallback_keeps_only_last_attempt_and_persists()
                                     routing: RoutingPolicy::Order,
                                     first_token_timeout_ms: 0,
                                     affinity: Default::default(),
+                                    patience_s: None,
                                 });
                             } else {
                                 config.provider[0].fallback = vec!["spare/backup-model".into()];
@@ -3733,6 +3738,7 @@ async fn group_first_token_applies_to_distinct_models_on_one_provider() {
                 routing: magpie_gateway::RoutingPolicy::Order,
                 first_token_timeout_ms: 120,
                 affinity: Default::default(),
+                patience_s: None,
             });
         },
     )
@@ -4339,6 +4345,7 @@ async fn loop_guard_after_fallback_and_keepalive_persists_only_selected_partial_
                                 routing: RoutingPolicy::Order,
                                 first_token_timeout_ms: 0,
                                 affinity: Default::default(),
+                                patience_s: None,
                             });
                         } else {
                             config.provider[0].fallback = vec!["spare/backup-model".into()];

@@ -182,6 +182,7 @@ async fn gateway(
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
             affinity: Default::default(),
+            patience_s: None,
         }]
     } else {
         Vec::new()

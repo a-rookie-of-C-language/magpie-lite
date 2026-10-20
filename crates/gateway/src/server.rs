@@ -909,6 +909,35 @@ fn lane_failure(
     )
 }
 
+/// How many times a busy group's members are asked again at most,
+/// whatever patience is left (the reference's `replanRounds`, #1418).
+const MAX_REPLAN_ROUNDS: u32 = 6;
+
+/// Wait, within `deadline`, for a lane slot or minute room on any route's
+/// key: polling `candidate_ready` the way the reference's replan waits
+/// for its busy members to come back (#1418). False when the deadline
+/// passes with every key still full.
+async fn wait_for_room(
+    state: &AppState,
+    routes: &[UpstreamRoute],
+    deadline: std::time::Instant,
+) -> bool {
+    loop {
+        if routes.iter().any(|route| {
+            route
+                .api_keys
+                .iter()
+                .any(|(_, key)| candidate_ready(state, &route.provider, key))
+        }) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 /// Whether a request for `key` under `provider` would go at once: a slot
 /// free in its lane and room in its minute (the reference's `ready`).
 fn candidate_ready(state: &AppState, provider: &ProviderConfig, key: &str) -> bool {
@@ -2150,7 +2179,6 @@ async fn send_with_fallback(
     // routing group (the reference's laneMate, #892). A fallback provider
     // is never asked for want of a slot.
     give_way_to_free_lanes(state, &mut routes);
-    let last_route = routes.len().saturating_sub(1);
     let no_route = routes
         .first()
         .map(|route| {
@@ -2165,820 +2193,909 @@ async fn send_with_fallback(
     // key in turn.
     let mut forbade: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    'routes: for (route_index, route) in routes.into_iter().enumerate() {
-        if let (Some(group_id), Some(group_route_index)) =
-            (&route.group_id, route.group_route_index)
-            && let Some(group) = config.group(group_id)
-        {
-            state.key_rotation.record_group_attempt(
-                group_id,
-                group.routing,
-                &group.routes,
-                &group.route_weights(),
-                group_route_index,
-            );
-        }
-        'keys: for (attempt, (key_slot, api_key)) in route.api_keys.iter().enumerate() {
-            let candidate = UpstreamCandidate::new(&route, *key_slot);
-            tracker.begin_attempt(&route.provider.id, &route.model, *key_slot);
-            // A key or account with `max_concurrency` is asked once one of
-            // its slots is free, in turn; one with `max_rpm` then waits for
-            // room in its minute. Its queue full, or its wait out, nobody
-            // failed and nobody rests: the next key or member is asked,
-            // else the agent is told with a 429 and Retry-After (#892).
-            let who = who_of(&route.provider.id, api_key);
-            let limit = route.provider.lane_limit_for_key(api_key);
-            // What the send waits for a slot and minute room counts on
-            // its try, told the agent's way (the reference's `Queued`).
-            let waited = std::time::Instant::now();
-            let slot = match state
-                .lanes
-                .take(
-                    &who,
-                    limit,
-                    route.provider.queue_bound(),
-                    route.provider.queue_wait(),
-                )
-                .await
+    // A group whose every member is busy asks them again as slots free,
+    // within its patience, instead of ending the turn on the first
+    // round's refusals (the reference's replan, #1418). Only rounds where
+    // no vendor was asked replan: a vendor's answer stands. A direct
+    // provider keeps today's fail-fast.
+    let patience = group_plan
+        .as_ref()
+        .and_then(|plan| config.group(&plan.id))
+        .map(|group| group.patience())
+        .unwrap_or(std::time::Duration::ZERO);
+    let mut wait_from: Option<std::time::Instant> = None;
+    let mut rounds = 0u32;
+    // Set false at each round's top, true once a vendor is asked.
+    let mut round_sent: bool;
+
+    'replan: loop {
+        let mut round_routes = routes.clone();
+        // Lanes freed since the last round reorder first, as on the way
+        // in (the reference asks laneMate again every round, #892).
+        give_way_to_free_lanes(state, &mut round_routes);
+        let last_route = round_routes.len().saturating_sub(1);
+        round_sent = false;
+        'routes: for (route_index, route) in round_routes.into_iter().enumerate() {
+            if let (Some(group_id), Some(group_route_index)) =
+                (&route.group_id, route.group_route_index)
+                && let Some(group) = config.group(group_id)
             {
-                Ok(slot) => slot,
-                Err(error) => {
-                    let queued_ms = waited.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                    let reason = match error {
-                        lanes::LaneError::Full => format!(
-                            "its queue is full ({} waiting)",
-                            route.provider.queue_bound()
-                        ),
-                        lanes::LaneError::Waited => format!(
-                            "this one waited {:.1}s for a free slot, as long as it may ({}s)",
-                            queued_ms as f64 / 1000.0,
-                            route.provider.queue_wait().as_secs()
-                        ),
-                    };
+                state.key_rotation.record_group_attempt(
+                    group_id,
+                    group.routing,
+                    &group.routes,
+                    &group.route_weights(),
+                    group_route_index,
+                );
+            }
+            'keys: for (attempt, (key_slot, api_key)) in route.api_keys.iter().enumerate() {
+                let candidate = UpstreamCandidate::new(&route, *key_slot);
+                tracker.begin_attempt(&route.provider.id, &route.model, *key_slot);
+                // A key or account with `max_concurrency` is asked once one of
+                // its slots is free, in turn; one with `max_rpm` then waits for
+                // room in its minute. Its queue full, or its wait out, nobody
+                // failed and nobody rests: the next key or member is asked,
+                // else the agent is told with a 429 and Retry-After (#892).
+                let who = who_of(&route.provider.id, api_key);
+                let limit = route.provider.lane_limit_for_key(api_key);
+                // What the send waits for a slot and minute room counts on
+                // its try, told the agent's way (the reference's `Queued`).
+                let waited = std::time::Instant::now();
+                let slot = match state
+                    .lanes
+                    .take(
+                        &who,
+                        limit,
+                        route.provider.queue_bound(),
+                        route.provider.queue_wait(),
+                    )
+                    .await
+                {
+                    Ok(slot) => slot,
+                    Err(error) => {
+                        let queued_ms = waited.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                        let reason = match error {
+                            lanes::LaneError::Full => format!(
+                                "its queue is full ({} waiting)",
+                                route.provider.queue_bound()
+                            ),
+                            lanes::LaneError::Waited => format!(
+                                "this one waited {:.1}s for a free slot, as long as it may ({}s)",
+                                queued_ms as f64 / 1000.0,
+                                route.provider.queue_wait().as_secs()
+                            ),
+                        };
+                        let failure = lane_failure(
+                            &route.provider,
+                            format!(
+                                "{limit} requests at once is its limit, and {reason}; try again shortly"
+                            ),
+                            None,
+                        );
+                        tracker.record_attempt(&route.provider.id, *key_slot, "queue_refused");
+                        if attempt + 1 < route.api_keys.len() {
+                            continue 'keys;
+                        }
+                        if route_index != last_route && route.group_id.is_none() {
+                            break 'keys;
+                        }
+                        if route_index != last_route {
+                            break 'keys;
+                        }
+                        // Every member busy and none asked: wait for a slot
+                        // to free and ask the round again, while the group's
+                        // patience lasts (the reference's replan, #1418).
+                        if !round_sent
+                            && rounds < MAX_REPLAN_ROUNDS
+                            && patience > std::time::Duration::ZERO
+                        {
+                            let now = std::time::Instant::now();
+                            let start = *wait_from.get_or_insert(now);
+                            if now - start < patience
+                                && wait_for_room(state, &routes, start + patience).await
+                            {
+                                rounds += 1;
+                                continue 'replan;
+                            }
+                        }
+                        return Err((failure, candidate, decision.clone()));
+                    }
+                };
+                if let Err(error) = state
+                    .rpms
+                    .wait(
+                        &who,
+                        route.provider.rpm_limit(),
+                        lanes::rpm_longest(&route.provider),
+                    )
+                    .await
+                {
+                    drop(slot);
+                    let retry_after = error.retry_after();
                     let failure = lane_failure(
                         &route.provider,
-                        format!(
-                            "{limit} requests at once is its limit, and {reason}; try again shortly"
-                        ),
-                        None,
+                        format!("{error}; try again then"),
+                        Some(retry_after),
                     );
-                    tracker.record_attempt(&route.provider.id, *key_slot, "queue_refused");
+                    tracker.record_attempt(&route.provider.id, *key_slot, "rpm_refused");
                     if attempt + 1 < route.api_keys.len() {
                         continue 'keys;
-                    }
-                    if route_index != last_route && route.group_id.is_none() {
-                        break 'keys;
                     }
                     if route_index != last_route {
                         break 'keys;
                     }
+                    // Every member busy and none asked: wait for a slot to
+                    // free and ask the round again, while the group's patience
+                    // lasts (the reference's replan, #1418).
+                    if !round_sent
+                        && rounds < MAX_REPLAN_ROUNDS
+                        && patience > std::time::Duration::ZERO
+                    {
+                        let now = std::time::Instant::now();
+                        let start = *wait_from.get_or_insert(now);
+                        if now - start < patience
+                            && wait_for_room(state, &routes, start + patience).await
+                        {
+                            rounds += 1;
+                            continue 'replan;
+                        }
+                    }
                     return Err((failure, candidate, decision.clone()));
                 }
-            };
-            if let Err(error) = state
-                .rpms
-                .wait(
-                    &who,
-                    route.provider.rpm_limit(),
-                    lanes::rpm_longest(&route.provider),
-                )
-                .await
-            {
-                drop(slot);
-                let retry_after = error.retry_after();
-                let failure = lane_failure(
-                    &route.provider,
-                    format!("{error}; try again then"),
-                    Some(retry_after),
-                );
-                tracker.record_attempt(&route.provider.id, *key_slot, "rpm_refused");
-                if attempt + 1 < route.api_keys.len() {
-                    continue 'keys;
-                }
-                if route_index != last_route {
-                    break 'keys;
-                }
-                return Err((failure, candidate, decision.clone()));
-            }
-            let queued_ms = waited.elapsed().as_millis().min(u64::MAX as u128) as u64;
-            let folds_roots = object_root::folds_roots(&route.provider, &route.model);
-            let mut empty_retries = 0;
-            let mut optional_retry: Option<Vec<&'static str>> = None;
-            let mut sampling_retry = false;
-            let mut root_union_retry = false;
-            // The room a window left for the reply, once a refusal has
-            // said it: the same candidate is asked again under it, and it
-            // is asked no more.
-            let mut room_cap: Option<u64> = None;
-            let mut original_root_union_refusal: Option<(Value, String)> = None;
-            // A Chat endpoint refusing tools with reasoning was asked
-            // again with `reasoning_effort: "none"` (#176); when `none`
-            // is refused too, that refusal stands as the answer (#2670).
-            let mut tools_without_effort_retry = false;
-            let mut tools_refusal: Option<Value> = None;
-            // The client's own Chat/Responses conversation ends with the
-            // assistant's message: a turn already said, not one to go on
-            // from — an upstream model that takes no prefill is asked with
-            // a user turn after it (the reference's `userLast`, #1447).
-            let client_last_is_turn =
-                matches!(wire, ClientWire::Chat { .. } | ClientWire::Responses)
-                    && crate::continuation::ends_with_assistant(creq);
-            let mut turn_after = false;
-            'candidate: loop {
-                liveness.activity.attempt();
-                // A member fixed at an effort asks for it — whatever the
-                // agent asked and whatever the turn picked (the reference's
-                // `withFixedEffort`), fitted as the turn's pick is.
-                let fixed = if route.effort.is_empty() {
-                    None
-                } else {
-                    magpie_core::effort::Effort::parse(&crate::rules::fit_level(&route.effort)).map(
-                        |level| {
-                            let mut owned = (*creq).clone();
-                            owned.effort = Some(level);
-                            owned
-                        },
-                    )
-                };
-                let send = fixed.as_ref().unwrap_or(creq);
-                // A group naming levels bounds every reasoning ask for its
-                // members to the nearest offered — the agent's, a fixed
-                // effort, a rule's, or the turn's pick — except off, which
-                // stays off (the reference's `withinLevels`).
-                let bounded;
-                let send = if !route.levels.is_empty()
-                    && let Some(want) = send.effort
-                {
-                    let mut owned = send.clone();
-                    owned.effort = Some(crate::rules::within_levels(want, &route.levels));
-                    bounded = owned;
-                    &bounded
-                } else {
-                    send
-                };
-                let mut body = match upstream::build_request(&route.provider, send, &route.model) {
-                    Ok(body) => body,
-                    Err(error) => {
-                        // A local conversion error is not a bad credential or
-                        // upstream outage. Skip the entire key pool, with no
-                        // cooldown or network call, and try a compatible route.
-                        // Do not count a credential attempt: no HTTP request was sent.
-                        if route_index != last_route {
-                            continue 'routes;
+                let queued_ms = waited.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                let folds_roots = object_root::folds_roots(&route.provider, &route.model);
+                let mut empty_retries = 0;
+                let mut optional_retry: Option<Vec<&'static str>> = None;
+                let mut sampling_retry = false;
+                let mut root_union_retry = false;
+                // The room a window left for the reply, once a refusal has
+                // said it: the same candidate is asked again under it, and it
+                // is asked no more.
+                let mut room_cap: Option<u64> = None;
+                let mut original_root_union_refusal: Option<(Value, String)> = None;
+                // A Chat endpoint refusing tools with reasoning was asked
+                // again with `reasoning_effort: "none"` (#176); when `none`
+                // is refused too, that refusal stands as the answer (#2670).
+                let mut tools_without_effort_retry = false;
+                let mut tools_refusal: Option<Value> = None;
+                // The client's own Chat/Responses conversation ends with the
+                // assistant's message: a turn already said, not one to go on
+                // from — an upstream model that takes no prefill is asked with
+                // a user turn after it (the reference's `userLast`, #1447).
+                let client_last_is_turn =
+                    matches!(wire, ClientWire::Chat { .. } | ClientWire::Responses)
+                        && crate::continuation::ends_with_assistant(creq);
+                let mut turn_after = false;
+                'candidate: loop {
+                    liveness.activity.attempt();
+                    // A member fixed at an effort asks for it — whatever the
+                    // agent asked and whatever the turn picked (the reference's
+                    // `withFixedEffort`), fitted as the turn's pick is.
+                    let fixed = if route.effort.is_empty() {
+                        None
+                    } else {
+                        magpie_core::effort::Effort::parse(&crate::rules::fit_level(&route.effort))
+                            .map(|level| {
+                                let mut owned = (*creq).clone();
+                                owned.effort = Some(level);
+                                owned
+                            })
+                    };
+                    let send = fixed.as_ref().unwrap_or(creq);
+                    // A group naming levels bounds every reasoning ask for its
+                    // members to the nearest offered — the agent's, a fixed
+                    // effort, a rule's, or the turn's pick — except off, which
+                    // stays off (the reference's `withinLevels`).
+                    let bounded;
+                    let send = if !route.levels.is_empty()
+                        && let Some(want) = send.effort
+                    {
+                        let mut owned = send.clone();
+                        owned.effort = Some(crate::rules::within_levels(want, &route.levels));
+                        bounded = owned;
+                        &bounded
+                    } else {
+                        send
+                    };
+                    let mut body =
+                        match upstream::build_request(&route.provider, send, &route.model) {
+                            Ok(body) => body,
+                            Err(error) => {
+                                // A local conversion error is not a bad credential or
+                                // upstream outage. Skip the entire key pool, with no
+                                // cooldown or network call, and try a compatible route.
+                                // Do not count a credential attempt: no HTTP request was sent.
+                                if route_index != last_route {
+                                    continue 'routes;
+                                }
+                                return Err((
+                                    ProxyFailure::new(StatusCode::BAD_REQUEST, error.to_string()),
+                                    candidate,
+                                    decision.clone(),
+                                ));
+                            }
+                        };
+                    // A vendor that turned an optional field away once gets a
+                    // request without it from the start.
+                    if body.as_object().is_some() {
+                        let unfit: Vec<&str> = optional_fields::OPTIONAL_FIELDS
+                            .iter()
+                            .copied()
+                            .filter(|field| {
+                                body.get(*field).is_some()
+                                    && unfit_fields::unfit(
+                                        &route.provider.id,
+                                        &route.model,
+                                        route.provider.protocol.as_str(),
+                                        field,
+                                    )
+                            })
+                            .collect();
+                        if !unfit.is_empty() {
+                            body = optional_fields::without_fields(&body, &unfit);
+                            tracing::debug!(
+                                provider = %route.provider.id,
+                                model = %route.model,
+                                fields = ?unfit,
+                                "omitting optional fields an upstream refused"
+                            );
                         }
-                        return Err((
-                            ProxyFailure::new(StatusCode::BAD_REQUEST, error.to_string()),
-                            candidate,
-                            decision.clone(),
-                        ));
                     }
-                };
-                // A vendor that turned an optional field away once gets a
-                // request without it from the start.
-                if body.as_object().is_some() {
-                    let unfit: Vec<&str> = optional_fields::OPTIONAL_FIELDS
-                        .iter()
-                        .copied()
-                        .filter(|field| {
-                            body.get(*field).is_some()
-                                && unfit_fields::unfit(
-                                    &route.provider.id,
-                                    &route.model,
-                                    route.provider.protocol.as_str(),
-                                    field,
-                                )
-                        })
-                        .collect();
-                    if !unfit.is_empty() {
-                        body = optional_fields::without_fields(&body, &unfit);
+                    if let Some(fields) = &optional_retry {
+                        body = optional_fields::without_fields(&body, fields);
+                    }
+                    if sampling_retry {
+                        body.as_object_mut()
+                            .expect("request body object")
+                            .remove("temperature");
+                        body.as_object_mut()
+                            .expect("request body object")
+                            .remove("top_p");
+                        body.as_object_mut()
+                            .expect("request body object")
+                            .remove("top_k");
+                    }
+                    if tools_without_effort_retry && let Some(object) = body.as_object_mut() {
+                        object.insert("reasoning_effort".into(), json!("none"));
+                    }
+                    if (folds_roots || root_union_retry) && object_root::fold_tool_roots(&mut body)
+                    {
                         tracing::debug!(
                             provider = %route.provider.id,
                             model = %route.model,
-                            fields = ?unfit,
-                            "omitting optional fields an upstream refused"
+                            "folding tool roots to an object"
                         );
                     }
-                }
-                if let Some(fields) = &optional_retry {
-                    body = optional_fields::without_fields(&body, fields);
-                }
-                if sampling_retry {
-                    body.as_object_mut()
-                        .expect("request body object")
-                        .remove("temperature");
-                    body.as_object_mut()
-                        .expect("request body object")
-                        .remove("top_p");
-                    body.as_object_mut()
-                        .expect("request body object")
-                        .remove("top_k");
-                }
-                if tools_without_effort_retry && let Some(object) = body.as_object_mut() {
-                    object.insert("reasoning_effort".into(), json!("none"));
-                }
-                if (folds_roots || root_union_retry) && object_root::fold_tool_roots(&mut body) {
+                    if matches!(
+                        route.provider.protocol,
+                        Protocol::Chat | Protocol::Responses
+                    ) && client_last_is_turn
+                        && (turn_after
+                            || unfit_fields::unfit(
+                                &route.provider.id,
+                                &route.model,
+                                route.provider.protocol.as_str(),
+                                &crate::continuation::prefill_refused_field(&route.model),
+                            ))
+                    {
+                        if let Some(next) =
+                            crate::continuation::user_last_body(route.provider.protocol, &body)
+                        {
+                            body = next;
+                            turn_after = true;
+                        }
+                    }
+                    if let Some(room) = room_cap {
+                        // The reply asked for with the prompt passed the
+                        // window: ask the same candidate again for what the
+                        // window has left.
+                        reply_room::with_reply_cap(&mut body, route.provider.protocol, room);
+                    }
                     tracing::debug!(
                         provider = %route.provider.id,
                         model = %route.model,
-                        "folding tool roots to an object"
+                        key_slot,
+                        route_index,
+                        "routing upstream"
                     );
-                }
-                if matches!(
-                    route.provider.protocol,
-                    Protocol::Chat | Protocol::Responses
-                ) && client_last_is_turn
-                    && (turn_after
-                        || unfit_fields::unfit(
-                            &route.provider.id,
-                            &route.model,
-                            route.provider.protocol.as_str(),
-                            &crate::continuation::prefill_refused_field(&route.model),
-                        ))
-                {
-                    if let Some(next) =
-                        crate::continuation::user_last_body(route.provider.protocol, &body)
-                    {
-                        body = next;
-                        turn_after = true;
-                    }
-                }
-                if let Some(room) = room_cap {
-                    // The reply asked for with the prompt passed the
-                    // window: ask the same candidate again for what the
-                    // window has left.
-                    reply_room::with_reply_cap(&mut body, route.provider.protocol, room);
-                }
-                tracing::debug!(
-                    provider = %route.provider.id,
-                    model = %route.model,
-                    key_slot,
-                    route_index,
-                    "routing upstream"
-                );
 
-                // The reasoning this send goes at, whoever chose it, for
-                // the request's record (the reference's `sentEffort` on
-                // each try, read back off the send as built).
-                tracker.push_try(
-                    &route.provider.id,
-                    &route.model,
-                    *key_slot,
-                    &crate::usage::sent_effort(magpie_core::effort::decode(
-                        match route.provider.protocol {
-                            Protocol::Chat => magpie_core::ir::ToolChoiceProtocol::Chat,
-                            Protocol::Responses => magpie_core::ir::ToolChoiceProtocol::Responses,
-                            Protocol::Anthropic => magpie_core::ir::ToolChoiceProtocol::Anthropic,
-                            Protocol::Gemini => magpie_core::ir::ToolChoiceProtocol::Gemini,
-                        },
-                        &body,
-                    )),
-                    queued_ms,
-                );
-                let first_token =
-                    GroupFirstToken::new(if creq.stream && route_index != last_route {
-                        route
-                            .group_id
-                            .as_deref()
-                            .and_then(|id| config.group(id))
-                            .map_or(0, |group| group.first_token_timeout_ms)
-                    } else {
-                        0
-                    });
-                let clock = StreamClock::new(
-                    if creq.stream {
-                        config.stream_first_content_timeout_ms
-                    } else {
-                        0
-                    },
-                    config.stream_idle_timeout_ms,
-                );
-                let resp = match first_token
-                    .wait(clock.headers(upstream::send(
-                        &state.http,
-                        &route.provider,
-                        api_key,
-                        &body,
-                        &route.model,
-                        creq.stream,
-                    )))
-                    .await
-                    .and_then(|result| result)
-                {
-                    Ok(Ok(resp)) => resp,
-                    Err(timeout) => {
-                        tracker.record_attempt(
-                            &route.provider.id,
-                            *key_slot,
-                            timeout.attempt_status(),
-                        );
-                        if route_index == last_route {
-                            return Err((
-                                ProxyFailure::new(StatusCode::GATEWAY_TIMEOUT, timeout.message()),
-                                candidate,
-                                decision.clone(),
-                            ));
-                        }
-                        // No response headers: an endpoint timeout is not a bad key.
-                        break 'keys;
-                    }
-                    Ok(Err(e)) => {
-                        tracker.record_attempt(&route.provider.id, *key_slot, "network_error");
-                        let message = format!("cannot reach {}: {e}", route.provider.id);
-                        tracing::warn!("{message}");
-                        if route_index == last_route {
-                            return Err((
-                                ProxyFailure::new(StatusCode::BAD_GATEWAY, message),
-                                candidate,
-                                decision.clone(),
-                            ));
-                        }
-                        // A connection-level failure belongs to the endpoint, not
-                        // to one credential, so try the next route directly.
-                        break 'keys;
-                    }
-                };
-
-                let status = resp.status();
-                liveness.activity.headers(status.is_success());
-                if status.is_success()
-                    && let Some(fields) = optional_retry.take()
-                {
-                    // The retried ask accepted the request: this vendor and
-                    // model do not take these fields at all.
-                    for field in fields {
-                        unfit_fields::refuse(
-                            &route.provider.id,
-                            &route.model,
-                            route.provider.protocol.as_str(),
-                            field,
-                        );
-                    }
-                }
-                if status.is_success() && root_union_retry {
-                    unfit_fields::refuse(
+                    // The reasoning this send goes at, whoever chose it, for
+                    // the request's record (the reference's `sentEffort` on
+                    // each try, read back off the send as built).
+                    tracker.push_try(
                         &route.provider.id,
                         &route.model,
-                        route.provider.protocol.as_str(),
-                        "root_union",
-                    );
-                }
-                if status.is_success() {
-                    // A vendor that ignored `stream: true` answers with a
-                    // whole JSON body, not an SSE stream. It can no longer go
-                    // to the agent as one: replay it as the client's stream.
-                    let content_type = resp
-                        .headers()
-                        .get(header::CONTENT_TYPE)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or_default()
-                        .to_ascii_lowercase();
-                    let streamed = creq.stream && content_type.contains("text/event-stream");
-                    if !creq.stream || !streamed {
-                        let value: Value = match resp.json().await {
-                            Ok(value) => value,
-                            Err(error) => {
-                                tracker.record_attempt(
-                                    &route.provider.id,
-                                    *key_slot,
-                                    "bad_upstream_body",
-                                );
-                                return Err((
-                                    ProxyFailure::new(
-                                        StatusCode::BAD_GATEWAY,
-                                        format!("bad upstream body: {error}"),
-                                    ),
-                                    candidate,
-                                    decision.clone(),
-                                ));
-                            }
-                        };
-                        let protocol = route.provider.protocol;
-                        tracker.observe_usage(&decode_upstream_response_usage(protocol, &value));
-                        if stream_refusal::policy_error(&value)
-                            || (stream_refusal::filtered(protocol, &value)
-                                && !stream_refusal::has_answer(protocol, &value, true))
-                        {
-                            tracker.record_attempt(&route.provider.id, *key_slot, "refusal");
-                            if route_index != last_route {
-                                break 'keys;
-                            }
-                            return Err((ProxyFailure::refusal(), candidate, decision.clone()));
-                        }
-                        if value.get("error").is_some() {
-                            tracker.record_attempt(&route.provider.id, *key_slot, "upstream_error");
-                            return Err((
-                                ProxyFailure::new(
-                                    StatusCode::BAD_GATEWAY,
-                                    "upstream returned an error instead of a reply",
-                                ),
-                                candidate,
-                                decision.clone(),
-                            ));
-                        }
-                        if protocol == Protocol::Gemini {
-                            for event in gemini::GeminiStreamDecoder::new().decode(&value) {
-                                if let StreamEvent::Usage(usage) = event {
-                                    tracker.observe_usage(&usage);
+                        *key_slot,
+                        &crate::usage::sent_effort(magpie_core::effort::decode(
+                            match route.provider.protocol {
+                                Protocol::Chat => magpie_core::ir::ToolChoiceProtocol::Chat,
+                                Protocol::Responses => {
+                                    magpie_core::ir::ToolChoiceProtocol::Responses
                                 }
-                            }
-                            let mut reply = GeminiReply::default();
-                            reply.observe(&value);
-                            if reply.is_empty() {
-                                tracker.record_attempt(
-                                    &route.provider.id,
-                                    *key_slot,
-                                    "empty_reply",
-                                );
-                                if empty_retries == 0 {
-                                    empty_retries += 1;
-                                    tracker.begin_reask();
-                                    tokio::time::sleep(Duration::from_secs(1)).await;
-                                    continue 'candidate;
+                                Protocol::Anthropic => {
+                                    magpie_core::ir::ToolChoiceProtocol::Anthropic
                                 }
-                                if attempt + 1 < route.api_keys.len() {
-                                    continue 'keys;
-                                }
-                                if route_index != last_route {
-                                    break 'keys;
-                                }
-                                return Err((
-                                    ProxyFailure::new(StatusCode::BAD_GATEWAY, EMPTY_REPLY),
-                                    candidate,
-                                    decision.clone(),
-                                ));
-                            }
-                        }
-                        let mut ir = match decode_upstream_response(protocol, &value) {
-                            Ok(ir) => ir,
-                            Err(error) => {
-                                tracker.record_attempt(
-                                    &route.provider.id,
-                                    *key_slot,
-                                    "upstream_decode_error",
-                                );
-                                return Err((
-                                    ProxyFailure::new(StatusCode::BAD_GATEWAY, error.to_string()),
-                                    candidate,
-                                    decision.clone(),
-                                ));
-                            }
-                        };
-                        // Grok writes a whole number in a call's arguments as
-                        // 2500.0; a client that types its arguments strictly
-                        // reads 2500, which is the same value in JSON.
-                        if crate::grok_integral::grok_served(&creq.model, &route.model) {
-                            crate::grok_integral::whole_reply(&mut ir);
-                        }
-                        tracker.record_attempt(&route.provider.id, *key_slot, "ok");
-                        return Ok((
-                            UpstreamReply::Decoded {
-                                ir,
-                                whole_as_stream: creq.stream,
+                                Protocol::Gemini => magpie_core::ir::ToolChoiceProtocol::Gemini,
                             },
-                            candidate,
-                            decision.clone(),
-                        ));
-                    }
-                    let headers = resp.headers().clone();
-                    let (events, failure) = match first_token
-                        .wait(prefetch_stream(
-                            resp,
-                            route.provider.protocol,
-                            tracker,
-                            clock,
-                            liveness,
-                            config.stream_loop_guard,
-                        ))
+                            &body,
+                        )),
+                        queued_ms,
+                    );
+                    // A vendor saw this round: its answer stands, and no
+                    // later all-busy round asks the group again.
+                    round_sent = true;
+                    let first_token =
+                        GroupFirstToken::new(if creq.stream && route_index != last_route {
+                            route
+                                .group_id
+                                .as_deref()
+                                .and_then(|id| config.group(id))
+                                .map_or(0, |group| group.first_token_timeout_ms)
+                        } else {
+                            0
+                        });
+                    let clock = StreamClock::new(
+                        if creq.stream {
+                            config.stream_first_content_timeout_ms
+                        } else {
+                            0
+                        },
+                        config.stream_idle_timeout_ms,
+                    );
+                    let resp = match first_token
+                        .wait(clock.headers(upstream::send(
+                            &state.http,
+                            &route.provider,
+                            api_key,
+                            &body,
+                            &route.model,
+                            creq.stream,
+                        )))
                         .await
+                        .and_then(|result| result)
                     {
-                        Ok(result) => result,
+                        Ok(Ok(resp)) => resp,
                         Err(timeout) => {
                             tracker.record_attempt(
                                 &route.provider.id,
                                 *key_slot,
                                 timeout.attempt_status(),
                             );
-                            // Dropping prefetch cancels the held response. Slow starts
-                            // belong to this route, not a credential: skip its other
-                            // keys without cooldown. Only non-final routes have a cap.
+                            if route_index == last_route {
+                                return Err((
+                                    ProxyFailure::new(
+                                        StatusCode::GATEWAY_TIMEOUT,
+                                        timeout.message(),
+                                    ),
+                                    candidate,
+                                    decision.clone(),
+                                ));
+                            }
+                            // No response headers: an endpoint timeout is not a bad key.
+                            break 'keys;
+                        }
+                        Ok(Err(e)) => {
+                            tracker.record_attempt(&route.provider.id, *key_slot, "network_error");
+                            let message = format!("cannot reach {}: {e}", route.provider.id);
+                            tracing::warn!("{message}");
+                            if route_index == last_route {
+                                return Err((
+                                    ProxyFailure::new(StatusCode::BAD_GATEWAY, message),
+                                    candidate,
+                                    decision.clone(),
+                                ));
+                            }
+                            // A connection-level failure belongs to the endpoint, not
+                            // to one credential, so try the next route directly.
                             break 'keys;
                         }
                     };
-                    if let Some(ref failure) = failure {
-                        tracker.record_attempt(
-                            &route.provider.id,
-                            *key_slot,
-                            match failure.kind {
-                                FailureKind::EmptyReply => "empty_reply",
-                                FailureKind::Refusal => "refusal",
-                                FailureKind::Upstream => "upstream_stream_error",
-                            },
-                        );
-                        if failure.kind == FailureKind::Refusal {
-                            drop(events);
-                            if route_index != last_route {
-                                break 'keys;
-                            }
-                            return Err((ProxyFailure::refusal(), candidate, decision.clone()));
-                        }
-                        if failure.kind == FailureKind::EmptyReply && empty_retries == 0 {
-                            drop(events);
-                            empty_retries += 1;
-                            tracker.begin_reask();
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            continue 'candidate;
-                        }
-                        if quota_limited_status(failure.status) {
-                            let cooldown = quota_cooldown(
-                                &headers,
-                                Some(&failure.body),
-                                config.key_cooldown_for(&route.provider),
-                            );
-                            state.key_rotation.cool_down(
-                                &route.provider.id,
-                                route.provider.key_generation,
-                                *key_slot,
-                                cooldown,
-                            );
-                        }
-                        // A mate key of this provider already gave a plain
-                        // 403 on this request: it is the request refused,
-                        // not each key — stop the pool without resting this
-                        // one either. On the last key of the last route its
-                        // own 403 is the answer.
-                        if plain_forbidden(failure.status.as_u16(), &failure.body)
-                            && !forbade.insert(route.provider.id.clone())
-                            && (attempt + 1 < route.api_keys.len() || route_index != last_route)
-                        {
-                            drop(events);
-                            break 'keys;
-                        }
-                        if attempt + 1 < route.api_keys.len()
-                            && (failure.kind == FailureKind::EmptyReply
-                                || key_retryable_status(failure.status))
-                        {
-                            drop(events);
-                            continue 'keys;
-                        }
-                        if route_index != last_route
-                            && route_retryable_status(failure.status, &failure.body, "")
-                        {
-                            drop(events);
-                            if model_retired(failure.status.as_u16(), &failure.body) {
-                                retired_store::retire(
-                                    &route.provider.id,
-                                    &route.model,
-                                    std::time::SystemTime::now(),
-                                );
-                            }
-                            break 'keys;
-                        }
-                    } else {
-                        tracker.record_attempt(&route.provider.id, *key_slot, "ok");
-                    }
-                    return Ok((
-                        UpstreamReply::Stream {
-                            events,
-                            empty_retries,
-                            reask_allowed: failure.is_none(),
-                        },
-                        candidate,
-                        decision.clone(),
-                    ));
-                }
-                let headers = resp.headers().clone();
-                let error = match clock.headers(upstream::error_detail(resp)).await {
-                    Ok(error) => error,
-                    Err(timeout) => {
-                        tracker.record_attempt(&route.provider.id, *key_slot, "504");
-                        if route_index == last_route {
-                            return Err((
-                                ProxyFailure::new(StatusCode::GATEWAY_TIMEOUT, timeout.message()),
-                                candidate,
-                                decision.clone(),
-                            ));
-                        }
-                        break 'keys;
-                    }
-                };
-                if stream_refusal::policy_error(&error.body) {
-                    tracker.record_attempt(&route.provider.id, *key_slot, "refusal");
-                    if route_index != last_route {
-                        break 'keys;
-                    }
-                    return Err((ProxyFailure::refusal(), candidate, decision.clone()));
-                }
-                tracker.record_attempt(&route.provider.id, *key_slot, &status.as_u16().to_string());
-                // A vendor that names a union at a tool's parameter root
-                // gets one more ask with every root folded to an object.
-                if optional_fields::bad_request(status.as_u16())
-                    && !root_union_retry
-                    && object_root::refusal(&error.body)
-                    && object_root::fold_tool_roots(&mut body)
-                {
-                    original_root_union_refusal = Some((error.body.clone(), error.message.clone()));
-                    root_union_retry = true;
-                    continue 'candidate;
-                }
-                // A vendor that names an optional request field in a 400/422
-                // gets one more ask without it, on the same credential. An
-                // invalid value must reach the client instead.
-                if optional_fields::bad_request(status.as_u16())
-                    && route.provider.protocol != Protocol::Anthropic
-                    && optional_retry.is_none()
-                {
-                    let refused = optional_fields::refused_optional(
-                        status.as_u16(),
-                        &body,
-                        &error.body.get("error").unwrap_or(&error.body).clone(),
-                    );
-                    if !refused.is_empty() {
-                        optional_retry = Some(refused);
-                        continue 'candidate;
-                    }
-                }
-                // A Claude that refuses a sampling parameter by a wording
-                // no other rule reads (#1454, as the reference
-                // `samplingDeprecated`) is asked once more without
-                // temperature and top_p, on the same credential.
-                if sampling_refused(status, &error.body)
-                    && route.provider.protocol == Protocol::Anthropic
-                    && !sampling_retry
-                    && (creq.temperature.is_some() || creq.top_p.is_some())
-                {
-                    sampling_retry = true;
-                    continue 'candidate;
-                }
-                // A Chat endpoint that refuses function tools with
-                // reasoning but names `none` is asked once more that way,
-                // when no Responses route of this member can take them
-                // (#176). When `none` is refused too, naming the levels
-                // the model takes, that refusal is not a retry at the
-                // model's lowest level — the same by the upstream's own
-                // word — but the endpoint refusal it is (#2670): the
-                // original tools refusal stands as the answer, a group's
-                // next member is asked and the key doesn't rest.
-                let mut error = error;
-                // If folding the roots exposed a different shape refusal,
-                // the agent still sees the union refusal that made us try.
-                if root_union_retry
-                    && shape_refused(status.as_u16(), &error.body)
-                    && let Some((refusal_body, refusal_message)) =
-                        original_root_union_refusal.take()
-                {
-                    error.body = refusal_body;
-                    error.message = refusal_message;
-                }
-                if status == StatusCode::BAD_REQUEST {
-                    if let Some(refusal) = &tools_refusal {
-                        if crate::wrong_endpoint::effort_levels_named(&error.body) {
+
+                    let status = resp.status();
+                    liveness.activity.headers(status.is_success());
+                    if status.is_success()
+                        && let Some(fields) = optional_retry.take()
+                    {
+                        // The retried ask accepted the request: this vendor and
+                        // model do not take these fields at all.
+                        for field in fields {
                             unfit_fields::refuse(
                                 &route.provider.id,
                                 &route.model,
                                 route.provider.protocol.as_str(),
-                                "reasoning_off",
+                                field,
                             );
-                            error.body = refusal.clone();
-                            if let Some(message) = refusal
-                                .pointer("/error/message")
-                                .or_else(|| refusal.pointer("/message"))
-                                .and_then(Value::as_str)
-                            {
-                                error.message = format!("upstream {status}: {message}");
-                            }
                         }
-                    } else if !tools_without_effort_retry
-                        && body
-                            .get("reasoning_effort")
-                            .and_then(Value::as_str)
-                            .is_some_and(|level| level != "none")
-                        && crate::wrong_endpoint::tools_without_effort(&error.body)
-                        && !unfit_fields::unfit(
+                    }
+                    if status.is_success() && root_union_retry {
+                        unfit_fields::refuse(
                             &route.provider.id,
                             &route.model,
                             route.provider.protocol.as_str(),
-                            "reasoning_off",
-                        )
-                    {
-                        tools_refusal = Some(error.body.clone());
-                        tools_without_effort_retry = true;
-                        continue 'candidate;
-                    }
-                }
-                // A model that takes no prefill — it refuses a
-                // conversation ending with the assistant's message —
-                // is remembered for it alone, and the client's own such
-                // conversation is asked once more with a user turn after
-                // it (the reference's `refusesPrefill`/`userLast`, #1447).
-                if crate::continuation::refuses_prefill(status.as_u16(), &error.body)
-                    && crate::continuation::ends_with_assistant(creq)
-                {
-                    unfit_fields::refuse(
-                        &route.provider.id,
-                        &route.model,
-                        route.provider.protocol.as_str(),
-                        &crate::continuation::prefill_refused_field(&route.model),
-                    );
-                    if client_last_is_turn
-                        && !turn_after
-                        && matches!(
-                            route.provider.protocol,
-                            Protocol::Chat | Protocol::Responses
-                        )
-                    {
-                        turn_after = true;
-                        continue 'candidate;
-                    }
-                }
-                // The window held the prompt but not the reply asked for
-                // with it: DeepSeek counts `max_tokens` in its 1M window,
-                // so a client asking its full 384K for a ~700K
-                // conversation was refused there as too long, where every
-                // other member of its group answered. The same candidate
-                // is asked again for what the window has left — same key,
-                // same model, nobody rests. Room too small to be worth a
-                // reply still reaches the agent as the overflow it is.
-                if room_cap.is_none()
-                    && optional_fields::bad_request(status.as_u16())
-                    && let Some(left) = reply_room::reply_left(&error.message)
-                        .or_else(|| reply_room::reply_left(&error.body.to_string()))
-                    && left >= reply_room::LEAST_REPLY_ROOM
-                    && reply_room::with_reply_cap(&mut body, route.provider.protocol, left)
-                {
-                    tracing::debug!(
-                        provider = %route.provider.id,
-                        model = %route.model,
-                        left,
-                        "asking again for the reply the window leaves"
-                    );
-                    room_cap = Some(left);
-                    continue 'candidate;
-                }
-                if quota_limited_status(status) {
-                    let cooldown = quota_cooldown(
-                        &headers,
-                        Some(&error.body),
-                        config.key_cooldown_for(&route.provider),
-                    );
-                    state.key_rotation.cool_down(
-                        &route.provider.id,
-                        route.provider.key_generation,
-                        *key_slot,
-                        cooldown,
-                    );
-                }
-                let mut detail = error.message;
-                tracing::warn!(
-                    "upstream {} key {}: {detail}",
-                    route.provider.id,
-                    key_slot + 1
-                );
-                // A mate key of this provider already gave a plain 403 on
-                // this request: it is the request refused, not each key —
-                // stop the pool without resting this one either. On the
-                // last key of the last route its own 403 is the answer.
-                if plain_forbidden(status.as_u16(), &error.body)
-                    && !forbade.insert(route.provider.id.clone())
-                    && (attempt + 1 < route.api_keys.len() || route_index != last_route)
-                {
-                    break 'keys;
-                }
-                if attempt + 1 < route.api_keys.len() && key_retryable_status(status) {
-                    continue 'keys;
-                }
-                if route_index != last_route && route_retryable_status(status, &error.body, &detail)
-                {
-                    if model_retired(status.as_u16(), &error.body) {
-                        retired_store::retire(
-                            &route.provider.id,
-                            &route.model,
-                            std::time::SystemTime::now(),
+                            "root_union",
                         );
                     }
-                    break 'keys;
-                }
-                if edge_blocked(&error.body) || edge_blocked_text(&detail) {
-                    detail = format!("{detail} — {BLOCKED_HINT}");
-                }
-                if crate::wrong_endpoint::wrong_endpoint(status.as_u16(), &error.body) {
-                    let asked = match route.provider.protocol {
-                        Protocol::Chat => "/v1/chat/completions",
-                        Protocol::Responses => "/v1/responses",
-                        Protocol::Anthropic => "/v1/messages",
-                        Protocol::Gemini => "generateContent",
+                    if status.is_success() {
+                        // A vendor that ignored `stream: true` answers with a
+                        // whole JSON body, not an SSE stream. It can no longer go
+                        // to the agent as one: replay it as the client's stream.
+                        let content_type = resp
+                            .headers()
+                            .get(header::CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default()
+                            .to_ascii_lowercase();
+                        let streamed = creq.stream && content_type.contains("text/event-stream");
+                        if !creq.stream || !streamed {
+                            let value: Value = match resp.json().await {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    tracker.record_attempt(
+                                        &route.provider.id,
+                                        *key_slot,
+                                        "bad_upstream_body",
+                                    );
+                                    return Err((
+                                        ProxyFailure::new(
+                                            StatusCode::BAD_GATEWAY,
+                                            format!("bad upstream body: {error}"),
+                                        ),
+                                        candidate,
+                                        decision.clone(),
+                                    ));
+                                }
+                            };
+                            let protocol = route.provider.protocol;
+                            tracker
+                                .observe_usage(&decode_upstream_response_usage(protocol, &value));
+                            if stream_refusal::policy_error(&value)
+                                || (stream_refusal::filtered(protocol, &value)
+                                    && !stream_refusal::has_answer(protocol, &value, true))
+                            {
+                                tracker.record_attempt(&route.provider.id, *key_slot, "refusal");
+                                if route_index != last_route {
+                                    break 'keys;
+                                }
+                                return Err((ProxyFailure::refusal(), candidate, decision.clone()));
+                            }
+                            if value.get("error").is_some() {
+                                tracker.record_attempt(
+                                    &route.provider.id,
+                                    *key_slot,
+                                    "upstream_error",
+                                );
+                                return Err((
+                                    ProxyFailure::new(
+                                        StatusCode::BAD_GATEWAY,
+                                        "upstream returned an error instead of a reply",
+                                    ),
+                                    candidate,
+                                    decision.clone(),
+                                ));
+                            }
+                            if protocol == Protocol::Gemini {
+                                for event in gemini::GeminiStreamDecoder::new().decode(&value) {
+                                    if let StreamEvent::Usage(usage) = event {
+                                        tracker.observe_usage(&usage);
+                                    }
+                                }
+                                let mut reply = GeminiReply::default();
+                                reply.observe(&value);
+                                if reply.is_empty() {
+                                    tracker.record_attempt(
+                                        &route.provider.id,
+                                        *key_slot,
+                                        "empty_reply",
+                                    );
+                                    if empty_retries == 0 {
+                                        empty_retries += 1;
+                                        tracker.begin_reask();
+                                        tokio::time::sleep(Duration::from_secs(1)).await;
+                                        continue 'candidate;
+                                    }
+                                    if attempt + 1 < route.api_keys.len() {
+                                        continue 'keys;
+                                    }
+                                    if route_index != last_route {
+                                        break 'keys;
+                                    }
+                                    return Err((
+                                        ProxyFailure::new(StatusCode::BAD_GATEWAY, EMPTY_REPLY),
+                                        candidate,
+                                        decision.clone(),
+                                    ));
+                                }
+                            }
+                            let mut ir = match decode_upstream_response(protocol, &value) {
+                                Ok(ir) => ir,
+                                Err(error) => {
+                                    tracker.record_attempt(
+                                        &route.provider.id,
+                                        *key_slot,
+                                        "upstream_decode_error",
+                                    );
+                                    return Err((
+                                        ProxyFailure::new(
+                                            StatusCode::BAD_GATEWAY,
+                                            error.to_string(),
+                                        ),
+                                        candidate,
+                                        decision.clone(),
+                                    ));
+                                }
+                            };
+                            // Grok writes a whole number in a call's arguments as
+                            // 2500.0; a client that types its arguments strictly
+                            // reads 2500, which is the same value in JSON.
+                            if crate::grok_integral::grok_served(&creq.model, &route.model) {
+                                crate::grok_integral::whole_reply(&mut ir);
+                            }
+                            tracker.record_attempt(&route.provider.id, *key_slot, "ok");
+                            return Ok((
+                                UpstreamReply::Decoded {
+                                    ir,
+                                    whole_as_stream: creq.stream,
+                                },
+                                candidate,
+                                decision.clone(),
+                            ));
+                        }
+                        let headers = resp.headers().clone();
+                        let (events, failure) = match first_token
+                            .wait(prefetch_stream(
+                                resp,
+                                route.provider.protocol,
+                                tracker,
+                                clock,
+                                liveness,
+                                config.stream_loop_guard,
+                            ))
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(timeout) => {
+                                tracker.record_attempt(
+                                    &route.provider.id,
+                                    *key_slot,
+                                    timeout.attempt_status(),
+                                );
+                                // Dropping prefetch cancels the held response. Slow starts
+                                // belong to this route, not a credential: skip its other
+                                // keys without cooldown. Only non-final routes have a cap.
+                                break 'keys;
+                            }
+                        };
+                        if let Some(ref failure) = failure {
+                            tracker.record_attempt(
+                                &route.provider.id,
+                                *key_slot,
+                                match failure.kind {
+                                    FailureKind::EmptyReply => "empty_reply",
+                                    FailureKind::Refusal => "refusal",
+                                    FailureKind::Upstream => "upstream_stream_error",
+                                },
+                            );
+                            if failure.kind == FailureKind::Refusal {
+                                drop(events);
+                                if route_index != last_route {
+                                    break 'keys;
+                                }
+                                return Err((ProxyFailure::refusal(), candidate, decision.clone()));
+                            }
+                            if failure.kind == FailureKind::EmptyReply && empty_retries == 0 {
+                                drop(events);
+                                empty_retries += 1;
+                                tracker.begin_reask();
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                continue 'candidate;
+                            }
+                            if quota_limited_status(failure.status) {
+                                let cooldown = quota_cooldown(
+                                    &headers,
+                                    Some(&failure.body),
+                                    config.key_cooldown_for(&route.provider),
+                                );
+                                state.key_rotation.cool_down(
+                                    &route.provider.id,
+                                    route.provider.key_generation,
+                                    *key_slot,
+                                    cooldown,
+                                );
+                            }
+                            // A mate key of this provider already gave a plain
+                            // 403 on this request: it is the request refused,
+                            // not each key — stop the pool without resting this
+                            // one either. On the last key of the last route its
+                            // own 403 is the answer.
+                            if plain_forbidden(failure.status.as_u16(), &failure.body)
+                                && !forbade.insert(route.provider.id.clone())
+                                && (attempt + 1 < route.api_keys.len() || route_index != last_route)
+                            {
+                                drop(events);
+                                break 'keys;
+                            }
+                            if attempt + 1 < route.api_keys.len()
+                                && (failure.kind == FailureKind::EmptyReply
+                                    || key_retryable_status(failure.status))
+                            {
+                                drop(events);
+                                continue 'keys;
+                            }
+                            if route_index != last_route
+                                && route_retryable_status(failure.status, &failure.body, "")
+                            {
+                                drop(events);
+                                if model_retired(failure.status.as_u16(), &failure.body) {
+                                    retired_store::retire(
+                                        &route.provider.id,
+                                        &route.model,
+                                        std::time::SystemTime::now(),
+                                    );
+                                }
+                                break 'keys;
+                            }
+                        } else {
+                            tracker.record_attempt(&route.provider.id, *key_slot, "ok");
+                        }
+                        return Ok((
+                            UpstreamReply::Stream {
+                                events,
+                                empty_retries,
+                                reask_allowed: failure.is_none(),
+                            },
+                            candidate,
+                            decision.clone(),
+                        ));
+                    }
+                    let headers = resp.headers().clone();
+                    let error = match clock.headers(upstream::error_detail(resp)).await {
+                        Ok(error) => error,
+                        Err(timeout) => {
+                            tracker.record_attempt(&route.provider.id, *key_slot, "504");
+                            if route_index == last_route {
+                                return Err((
+                                    ProxyFailure::new(
+                                        StatusCode::GATEWAY_TIMEOUT,
+                                        timeout.message(),
+                                    ),
+                                    candidate,
+                                    decision.clone(),
+                                ));
+                            }
+                            break 'keys;
+                        }
                     };
-                    detail =
-                        wrong_api_note(&route.provider, &route.model, &error.body, asked, detail);
+                    if stream_refusal::policy_error(&error.body) {
+                        tracker.record_attempt(&route.provider.id, *key_slot, "refusal");
+                        if route_index != last_route {
+                            break 'keys;
+                        }
+                        return Err((ProxyFailure::refusal(), candidate, decision.clone()));
+                    }
+                    tracker.record_attempt(
+                        &route.provider.id,
+                        *key_slot,
+                        &status.as_u16().to_string(),
+                    );
+                    // A vendor that names a union at a tool's parameter root
+                    // gets one more ask with every root folded to an object.
+                    if optional_fields::bad_request(status.as_u16())
+                        && !root_union_retry
+                        && object_root::refusal(&error.body)
+                        && object_root::fold_tool_roots(&mut body)
+                    {
+                        original_root_union_refusal =
+                            Some((error.body.clone(), error.message.clone()));
+                        root_union_retry = true;
+                        continue 'candidate;
+                    }
+                    // A vendor that names an optional request field in a 400/422
+                    // gets one more ask without it, on the same credential. An
+                    // invalid value must reach the client instead.
+                    if optional_fields::bad_request(status.as_u16())
+                        && route.provider.protocol != Protocol::Anthropic
+                        && optional_retry.is_none()
+                    {
+                        let refused = optional_fields::refused_optional(
+                            status.as_u16(),
+                            &body,
+                            &error.body.get("error").unwrap_or(&error.body).clone(),
+                        );
+                        if !refused.is_empty() {
+                            optional_retry = Some(refused);
+                            continue 'candidate;
+                        }
+                    }
+                    // A Claude that refuses a sampling parameter by a wording
+                    // no other rule reads (#1454, as the reference
+                    // `samplingDeprecated`) is asked once more without
+                    // temperature and top_p, on the same credential.
+                    if sampling_refused(status, &error.body)
+                        && route.provider.protocol == Protocol::Anthropic
+                        && !sampling_retry
+                        && (creq.temperature.is_some() || creq.top_p.is_some())
+                    {
+                        sampling_retry = true;
+                        continue 'candidate;
+                    }
+                    // A Chat endpoint that refuses function tools with
+                    // reasoning but names `none` is asked once more that way,
+                    // when no Responses route of this member can take them
+                    // (#176). When `none` is refused too, naming the levels
+                    // the model takes, that refusal is not a retry at the
+                    // model's lowest level — the same by the upstream's own
+                    // word — but the endpoint refusal it is (#2670): the
+                    // original tools refusal stands as the answer, a group's
+                    // next member is asked and the key doesn't rest.
+                    let mut error = error;
+                    // If folding the roots exposed a different shape refusal,
+                    // the agent still sees the union refusal that made us try.
+                    if root_union_retry
+                        && shape_refused(status.as_u16(), &error.body)
+                        && let Some((refusal_body, refusal_message)) =
+                            original_root_union_refusal.take()
+                    {
+                        error.body = refusal_body;
+                        error.message = refusal_message;
+                    }
+                    if status == StatusCode::BAD_REQUEST {
+                        if let Some(refusal) = &tools_refusal {
+                            if crate::wrong_endpoint::effort_levels_named(&error.body) {
+                                unfit_fields::refuse(
+                                    &route.provider.id,
+                                    &route.model,
+                                    route.provider.protocol.as_str(),
+                                    "reasoning_off",
+                                );
+                                error.body = refusal.clone();
+                                if let Some(message) = refusal
+                                    .pointer("/error/message")
+                                    .or_else(|| refusal.pointer("/message"))
+                                    .and_then(Value::as_str)
+                                {
+                                    error.message = format!("upstream {status}: {message}");
+                                }
+                            }
+                        } else if !tools_without_effort_retry
+                            && body
+                                .get("reasoning_effort")
+                                .and_then(Value::as_str)
+                                .is_some_and(|level| level != "none")
+                            && crate::wrong_endpoint::tools_without_effort(&error.body)
+                            && !unfit_fields::unfit(
+                                &route.provider.id,
+                                &route.model,
+                                route.provider.protocol.as_str(),
+                                "reasoning_off",
+                            )
+                        {
+                            tools_refusal = Some(error.body.clone());
+                            tools_without_effort_retry = true;
+                            continue 'candidate;
+                        }
+                    }
+                    // A model that takes no prefill — it refuses a
+                    // conversation ending with the assistant's message —
+                    // is remembered for it alone, and the client's own such
+                    // conversation is asked once more with a user turn after
+                    // it (the reference's `refusesPrefill`/`userLast`, #1447).
+                    if crate::continuation::refuses_prefill(status.as_u16(), &error.body)
+                        && crate::continuation::ends_with_assistant(creq)
+                    {
+                        unfit_fields::refuse(
+                            &route.provider.id,
+                            &route.model,
+                            route.provider.protocol.as_str(),
+                            &crate::continuation::prefill_refused_field(&route.model),
+                        );
+                        if client_last_is_turn
+                            && !turn_after
+                            && matches!(
+                                route.provider.protocol,
+                                Protocol::Chat | Protocol::Responses
+                            )
+                        {
+                            turn_after = true;
+                            continue 'candidate;
+                        }
+                    }
+                    // The window held the prompt but not the reply asked for
+                    // with it: DeepSeek counts `max_tokens` in its 1M window,
+                    // so a client asking its full 384K for a ~700K
+                    // conversation was refused there as too long, where every
+                    // other member of its group answered. The same candidate
+                    // is asked again for what the window has left — same key,
+                    // same model, nobody rests. Room too small to be worth a
+                    // reply still reaches the agent as the overflow it is.
+                    if room_cap.is_none()
+                        && optional_fields::bad_request(status.as_u16())
+                        && let Some(left) = reply_room::reply_left(&error.message)
+                            .or_else(|| reply_room::reply_left(&error.body.to_string()))
+                        && left >= reply_room::LEAST_REPLY_ROOM
+                        && reply_room::with_reply_cap(&mut body, route.provider.protocol, left)
+                    {
+                        tracing::debug!(
+                            provider = %route.provider.id,
+                            model = %route.model,
+                            left,
+                            "asking again for the reply the window leaves"
+                        );
+                        room_cap = Some(left);
+                        continue 'candidate;
+                    }
+                    if quota_limited_status(status) {
+                        let cooldown = quota_cooldown(
+                            &headers,
+                            Some(&error.body),
+                            config.key_cooldown_for(&route.provider),
+                        );
+                        state.key_rotation.cool_down(
+                            &route.provider.id,
+                            route.provider.key_generation,
+                            *key_slot,
+                            cooldown,
+                        );
+                    }
+                    let mut detail = error.message;
+                    tracing::warn!(
+                        "upstream {} key {}: {detail}",
+                        route.provider.id,
+                        key_slot + 1
+                    );
+                    // A mate key of this provider already gave a plain 403 on
+                    // this request: it is the request refused, not each key —
+                    // stop the pool without resting this one either. On the
+                    // last key of the last route its own 403 is the answer.
+                    if plain_forbidden(status.as_u16(), &error.body)
+                        && !forbade.insert(route.provider.id.clone())
+                        && (attempt + 1 < route.api_keys.len() || route_index != last_route)
+                    {
+                        break 'keys;
+                    }
+                    if attempt + 1 < route.api_keys.len() && key_retryable_status(status) {
+                        continue 'keys;
+                    }
+                    if route_index != last_route
+                        && route_retryable_status(status, &error.body, &detail)
+                    {
+                        if model_retired(status.as_u16(), &error.body) {
+                            retired_store::retire(
+                                &route.provider.id,
+                                &route.model,
+                                std::time::SystemTime::now(),
+                            );
+                        }
+                        break 'keys;
+                    }
+                    if edge_blocked(&error.body) || edge_blocked_text(&detail) {
+                        detail = format!("{detail} — {BLOCKED_HINT}");
+                    }
+                    if crate::wrong_endpoint::wrong_endpoint(status.as_u16(), &error.body) {
+                        let asked = match route.provider.protocol {
+                            Protocol::Chat => "/v1/chat/completions",
+                            Protocol::Responses => "/v1/responses",
+                            Protocol::Anthropic => "/v1/messages",
+                            Protocol::Gemini => "generateContent",
+                        };
+                        detail = wrong_api_note(
+                            &route.provider,
+                            &route.model,
+                            &error.body,
+                            asked,
+                            detail,
+                        );
+                    }
+                    let status =
+                        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                    return Err((
+                        ProxyFailure::new(status, detail),
+                        candidate,
+                        decision.clone(),
+                    ));
                 }
-                let status =
-                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-                return Err((
-                    ProxyFailure::new(status, detail),
-                    candidate,
-                    decision.clone(),
-                ));
             }
         }
+        break 'replan;
     }
 
     Err((
@@ -4531,6 +4648,7 @@ mod tests {
                             routing: RoutingPolicy::Order,
                             first_token_timeout_ms: 0,
                             affinity: Default::default(),
+                            patience_s: None,
                         }]
                     } else {
                         vec![]

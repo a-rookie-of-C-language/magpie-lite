@@ -719,6 +719,7 @@
                 <div id="group-weights-field" class="field" hidden><label for="group-weights">Route weights</label><textarea id="group-weights" class="token-input" placeholder="3&#10;1&#10;4" aria-describedby="group-weights-help"></textarea><p id="group-weights-help" class="group-help">One weight per route, in route order, each a whole number from 0 to 1000. A missing weight counts as 1; 0 makes the route fallback-only.</p></div>
                 <div class="field"><label for="group-affinity">Conversation affinity</label><select id="group-affinity" class="token-input" aria-describedby="group-affinity-help"><option value="auto">Auto</option><option value="session">Whole session</option><option value="turn">Within a turn</option><option value="off">Off</option></select><p id="group-affinity-help" class="group-help">Keep a conversation on the route that answered it so the vendor's prompt cache keeps hitting. Auto follows the route policy: rotate spreads load, everything else sticks by conversation.</p></div>
                 <div class="field"><label for="group-first-token">First-content timeout (ms)</label><input id="group-first-token" class="token-input" type="number" min="0" max="9007199254740991" step="1" value="0" required aria-describedby="group-first-token-help"><p id="group-first-token-help" class="group-help">0 disables this group limit. Streaming requests only: a slow non-final route switches to the next candidate before any reply is released. The final route still obeys gateway-wide limits.</p></div>
+                <div class="field"><label for="group-patience">Busy patience (s)</label><input id="group-patience" class="token-input" type="number" min="-9007199254740991" max="9007199254740991" step="1" placeholder="60" aria-describedby="group-patience-help"><p id="group-patience-help" class="group-help">Blank takes 60: while every member is busy, the request waits for a slot to free and asks the members again. A negative disables re-asking; above 240 takes 240. A direct provider still fails fast.</p></div>
                 <div class="field"><label for="group-classifier">Classifier model (optional)</label><input id="group-classifier" class="token-input" list="agent-model-options" placeholder="deepseek/deepseek-chat" aria-describedby="group-classifier-help" spellcheck="false"><p id="group-classifier-help" class="group-help">The model asked which of the rules' intents a turn's message is, as the turn begins. Needed when a rule has an intent; leave blank otherwise.</p></div>
                 <div class="field"><label for="group-effort">Turn reasoning</label><select id="group-effort" class="token-input" aria-describedby="group-effort-help"><option value="">Agent's choice</option><option value="auto">Judge each turn</option></select><p id="group-effort-help" class="group-help">Blank sends what the agent asked for. Judge each turn has the classifier above judge how hard the turn is as it begins, and the turn's requests ask their model for it; it needs the classifier model.</p></div>
                 <div class="field"><label for="group-levels">Offered reasoning levels (optional)</label><input id="group-levels" class="token-input" placeholder="low, high" aria-describedby="group-levels-help" spellcheck="false"><p id="group-levels-help" class="group-help">Blank offers everything. Levels separated by commas or spaces, e.g. low, high: every reasoning ask for a member is sent at the nearest offered, a tie going up, except off, which stays off.</p></div>
@@ -840,6 +841,7 @@
       groupWeights: document.getElementById("group-weights"),
       groupAffinity: document.getElementById("group-affinity"),
       groupFirstToken: document.getElementById("group-first-token"),
+      groupPatience: document.getElementById("group-patience"),
       groupClassifier: document.getElementById("group-classifier"),
       groupEffort: document.getElementById("group-effort"),
       groupLevels: document.getElementById("group-levels"),
@@ -1485,7 +1487,8 @@
         const weights = group.routing === "weight" ? ` · weights: ${(group.weights || []).join(", ")}` : "";
         const picked = group.routing === "manual" ? ` → ${group.pick || (group.routes || [])[0] || "—"}` : "";
         const found = group.auto ? " · found" : "";
-        const policy = text("span", `Policy: ${group.routing || "order"}${picked}${weights} · affinity: ${group.affinity || "auto"}${found}`, "model-owner");
+        const patience = group.patience_s == null ? "" : ` · patience: ${group.patience_s < 0 ? "off" : group.patience_s + "s"}`;
+        const policy = text("span", `Policy: ${group.routing || "order"}${picked}${weights} · affinity: ${group.affinity || "auto"}${patience}${found}`, "model-owner");
         if (group.auto) policy.title = "Magpie found this group: one model served by several providers. Editing it makes it yours; deleting hides it until brought back.";
         const rules = text("span", ruleSummary(group.rules || []), "model-owner");
         if (group.classifier) rules.textContent += ` · classifier: ${group.classifier}`;
@@ -2079,6 +2082,7 @@
       elements.groupWeights.value = (group?.weights || []).join("\n");
       elements.groupAffinity.value = group?.affinity || "auto";
       elements.groupFirstToken.value = group?.first_token_timeout_ms ?? 0;
+      elements.groupPatience.value = group?.patience_s ?? "";
       elements.groupClassifier.value = group?.classifier || "";
       elements.groupEffort.value = group?.effort || "";
       elements.groupLevels.value = (group?.levels || []).join(", ");
@@ -2228,7 +2232,8 @@
         routing: elements.groupRouting.value,
         weights: [],
         affinity: elements.groupAffinity.value,
-        first_token_timeout_ms: Number(elements.groupFirstToken.value)
+        first_token_timeout_ms: Number(elements.groupFirstToken.value),
+        patience_s: elements.groupPatience.value.trim() === "" ? null : Number(elements.groupPatience.value)
       };
       if (!body.routes.length) {
         elements.groupMessage.textContent = "Enter at least one provider/model route.";
@@ -2266,6 +2271,11 @@
       if (!Number.isSafeInteger(body.first_token_timeout_ms) || body.first_token_timeout_ms < 0) {
         elements.groupMessage.textContent = "Enter a non-negative whole-number timeout in milliseconds (0 disables).";
         elements.groupFirstToken.focus();
+        return;
+      }
+      if (body.patience_s !== null && !Number.isSafeInteger(body.patience_s)) {
+        elements.groupMessage.textContent = "Patience is whole seconds: blank takes the 60s default, a negative disables re-asking.";
+        elements.groupPatience.focus();
         return;
       }
       if (body.routing === "weight") {

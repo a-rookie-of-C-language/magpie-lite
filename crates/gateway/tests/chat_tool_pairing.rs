@@ -268,6 +268,7 @@ async fn fixture() -> Fixture {
             routing: RoutingPolicy::Rotate,
             first_token_timeout_ms: 0,
             affinity: Default::default(),
+            patience_s: None,
         }],
         ..Config::default()
     };

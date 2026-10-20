@@ -642,6 +642,7 @@ async fn gateway_with_levels(
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
             affinity: Default::default(),
+            patience_s: None,
         }],
         ..Config::default()
     };
@@ -721,6 +722,7 @@ fn an_intent_rule_needs_its_group_classifier() {
         routing: RoutingPolicy::Order,
         first_token_timeout_ms: 0,
         affinity: Default::default(),
+        patience_s: None,
     };
     let err = group.validate().unwrap_err();
     let msg = err.to_string();
@@ -752,6 +754,7 @@ fn a_classifier_names_a_model_not_a_group() {
         routing: RoutingPolicy::Order,
         first_token_timeout_ms: 0,
         affinity: Default::default(),
+        patience_s: None,
     };
     assert!(group.check_classifier(&config).is_err());
     group.classifier = "group/other".into();
@@ -1077,6 +1080,7 @@ fn effort_auto_needs_its_group_classifier() {
         routing: RoutingPolicy::Order,
         first_token_timeout_ms: 0,
         affinity: Default::default(),
+        patience_s: None,
     };
     let err = group.validate().unwrap_err();
     assert!(

@@ -332,6 +332,7 @@ async fn spawn_gateway_with_providers_and_groups(
                 routing: RoutingPolicy::Order,
                 first_token_timeout_ms: 0,
                 affinity: Default::default(),
+                patience_s: None,
             }]
         },
     };
@@ -1995,6 +1996,7 @@ async fn spawn_gateway_with_same_provider_group(upstream: String) -> String {
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
             affinity: Default::default(),
+            patience_s: None,
         }],
     };
     let requests = request_log(&config);
@@ -2121,6 +2123,7 @@ async fn spawn_gateway_with_group_routes(
             routing,
             first_token_timeout_ms: 0,
             affinity: Default::default(),
+            patience_s: None,
         }],
     };
     let requests = request_log(&config);

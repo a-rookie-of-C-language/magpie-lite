@@ -146,6 +146,7 @@ async fn gateway(free: ProviderConfig, paid: ProviderConfig) -> String {
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
             affinity: Default::default(),
+            patience_s: None,
         }],
     };
     let state = Arc::new(AppState {

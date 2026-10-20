@@ -1,8 +1,13 @@
 //! Authenticated group editing persists before publishing and immediately changes routing.
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::{Json, Router, extract::State, routing::post};
-use magpie_gateway::{AppState, Config, ConfigStore, Protocol, ProviderConfig, build_router};
+use magpie_gateway::{
+    AppState, Config, ConfigStore, GroupConfig, Protocol, ProviderConfig, RoutingPolicy,
+    build_router,
+};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
 
@@ -1602,5 +1607,193 @@ async fn found_group_request_level_round_trip() {
     assert_eq!(
         up.lock().unwrap().as_ref().unwrap()["reasoning_effort"],
         "high"
+    );
+}
+
+/// A fake vendor that counts asks, holds `hold`, then answers whole.
+#[derive(Clone)]
+struct PatientMember {
+    asked: Arc<AtomicUsize>,
+    hold: Duration,
+}
+
+impl PatientMember {
+    fn new(hold: Duration) -> Self {
+        Self {
+            asked: Arc::new(AtomicUsize::new(0)),
+            hold,
+        }
+    }
+}
+
+async fn patient_chat(
+    State(member): State<PatientMember>,
+    Json(_body): Json<Value>,
+) -> Json<Value> {
+    member.asked.fetch_add(1, Ordering::SeqCst);
+    tokio::time::sleep(member.hold).await;
+    Json(json!({
+        "id": "chatcmpl-mock",
+        "object": "chat.completion",
+        "model": "mock-model",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "hello"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    }))
+}
+
+fn patient_provider(url: String) -> ProviderConfig {
+    ProviderConfig {
+        id: "solo".into(),
+        name: "Solo".into(),
+        protocol: Protocol::Chat,
+        base_url: url,
+        api_key: "fixture-key".into(),
+        api_keys: Vec::new(),
+        models: vec!["mock-model".into()],
+        contexts: Default::default(),
+        fallback: Vec::new(),
+        key_cooldown_ms: None,
+        capabilities: Default::default(),
+        routing: RoutingPolicy::Order,
+        weights: Vec::new(),
+        affinity: Default::default(),
+        max_concurrency: Some(1),
+        max_rpm: None,
+        queue_limit: Some(1),
+        queue_wait_s: None,
+        key_generation: 0,
+        key_limits: Vec::new(),
+    }
+}
+
+/// A gateway whose only group `g` holds one slow member, with the
+/// patience given.
+async fn patient_gateway(patience_s: Option<i64>, hold: Duration) -> (String, Arc<AtomicUsize>) {
+    let member = PatientMember::new(hold);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn({
+        let member = member.clone();
+        async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(patient_chat))
+                    .with_state(member),
+            )
+            .await
+            .unwrap()
+        }
+    });
+    let config = Config {
+        provider: vec![patient_provider(format!("http://{addr}/v1"))],
+        group: vec![GroupConfig {
+            id: "g".into(),
+            name: "G".into(),
+            routes: vec!["solo/mock-model".into()],
+            rules: Vec::new(),
+            classifier: String::new(),
+            effort: String::new(),
+            levels: Vec::new(),
+            pick: String::new(),
+            auto: false,
+            weights: Vec::new(),
+            routing: RoutingPolicy::Order,
+            first_token_timeout_ms: 0,
+            affinity: Default::default(),
+            patience_s,
+        }],
+        ..Config::default()
+    };
+    let state = Arc::new(AppState {
+        agents: None,
+        config: ConfigStore::new(config, None),
+        http: magpie_gateway::upstream::http_client().unwrap(),
+        requests: Arc::new(Mutex::new(magpie_gateway::usage::RequestLog::default())),
+        key_rotation: magpie_gateway::KeyRotator::default(),
+        affinity: magpie_gateway::AffinityStore::default(),
+        lanes: magpie_gateway::lanes::Lanes::default(),
+        rpms: magpie_gateway::lanes::Rpms::default(),
+    });
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn({
+        let state = state.clone();
+        async move { axum::serve(listener, build_router(state)).await.unwrap() }
+    });
+    (format!("http://{addr}"), member.asked)
+}
+
+async fn patient_ask(gateway: String) -> (StatusCode, Value) {
+    let resp = Client::new()
+        .post(format!("{gateway}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "group/g",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    (
+        status,
+        serde_json::from_str(&body).unwrap_or(Value::String(body)),
+    )
+}
+
+/// A group whose only member is busy asks it again as its slot frees,
+/// within its patience, instead of answering 429 (the reference's
+/// replan, #1418).
+#[tokio::test]
+async fn a_busy_group_is_asked_again_and_served_within_patience() {
+    let (gw, asked) = patient_gateway(None, Duration::from_millis(300)).await;
+    // Occupy the slot and its one queue place.
+    let first = tokio::spawn(patient_ask(gw.clone()));
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let queued = tokio::spawn(patient_ask(gw.clone()));
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    // The slot and its queue place are taken: without patience this
+    // third request is a 429 at once; with it the round is asked
+    // again and the request is served.
+    let (status, body) = patient_ask(gw.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    drop(first.await.unwrap());
+    drop(queued.await.unwrap());
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        3,
+        "the refused round reached the vendor again"
+    );
+}
+
+/// Patience spent while every member stays busy answers 429: the wait
+/// does not outlast what the group allows (the reference's replan,
+/// #1418).
+#[tokio::test]
+async fn a_group_out_of_patience_answers_429_while_busy() {
+    let (gw, asked) = patient_gateway(Some(1), Duration::from_millis(700)).await;
+    // Occupy the slot and its one queue place past the one second.
+    let first = tokio::spawn(patient_ask(gw.clone()));
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let queued = tokio::spawn(patient_ask(gw.clone()));
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let (status, body) = patient_ask(gw.clone()).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    drop(first.await.unwrap());
+    drop(queued.await.unwrap());
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        2,
+        "the refused request never went upstream"
     );
 }

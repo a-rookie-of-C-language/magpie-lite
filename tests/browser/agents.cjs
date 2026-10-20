@@ -590,6 +590,18 @@ test("Agent console against a real isolated Rust gateway", { timeout: 120000 }, 
       await page.waitForFunction(() => document.getElementById("group-editor").hidden);
       assert.equal((await api("/config")).groups.find(group => group.id === "extra-group").first_token_timeout_ms, 0);
       await page.getByRole("button", { name: "Edit group extra-group", exact: true }).click();
+      assert.equal(await page.locator("#group-patience").inputValue(), "");
+      await page.locator("#group-patience").fill("90");
+      await page.locator("#group-save").click();
+      await page.waitForFunction(() => document.getElementById("group-editor").hidden);
+      assert.equal((await api("/config")).groups.find(group => group.id === "extra-group").patience_s, 90);
+      assert.ok((await fs.readFile(gateway.config, "utf8")).includes("patience_s = 90"));
+      await page.getByRole("button", { name: "Edit group extra-group", exact: true }).click();
+      await page.locator("#group-patience").fill("");
+      await page.locator("#group-save").click();
+      await page.waitForFunction(() => document.getElementById("group-editor").hidden);
+      assert.equal((await api("/config")).groups.find(group => group.id === "extra-group").patience_s, undefined);
+      await page.getByRole("button", { name: "Edit group extra-group", exact: true }).click();
       assert.equal(await page.locator("#group-first-token").inputValue(), "0");
       await page.locator("#group-first-token").press("Escape");
       assert.equal(await page.locator("#group-new").evaluate(node => node === document.activeElement), true);

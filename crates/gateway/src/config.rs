@@ -997,9 +997,31 @@ pub struct GroupConfig {
     /// answered it. `auto` follows the routing policy.
     #[serde(default)]
     pub affinity: Affinity,
+    /// Seconds a request to the group may be kept while all its members
+    /// are busy, asking them again as slots free instead of ending the
+    /// turn on the first round's refusals (the reference's `Patience`,
+    /// #1418): none takes 60, a negative takes none, above 240 takes 240.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patience_s: Option<i64>,
 }
 
+/// A group's patience when none is set, in seconds (the reference's
+/// `PatienceDefault`); the most one may set (`PatienceLongest`).
+pub const DEFAULT_GROUP_PATIENCE_S: i64 = 60;
+pub const MAX_GROUP_PATIENCE_S: i64 = 240;
+
 impl GroupConfig {
+    /// How long a request to the group may be kept while all its members
+    /// are busy (the reference's `Waits`): none set takes 60s, a
+    /// negative takes none, above 240s takes 240s.
+    pub fn patience(&self) -> std::time::Duration {
+        match self.patience_s {
+            None => std::time::Duration::from_secs(DEFAULT_GROUP_PATIENCE_S as u64),
+            Some(n) if n < 0 => std::time::Duration::ZERO,
+            Some(n) => std::time::Duration::from_secs(n.min(MAX_GROUP_PATIENCE_S) as u64),
+        }
+    }
+
     /// The member the user named: its route, or a bare model id one
     /// member has (the reference's `pickMember`, #317).
     pub fn pick_member(&self, want: &str) -> anyhow::Result<String> {
@@ -1299,6 +1321,10 @@ pub struct GroupConfigSnapshot {
     pub first_token_timeout_ms: u64,
     /// How much this group keeps one conversation on the same account.
     pub affinity: Affinity,
+    /// Seconds a request to the group may be kept while all its members
+    /// are busy; none when unset in the file, a negative when off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patience_s: Option<i64>,
 }
 
 /// Secret-free routing configuration for the token-protected console.
@@ -1759,6 +1785,7 @@ impl Config {
                     routing: g.routing,
                     first_token_timeout_ms: g.first_token_timeout_ms,
                     affinity: g.affinity,
+                    patience_s: g.patience_s,
                 })
                 .chain(self.auto_groups().iter().map(|g| GroupConfigSnapshot {
                     id: g.id.clone(),
@@ -1775,6 +1802,7 @@ impl Config {
                     routing: g.routing,
                     first_token_timeout_ms: g.first_token_timeout_ms,
                     affinity: g.affinity,
+                    patience_s: g.patience_s,
                 }))
                 .chain(
                     self.hidden_found_groups()
@@ -1794,6 +1822,7 @@ impl Config {
                             routing: g.routing,
                             first_token_timeout_ms: g.first_token_timeout_ms,
                             affinity: g.affinity,
+                            patience_s: g.patience_s,
                         }),
                 )
                 .collect(),
@@ -1984,6 +2013,7 @@ impl Config {
                 routing: RoutingPolicy::default(),
                 first_token_timeout_ms: 0,
                 affinity: Affinity::default(),
+                patience_s: None,
             });
         }
         out
@@ -2577,6 +2607,7 @@ base_url = "http://127.0.0.1:1/v1"
                 routing: RoutingPolicy::Manual,
                 first_token_timeout_ms: 0,
                 affinity: Default::default(),
+                patience_s: None,
             }
         }
         let group = picked_group(&["a/one", "b/two"], "");
@@ -2734,6 +2765,7 @@ base_url = "http://127.0.0.1:1/v1"
             routing: RoutingPolicy::default(),
             first_token_timeout_ms: 0,
             affinity: Default::default(),
+            patience_s: None,
         });
 
         let snapshot = config.snapshot();
@@ -2771,9 +2803,43 @@ base_url = "http://127.0.0.1:1/v1"
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
             affinity: Default::default(),
+            patience_s: None,
         };
 
         assert!(group.validate().is_ok());
+    }
+
+    #[test]
+    fn group_patience_defaults_and_clamps() {
+        let group = GroupConfig {
+            id: "g".into(),
+            name: String::new(),
+            routes: vec!["a/one".into()],
+            rules: Vec::new(),
+            classifier: String::new(),
+            effort: String::new(),
+            levels: Vec::new(),
+            pick: String::new(),
+            auto: false,
+            weights: Vec::new(),
+            routing: RoutingPolicy::Order,
+            first_token_timeout_ms: 0,
+            affinity: Default::default(),
+            patience_s: None,
+        };
+        // Unset takes the reference default: a minute of re-asking.
+        assert_eq!(group.patience(), std::time::Duration::from_secs(60));
+        // A negative takes none: the first round's refusals stand.
+        let mut group = group;
+        group.patience_s = Some(-1);
+        assert_eq!(group.patience(), std::time::Duration::ZERO);
+        group.patience_s = Some(0);
+        assert_eq!(group.patience(), std::time::Duration::ZERO);
+        group.patience_s = Some(30);
+        assert_eq!(group.patience(), std::time::Duration::from_secs(30));
+        // Above the longest takes the longest.
+        group.patience_s = Some(1_000);
+        assert_eq!(group.patience(), std::time::Duration::from_secs(240));
     }
 
     #[test]
@@ -2885,6 +2951,7 @@ affinity = "session"
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
             affinity: Affinity::Turn,
+            patience_s: None,
         });
         config.save(&path).unwrap();
         let loaded = Config::load(&path).unwrap();
@@ -2979,6 +3046,7 @@ affinity = "session"
             routing: RoutingPolicy::Manual,
             first_token_timeout_ms: 0,
             affinity: Default::default(),
+            patience_s: None,
         };
         // Without one, a manual group sends to its first route.
         group.validate().unwrap();
@@ -3060,6 +3128,7 @@ affinity = "session"
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
             affinity: Default::default(),
+            patience_s: None,
         };
         config.clean_member_efforts(&mut group);
         assert_eq!(group.routes, vec!["mock/a:high", "mock/b"]);
@@ -3085,6 +3154,7 @@ affinity = "session"
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
             affinity: Default::default(),
+            patience_s: None,
         };
         assert!(group.validate().is_err());
         group.rules[0].use_ = "mock/a:high".into();
@@ -3279,6 +3349,7 @@ affinity = "session"
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
             affinity: Default::default(),
+            patience_s: None,
         });
         assert!(owned.auto_groups().is_empty());
         let theirs = owned.group("auto-same").unwrap();
@@ -3382,6 +3453,7 @@ affinity = "session"
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
             affinity: Default::default(),
+            patience_s: None,
         });
         assert!(owned.auto_stand_in("group/auto-same").is_none());
         let (provider, model) = owned
@@ -3430,6 +3502,7 @@ affinity = "session"
             routing: RoutingPolicy::Weighted,
             first_token_timeout_ms: 0,
             affinity: Default::default(),
+            patience_s: None,
         };
         assert_eq!(group.route_weights(), vec![3, 1]);
         assert!(group.validate().is_ok());

@@ -150,6 +150,10 @@ enum GroupCommand {
         /// How strongly a conversation stays with the key that answered it: auto, session, turn, or off.
         #[arg(long, default_value = "auto")]
         affinity: Affinity,
+        /// Seconds a busy group keeps re-asking its members as slots free;
+        /// a negative disables re-asking, above 240 takes 240, unset takes 60.
+        #[arg(long)]
+        patience: Option<i64>,
         /// A routing rule as JSON, e.g. `{"use":"deepseek/deepseek-chat","images":true}`;
         /// repeat for each rule. Rules put their member first for the requests
         /// they match; a `"pause":true` rule leaves its member out instead. A
@@ -474,6 +478,7 @@ async fn main() -> Result<()> {
                     route_weights,
                     first_token_timeout_ms,
                     affinity,
+                    patience,
                     rules,
                     classifier,
                     effort,
@@ -503,6 +508,7 @@ async fn main() -> Result<()> {
                         routing,
                         first_token_timeout_ms,
                         affinity,
+                        patience_s: patience,
                     };
                     if !group.pick.is_empty() {
                         // A pick names its member, and makes the group
@@ -547,14 +553,19 @@ async fn main() -> Result<()> {
                         } else {
                             g.name.as_str()
                         };
+                        let patience = match g.patience_s {
+                            Some(n) if n < 0 => "off".to_owned(),
+                            _ => format!("{}s", g.patience().as_secs()),
+                        };
                         println!(
-                            "{:<24} {} [routing: {}, weights: {:?}, affinity: {}, first-token: {} ms]",
+                            "{:<24} {} [routing: {}, weights: {:?}, affinity: {}, first-token: {} ms, patience: {}]",
                             cfg.group_public_ref(g),
                             label,
                             g.routing.as_str(),
                             g.route_weights(),
                             g.affinity.as_str(),
-                            g.first_token_timeout_ms
+                            g.first_token_timeout_ms,
+                            patience
                         );
                         if g.auto {
                             println!(

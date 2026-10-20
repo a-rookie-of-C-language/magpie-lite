@@ -375,6 +375,7 @@ fn group_validation_cleans_rules_and_refuses_bad_ones() {
         routing: RoutingPolicy::Order,
         first_token_timeout_ms: 0,
         affinity: Default::default(),
+        patience_s: None,
     };
     group.validate().unwrap();
 
@@ -504,6 +505,7 @@ fn group_validation_cleans_levels_and_refuses_bad_ones() {
         routing: RoutingPolicy::Order,
         first_token_timeout_ms: 0,
         affinity: Default::default(),
+        patience_s: None,
     };
     group.validate().unwrap();
     assert_eq!(group.levels, vec!["high".to_owned(), "low".to_owned()]);
@@ -603,6 +605,7 @@ async fn gateway(rules: Vec<Rule>) -> Gateway {
             routing: RoutingPolicy::Order,
             first_token_timeout_ms: 0,
             affinity: Default::default(),
+            patience_s: None,
         }],
         ..Config::default()
     };
