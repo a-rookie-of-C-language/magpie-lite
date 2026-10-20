@@ -8,6 +8,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const os = require("node:os");
 const { spawn } = require("node:child_process");
+const http = require("node:http");
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || "playwright");
 const TOKEN = "sandbox-browser-gateway-token";
 const KEY = "sandbox-provider-private-key";
@@ -730,6 +731,84 @@ test("Agent console against a real isolated Rust gateway", { timeout: 120000 }, 
       await page.locator("#group-first-token").press("Escape");
       assert.deepEqual(pageErrors, [], "Browser runtime errors");
       await safeDom();
+    });
+
+    await t.test("a replan is counted on /stats and shown on recent requests", async () => {
+      let asked = 0;
+      const vendor = http.createServer((req, res) => {
+        if (req.method !== "POST" || req.url !== "/v1/chat/completions") {
+          res.writeHead(404, { "content-type": "application/json" });
+          res.end("{}");
+          return;
+        }
+        req.resume();
+        req.on("end", () => {
+          asked += 1;
+          if (asked === 1) {
+            res.writeHead(503, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: { message: "overloaded" } }));
+            return;
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({
+            id: "chatcmpl-mock",
+            object: "chat.completion",
+            model: "mock-model",
+            choices: [{ index: 0, message: { role: "assistant", content: "hello" }, finish_reason: "stop" }],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          }));
+        });
+      });
+      await new Promise(resolve => vendor.listen(0, "127.0.0.1", resolve));
+      const vendorPort = vendor.address().port;
+      const replanRoot = await fs.mkdtemp(path.join(os.tmpdir(), "magpie-replan-"));
+      let replanChild;
+      try {
+        const replanConfig = path.join(replanRoot, "config.toml");
+        await write(replanConfig, `port=45555\ntoken='${TOKEN}'\ndefault_provider='solo'\n[[provider]]\nid='solo'\nprotocol='chat'\nbase_url='http://127.0.0.1:${vendorPort}/v1'\napi_key='fixture-key'\nmodels=['mock-model']\n[[group]]\nid='g'\nname='G'\nroutes=['solo/mock-model']\n`);
+        replanChild = spawn(binary, ["--config", replanConfig, "serve", "--port", "0"], {
+          cwd: replanRoot, env: { ...process.env, MAGPIE_LITE_HOME: path.join(replanRoot, "home") },
+          windowsHide: true, stdio: ["ignore", "pipe", "pipe"]
+        });
+        const replanUrl = await new Promise((resolve, reject) => {
+          let output = "";
+          const timer = setTimeout(() => reject(new Error("Replan gateway startup timed out: " + output)), 10000);
+          const ready = chunk => {
+            output += chunk;
+            const match = output.match(/listening on (http:\/\/127\.0\.0\.1:\d+)/);
+            if (match) { clearTimeout(timer); resolve(match[1]); }
+          };
+          replanChild.stdout.on("data", ready); replanChild.stderr.on("data", ready);
+          replanChild.once("error", error => { clearTimeout(timer); reject(error); });
+          replanChild.once("exit", code => { clearTimeout(timer); reject(new Error("Replan gateway exited: " + code + " " + output)); });
+        });
+        const chat = await fetch(replanUrl + "/v1/chat/completions", {
+          method: "POST",
+          headers: { Authorization: "Bearer " + TOKEN, "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "group/g", messages: [{ role: "user", content: "hi" }] }),
+          signal: AbortSignal.timeout(60000)
+        });
+        assert.equal(chat.status, 200, await chat.clone().text());
+        assert.match(JSON.stringify(await chat.json()), /hello/);
+        assert.equal(asked, 2, "the overloaded round reached the vendor again");
+        const statsResponse = await fetch(replanUrl + "/stats", {
+          headers: { Authorization: "Bearer " + TOKEN }, signal: AbortSignal.timeout(5000)
+        });
+        assert.equal(statsResponse.status, 200);
+        const stats = await statsResponse.json();
+        assert.equal(stats.recent_requests.length, 1);
+        assert.equal(stats.recent_requests[0].replans, 1);
+        await page.goto(replanUrl);
+        await login();
+        await page.waitForFunction(() => document.getElementById("request-rows").textContent.includes("replan ×1"));
+        assert.ok((await page.locator("#request-rows").innerText()).includes("replan ×1"));
+        await safeDom();
+      } finally {
+        await stop(replanChild);
+        await new Promise(resolve => vendor.close(resolve));
+        assert.equal(path.dirname(replanRoot), os.tmpdir());
+        await fs.rm(replanRoot, { recursive: true, force: true });
+      }
     });
   } finally {
     if (browser) await browser.close();
