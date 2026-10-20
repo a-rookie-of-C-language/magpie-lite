@@ -700,12 +700,13 @@ pub fn clean_folder(p: &str) -> Result<String, String> {
 /// reference's `workDir`): Claude Code's "Primary working directory:",
 /// Codex's `<cwd>x</cwd>` in `<environment_context>`, Pi's `<cwd>` on its own
 /// line, OpenCode's "Working directory:" within `<env>`. Of those it says,
-/// the last one goes; assistant messages are skipped.
+/// the last one goes — a later message stating one wins over an earlier
+/// one however far into their texts each states it; assistant messages
+/// are skipped.
 pub fn work_dir(req: &CompletionRequest) -> String {
     let mut dir = String::new();
-    let mut pos = 0usize;
     for part in &req.system {
-        work_dir_in(&part.text, &mut dir, &mut pos);
+        dir = work_dir_in(&part.text, dir);
     }
     for m in &req.messages {
         if m.role == Role::Assistant {
@@ -713,7 +714,7 @@ pub fn work_dir(req: &CompletionRequest) -> String {
         }
         for p in &m.parts {
             if p.kind() == PartKind::Text {
-                work_dir_in(&p.text, &mut dir, &mut pos);
+                dir = work_dir_in(&p.text, dir);
             }
         }
     }
@@ -731,10 +732,10 @@ fn unescape(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
-/// The last folder `text` says at a position after `pos`, updating `dir`
-/// and `pos` (`workDirIn`). `pos` orders finds across calls so the last in
-/// the request wins, across system and user messages.
-fn work_dir_in(text: &str, dir: &mut String, pos: &mut usize) {
+/// The last folder `text` says, else `dir` unchanged (`workDirIn`): the
+/// caller folds the texts in order, so a later message stating a folder
+/// wins over an earlier one — offsets only order finds within one text.
+fn work_dir_in(text: &str, mut dir: String) -> String {
     static CC: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r"(?m)^(?: - )?Primary working directory: (.+)$").unwrap()
     });
@@ -746,23 +747,24 @@ fn work_dir_in(text: &str, dir: &mut String, pos: &mut usize) {
         LazyLock::new(|| regex::Regex::new(r" \(was .*\)$").unwrap());
 
     if !text.contains("irectory: ") && !text.contains("<cwd>") {
-        return;
+        return dir;
     }
+    let mut at: i64 = -1;
+    let take = |at_match: usize, value: String, at: &mut i64, dir: &mut String| {
+        if !value.is_empty() && at_match as i64 > *at {
+            *at = at_match as i64;
+            *dir = value;
+        }
+    };
     for m in CC.captures_iter(text) {
         let whole = m.get(0).unwrap();
         let v = unescape(WAS.replace(m.get(1).unwrap().as_str(), "").trim());
-        if !v.is_empty() && whole.start() > *pos {
-            *pos = whole.start();
-            *dir = v;
-        }
+        take(whole.start(), v, &mut at, &mut dir);
     }
     for m in CWD.captures_iter(text) {
         let whole = m.get(0).unwrap();
         let v = unescape(m.get(1).unwrap().as_str().trim());
-        if !v.is_empty() && whole.start() > *pos {
-            *pos = whole.start();
-            *dir = v;
-        }
+        take(whole.start(), v, &mut at, &mut dir);
     }
     // OpenCode's, only within its <env>
     let mut rest = text;
@@ -773,16 +775,13 @@ fn work_dir_in(text: &str, dir: &mut String, pos: &mut usize) {
         };
         let block = &rest[i..i + j];
         if let Some(m) = ENV_DIR.captures(block) {
-            let at = off + i + m.get(0).unwrap().start();
             let v = unescape(m.get(1).unwrap().as_str().trim());
-            if !v.is_empty() && at > *pos {
-                *pos = at;
-                *dir = v;
-            }
+            take(off + i + m.get(0).unwrap().start(), v, &mut at, &mut dir);
         }
         off += i + j;
         rest = &rest[i + j..];
     }
+    dir
 }
 
 // ---- the agent compacting ------------------------------------------------

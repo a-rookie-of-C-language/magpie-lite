@@ -7,9 +7,10 @@ use std::sync::{Arc, Mutex};
 
 use axum::{Json, Router, extract::State, routing::post};
 use magpie_core::effort::Effort;
+use magpie_core::ir::{CompletionRequest, Message, Part, Role};
 use magpie_gateway::rules::{
     Rule, RuleRequest, TimeWindow, agent_of, clean_folder, folder_key, folder_under, match_rule,
-    paused_out, then_uses, within_levels,
+    paused_out, then_uses, within_levels, work_dir,
 };
 use magpie_gateway::{
     AppState, Config, ConfigStore, GroupConfig, Protocol, ProviderConfig, RoutingPolicy,
@@ -317,6 +318,131 @@ fn a_folder_rule_matches_in_or_below_its_folders() {
     assert!(!rule.matches(&out));
     // no folder stated: no match
     assert!(!rule.matches(&req(RuleRequest::default())));
+}
+
+// ---- the working folder -----------------------------------------------------
+
+fn work_req(system: &str, messages: Vec<(Role, Vec<Part>)>) -> CompletionRequest {
+    CompletionRequest {
+        model: "mock/mock-model".into(),
+        system: if system.is_empty() {
+            Vec::new()
+        } else {
+            vec![Part::text(system)]
+        },
+        messages: messages
+            .into_iter()
+            .map(|(role, parts)| Message { role, parts })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+fn user(text: &str) -> (Role, Vec<Part>) {
+    (Role::User, vec![Part::text(text)])
+}
+
+#[test]
+fn work_dir_reads_each_agents_stated_folder() {
+    // Claude Code's environment, in the system prompt or a message, and the
+    // folder after a move (the old one in "(was …)").
+    assert_eq!(
+        work_dir(&work_req(
+            " - Primary working directory: /Users/me/work",
+            vec![]
+        )),
+        "/Users/me/work"
+    );
+    assert_eq!(
+        work_dir(&work_req(
+            "Primary working directory: /new (was /old)",
+            vec![]
+        )),
+        "/new"
+    );
+    // Codex's <environment_context>, Pi's bare <cwd>, OpenCode's <env>.
+    assert_eq!(
+        work_dir(&work_req(
+            "",
+            vec![user(
+                "<environment_context>\n<cwd>/home/u/proj</cwd>\n</environment_context>"
+            )]
+        )),
+        "/home/u/proj"
+    );
+    assert_eq!(
+        work_dir(&work_req("", vec![user("<cwd>\n/home/u/pi\n</cwd>")])),
+        "/home/u/pi"
+    );
+    assert_eq!(
+        work_dir(&work_req(
+            "",
+            vec![user("<env>\n  Working directory: /home/u/oc\n</env>")]
+        )),
+        "/home/u/oc"
+    );
+    // A working-directory line outside OpenCode's <env> is not its folder.
+    assert_eq!(
+        work_dir(&work_req("", vec![user("Working directory: /home/u/oc")])),
+        ""
+    );
+    // Entities unescape, as the agents send them.
+    assert_eq!(
+        work_dir(&work_req("", vec![user("<cwd>/home/u/a&lt;b</cwd>")])),
+        "/home/u/a<b"
+    );
+}
+
+#[test]
+fn work_dir_takes_the_last_stated_folder() {
+    // The user message wins over the system prompt however far into each
+    // text the folder is stated — offsets only order finds within one
+    // text, and a statement at offset zero counts.
+    assert_eq!(
+        work_dir(&work_req(
+            "You are helpful.\n - Primary working directory: /sys",
+            vec![user("Primary working directory: /user")]
+        )),
+        "/user"
+    );
+    assert_eq!(
+        work_dir(&work_req(
+            "",
+            vec![user("<cwd>/first</cwd>"), user("<cwd>/second</cwd>")]
+        )),
+        "/second"
+    );
+    // A later message stating none leaves the earlier folder standing.
+    assert_eq!(
+        work_dir(&work_req(
+            "",
+            vec![user("<cwd>/kept</cwd>"), user("just chatting")]
+        )),
+        "/kept"
+    );
+    // The model's words are not the agent's, and neither are tool results.
+    assert_eq!(
+        work_dir(&work_req(
+            "",
+            vec![
+                (
+                    Role::Assistant,
+                    vec![Part::text("Primary working directory: /model")]
+                ),
+                (
+                    Role::User,
+                    vec![Part::tool_result(
+                        "call_1",
+                        "Primary working directory: /tool",
+                        false
+                    )]
+                ),
+            ]
+        )),
+        ""
+    );
+    // Nothing stated anywhere is no folder, never empty-as-unknown matched.
+    assert_eq!(work_dir(&work_req("", vec![user("hi")])), "");
 }
 
 // ---- agents ----------------------------------------------------------------
