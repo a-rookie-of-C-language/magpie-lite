@@ -709,6 +709,7 @@
                 <div class="field"><label for="group-first-token">First-content timeout (ms)</label><input id="group-first-token" class="token-input" type="number" min="0" max="9007199254740991" step="1" value="0" required aria-describedby="group-first-token-help"><p id="group-first-token-help" class="group-help">0 disables this group limit. Streaming requests only: a slow non-final route switches to the next candidate before any reply is released. The final route still obeys gateway-wide limits.</p></div>
                 <div class="field"><label for="group-classifier">Classifier model (optional)</label><input id="group-classifier" class="token-input" list="agent-model-options" placeholder="deepseek/deepseek-chat" aria-describedby="group-classifier-help" spellcheck="false"><p id="group-classifier-help" class="group-help">The model asked which of the rules' intents a turn's message is, as the turn begins. Needed when a rule has an intent; leave blank otherwise.</p></div>
                 <div class="field"><label for="group-effort">Turn reasoning</label><select id="group-effort" class="token-input" aria-describedby="group-effort-help"><option value="">Agent's choice</option><option value="auto">Judge each turn</option></select><p id="group-effort-help" class="group-help">Blank sends what the agent asked for. Judge each turn has the classifier above judge how hard the turn is as it begins, and the turn's requests ask their model for it; it needs the classifier model.</p></div>
+                <div class="field"><label for="group-levels">Offered reasoning levels (optional)</label><input id="group-levels" class="token-input" placeholder="low, high" aria-describedby="group-levels-help" spellcheck="false"><p id="group-levels-help" class="group-help">Blank offers everything. Levels separated by commas or spaces, e.g. low, high: every reasoning ask for a member is sent at the nearest offered, a tie going up, except off, which stays off.</p></div>
                 <div class="field"><label for="group-rules">Routing rules (optional JSON)</label><textarea id="group-rules" class="token-input" placeholder='[{"use":"deepseek/deepseek-chat","images":true}]' aria-describedby="group-rules-help" spellcheck="false"></textarea><p id="group-rules-help" class="group-help">A JSON array of routing rules. A rule sends the requests it matches to its member first; a rule with "pause": true leaves its member out instead while its hours, days, agents or folders hold. Conditions: tokens, images, effort, agents, intent, compact, time, folders, exceptFolders; an intent rule needs the classifier model above. Leave blank for no rules.</p></div>
                 <div class="group-actions"><button id="group-save" class="button" type="submit">Save group</button><button id="group-cancel" class="button secondary" type="button">Cancel</button></div>
               </form>
@@ -828,6 +829,7 @@
       groupFirstToken: document.getElementById("group-first-token"),
       groupClassifier: document.getElementById("group-classifier"),
       groupEffort: document.getElementById("group-effort"),
+      groupLevels: document.getElementById("group-levels"),
       groupRules: document.getElementById("group-rules"),
       groupProviders: document.getElementById("group-providers"),
       groupFound: document.getElementById("group-found"),
@@ -1428,6 +1430,7 @@
         const rules = text("span", ruleSummary(group.rules || []), "model-owner");
         if (group.classifier) rules.textContent += ` · classifier: ${group.classifier}`;
         if (group.effort) rules.textContent += ` · effort: ${group.effort}`;
+        if ((group.levels || []).length) rules.textContent += ` · levels: ${group.levels.join(", ")}`;
       const failure = group.classifier ? classifierStatusByModel[group.classifier] : undefined;
       if (failure) {
         const bad = text(
@@ -1839,6 +1842,7 @@
       elements.groupFirstToken.value = group?.first_token_timeout_ms ?? 0;
       elements.groupClassifier.value = group?.classifier || "";
       elements.groupEffort.value = group?.effort || "";
+      elements.groupLevels.value = (group?.levels || []).join(", ");
       elements.groupRules.value = group?.rules?.length ? JSON.stringify(group.rules, null, 2) : "";
       groupRoutingChanged();
       elements.groupMessage.textContent = "";
@@ -2000,6 +2004,15 @@
       body.rules = rules;
       body.classifier = elements.groupClassifier.value.trim();
       body.effort = elements.groupEffort.value;
+      const levels = elements.groupLevels.value.split(/[\s,]+/).map(level => level.trim().toLowerCase()).filter(Boolean);
+      const knownLevels = ["low", "medium", "high", "xhigh", "max"];
+      const unknown = levels.find(level => !knownLevels.includes(level));
+      if (unknown) {
+        elements.groupMessage.textContent = `Offered levels are low, medium, high, xhigh and max — not "${unknown}". Blank offers everything.`;
+        elements.groupLevels.focus();
+        return;
+      }
+      body.levels = [...new Set(levels)];
       body.pick = elements.groupPick.value.trim();
       if (!Number.isSafeInteger(body.first_token_timeout_ms) || body.first_token_timeout_ms < 0) {
         elements.groupMessage.textContent = "Enter a non-negative whole-number timeout in milliseconds (0 disables).";
