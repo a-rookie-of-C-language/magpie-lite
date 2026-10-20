@@ -1718,13 +1718,19 @@ impl Config {
     /// Find a routing group by the ref an agent uses: `group/<id>` for a
     /// hand-made group or a found group's old id, `auto/<model>` for a
     /// found one. The internal id stays what it was, so both spellings
-    /// route to the same group and count as one.
+    /// route to the same group and count as one. A bare model id without
+    /// a provider in it names its found group too, when two or more
+    /// providers serve it (the reference's `GroupFor`); anything else
+    /// resolves as a provider's model below.
     pub fn group_by_ref(&self, reference: &str) -> Option<GroupConfig> {
         if let Some(id) = reference.strip_prefix("group/") {
             return self.group(id);
         }
         if let Some(model) = reference.strip_prefix("auto/") {
             return self.found_group(model);
+        }
+        if !reference.contains('/') {
+            return self.found_group(reference);
         }
         None
     }
@@ -2979,6 +2985,11 @@ affinity = "session"
             config.group_by_ref("group/auto-same").unwrap().id,
             "auto-same"
         );
+        // A bare model id without a provider in it names its found group
+        // too (the reference's `GroupFor`); a model one provider alone
+        // serves stays that provider's.
+        assert_eq!(config.group_by_ref("same").unwrap().id, "auto-same");
+        assert!(config.group_by_ref("solo-a").is_none());
         assert!(config.group_by_ref("auto/other").is_none());
         assert!(config.group_by_ref("daily").is_none());
         assert_eq!(
@@ -3104,6 +3115,7 @@ affinity = "session"
         assert!(off.group("auto-same").is_none());
         assert!(off.found_group("same").is_none());
         assert!(off.group_by_ref("auto/same").is_none());
+        assert!(off.group_by_ref("same").is_none());
         assert!(!off.catalog().iter().any(|(id, _)| id == "auto/same"));
         // Either spelling still serves: the first provider's seat.
         assert_eq!(

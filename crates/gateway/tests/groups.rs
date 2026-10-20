@@ -42,6 +42,18 @@ async fn mock(
     )
 }
 
+/// A vendor whose member is down: records the ask, answers 500.
+async fn failing(
+    State(last): State<Arc<Mutex<Option<Value>>>>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    *last.lock().unwrap() = Some(body);
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": {"message": "mate is down", "type": "server_error"}})),
+    )
+}
+
 async fn gateway(referenced: bool) -> Gateway {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.toml");
@@ -943,6 +955,86 @@ async fn found_groups_off_serves_the_first_seat_but_lists_nothing() {
     assert_eq!(ask(&url, "group/auto-shared").await, StatusCode::OK);
     assert_eq!(first.lock().unwrap().as_ref().unwrap()["model"], "shared");
     assert!(second.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_bare_model_id_reaches_its_found_group() {
+    async fn ask(url: &str, model: &str) -> StatusCode {
+        Client::new()
+            .post(format!("{url}/v1/chat/completions"))
+            .bearer_auth("magpie-lite")
+            .json(&json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "Hi"}],
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    }
+    // Two vendors serve one model; the first is down. A bare id names
+    // the found group (the reference's `GroupFor`), so the ask fails
+    // over to the second member; sent to the first provider alone it
+    // would come back 500.
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let down = Arc::new(Mutex::new(None));
+    let up = Arc::new(Mutex::new(None));
+    let (down_url, down_task) = bind(
+        Router::new()
+            .route("/v1/chat/completions", post(failing))
+            .with_state(down.clone()),
+    )
+    .await;
+    let (up_url, up_task) = bind(
+        Router::new()
+            .route("/v1/chat/completions", post(mock))
+            .with_state(up.clone()),
+    )
+    .await;
+    let peer = |id: &str, upstream: &str| ProviderConfig {
+        id: id.into(),
+        name: id.into(),
+        protocol: Protocol::Chat,
+        base_url: format!("{upstream}/v1"),
+        api_key: "secret-provider-key".into(),
+        api_keys: Vec::new(),
+        models: vec!["shared".into()],
+        contexts: Default::default(),
+        fallback: Vec::new(),
+        key_cooldown_ms: None,
+        capabilities: Default::default(),
+        routing: magpie_gateway::RoutingPolicy::Rotate,
+        weights: Vec::new(),
+        affinity: Default::default(),
+        max_concurrency: None,
+        max_rpm: None,
+        queue_limit: None,
+        queue_wait_s: None,
+        key_generation: 0,
+    };
+    let config = Config {
+        provider: vec![peer("mock-a", &down_url), peer("mock-b", &up_url)],
+        ..Config::default()
+    };
+    config.save(&path).unwrap();
+    let state = Arc::new(AppState {
+        agents: None,
+        config: ConfigStore::new(config, Some(path.clone())),
+        http: magpie_gateway::upstream::http_client().unwrap(),
+        requests: Arc::new(Mutex::new(magpie_gateway::usage::RequestLog::default())),
+        key_rotation: magpie_gateway::KeyRotator::default(),
+        affinity: magpie_gateway::AffinityStore::default(),
+        lanes: magpie_gateway::lanes::Lanes::default(),
+        rpms: magpie_gateway::lanes::Rpms::default(),
+    });
+    let (url, gateway_task) = bind(build_router(state)).await;
+    let _tasks = vec![down_task, up_task, gateway_task];
+    assert_eq!(ask(&url, "shared").await, StatusCode::OK);
+    // The down member was tried first, in provider order, and the
+    // second member served it.
+    assert!(down.lock().unwrap().is_some());
+    assert_eq!(up.lock().unwrap().as_ref().unwrap()["model"], "shared");
 }
 
 #[tokio::test]
