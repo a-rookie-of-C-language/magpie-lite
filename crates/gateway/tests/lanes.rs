@@ -234,6 +234,7 @@ async fn stats_show_live_lanes_while_a_request_queues() {
     let member = Member::new(Duration::from_millis(300));
     let mut only = provider("solo", upstream(member.clone()).await);
     only.max_concurrency = Some(1);
+    only.max_rpm = Some(60);
     let (gw, state) = gateway(vec![only]).await;
 
     let who = magpie_gateway::affinity::who_of("solo", "fixture-key");
@@ -250,9 +251,18 @@ async fn stats_show_live_lanes_while_a_request_queues() {
         json!([{"who": &who, "busy": 1, "waiting": 1, "limit": 1}]),
         "one held, one queued"
     );
+    // Nothing reached the vendor yet: the slot is held and the request
+    // still waits for it, so no minute is counted.
+    let rpm = stats(&gw).await["rpm"].clone();
+    assert!(rpm.is_null() || rpm == json!([]), "{rpm}");
     drop(hold);
     let (status, _headers, body) = queued.await.unwrap();
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        stats(&gw).await["rpm"],
+        json!([{"who": &who, "used": 1}]),
+        "one sent this minute"
+    );
     // The lane is gone once nothing holds or waits on it (an empty lane
     // list is omitted from `/stats`, like other empty details).
     let mut lanes = Value::Null;

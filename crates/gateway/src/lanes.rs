@@ -293,6 +293,23 @@ impl Rpms {
         }
     }
 
+    /// How many of `who`'s requests are counted in its minute now, for the
+    /// console: (who, used), oldest lanes of idle keys dropped.
+    pub fn snapshot(&self) -> Vec<(String, usize)> {
+        let now = Instant::now();
+        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        map.retain(|_, times| {
+            times.retain(|t| now.duration_since(*t) < RPM_WINDOW + RPM_SLACK);
+            !times.is_empty()
+        });
+        let mut out = map
+            .iter()
+            .map(|(who, times)| (who.clone(), times.len()))
+            .collect::<Vec<_>>();
+        out.sort();
+        out
+    }
+
     /// Whether a request for `who` would go at once: no limit, or room in
     /// its minute.
     pub fn free(&self, who: &str, limit: u32) -> bool {

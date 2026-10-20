@@ -304,6 +304,12 @@ async fn stats(State(state): State<Arc<AppState>>, Query(query): Query<StatsQuer
             limit,
         })
         .collect();
+    snapshot.rpm = state
+        .rpms
+        .snapshot()
+        .into_iter()
+        .map(|(who, used)| crate::usage::RpmSnapshot { who, used })
+        .collect();
     snapshot.classifier_status = crate::classify::failures();
     Json(snapshot).into_response()
 }

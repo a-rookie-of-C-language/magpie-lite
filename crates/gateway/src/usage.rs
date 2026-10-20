@@ -209,6 +209,16 @@ pub struct LaneSnapshot {
     pub limit: u32,
 }
 
+/// One key's rolling-minute usage: how many requests it sent the vendor
+/// in the last 60 seconds.
+#[derive(Debug, Clone, Serialize)]
+pub struct RpmSnapshot {
+    /// The minute's key: provider id or provider id plus key fingerprint.
+    pub who: String,
+    /// Requests counted in its minute now.
+    pub used: usize,
+}
+
 /// The complete `/stats` response.
 #[derive(Debug, Clone, Serialize)]
 pub struct StatsSnapshot {
@@ -224,6 +234,10 @@ pub struct StatsSnapshot {
     /// bound. Empty when no lane is held or waited on.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lanes: Vec<LaneSnapshot>,
+    /// Rolling-minute usage by key: what each key sent the vendor in the
+    /// last 60 seconds. Empty when no key sent anything lately.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rpm: Vec<RpmSnapshot>,
     /// Usage totals over the recent-history window.
     pub recent_usage: RecentUsageSummary,
     /// The most recent records, oldest first.
@@ -348,6 +362,7 @@ impl RequestLog {
             providers: self.providers.clone(),
             key_cooldowns: BTreeMap::new(),
             lanes: Vec::new(),
+            rpm: Vec::new(),
             recent_usage: summarize_recent(&recent_requests),
             recent_requests,
             classifier_status: Vec::new(),

@@ -587,6 +587,7 @@
                       <th scope="col">Key slots</th>
                       <th scope="col">Cooldowns</th>
                       <th scope="col">Lanes</th>
+                      <th scope="col">Minute</th>
                     </tr>
                   </thead>
                   <tbody id="provider-rows"></tbody>
@@ -998,7 +999,7 @@
         ? "—"
         : `${fmt(totals.average_latency_ms)} ms`;
 
-      renderProviders(stats.providers || {}, stats.key_cooldowns || {}, stats.lanes || []);
+      renderProviders(stats.providers || {}, stats.key_cooldowns || {}, stats.lanes || [], stats.rpm || []);
       renderRequests(stats.recent_requests || []);
       renderUsage(stats.recent_usage?.by_model || {});
       classifierStatusByModel = {};
@@ -1033,7 +1034,14 @@
       }).join("; ");
     }
 
-    function renderProviders(providers, cooldowns, lanes) {
+    function rpmSummary(minute, id) {
+      const used = (minute || [])
+        .filter(entry => entry.who === id || entry.who.startsWith(id + "#"))
+        .reduce((total, entry) => total + Number(entry.used || 0), 0);
+      return used === 0 ? "—" : `${used} sent`;
+    }
+
+    function renderProviders(providers, cooldowns, lanes, minute) {
       clear(elements.providerRows);
       const entries = Object.entries(providers);
       elements.providerEmpty.hidden = entries.length !== 0;
@@ -1046,7 +1054,8 @@
           text("td", fmt(provider.output_tokens)),
           text("td", keySummary(provider.keys || {})),
           text("td", cooldownSummary(cooldowns[id] || {})),
-          text("td", laneSummary(lanes, id))
+          text("td", laneSummary(lanes, id)),
+          text("td", rpmSummary(minute, id))
         ]));
       }
     }
