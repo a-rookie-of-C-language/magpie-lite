@@ -286,6 +286,7 @@ async fn spawn_gateway_with_providers_and_groups(
             api_keys: Vec::new(),
             models: vec!["mock-model".into()],
             contexts: Default::default(),
+            outputs: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),
@@ -1777,6 +1778,7 @@ async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) ->
         api_keys: vec!["first-key".into(), "second-key".into()],
         models: vec!["mock-model".into()],
         contexts: Default::default(),
+        outputs: Default::default(),
         fallback: Vec::new(),
         key_cooldown_ms: None,
         capabilities: Default::default(),
@@ -1801,6 +1803,7 @@ async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) ->
             api_keys: Vec::new(),
             models: vec!["mock-model".into()],
             contexts: Default::default(),
+            outputs: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),
@@ -1887,6 +1890,7 @@ async fn spawn_gateway_with_fallback_named(
                 api_keys: Vec::new(),
                 models: vec!["mock-model".into()],
                 contexts: Default::default(),
+                outputs: Default::default(),
                 fallback: vec![format!("{backup_id}/mock-model")],
                 key_cooldown_ms: None,
                 capabilities: Default::default(),
@@ -1909,6 +1913,7 @@ async fn spawn_gateway_with_fallback_named(
                 api_keys: Vec::new(),
                 models: vec!["mock-model".into()],
                 contexts: Default::default(),
+                outputs: Default::default(),
                 fallback: Vec::new(),
                 key_cooldown_ms: None,
                 capabilities: Default::default(),
@@ -1969,6 +1974,7 @@ async fn spawn_gateway_with_same_provider_group(upstream: String) -> String {
             api_keys: Vec::new(),
             models: vec!["model-a".into(), "model-b".into()],
             contexts: Default::default(),
+            outputs: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),
@@ -2073,6 +2079,7 @@ async fn spawn_gateway_with_group_routes(
                 api_keys: Vec::new(),
                 models: vec!["mock-model".into()],
                 contexts: Default::default(),
+                outputs: Default::default(),
                 fallback: Vec::new(),
                 key_cooldown_ms: None,
                 capabilities: Default::default(),
@@ -2095,6 +2102,7 @@ async fn spawn_gateway_with_group_routes(
                 api_keys: Vec::new(),
                 models: vec!["mock-model".into()],
                 contexts: Default::default(),
+                outputs: Default::default(),
                 fallback: Vec::new(),
                 key_cooldown_ms: None,
                 capabilities: Default::default(),
@@ -3333,6 +3341,7 @@ async fn spawn_gateway_with_models(
     upstream_base: String,
     protocol: Protocol,
     models: Vec<String>,
+    outputs: Vec<(String, u64)>,
 ) -> String {
     let provider = ProviderConfig {
         id: "mock".to_string(),
@@ -3347,6 +3356,7 @@ async fn spawn_gateway_with_models(
         api_keys: Vec::new(),
         models,
         contexts: Default::default(),
+        outputs: outputs.into_iter().collect(),
         fallback: Vec::new(),
         key_cooldown_ms: None,
         capabilities: Default::default(),
@@ -3484,6 +3494,7 @@ async fn billing_line_is_kept_for_claude_on_anthropic() {
         upstream,
         Protocol::Anthropic,
         vec!["claude-sonnet-4-5-20250929".to_string()],
+        Vec::new(),
     )
     .await;
     let resp = anthropic_turn(&gw, "mock/claude-sonnet-4-5-20250929", "0218c").await;
@@ -3500,6 +3511,135 @@ async fn billing_line_is_kept_for_claude_on_anthropic() {
     assert!(
         system.starts_with("x-anthropic-billing-header: cc_version=2.1.114.aff;"),
         "{system}"
+    );
+}
+
+async fn anthropic_limit_turn(gw: &str, model: &str, max_tokens: Option<u64>) -> reqwest::Response {
+    let mut body = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    if let Some(n) = max_tokens {
+        body["max_tokens"] = json!(n);
+    }
+    reqwest::Client::new()
+        .post(format!("{gw}/v1/messages"))
+        .bearer_auth("magpie-lite")
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn chat_limit_turn(gw: &str, model: &str, max_tokens: Option<u64>) -> reqwest::Response {
+    let mut body = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    if let Some(n) = max_tokens {
+        body["max_tokens"] = json!(n);
+    }
+    reqwest::Client::new()
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// The user's Max output fills an unnamed limit headed for Anthropic's API
+/// -- which needs one -- and lowers a named one above it (#1792: a flat
+/// 16384 cut a long Codex thinking and tool turn short).
+#[tokio::test]
+async fn user_output_fills_and_lowers_anthropic_limits() {
+    let (upstream, last) = spawn_capture_anthropic().await;
+    let gw = spawn_gateway_with_models(
+        upstream,
+        Protocol::Anthropic,
+        vec!["mock-model".to_string()],
+        vec![("mock-model".to_string(), 32_000)],
+    )
+    .await;
+    let last_max_tokens = || {
+        last.lock().unwrap().clone().expect("upstream was called")["max_tokens"]
+            .as_u64()
+            .expect("upstream max_tokens")
+    };
+    let resp = anthropic_limit_turn(&gw, "mock/mock-model", None).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "{}",
+        resp.text().await.unwrap()
+    );
+    assert_eq!(last_max_tokens(), 32_000);
+    let resp = anthropic_limit_turn(&gw, "mock/mock-model", Some(128_000)).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "{}",
+        resp.text().await.unwrap()
+    );
+    assert_eq!(last_max_tokens(), 32_000);
+    let resp = anthropic_limit_turn(&gw, "mock/mock-model", Some(16_000)).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "{}",
+        resp.text().await.unwrap()
+    );
+    assert_eq!(last_max_tokens(), 16_000);
+}
+
+/// The same user figure lowers a named Chat limit, while an unnamed one
+/// stays unnamed: only Anthropic's API needs a limit filled in.
+#[tokio::test]
+async fn user_output_lowers_a_named_chat_limit_but_leaves_unnamed_alone() {
+    let (upstream, last) = spawn_mock().await;
+    let gw = spawn_gateway_with_models(
+        upstream,
+        Protocol::Chat,
+        vec!["mock-model".to_string()],
+        vec![("mock-model".to_string(), 32_000)],
+    )
+    .await;
+    let resp = chat_limit_turn(&gw, "mock/mock-model", Some(128_000)).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "{}",
+        resp.text().await.unwrap()
+    );
+    assert_eq!(
+        last.lock().unwrap().clone().expect("upstream was called")["max_tokens"],
+        32_000
+    );
+    let resp = chat_limit_turn(&gw, "mock/mock-model", Some(16_000)).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "{}",
+        resp.text().await.unwrap()
+    );
+    assert_eq!(
+        last.lock().unwrap().clone().expect("upstream was called")["max_tokens"],
+        16_000
+    );
+    let resp = chat_limit_turn(&gw, "mock/mock-model", None).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "{}",
+        resp.text().await.unwrap()
+    );
+    assert!(
+        last.lock()
+            .unwrap()
+            .clone()
+            .expect("upstream was called")
+            .get("max_tokens")
+            .is_none()
     );
 }
 

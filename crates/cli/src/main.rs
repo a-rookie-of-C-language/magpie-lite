@@ -235,6 +235,11 @@ enum ProviderCommand {
         /// asked it.
         #[arg(long = "context", value_parser = parse_context)]
         contexts: Vec<(String, u64)>,
+        /// Max reply tokens, as model=limit; repeat for each model. A
+        /// request naming more is lowered to it on any route, and an
+        /// unnamed limit headed for Anthropic's API is filled with it.
+        #[arg(long = "output", value_parser = parse_output)]
+        outputs: Vec<(String, u64)>,
         /// Fallback routes, tried in order when this provider is rate limited, out of quota, or down.
         #[arg(long = "fallback")]
         fallback: Vec<String>,
@@ -322,6 +327,22 @@ fn parse_context(value: &str) -> Result<(String, u64)> {
     Ok((model.to_owned(), window))
 }
 
+/// Parse `model=limit`, the shape `provider add --output` takes.
+fn parse_output(value: &str) -> Result<(String, u64)> {
+    let (model, limit) = value
+        .rsplit_once('=')
+        .context("--output takes model=limit, for example claude-sonnet-4-5=32000")?;
+    let limit: u64 = limit
+        .parse()
+        .context("--output limit must be a whole number of tokens")?;
+    if model.is_empty() || model.chars().any(char::is_whitespace) || limit == 0 {
+        anyhow::bail!(
+            "--output needs a non-empty model id with no whitespace and a limit above zero"
+        );
+    }
+    Ok((model.to_owned(), limit))
+}
+
 fn agent_manager(path: &Option<std::path::PathBuf>) -> Result<Manager> {
     Ok(Manager::native(state_directory(&provider_path(path)?)?)?)
 }
@@ -378,6 +399,7 @@ async fn main() -> Result<()> {
                 name,
                 models,
                 contexts,
+                outputs,
                 fallback,
                 key_cooldown_ms,
                 routing,
@@ -404,6 +426,7 @@ async fn main() -> Result<()> {
                     api_keys,
                     models,
                     contexts: contexts.into_iter().collect(),
+                    outputs: outputs.into_iter().collect(),
                     fallback,
                     key_cooldown_ms,
                     routing,
@@ -453,6 +476,9 @@ async fn main() -> Result<()> {
                         println!("               {}/{}", p.id, m);
                         if let Some(window) = p.contexts.get(m) {
                             println!("               ↳ window {window} tokens");
+                        }
+                        if let Some(limit) = p.outputs.get(m) {
+                            println!("               ↳ max output {limit} tokens");
                         }
                     }
                     for route in &p.fallback {

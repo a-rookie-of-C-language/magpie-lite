@@ -100,6 +100,7 @@ fn provider(id: &str, url: String, window: u64) -> ProviderConfig {
         api_keys: Vec::new(),
         models: vec!["mock-model".into()],
         contexts,
+        outputs: Default::default(),
         fallback: Vec::new(),
         key_cooldown_ms: None,
         capabilities: Default::default(),

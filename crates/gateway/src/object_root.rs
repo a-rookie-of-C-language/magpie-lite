@@ -416,6 +416,7 @@ mod tests {
             api_keys: Vec::new(),
             models: vec!["m".into()],
             contexts: Default::default(),
+            outputs: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             routing: RoutingPolicy::Rotate,

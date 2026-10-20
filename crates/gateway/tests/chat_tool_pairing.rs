@@ -242,6 +242,7 @@ async fn fixture() -> Fixture {
             api_keys: vec![],
             models: vec!["mock-model".into()],
             contexts: Default::default(),
+            outputs: Default::default(),
             fallback: vec![],
             key_cooldown_ms: None,
             routing: RoutingPolicy::Rotate,

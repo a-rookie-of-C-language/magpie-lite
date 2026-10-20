@@ -312,6 +312,7 @@ impl Fixture {
             api_keys: extra_keys,
             models: vec!["up-model".into()],
             contexts: Default::default(),
+            outputs: Default::default(),
             fallback: vec![],
             key_cooldown_ms: None,
             capabilities: Default::default(),

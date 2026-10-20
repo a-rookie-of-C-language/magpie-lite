@@ -15,6 +15,7 @@ mod grok_integral;
 mod grok_schema;
 mod kimi_schema;
 pub mod lanes;
+mod maxoutput;
 mod model_gone;
 mod object_root;
 mod oneof_schema;

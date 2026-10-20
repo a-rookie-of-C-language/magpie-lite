@@ -93,6 +93,7 @@ fn provider(id: &str, url: String) -> ProviderConfig {
         api_keys: Vec::new(),
         models: vec!["mock-model".into()],
         contexts: BTreeMap::new(),
+        outputs: Default::default(),
         fallback: Vec::new(),
         key_cooldown_ms: None,
         capabilities: Default::default(),

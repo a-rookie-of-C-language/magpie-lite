@@ -9,6 +9,8 @@ use crate::config::{Protocol, ProviderConfig};
 
 use crate::billing::{drops_billing_line, strip_billing_line};
 
+use crate::maxoutput::apply_user_output;
+
 /// A configured HTTP client (connection pooling, no total timeout: streams
 /// may run for a long while).
 pub fn http_client() -> anyhow::Result<reqwest::Client> {
@@ -29,12 +31,20 @@ pub fn build_request(
     // model or another API's Claude: its prompt cache would miss from the
     // first byte, so the line goes on only to a Claude model asked on
     // Anthropic's Messages API (the reference's `billing_line.go`, #1600).
-    let stripped;
-    let req = if client_anthropic && drops_billing_line(p.protocol, model) {
+    // A Max output the user set for the model lowers a request asking for
+    // more on any target, and fills an unnamed limit headed for Anthropic's
+    // API, which needs one (the reference's `maxoutput.go`, #1792).
+    let strip = client_anthropic && drops_billing_line(p.protocol, model);
+    let limit = p.output_of(model);
+    let owned;
+    let req = if strip || limit > 0 {
         let mut copy = req.clone();
-        strip_billing_line(&mut copy.system);
-        stripped = copy;
-        &stripped
+        if strip {
+            strip_billing_line(&mut copy.system);
+        }
+        apply_user_output(&mut copy, p.protocol, limit);
+        owned = copy;
+        &owned
     } else {
         req
     };

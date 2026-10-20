@@ -563,6 +563,7 @@ fn provider(id: &str, upstream: &str, model: &str) -> ProviderConfig {
         api_keys: Vec::new(),
         models: vec![model.into()],
         contexts: Default::default(),
+        outputs: Default::default(),
         fallback: Vec::new(),
         key_cooldown_ms: None,
         capabilities: Default::default(),

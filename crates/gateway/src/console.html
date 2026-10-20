@@ -663,6 +663,7 @@
                 </div>
                 <div class="field"><label for="provider-models">Model IDs</label><textarea id="provider-models" class="token-input" placeholder="deepseek-chat&#10;deepseek-reasoner" aria-describedby="provider-models-help"></textarea><p id="provider-models-help" class="group-help">One upstream model ID per line. Listed models appear in the agent catalog; explicit provider/model routes also work for unlisted models.</p></div>
                 <div class="field"><label for="provider-contexts">Context windows (optional)</label><textarea id="provider-contexts" class="token-input" placeholder="deepseek-chat=131072&#10;deepseek-reasoner=65536" aria-describedby="provider-contexts-help"></textarea><p id="provider-contexts-help" class="group-help">One model=window in tokens per line. A routing group leaves out a member whose known window cannot hold the request, instead of asking it and failing there. A model without a window is always tried.</p></div>
+                <div class="field"><label for="provider-outputs">Max outputs (optional)</label><textarea id="provider-outputs" class="token-input" placeholder="claude-sonnet-4-5=32000&#10;gpt-5-mini=16384" aria-describedby="provider-outputs-help"></textarea><p id="provider-outputs-help" class="group-help">One model=limit in tokens per line. A request naming more is lowered to it on any route, and an unnamed limit headed for Anthropic's API is filled with it. A model without a limit is sent as the agent asked.</p></div>
                 <div class="field"><label for="provider-key-mode">API keys</label><select id="provider-key-mode" class="token-input" aria-describedby="provider-key-help"><option value="keep">Keep existing keys</option><option value="replace">Replace key pool</option><option value="clear">No upstream authentication</option></select><p id="provider-key-help" class="group-help">Saved keys are never displayed. Choose Replace to rotate credentials, or No upstream authentication for a local service.</p></div>
                 <div id="provider-keys-field" class="field" hidden><label for="provider-keys">New key pool</label><textarea id="provider-keys" class="token-input" autocomplete="off" spellcheck="false" aria-describedby="provider-keys-help"></textarea><p id="provider-keys-help" class="group-help">One API key per line, in rotation order. These values are sent when you save, discover models or test a connection.</p></div>
                 <div class="field"><label for="provider-routing">Key routing</label><select id="provider-routing" class="token-input" aria-describedby="provider-routing-help"><option value="rotate">Rotate</option><option value="order">Ordered</option><option value="usage">Least used</option><option value="weight">Weighted</option></select><p id="provider-routing-help" class="group-help">Rotate spreads requests across the key pool, the default. Ordered always starts at the first key. Least used prefers the key that served the fewest tokens lately. Weighted spreads by each key's weight.</p></div>
@@ -804,6 +805,7 @@
       providerUrl: document.getElementById("provider-url"),
       providerModels: document.getElementById("provider-models"),
   providerContexts: document.getElementById("provider-contexts"),
+      providerOutputs: document.getElementById("provider-outputs"),
       providerKeyMode: document.getElementById("provider-key-mode"),
       providerKeysField: document.getElementById("provider-keys-field"),
       providerKeys: document.getElementById("provider-keys"),
@@ -1821,6 +1823,7 @@
       elements.providerUrl.value = provider?.base_url || "";
       elements.providerModels.value = (provider?.models || []).join("\n");
       elements.providerContexts.value = Object.entries(provider?.contexts || {}).map(([model, window]) => model + "=" + window).join("\n");
+      elements.providerOutputs.value = Object.entries(provider?.outputs || {}).map(([model, limit]) => model + "=" + limit).join("\n");
       elements.providerFallback.value = (provider?.fallback || []).join("\n");
       elements.providerRouting.value = provider?.routing || "rotate";
       elements.providerAffinity.value = provider?.affinity || "auto";
@@ -1850,6 +1853,7 @@
       elements.providerEditor.hidden = true;
       elements.providerEditor.reset();
       elements.providerContexts.value = "";
+      elements.providerOutputs.value = "";
       elements.providerKeys.value = "";
       elements.providerDiscoveredModels.replaceChildren();
       keyModeChanged();
@@ -1878,6 +1882,24 @@
         windows[model] = window;
       }
       return windows;
+    }
+
+    // One `model=limit` per line, as the provider's outputs map. A line
+    // without a positive whole limit is refused before saving.
+    function maxOutputs() {
+      const outputs = {};
+      for (const line of lines(elements.providerOutputs.value)) {
+        const at = line.lastIndexOf("=");
+        const model = at > 0 ? line.slice(0, at).trim() : "";
+        const limit = at > 0 ? Number(line.slice(at + 1).trim()) : NaN;
+        if (!model || /\s/.test(model) || !Number.isSafeInteger(limit) || limit <= 0) {
+          elements.providerMessage.textContent = "Max outputs must be model=limit, one per line, with a whole limit above zero.";
+          elements.providerOutputs.focus();
+          return null;
+        }
+        outputs[model] = limit;
+      }
+      return outputs;
     }
 
     function boolOrNull(value) {
@@ -1970,6 +1992,8 @@
       if (!queueWait.ok) return;
       const contexts = contextWindows();
       if (contexts === null) return;
+      const outputs = maxOutputs();
+      if (outputs === null) return;
       const body = {
         id: elements.providerId.value.trim(),
         name: elements.providerName.value.trim(),
@@ -1983,6 +2007,7 @@
         base_url: elements.providerUrl.value.trim(),
         models: lines(elements.providerModels.value),
         contexts,
+        outputs,
         fallback: lines(elements.providerFallback.value),
         key_cooldown_ms: cooldown === "" ? null : Number(cooldown),
         max_concurrency: maxConcurrency.value,

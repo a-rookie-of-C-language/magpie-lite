@@ -4693,6 +4693,7 @@ mod tests {
             api_keys: vec![],
             models: vec![model.into()],
             contexts: Default::default(),
+            outputs: Default::default(),
             fallback: vec![],
             key_cooldown_ms: None,
             capabilities: Default::default(),

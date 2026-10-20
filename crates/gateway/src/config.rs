@@ -136,6 +136,13 @@ pub struct ProviderConfig {
     /// A model absent here has no known window.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub contexts: BTreeMap<String, u64>,
+    /// Max reply tokens by model id, as the user set them: a request
+    /// naming more is lowered to it on any route, and an unnamed limit
+    /// translated to Anthropic's Messages API is filled with it (the
+    /// reference's `userOutput`/`askedOutput`, #1792). A model absent
+    /// here has no user-set limit.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub outputs: BTreeMap<String, u64>,
     /// Where a request goes when this provider cannot take it — out of
     /// quota, rate limited, overloaded, or down — tried in order, before
     /// any of the reply has been sent: models as agents pick them.
@@ -258,6 +265,13 @@ impl ProviderConfig {
                 "context windows need a non-empty model id with no whitespace and a window above zero"
             );
         }
+        if self.outputs.iter().any(|(model, limit)| {
+            model.is_empty() || model.chars().any(char::is_whitespace) || *limit == 0
+        }) {
+            anyhow::bail!(
+                "max outputs need a non-empty model id with no whitespace and a limit above zero"
+            );
+        }
         if self.weights.iter().any(|weight| *weight > MAX_KEY_WEIGHT) {
             anyhow::bail!("key weights cannot be above {MAX_KEY_WEIGHT}");
         }
@@ -314,6 +328,13 @@ impl ProviderConfig {
     /// known. A window may be keyed by the upstream model id or a listed alias.
     pub fn window_of(&self, model: &str) -> u64 {
         self.contexts.get(model).copied().unwrap_or(0)
+    }
+
+    /// The Max output the user set for `model`, in tokens; zero when they
+    /// set none. A limit may be keyed by the upstream model id or a listed
+    /// alias.
+    pub fn output_of(&self, model: &str) -> u64 {
+        self.outputs.get(model).copied().unwrap_or(0)
     }
 
     /// How many requests may be out at once on one of its keys, 0 for no
@@ -1231,6 +1252,10 @@ pub struct ProviderConfigSnapshot {
     /// no known window.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub contexts: BTreeMap<String, u64>,
+    /// Max reply tokens by model id, as the user set them. A model absent
+    /// here has no user-set limit.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub outputs: BTreeMap<String, u64>,
     /// Number of effective key slots, not the keys themselves.
     pub key_count: usize,
     /// Number of configured credentials (zero means no upstream authentication).
@@ -1747,6 +1772,7 @@ impl Config {
                     base_url: p.base_url.clone(),
                     models: p.models.clone(),
                     contexts: p.contexts.clone(),
+                    outputs: p.outputs.clone(),
                     key_count: p.api_key_pool().len(),
                     credential_count: p
                         .api_key_pool()
@@ -2254,6 +2280,7 @@ base_url = "http://127.0.0.1:1/v1"
             api_keys: Vec::new(),
             models: vec!["mock".into()],
             contexts: Default::default(),
+            outputs: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),
@@ -2280,6 +2307,51 @@ base_url = "http://127.0.0.1:1/v1"
     }
 
     #[test]
+    fn max_outputs_round_trip_and_refuse_a_zero_an_empty_id_and_whitespace() {
+        let mut provider = ProviderConfig {
+            id: "mock".into(),
+            name: String::new(),
+            protocol: Protocol::Chat,
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: "key".into(),
+            api_keys: Vec::new(),
+            models: vec!["mock".into()],
+            contexts: Default::default(),
+            outputs: Default::default(),
+            fallback: Vec::new(),
+            key_cooldown_ms: None,
+            capabilities: Default::default(),
+            routing: RoutingPolicy::Rotate,
+            weights: Vec::new(),
+            affinity: Default::default(),
+            max_concurrency: None,
+            max_rpm: None,
+            queue_limit: None,
+            queue_wait_s: None,
+            key_generation: 0,
+            key_limits: Vec::new(),
+        };
+        assert_eq!(provider.output_of("unknown"), 0);
+        provider.outputs.insert("small".into(), 8192);
+        assert_eq!(provider.output_of("small"), 8192);
+        assert!(provider.validate().is_ok());
+
+        let encoded = toml::to_string(&provider).unwrap();
+        assert!(encoded.contains("small = 8192"), "{encoded}");
+        let restored: ProviderConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(restored.outputs, provider.outputs);
+
+        for (model, limit) in [("", 1000), ("has space", 1000), ("mock", 0)] {
+            provider.outputs.clear();
+            provider.outputs.insert(model.into(), limit);
+            assert!(
+                provider.validate().is_err(),
+                "{model:?}={limit} should be refused"
+            );
+        }
+    }
+
+    #[test]
     fn api_key_pool_keeps_the_legacy_singular_key() {
         let provider = ProviderConfig {
             id: "mock".into(),
@@ -2290,6 +2362,7 @@ base_url = "http://127.0.0.1:1/v1"
             api_keys: Vec::new(),
             models: Vec::new(),
             contexts: Default::default(),
+            outputs: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),
@@ -2334,6 +2407,7 @@ base_url = "http://127.0.0.1:1/v1"
             api_keys: Vec::new(),
             models: Vec::new(),
             contexts: Default::default(),
+            outputs: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             routing: RoutingPolicy::Rotate,
@@ -2371,6 +2445,7 @@ base_url = "http://127.0.0.1:1/v1"
             api_keys: Vec::new(),
             models: Vec::new(),
             contexts: Default::default(),
+            outputs: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             routing: RoutingPolicy::Rotate,
@@ -2403,6 +2478,7 @@ base_url = "http://127.0.0.1:1/v1"
             api_keys: Vec::new(),
             models: Vec::new(),
             contexts: Default::default(),
+            outputs: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             routing: RoutingPolicy::Rotate,
@@ -2696,6 +2772,7 @@ base_url = "http://127.0.0.1:1/v1"
                 api_keys: vec![],
                 models: vec![],
                 contexts: Default::default(),
+                outputs: Default::default(),
                 fallback: vec![],
                 key_cooldown_ms: None,
                 capabilities: Default::default(),
@@ -2738,6 +2815,7 @@ base_url = "http://127.0.0.1:1/v1"
             api_keys: vec!["secret-one".into(), "secret-two".into()],
             models: vec!["mock-model".into()],
             contexts: Default::default(),
+            outputs: Default::default(),
             fallback: vec!["backup/other".into()],
             key_cooldown_ms: Some(1_200),
             capabilities: Default::default(),
@@ -2924,6 +3002,7 @@ affinity = "session"
             api_keys: Vec::new(),
             models: vec!["model".into()],
             contexts: Default::default(),
+            outputs: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),
@@ -3171,6 +3250,7 @@ affinity = "session"
             api_keys: Vec::new(),
             models: models.iter().map(|model| model.to_string()).collect(),
             contexts: Default::default(),
+            outputs: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),
@@ -3537,6 +3617,7 @@ affinity = "session"
             api_keys: Vec::new(),
             models: Vec::new(),
             contexts: Default::default(),
+            outputs: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),

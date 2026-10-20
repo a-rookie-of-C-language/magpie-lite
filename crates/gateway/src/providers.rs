@@ -35,6 +35,8 @@ pub(crate) struct ProviderEdit {
     models: Vec<String>,
     /// Omitted on update to preserve the existing windows; `{}` clears them.
     contexts: Option<BTreeMap<String, u64>>,
+    /// Omitted on update to preserve the existing Max outputs; `{}` clears them.
+    outputs: Option<BTreeMap<String, u64>>,
     #[serde(default)]
     fallback: Vec<String>,
     key_cooldown_ms: Option<u64>,
@@ -82,6 +84,9 @@ impl ProviderEdit {
         let contexts = self
             .contexts
             .unwrap_or_else(|| existing.map(|p| p.contexts.clone()).unwrap_or_default());
+        let outputs = self
+            .outputs
+            .unwrap_or_else(|| existing.map(|p| p.outputs.clone()).unwrap_or_default());
         let affinity = self
             .affinity
             .unwrap_or_else(|| existing.map(|p| p.affinity).unwrap_or_default());
@@ -107,6 +112,7 @@ impl ProviderEdit {
             api_keys,
             models: self.models,
             contexts,
+            outputs,
             fallback: self.fallback,
             key_cooldown_ms: self.key_cooldown_ms,
             routing,
