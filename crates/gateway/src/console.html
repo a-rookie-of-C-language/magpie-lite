@@ -441,6 +441,15 @@
     .group-editor[hidden] { display: none; }
     .group-editor textarea { resize: vertical; min-height: 110px; }
     .group-help { margin: 0; color: var(--muted); font-size: .85rem; overflow-wrap: anywhere; }
+    .field-label { font-weight: 680; }
+    .rule-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+    .rule-item { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-soft); overflow-wrap: anywhere; }
+    .rule-item .rule-text { flex: 1 1 200px; min-width: 0; }
+    .rule-form { display: grid; gap: 12px; padding: 12px; border: 1px solid var(--border); border-radius: 12px; }
+    .rule-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .rule-grid .field { min-width: 0; }
+    .rule-checks { display: flex; flex-wrap: wrap; gap: 8px 16px; }
+    @media (max-width: 540px) { .rule-grid { grid-template-columns: minmax(0, 1fr); } }
     .group-item { display: grid; gap: 8px; padding: 12px 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
     #group-list { display: block; list-style: none; }
     #group-new { min-height: 44px; flex-shrink: 0; }
@@ -712,7 +721,7 @@
                 <div class="field"><label for="group-classifier">Classifier model (optional)</label><input id="group-classifier" class="token-input" list="agent-model-options" placeholder="deepseek/deepseek-chat" aria-describedby="group-classifier-help" spellcheck="false"><p id="group-classifier-help" class="group-help">The model asked which of the rules' intents a turn's message is, as the turn begins. Needed when a rule has an intent; leave blank otherwise.</p></div>
                 <div class="field"><label for="group-effort">Turn reasoning</label><select id="group-effort" class="token-input" aria-describedby="group-effort-help"><option value="">Agent's choice</option><option value="auto">Judge each turn</option></select><p id="group-effort-help" class="group-help">Blank sends what the agent asked for. Judge each turn has the classifier above judge how hard the turn is as it begins, and the turn's requests ask their model for it; it needs the classifier model.</p></div>
                 <div class="field"><label for="group-levels">Offered reasoning levels (optional)</label><input id="group-levels" class="token-input" placeholder="low, high" aria-describedby="group-levels-help" spellcheck="false"><p id="group-levels-help" class="group-help">Blank offers everything. Levels separated by commas or spaces, e.g. low, high: every reasoning ask for a member is sent at the nearest offered, a tie going up, except off, which stays off.</p></div>
-                <div class="field"><label for="group-rules">Routing rules (optional JSON)</label><textarea id="group-rules" class="token-input" placeholder='[{"use":"deepseek/deepseek-chat","images":true}]' aria-describedby="group-rules-help" spellcheck="false"></textarea><p id="group-rules-help" class="group-help">A JSON array of routing rules. A rule sends the requests it matches to its member first; a rule with "pause": true leaves its member out instead while its hours, days, agents or folders hold. Conditions: tokens, images, effort, agents, intent, compact, time, folders, exceptFolders; an intent rule needs the classifier model above. Leave blank for no rules.</p></div>
+                <div class="field"><span class="field-label" id="group-rules-label">Routing rules (optional)</span><ul id="group-rule-list" class="rule-list" aria-labelledby="group-rules-label"></ul><p id="group-rules-empty" class="empty">No rules: every request follows the policy above.</p><div class="group-actions"><button id="rule-add" class="mini-button" type="button">Add rule</button></div><div id="rule-form" class="rule-form" hidden><div class="field"><label for="rule-use">Send first to</label><select id="rule-use" class="token-input"></select><p class="group-help">One of the routes above, sent first for the requests this rule matches.</p></div><div class="rule-grid"><div class="field"><label for="rule-tokens">At least this many tokens</label><input id="rule-tokens" class="token-input" type="number" min="0" step="1" placeholder="0"></div><div class="field"><label for="rule-effort">Reasoning asked</label><select id="rule-effort" class="token-input"><option value="">Any</option><option value="on">Any reasoning</option><option value="low">low or more</option><option value="medium">medium or more</option><option value="high">high or more</option><option value="xhigh">xhigh or more</option><option value="max">max</option></select></div><div class="field"><label for="rule-use-effort">Ask it for</label><select id="rule-use-effort" class="token-input"><option value="">Unchanged</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option></select></div><div class="field"><label for="rule-agents">From agents</label><input id="rule-agents" class="token-input" placeholder="claude, codex" spellcheck="false"></div><div class="field"><label for="rule-intent">Intent is</label><input id="rule-intent" class="token-input" placeholder="research" spellcheck="false"></div><div class="field"><label for="rule-time-from">Between (HH:MM)</label><input id="rule-time-from" class="token-input" placeholder="22:00" spellcheck="false"></div><div class="field"><label for="rule-time-to">And (HH:MM)</label><input id="rule-time-to" class="token-input" placeholder="08:00" spellcheck="false"></div><div class="field"><label for="rule-days">On days</label><input id="rule-days" class="token-input" placeholder="mon, tue" spellcheck="false"></div></div><div class="field"><label for="rule-folders">Working folder in</label><textarea id="rule-folders" class="token-input" placeholder="/home/user/project" aria-describedby="rule-folders-help" spellcheck="false"></textarea><p id="rule-folders-help" class="group-help">One folder per line; a request inside one matches. Leave blank for anywhere.</p></div><div class="field"><label for="rule-except-folders">Working folder outside</label><textarea id="rule-except-folders" class="token-input" placeholder="/home/user/scratch" spellcheck="false"></textarea></div><div class="rule-checks"><label class="switch"><input id="rule-images" type="checkbox"> Carries an image</label><label class="switch"><input id="rule-compact" type="checkbox"> Compacting</label><label class="switch"><input id="rule-pause" type="checkbox"> Pause this member instead</label></div><p id="rule-message" class="console-message" role="status" aria-live="polite" aria-atomic="true"></p><div class="group-actions"><button id="rule-save" class="mini-button" type="button">Save rule</button><button id="rule-cancel" class="mini-button secondary" type="button">Cancel</button></div></div><p id="group-rules-help" class="group-help">A rule sends the requests it matches to its member first; pausing leaves its member out instead while its hours, days, agents or folders hold. An intent rule needs the classifier model above. A pause only holds on hours, days, agents or folders.</p></div>
                 <div class="group-actions"><button id="group-save" class="button" type="submit">Save group</button><button id="group-cancel" class="button secondary" type="button">Cancel</button></div>
               </form>
               <p id="group-message" class="console-message" role="status" aria-live="polite" aria-atomic="true"></p>
@@ -832,7 +841,27 @@
       groupClassifier: document.getElementById("group-classifier"),
       groupEffort: document.getElementById("group-effort"),
       groupLevels: document.getElementById("group-levels"),
-      groupRules: document.getElementById("group-rules"),
+      ruleList: document.getElementById("group-rule-list"),
+      ruleEmpty: document.getElementById("group-rules-empty"),
+      ruleAdd: document.getElementById("rule-add"),
+      ruleForm: document.getElementById("rule-form"),
+      ruleUse: document.getElementById("rule-use"),
+      ruleTokens: document.getElementById("rule-tokens"),
+      ruleEffort: document.getElementById("rule-effort"),
+      ruleUseEffort: document.getElementById("rule-use-effort"),
+      ruleAgents: document.getElementById("rule-agents"),
+      ruleIntent: document.getElementById("rule-intent"),
+      ruleTimeFrom: document.getElementById("rule-time-from"),
+      ruleTimeTo: document.getElementById("rule-time-to"),
+      ruleDays: document.getElementById("rule-days"),
+      ruleFolders: document.getElementById("rule-folders"),
+      ruleExceptFolders: document.getElementById("rule-except-folders"),
+      ruleImages: document.getElementById("rule-images"),
+      ruleCompact: document.getElementById("rule-compact"),
+      rulePause: document.getElementById("rule-pause"),
+      ruleMessage: document.getElementById("rule-message"),
+      ruleSave: document.getElementById("rule-save"),
+      ruleCancel: document.getElementById("rule-cancel"),
       groupProviders: document.getElementById("group-providers"),
       groupFound: document.getElementById("group-found"),
       groupNew: document.getElementById("group-new"),
@@ -879,6 +908,8 @@
     let agentPreview = null;
     let editingGroup = null;
     let editingProvider = null;
+    let editingRules = [];
+    let editingRuleIndex = null;
     let routingSnapshot = null;
     let configRevision = null;
     let managementBusy = false;
@@ -1510,30 +1541,197 @@
       elements.groupPickField.hidden = elements.groupRouting.value !== "manual";
     }
 
-    // One line for a group's routing rules, mirroring the server's rule conditions.
+    // One line for a group's routing rules, mirroring the server's rule
+    // conditions (`Rule.conditions`); `describeRule` also feeds the rule
+    // editor rows so the card and the editor never disagree.
+    function describeRule(rule, index) {
+      const member = rule.useEffort ? `${rule.use} at ${rule.useEffort}` : rule.use;
+      const conds = [];
+      if (rule.tokens > 0) conds.push(`tokens ≥ ${rule.tokens}`);
+      if (rule.images) conds.push("images");
+      if (rule.effort === "on") conds.push("reasoning");
+      else if (rule.effort) conds.push(`effort ≥ ${rule.effort}`);
+      if (rule.agents?.length) conds.push(`agent ${rule.agents.join("|")}`);
+      if (rule.intent) conds.push(`intent ${JSON.stringify(rule.intent)}`);
+      if (rule.compact) conds.push("compacting");
+      if (rule.time) {
+        let span = `${rule.time.from}–${rule.time.to}`;
+        if (rule.time.from === rule.time.to) span = "all day";
+        if (rule.time.days?.length) span += ` ${rule.time.days.join(",")}`;
+        conds.push(`time ${span}`);
+      }
+      if (rule.folders?.length) conds.push(`folder ${rule.folders.join("|")}`);
+      if (rule.exceptFolders?.length) conds.push(`not folder ${rule.exceptFolders.join("|")}`);
+      const what = conds.length ? ` when ${conds.join(", ")}` : "";
+      const kind = rule.pause ? "pauses" : "sends first to";
+      return `Rule ${index + 1} ${kind} ${member}${what}`;
+    }
+
     function ruleSummary(rules) {
       if (!rules.length) return "No routing rules";
-      return rules.map((rule, index) => {
-        const conds = [];
-        if (rule.tokens > 0) conds.push(`tokens ≥ ${rule.tokens}`);
-        if (rule.images) conds.push("images");
-        if (rule.effort === "on") conds.push("reasoning");
-        else if (rule.effort) conds.push(`effort ≥ ${rule.effort}`);
-        if (rule.agents?.length) conds.push(`agent ${rule.agents.join("|")}`);
-        if (rule.intent) conds.push(`intent ${JSON.stringify(rule.intent)}`);
-        if (rule.compact) conds.push("compacting");
-        if (rule.time) {
-          let span = `${rule.time.from}–${rule.time.to}`;
-          if (rule.time.from === rule.time.to) span = "all day";
-          if (rule.time.days?.length) span += ` ${rule.time.days.join(",")}`;
-          conds.push(`time ${span}`);
-        }
-        if (rule.folders?.length) conds.push(`folder ${rule.folders.join("|")}`);
-        if (rule.exceptFolders?.length) conds.push(`not folder ${rule.exceptFolders.join("|")}`);
-        const what = conds.length ? ` when ${conds.join(", ")}` : "";
-        const kind = rule.pause ? "pauses" : "sends first to";
-        return `Rule ${index + 1} ${kind} ${rule.use}${what}`;
-      }).join("; ");
+      return rules.map((rule, index) => describeRule(rule, index)).join("; ");
+    }
+
+    // The rule editor mirrors the server's `Rule.clean` checks so a bad
+    // rule is refused in the form, with the server still the backstop.
+    const RULE_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+    const RULE_DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+    const RULE_CLOCK = /^([01]?\d|2[0-3]):[0-5]\d$/;
+
+    function ruleUseOptions() {
+      const routes = elements.groupRoutes.value.split(/\r?\n/).map(route => route.trim()).filter(Boolean);
+      const extra = editingRules.map(rule => rule.use).filter(use => use && !routes.includes(use));
+      return [...routes, ...extra];
+    }
+
+    function renderRuleRows() {
+      clear(elements.ruleList);
+      elements.ruleEmpty.hidden = editingRules.length !== 0;
+      editingRules.forEach((rule, index) => {
+        const li = document.createElement("li");
+        li.className = "rule-item";
+        const label = document.createElement("span");
+        label.className = "rule-text";
+        label.textContent = describeRule(rule, index);
+        const edit = text("button", "Edit", "mini-button");
+        edit.type = "button";
+        edit.setAttribute("aria-label", `Edit rule ${index + 1}`);
+        edit.addEventListener("click", () => openRuleForm(index));
+        const del = text("button", "Delete", "mini-button");
+        del.type = "button";
+        del.setAttribute("aria-label", `Delete rule ${index + 1}`);
+        del.addEventListener("click", () => {
+          if (managementBusy) return;
+          editingRules.splice(index, 1);
+          if (editingRuleIndex !== null) closeRuleForm();
+          renderRuleRows();
+        });
+        li.append(label, edit, del);
+        elements.ruleList.append(li);
+      });
+    }
+
+    function openRuleForm(index) {
+      if (managementBusy) return;
+      editingRuleIndex = index;
+      const rule = index === null ? {} : editingRules[index];
+      elements.ruleUse.innerHTML = "";
+      for (const route of ruleUseOptions()) {
+        const option = document.createElement("option");
+        option.value = route;
+        option.textContent = route;
+        elements.ruleUse.append(option);
+      }
+      elements.ruleUse.value = rule.use || elements.ruleUse.options[0]?.value || "";
+      elements.ruleTokens.value = rule.tokens > 0 ? rule.tokens : "";
+      elements.ruleEffort.value = rule.effort || "";
+      elements.ruleUseEffort.value = rule.useEffort || "";
+      elements.ruleAgents.value = (rule.agents || []).join(", ");
+      elements.ruleIntent.value = rule.intent || "";
+      elements.ruleTimeFrom.value = rule.time?.from || "";
+      elements.ruleTimeTo.value = rule.time?.to || "";
+      elements.ruleDays.value = (rule.time?.days || []).join(", ");
+      elements.ruleFolders.value = (rule.folders || []).join("\n");
+      elements.ruleExceptFolders.value = (rule.exceptFolders || []).join("\n");
+      elements.ruleImages.checked = Boolean(rule.images);
+      elements.ruleCompact.checked = Boolean(rule.compact);
+      elements.rulePause.checked = Boolean(rule.pause);
+      elements.ruleMessage.textContent = "";
+      elements.ruleForm.hidden = false;
+      elements.ruleAdd.disabled = true;
+      elements.ruleUse.focus();
+    }
+
+    function closeRuleForm() {
+      editingRuleIndex = null;
+      elements.ruleForm.hidden = true;
+      elements.ruleAdd.disabled = false;
+      elements.ruleMessage.textContent = "";
+    }
+
+    function orderRuleDays(days) {
+      return [...new Set(days)].sort((a, b) => RULE_DAYS.indexOf(a) - RULE_DAYS.indexOf(b));
+    }
+
+    function saveRuleForm() {
+      if (managementBusy) return;
+      const use = elements.ruleUse.value;
+      if (!use) {
+        elements.ruleMessage.textContent = "Pick the member this rule sends first to.";
+        elements.ruleUse.focus();
+        return;
+      }
+      const rawTokens = elements.ruleTokens.value.trim();
+      const tokens = rawTokens === "" ? 0 : Number(rawTokens);
+      if (!Number.isSafeInteger(tokens) || tokens < 0) {
+        elements.ruleMessage.textContent = "Tokens is a whole number of 0 or more; blank means no minimum.";
+        elements.ruleTokens.focus();
+        return;
+      }
+      const effort = elements.ruleEffort.value;
+      const useEffort = elements.ruleUseEffort.value;
+      const agents = elements.ruleAgents.value.split(",").map(agent => agent.trim().toLowerCase()).filter(Boolean);
+      const intent = elements.ruleIntent.value.split(/\s+/).filter(Boolean).join(" ");
+      if (intent.length > 200) {
+        elements.ruleMessage.textContent = "An intent is at most 200 characters.";
+        elements.ruleIntent.focus();
+        return;
+      }
+      const from = elements.ruleTimeFrom.value.trim();
+      const to = elements.ruleTimeTo.value.trim();
+      const days = elements.ruleDays.value.split(",").map(day => day.trim().toLowerCase()).filter(Boolean);
+      const badDay = days.find(day => !RULE_DAYS.includes(day));
+      if (badDay) {
+        elements.ruleMessage.textContent = `Days are mon … sun — not "${badDay}".`;
+        elements.ruleDays.focus();
+        return;
+      }
+      const padClock = value => {
+        const [hours, minutes] = value.split(":");
+        return `${hours.padStart(2, "0")}:${minutes}`;
+      };
+      if ((from || to || days.length) && (!RULE_CLOCK.test(from) || !RULE_CLOCK.test(to))) {
+        elements.ruleMessage.textContent = "Hours are HH:MM each (09:00).";
+        (RULE_CLOCK.test(from) ? elements.ruleTimeTo : elements.ruleTimeFrom).focus();
+        return;
+      }
+      if ((from || to) && from === to && days.length === 0) {
+        elements.ruleMessage.textContent = "Equal hours cover the whole day, every day: give days or other hours.";
+        elements.ruleDays.focus();
+        return;
+      }
+      const folders = elements.ruleFolders.value.split(/\r?\n/).map(folder => folder.trim()).filter(Boolean);
+      const exceptFolders = elements.ruleExceptFolders.value.split(/\r?\n/).map(folder => folder.trim()).filter(Boolean);
+      const images = elements.ruleImages.checked;
+      const compact = elements.ruleCompact.checked;
+      const pause = elements.rulePause.checked;
+      const hasCondition = tokens > 0 || images || effort || agents.length || intent || compact || from || folders.length || exceptFolders.length;
+      if (!hasCondition) {
+        elements.ruleMessage.textContent = "Give the rule a condition (tokens, images, effort, agents, intent, compacting, time or folders).";
+        elements.ruleTokens.focus();
+        return;
+      }
+      if (pause && (tokens > 0 || images || effort || useEffort || intent || compact)) {
+        elements.ruleMessage.textContent = "A pause holds by hours, days, agents or folders only.";
+        elements.rulePause.focus();
+        return;
+      }
+      const rule = { use };
+      if (tokens > 0) rule.tokens = tokens;
+      if (images) rule.images = true;
+      if (effort) rule.effort = effort;
+      if (useEffort) rule.useEffort = useEffort;
+      if (agents.length) rule.agents = [...new Set(agents)];
+      if (intent) rule.intent = intent;
+      if (compact) rule.compact = true;
+      if (from) rule.time = { from: padClock(from), to: padClock(to), ...(days.length ? { days: orderRuleDays(days) } : {}) };
+      if (folders.length) rule.folders = folders;
+      if (exceptFolders.length) rule.exceptFolders = exceptFolders;
+      if (pause) rule.pause = true;
+      if (editingRuleIndex === null) editingRules.push(rule);
+      else editingRules[editingRuleIndex] = rule;
+      closeRuleForm();
+      renderRuleRows();
     }
 
     function renderModels(models) {
@@ -1863,7 +2061,10 @@
       elements.groupClassifier.value = group?.classifier || "";
       elements.groupEffort.value = group?.effort || "";
       elements.groupLevels.value = (group?.levels || []).join(", ");
-      elements.groupRules.value = group?.rules?.length ? JSON.stringify(group.rules, null, 2) : "";
+      editingRules = structuredClone(group?.rules || []);
+      editingRuleIndex = null;
+      closeRuleForm();
+      renderRuleRows();
       groupRoutingChanged();
       elements.groupMessage.textContent = "";
       elements.groupEditor.hidden = false;
@@ -1872,6 +2073,7 @@
 
     function closeGroupEditor() {
       editingGroup = null;
+      closeRuleForm();
       elements.groupEditor.hidden = true;
       elements.groupEditor.reset();
       elements.groupNew.focus();
@@ -1981,12 +2183,19 @@
       }
     }
 
+    elements.ruleAdd.addEventListener("click", () => openRuleForm(null));
+    elements.ruleSave.addEventListener("click", saveRuleForm);
+    elements.ruleCancel.addEventListener("click", closeRuleForm);
     elements.groupNew.addEventListener("click", () => openGroupEditor());
     elements.groupFound.addEventListener("click", toggleFoundGroups);
     elements.groupCancel.addEventListener("click", closeGroupEditor);
     elements.groupRouting.addEventListener("change", groupRoutingChanged);
     elements.groupEditor.addEventListener("keydown", event => {
-      if (event.key === "Escape" && !managementBusy) { event.preventDefault(); closeGroupEditor(); }
+      if (event.key === "Escape" && !managementBusy) {
+        event.preventDefault();
+        if (!elements.ruleForm.hidden) closeRuleForm();
+        else closeGroupEditor();
+      }
     });
     elements.groupEditor.addEventListener("submit", async event => {
       event.preventDefault();
@@ -2005,24 +2214,23 @@
         elements.groupRoutes.focus();
         return;
       }
-      let rules = [];
-      const rawRules = elements.groupRules.value.trim();
-      if (rawRules) {
-        try {
-          rules = JSON.parse(rawRules);
-        } catch (error) {
-          elements.groupMessage.textContent = "Routing rules are not valid JSON: " + error.message;
-          elements.groupRules.focus();
-          return;
-        }
-        if (!Array.isArray(rules)) {
-          elements.groupMessage.textContent = "Routing rules must be a JSON array, e.g. [{\"use\":\"provider/model\",\"images\":true}].";
-          elements.groupRules.focus();
-          return;
-        }
+      // Rules are built in the rule editor, which mirrors the server's
+      // checks; the routes may have changed since a rule was added, and
+      // the classifier may have been cleared, so both are rechecked here
+      // with the server still the backstop.
+      const stale = editingRules.find(rule => !body.routes.includes(rule.use));
+      if (stale) {
+        elements.groupMessage.textContent = `Rule for ${stale.use} is not in the group anymore: edit the rules or the routes.`;
+        openRuleForm(editingRules.indexOf(stale));
+        return;
       }
-      body.rules = rules;
+      body.rules = editingRules;
       body.classifier = elements.groupClassifier.value.trim();
+      if (body.rules.some(rule => rule.intent) && !body.classifier) {
+        elements.groupMessage.textContent = "A rule with an intent needs the group's classifier: the model that tells which intent a message is.";
+        elements.groupClassifier.focus();
+        return;
+      }
       body.effort = elements.groupEffort.value;
       const levels = elements.groupLevels.value.split(/[\s,]+/).map(level => level.trim().toLowerCase()).filter(Boolean);
       const knownLevels = ["low", "medium", "high", "xhigh", "max"];
