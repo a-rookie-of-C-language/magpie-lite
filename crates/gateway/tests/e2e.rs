@@ -297,6 +297,7 @@ async fn spawn_gateway_with_providers_and_groups(
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            key_limits: Vec::new(),
         });
     }
     let config = Config {
@@ -1786,6 +1787,7 @@ async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) ->
         queue_limit: None,
         queue_wait_s: None,
         key_generation: 0,
+        key_limits: Vec::new(),
     }];
     if let Some(backup) = backup {
         fallback.push("backup/mock-model".into());
@@ -1809,6 +1811,7 @@ async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) ->
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            key_limits: Vec::new(),
         });
     }
     providers[0].fallback = fallback;
@@ -1894,6 +1897,7 @@ async fn spawn_gateway_with_fallback_named(
                 queue_limit: None,
                 queue_wait_s: None,
                 key_generation: 0,
+                key_limits: Vec::new(),
             },
             ProviderConfig {
                 id: backup_id.into(),
@@ -1915,6 +1919,7 @@ async fn spawn_gateway_with_fallback_named(
                 queue_limit: None,
                 queue_wait_s: None,
                 key_generation: 0,
+                key_limits: Vec::new(),
             },
         ],
         group: Vec::new(),
@@ -1974,6 +1979,7 @@ async fn spawn_gateway_with_same_provider_group(upstream: String) -> String {
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            key_limits: Vec::new(),
         }],
         group: vec![GroupConfig {
             id: "same-provider".into(),
@@ -2076,6 +2082,7 @@ async fn spawn_gateway_with_group_routes(
                 queue_limit: None,
                 queue_wait_s: None,
                 key_generation: 0,
+                key_limits: Vec::new(),
             },
             ProviderConfig {
                 id: "backup".into(),
@@ -2097,6 +2104,7 @@ async fn spawn_gateway_with_group_routes(
                 queue_limit: None,
                 queue_wait_s: None,
                 key_generation: 0,
+                key_limits: Vec::new(),
             },
         ],
         group: vec![GroupConfig {

@@ -90,6 +90,7 @@ async fn gateway(status: u16, body: Value) -> Gateway {
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            key_limits: Vec::new(),
         }],
         ..Config::default()
     };

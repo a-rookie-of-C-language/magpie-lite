@@ -243,6 +243,10 @@ enum ProviderCommand {
         /// Per-key weight for `--routing weight`, in pool order; repeat for each key.
         #[arg(long = "key-weight", num_args = 1)]
         key_weights: Vec<u32>,
+        /// Per-key concurrency override in pool order (`--max-concurrency`
+        /// when absent); repeat for each key, 0 for no limit on that key.
+        #[arg(long = "key-limit", num_args = 1)]
+        key_limits: Vec<u32>,
         /// How strongly a conversation stays with the key that answered it: auto, session, turn, or off.
         #[arg(long, default_value = "auto")]
         affinity: Affinity,
@@ -374,6 +378,7 @@ async fn main() -> Result<()> {
                 key_cooldown_ms,
                 routing,
                 key_weights,
+                key_limits,
                 affinity,
                 max_concurrency,
                 max_rpm,
@@ -399,6 +404,7 @@ async fn main() -> Result<()> {
                     key_cooldown_ms,
                     routing,
                     weights: key_weights,
+                    key_limits,
                     capabilities: Default::default(),
                     affinity,
                     max_concurrency,

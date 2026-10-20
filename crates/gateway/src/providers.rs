@@ -49,6 +49,9 @@ pub(crate) struct ProviderEdit {
     queue_wait_s: Option<u32>,
     /// Omitted on update to preserve the existing weights; `[]` clears them.
     weights: Option<Vec<u32>>,
+    /// Omitted on update to preserve the existing per-key overrides; `[]`
+    /// clears them.
+    key_limits: Option<Vec<u32>>,
     #[serde(default)]
     make_default: bool,
 }
@@ -73,6 +76,9 @@ impl ProviderEdit {
         let weights = self
             .weights
             .unwrap_or_else(|| existing.map(|p| p.weights.clone()).unwrap_or_default());
+        let key_limits = self
+            .key_limits
+            .unwrap_or_else(|| existing.map(|p| p.key_limits.clone()).unwrap_or_default());
         let contexts = self
             .contexts
             .unwrap_or_else(|| existing.map(|p| p.contexts.clone()).unwrap_or_default());
@@ -105,6 +111,7 @@ impl ProviderEdit {
             key_cooldown_ms: self.key_cooldown_ms,
             routing,
             weights,
+            key_limits,
             affinity,
             max_concurrency,
             max_rpm,

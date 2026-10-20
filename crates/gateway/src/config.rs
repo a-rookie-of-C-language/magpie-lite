@@ -179,6 +179,13 @@ pub struct ProviderConfig {
     /// unboundedly in the queue (and up to 2 minutes for the minute).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_wait_s: Option<u32>,
+    /// Per-key overrides for `max_concurrency`, parallel to
+    /// `api_key_pool()`: the entry at index `i` caps the key at pool
+    /// slot `i`, 0 for no limit on that key. A slot with no entry takes
+    /// the provider's `max_concurrency` (the reference's per-key
+    /// `AccountConcurrency`, #892).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_limits: Vec<u32>,
     /// Process-local credential/endpoint version; never saved or disclosed.
     #[serde(skip)]
     pub key_generation: u64,
@@ -186,6 +193,9 @@ pub struct ProviderConfig {
 
 /// The largest weight a key may carry; zero is taken as the default 1.
 pub const MAX_KEY_WEIGHT: u32 = 1000;
+
+/// The largest per-key concurrency override; 0 is no limit on that key.
+pub const MAX_KEY_LIMIT: u32 = 1000;
 
 /// A provider rotates its key pool unless it says otherwise.
 pub(crate) fn default_provider_routing() -> RoutingPolicy {
@@ -254,6 +264,12 @@ impl ProviderConfig {
         if self.weights.len() > self.api_key_pool().len() {
             anyhow::bail!("there are more key weights than keys in the pool");
         }
+        if self.key_limits.iter().any(|limit| *limit > MAX_KEY_LIMIT) {
+            anyhow::bail!("per-key concurrency limits cannot be above {MAX_KEY_LIMIT}");
+        }
+        if self.key_limits.len() > self.api_key_pool().len() {
+            anyhow::bail!("there are more per-key concurrency limits than keys in the pool");
+        }
         Ok(())
     }
     /// Display name: the given one, or the id.
@@ -304,6 +320,35 @@ impl ProviderConfig {
     /// limit (`max_concurrency`, the reference's `LaneLimit`).
     pub fn lane_limit(&self) -> u32 {
         self.max_concurrency.unwrap_or(0)
+    }
+
+    /// How many requests may be out at once on `key`: its own entry in
+    /// `key_limits` when the key holds a pool slot with one, else the
+    /// provider's `max_concurrency` (the reference's `LaneLimit`, #892).
+    /// An entry of 0 lifts the provider's limit off that key.
+    pub fn lane_limit_for_key(&self, key: &str) -> u32 {
+        let pool = self.api_key_pool();
+        if let Some(slot) = pool.iter().position(|k| k == key) {
+            if let Some(limit) = self.key_limits.get(slot) {
+                return *limit;
+            }
+        }
+        self.lane_limit()
+    }
+
+    /// The effective per-slot concurrency limit, in pool order: each
+    /// slot's own `key_limits` entry, else the provider's
+    /// `max_concurrency`.
+    pub fn key_lane_limits(&self) -> Vec<u32> {
+        let pool = self.api_key_pool();
+        (0..pool.len())
+            .map(|slot| {
+                self.key_limits
+                    .get(slot)
+                    .copied()
+                    .unwrap_or_else(|| self.lane_limit())
+            })
+            .collect()
     }
 
     /// How many requests one of its keys may send in a rolling minute, 0
@@ -1183,6 +1228,10 @@ pub struct ProviderConfigSnapshot {
     pub affinity: Affinity,
     /// Requests allowed out at once per key; null for no limit.
     pub max_concurrency: Option<u32>,
+    /// Effective per-key concurrency limits, parallel to the key pool:
+    /// each slot's own entry, else `max_concurrency`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_limits: Vec<u32>,
     /// Requests allowed per rolling minute per key; null for no limit.
     pub max_rpm: Option<u32>,
     /// Requests allowed to wait in a key's queue; null for no bound.
@@ -1685,6 +1734,7 @@ impl Config {
                     weights: p.key_weights(),
                     affinity: p.affinity,
                     max_concurrency: p.max_concurrency,
+                    key_limits: p.key_lane_limits(),
                     max_rpm: p.max_rpm,
                     queue_limit: p.queue_limit,
                     queue_wait_s: p.queue_wait_s,
@@ -2184,6 +2234,7 @@ base_url = "http://127.0.0.1:1/v1"
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            key_limits: Vec::new(),
         };
         assert!(provider.validate().is_ok());
 
@@ -2219,6 +2270,7 @@ base_url = "http://127.0.0.1:1/v1"
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            key_limits: Vec::new(),
         };
 
         assert_eq!(provider.api_key_pool(), vec!["legacy-key".to_owned()]);
@@ -2261,6 +2313,7 @@ base_url = "http://127.0.0.1:1/v1"
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            key_limits: Vec::new(),
         };
         let encoded = toml::to_string(&provider).unwrap();
         assert!(encoded.contains("supported_protocols = [\"chat\", \"responses\"]"));
@@ -2297,6 +2350,7 @@ base_url = "http://127.0.0.1:1/v1"
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            key_limits: Vec::new(),
         };
         assert!(provider.validate().is_err());
         provider.capabilities.supported_protocols = vec![Protocol::Chat, Protocol::Chat];
@@ -2328,6 +2382,7 @@ base_url = "http://127.0.0.1:1/v1"
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            key_limits: Vec::new(),
         });
         let snapshot = config.snapshot();
         assert_eq!(
@@ -2572,6 +2627,32 @@ base_url = "http://127.0.0.1:1/v1"
         assert!(provider.validate().is_err());
     }
 
+    #[test]
+    fn per_key_concurrency_overrides_bound_and_resolve() {
+        let mut provider = cooldown_config().provider.remove(0);
+        provider.api_keys = vec!["one".to_owned(), "two".to_owned()];
+        provider.max_concurrency = Some(2);
+        // A missing tail takes the provider's limit; an unknown key too.
+        provider.key_limits = vec![1];
+        assert!(provider.validate().is_ok());
+        assert_eq!(provider.lane_limit_for_key("one"), 1);
+        assert_eq!(provider.lane_limit_for_key("two"), 2);
+        assert_eq!(provider.lane_limit_for_key("missing"), 2);
+        assert_eq!(provider.key_lane_limits(), vec![1, 2]);
+
+        // An explicit zero lifts the provider's limit off that key.
+        provider.key_limits = vec![1, 0];
+        assert!(provider.validate().is_ok());
+        assert_eq!(provider.lane_limit_for_key("two"), 0);
+        assert_eq!(provider.key_lane_limits(), vec![1, 0]);
+
+        provider.key_limits = vec![1, MAX_KEY_LIMIT + 1];
+        assert!(provider.validate().is_err());
+
+        provider.key_limits = vec![1, 1, 1];
+        assert!(provider.validate().is_err());
+    }
+
     fn cooldown_config() -> Config {
         Config {
             provider: vec![ProviderConfig {
@@ -2594,6 +2675,7 @@ base_url = "http://127.0.0.1:1/v1"
                 queue_limit: None,
                 queue_wait_s: None,
                 key_generation: 0,
+                key_limits: Vec::new(),
             }],
             ..Default::default()
         }
@@ -2635,6 +2717,7 @@ base_url = "http://127.0.0.1:1/v1"
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            key_limits: Vec::new(),
         });
         config.group.push(GroupConfig {
             id: "daily".into(),
@@ -2785,6 +2868,7 @@ affinity = "session"
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            key_limits: Vec::new(),
         });
         config.group.push(GroupConfig {
             id: "daily".into(),
@@ -3027,6 +3111,7 @@ affinity = "session"
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            key_limits: Vec::new(),
         }
     }
 
@@ -3389,6 +3474,7 @@ affinity = "session"
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            key_limits: Vec::new(),
         };
 
         assert_eq!(config.key_cooldown_for(&provider), Duration::from_secs(60));

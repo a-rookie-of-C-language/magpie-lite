@@ -906,14 +906,14 @@ fn lane_failure(
     ProxyFailure::lane(StatusCode::TOO_MANY_REQUESTS, message, retry_after)
 }
 
-/// Whether a request for `who` under `provider` would go at once: a slot
+/// Whether a request for `key` under `provider` would go at once: a slot
 /// free in its lane and room in its minute (the reference's `ready`).
-fn candidate_ready(state: &AppState, provider: &ProviderConfig, who: &str) -> bool {
+fn candidate_ready(state: &AppState, provider: &ProviderConfig, key: &str) -> bool {
     lanes::ready(
         &state.lanes,
         &state.rpms,
-        who,
-        provider.lane_limit(),
+        &who_of(&provider.id, key),
+        provider.lane_limit_for_key(key),
         provider.rpm_limit(),
     )
 }
@@ -932,14 +932,16 @@ fn give_way_to_free_lanes(state: &AppState, routes: &mut Vec<UpstreamRoute>) {
         let mut i = 0;
         while i < route.api_keys.len() {
             let who = who_of(&route.provider.id, &route.api_keys[i].1);
-            if gave_keys.contains(&who) || candidate_ready(state, &route.provider, &who) {
+            if gave_keys.contains(&who)
+                || candidate_ready(state, &route.provider, &route.api_keys[i].1)
+            {
                 i += 1;
                 continue;
             }
             let mut found = None;
             for j in (i + 1)..route.api_keys.len() {
                 let j_who = who_of(&route.provider.id, &route.api_keys[j].1);
-                if j_who != who && candidate_ready(state, &route.provider, &j_who) {
+                if j_who != who && candidate_ready(state, &route.provider, &route.api_keys[j].1) {
                     found = Some(j);
                     break;
                 }
@@ -970,14 +972,11 @@ fn give_way_to_free_lanes(state: &AppState, routes: &mut Vec<UpstreamRoute>) {
                 candidate_ready(
                     state,
                     &route.provider,
-                    &who_of(
-                        &route.provider.id,
-                        route
-                            .api_keys
-                            .first()
-                            .map(|(_, k)| k.as_str())
-                            .unwrap_or(""),
-                    ),
+                    route
+                        .api_keys
+                        .first()
+                        .map(|(_, k)| k.as_str())
+                        .unwrap_or(""),
                 ),
                 route.group_id.is_some(),
                 route.provider.id.clone(),
@@ -1007,7 +1006,15 @@ fn give_way_to_free_lanes(state: &AppState, routes: &mut Vec<UpstreamRoute>) {
                 continue;
             }
             let _ = j_group;
-            if candidate_ready(state, &routes[j].provider, &j_who) {
+            if candidate_ready(
+                state,
+                &routes[j].provider,
+                routes[j]
+                    .api_keys
+                    .first()
+                    .map(|(_, k)| k.as_str())
+                    .unwrap_or(""),
+            ) {
                 found = Some(j);
                 break;
             }
@@ -2181,7 +2188,7 @@ async fn send_with_fallback(
                 .lanes
                 .take(
                     &who,
-                    route.provider.lane_limit(),
+                    route.provider.lane_limit_for_key(api_key),
                     route.provider.queue_bound(),
                     route.provider.queue_wait(),
                 )
@@ -4430,6 +4437,7 @@ mod tests {
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            key_limits: Vec::new(),
         }
     }
 

@@ -89,6 +89,7 @@ async fn gateway(referenced: bool) -> Gateway {
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            key_limits: Vec::new(),
         }],
         ..Config::default()
     };
@@ -683,6 +684,7 @@ async fn gateway_with_shared_model() -> Gateway {
         queue_limit: None,
         queue_wait_s: None,
         key_generation: 0,
+        key_limits: Vec::new(),
     };
     let config = Config {
         provider: vec![peer("mock-a"), peer("mock-b")],
@@ -910,6 +912,7 @@ async fn found_groups_off_serves_the_first_seat_but_lists_nothing() {
         queue_limit: None,
         queue_wait_s: None,
         key_generation: 0,
+        key_limits: Vec::new(),
     };
     let config = Config {
         provider: vec![peer("mock-a", &upstream_a), peer("mock-b", &upstream_b)],
@@ -1012,6 +1015,7 @@ async fn a_bare_model_id_reaches_its_found_group() {
         queue_limit: None,
         queue_wait_s: None,
         key_generation: 0,
+        key_limits: Vec::new(),
     };
     let config = Config {
         provider: vec![peer("mock-a", &down_url), peer("mock-b", &up_url)],
@@ -1090,6 +1094,7 @@ async fn vendors_spelling_one_model_apart_share_one_served_group() {
         queue_limit: None,
         queue_wait_s: None,
         key_generation: 0,
+        key_limits: Vec::new(),
     };
     let config = Config {
         provider: vec![
@@ -1483,6 +1488,7 @@ async fn found_group_request_level_round_trip() {
         queue_limit: None,
         queue_wait_s: None,
         key_generation: 0,
+        key_limits: Vec::new(),
     };
     let colon = Config {
         provider: vec![guard("openrouter", vec!["x:free"])],
@@ -1540,6 +1546,7 @@ async fn found_group_request_level_round_trip() {
         queue_limit: None,
         queue_wait_s: None,
         key_generation: 0,
+        key_limits: Vec::new(),
     };
     let config = Config {
         provider: vec![peer("mock-a", &down_url), peer("mock-b", &up_url)],

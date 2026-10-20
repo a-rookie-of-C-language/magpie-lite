@@ -323,6 +323,7 @@ impl Fixture {
             queue_limit: None,
             queue_wait_s: None,
             key_generation: 0,
+            key_limits: Vec::new(),
         };
         let mut config = Config {
             token: "secret-local-token".into(),
