@@ -2279,6 +2279,23 @@ async fn send_with_fallback(
                     "routing upstream"
                 );
 
+                // The reasoning this send goes at, whoever chose it, for
+                // the request's record (the reference's `sentEffort` on
+                // each try, read back off the send as built).
+                tracker.push_try(
+                    &route.provider.id,
+                    &route.model,
+                    *key_slot,
+                    &crate::usage::sent_effort(magpie_core::effort::decode(
+                        match route.provider.protocol {
+                            Protocol::Chat => magpie_core::ir::ToolChoiceProtocol::Chat,
+                            Protocol::Responses => magpie_core::ir::ToolChoiceProtocol::Responses,
+                            Protocol::Anthropic => magpie_core::ir::ToolChoiceProtocol::Anthropic,
+                            Protocol::Gemini => magpie_core::ir::ToolChoiceProtocol::Gemini,
+                        },
+                        &body,
+                    )),
+                );
                 let first_token =
                     GroupFirstToken::new(if creq.stream && route_index != last_route {
                         route

@@ -2020,6 +2020,23 @@ async fn spawn_gateway_with_group_weights(
     routing: RoutingPolicy,
     weights: Vec<u32>,
 ) -> String {
+    spawn_gateway_with_group_routes(
+        primary,
+        backup,
+        routing,
+        weights,
+        vec!["primary/mock-model".into(), "backup/mock-model".into()],
+    )
+    .await
+}
+
+async fn spawn_gateway_with_group_routes(
+    primary: String,
+    backup: String,
+    routing: RoutingPolicy,
+    weights: Vec<u32>,
+    routes: Vec<String>,
+) -> String {
     let config = Config {
         port: 0,
         token: "magpie-lite".into(),
@@ -2080,7 +2097,7 @@ async fn spawn_gateway_with_group_weights(
         group: vec![GroupConfig {
             id: "daily-coding".into(),
             name: "Daily coding".into(),
-            routes: vec!["primary/mock-model".into(), "backup/mock-model".into()],
+            routes,
             rules: Vec::new(),
             classifier: String::new(),
             effort: String::new(),
@@ -3356,4 +3373,52 @@ async fn sampling_refusal_is_retried_without_the_sampling() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], "hello");
     assert_eq!(*requests.lock().unwrap(), 2);
+}
+
+/// The request's record keeps every upstream send: the member asked, at
+/// the reasoning level the send went at (the reference's tries with
+/// `sentEffort`). The first route is fixed at high and refuses; the
+/// agent asked low, so the fallback goes at low.
+#[tokio::test]
+async fn usage_records_the_effort_each_try_was_sent_at() {
+    let busy = json!({"error": {"message": "busy", "type": "server_error"}});
+    let (a, _) = spawn_scripted(vec![(500, busy)]).await;
+    let (b, _) = spawn_mock().await;
+    let gw = spawn_gateway_with_group_routes(
+        a,
+        b,
+        RoutingPolicy::Order,
+        Vec::new(),
+        vec!["primary/mock-model:high".into(), "backup/mock-model".into()],
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "group/daily-coding",
+            "reasoning_effort": "low",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let stats: Value = client
+        .get(format!("{gw}/stats"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        stats["recent_requests"][0]["tries"],
+        json!([
+            {"provider": "primary", "model": "mock-model", "key_slot": 0, "effort": "high"},
+            {"provider": "backup", "model": "mock-model", "key_slot": 0, "effort": "low"},
+        ])
+    );
 }

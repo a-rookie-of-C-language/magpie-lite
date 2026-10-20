@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use magpie_core::effort::Effort;
 use magpie_core::ir::{CompletionRequest, Usage};
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +55,10 @@ pub struct RequestRecord {
     /// Zero-based position in the provider's API-key pool. The key itself is
     /// deliberately not recorded.
     pub key_slot: usize,
+    /// Every upstream send, in order: who was asked, at which reasoning
+    /// level. Absent on history lines written before it was kept.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tries: Vec<TryRecord>,
     /// Whether the agent asked for SSE.
     pub stream: bool,
     /// `ok`, or a short failure kind.
@@ -67,6 +72,32 @@ pub struct RequestRecord {
     /// lines predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classified: Option<crate::rules::Classified>,
+}
+
+/// One upstream send: which member was asked, at which reasoning level
+/// (the reference's `Try`, narrowed to what the record tells).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TryRecord {
+    /// The provider id asked.
+    pub provider: String,
+    /// The provider's spelling of the model asked.
+    pub model: String,
+    /// Zero-based position in the provider's API-key pool.
+    pub key_slot: usize,
+    /// The reasoning level the send went at: `low` through `max`, `none`
+    /// when the send asked for none, empty when it named none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub effort: String,
+}
+
+/// The level a send went at for its try record: the wire name, `none`
+/// when the send asked for none, empty when it named none.
+pub fn sent_effort(effort: Option<Effort>) -> String {
+    match effort {
+        None | Some(Effort::Unspecified) => String::new(),
+        Some(Effort::Off) => "none".to_owned(),
+        Some(level) => level.wire_level().unwrap_or("").to_owned(),
+    }
 }
 
 /// Per-key totals inside a provider. Slot names are stable, secret-free ids.
@@ -376,6 +407,7 @@ impl RequestTracker {
                 provider: provider.to_owned(),
                 upstream_model: upstream_model.to_owned(),
                 key_slot,
+                tries: Vec::new(),
                 stream: request.stream,
                 status: "incomplete".to_owned(),
                 latency_ms: 0,
@@ -404,6 +436,16 @@ impl RequestTracker {
         self.record.provider = provider.to_owned();
         self.record.upstream_model = upstream_model.to_owned();
         self.record.key_slot = key_slot;
+    }
+
+    /// Note one upstream send: which member was asked, at which level.
+    pub fn push_try(&mut self, provider: &str, model: &str, key_slot: usize, effort: &str) {
+        self.record.tries.push(TryRecord {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            key_slot,
+            effort: effort.to_owned(),
+        });
     }
 
     /// Switch accounting before awaiting a concrete attempt, so cancellation
@@ -517,6 +559,7 @@ mod tests {
             provider: "mock".into(),
             upstream_model: format!("model-{index}"),
             key_slot: index as usize,
+            tries: Vec::new(),
             stream: index.is_multiple_of(2),
             status: status.into(),
             latency_ms: index,
@@ -754,6 +797,43 @@ mod tests {
         assert_eq!(record.usage.output, Some(6));
         assert_eq!(record.usage.cache_read, None);
         assert_eq!(record.usage.cache_write, None);
+    }
+
+    #[test]
+    fn sent_effort_names_the_level_a_send_went_at() {
+        assert_eq!(sent_effort(None), "");
+        assert_eq!(sent_effort(Some(Effort::Off)), "none");
+        assert_eq!(sent_effort(Some(Effort::Unspecified)), "");
+        assert_eq!(sent_effort(Some(Effort::Low)), "low");
+        assert_eq!(sent_effort(Some(Effort::Medium)), "medium");
+        assert_eq!(sent_effort(Some(Effort::High)), "high");
+        assert_eq!(sent_effort(Some(Effort::XHigh)), "xhigh");
+        assert_eq!(sent_effort(Some(Effort::Max)), "max");
+    }
+
+    #[test]
+    fn tries_keep_every_send_and_load_history_without_them() {
+        let log = Arc::new(Mutex::new(RequestLog::default()));
+        let mut tracker = tracker(log.clone());
+        tracker.push_try("primary", "one", 0, "high");
+        tracker.begin_attempt("backup", "two", 1);
+        tracker.push_try("backup", "two", 1, "low");
+        tracker.finish("ok", &Usage::default());
+
+        let record = &log.lock().unwrap().snapshot().recent_requests[0];
+        assert_eq!(record.provider, "backup");
+        assert_eq!(record.tries.len(), 2);
+        assert_eq!(record.tries[0].provider, "primary");
+        assert_eq!(record.tries[0].model, "one");
+        assert_eq!(record.tries[0].effort, "high");
+        assert_eq!(record.tries[1].key_slot, 1);
+        assert_eq!(record.tries[1].effort, "low");
+        // History lines written before tries were kept load without them.
+        let old: RequestRecord = serde_json::from_str(
+            r#"{"started_unix_ms":1,"client_protocol":"chat","requested_model":"m","provider":"p","upstream_model":"u","key_slot":0,"stream":false,"status":"ok","latency_ms":2,"usage":{}}"#,
+        )
+        .unwrap();
+        assert!(old.tries.is_empty());
     }
 
     #[test]
