@@ -3113,7 +3113,7 @@ async fn send_with_fallback(
                                 continue 'candidate;
                             }
                             if quota_limited_status(failure.status) {
-                                if let Some(back_in) = crate::cline::free_limit_rest(
+                                if let Some((back_in, message)) = crate::cline::model_rest_for_quota(
                                     &route.provider.base_url,
                                     failure.status.as_u16(),
                                     &failure.body,
@@ -3122,7 +3122,7 @@ async fn send_with_fallback(
                                         &route.provider.id,
                                         &route.model,
                                         back_in,
-                                        crate::cline::refusal_message(&failure.body),
+                                        message,
                                     );
                                 } else {
                                     let cooldown = quota_cooldown(
@@ -3389,7 +3389,7 @@ async fn send_with_fallback(
                         continue 'candidate;
                     }
                     if quota_limited_status(status) {
-                        if let Some(back_in) = crate::cline::free_limit_rest(
+                        if let Some((back_in, message)) = crate::cline::model_rest_for_quota(
                             &route.provider.base_url,
                             status.as_u16(),
                             &error.body,
@@ -3398,7 +3398,7 @@ async fn send_with_fallback(
                                 &route.provider.id,
                                 &route.model,
                                 back_in,
-                                error.message.clone(),
+                                message,
                             );
                         } else {
                             let cooldown = quota_cooldown(

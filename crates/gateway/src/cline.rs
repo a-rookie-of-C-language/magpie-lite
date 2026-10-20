@@ -231,6 +231,22 @@ pub fn refusal_message(body: &Value) -> String {
         .unwrap_or_else(|| body.to_string())
 }
 
+/// The model rest a quota refusal lays down: how long the model named by
+/// Cline's free-model daily-limit refusal is out, with the refusal's own
+/// words for the replay. `None` for anything that rests the key as before
+/// — a non-429, another vendor's same words, a Cline 429 that doesn't name
+/// the model's limit, or one that names no wait. Both quota branches call
+/// this one hook so the host gate can't drift between the streaming and
+/// whole-reply paths; a loopback fake can't live on a Cline host, so the
+/// gate itself is pinned here by unit tests against the real host names.
+pub fn model_rest_for_quota(
+    base_url: &str,
+    status: u16,
+    body: &Value,
+) -> Option<(Duration, String)> {
+    free_limit_rest(base_url, status, body).map(|back_in| (back_in, refusal_message(body)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,5 +564,37 @@ mod tests {
         );
         let body = json!({"success": false});
         assert_eq!(refusal_message(&body), body.to_string());
+    }
+
+    #[test]
+    fn quota_hook_rests_the_named_model_with_its_own_words() {
+        let (back_in, message) = model_rest_for_quota(CLINE_BASE, 429, &free_body(FREE_LIMIT))
+            .expect("one hook for both quota branches");
+        assert_eq!(back_in, Duration::from_secs(23 * 60 * 60 + 59 * 60));
+        assert_eq!(message, FREE_LIMIT);
+    }
+
+    #[test]
+    fn quota_hook_leaves_the_key_path_what_it_does_not_name() {
+        // A Cline 429 that names no wait lays down no rest.
+        assert_eq!(
+            model_rest_for_quota(CLINE_BASE, 429, &free_body("free limit reached on model m")),
+            None
+        );
+        // The model's limit on another status is not its daily cap.
+        assert_eq!(
+            model_rest_for_quota(CLINE_BASE, 500, &free_body(FREE_LIMIT)),
+            None
+        );
+        // Another vendor's same words rest its key as before.
+        assert_eq!(
+            model_rest_for_quota("https://api.openai.com/v1", 429, &free_body(FREE_LIMIT)),
+            None
+        );
+        // A plain Cline rate limit names no model.
+        assert_eq!(
+            model_rest_for_quota(CLINE_BASE, 429, &free_body("Rate limit exceeded")),
+            None
+        );
     }
 }
