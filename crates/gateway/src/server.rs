@@ -2938,6 +2938,13 @@ async fn send_with_fallback(
                                     ));
                                 }
                             };
+                            // Cline's API answers a request that is not
+                            // streamed with the completion inside
+                            // `{"success":true,"data":…}`; any other shape
+                            // passes as it came (the reference's
+                            // `clineUnwrapped`).
+                            let value =
+                                crate::cline::unwrap_envelope(&route.provider.base_url, value);
                             let protocol = route.provider.protocol;
                             tracker
                                 .observe_usage(&decode_upstream_response_usage(protocol, &value));

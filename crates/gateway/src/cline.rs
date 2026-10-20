@@ -105,9 +105,100 @@ pub fn pin_to_upstream(
     body
 }
 
+/// Take the `{success, data}` envelope off a Cline whole reply: Cline's
+/// API answers a request that is not streamed with the completion inside
+/// `{"success":true,"data":{chat.completion}}`, which every client of the
+/// Chat API reads at the top (the reference's `clineUnwrapped`, 6094S on
+/// Discord: Alma's tool-model calls failed with "Invalid JSON response").
+/// `{"success":true,"data"}` goes on as the completion, so the codecs,
+/// the usage sniffer and the agent see it; `{"success":false}` goes on
+/// as `{"error":{"message":…}}`, which the whole-reply error branch
+/// turns into the agent's API's refusal. A body without a boolean
+/// `success`, a `true` one whose `data` is no object, and any other
+/// provider's reply pass as they came. Streams never reach here: the
+/// whole-reply branch alone calls this, and a translated request is
+/// asked of Cline as a stream, which comes plain.
+pub fn unwrap_envelope(base_url: &str, value: Value) -> Value {
+    if !is_cline_base(base_url) {
+        return value;
+    }
+    let Some(success) = value.get("success").and_then(Value::as_bool) else {
+        return value;
+    };
+    if success {
+        match value.get("data") {
+            Some(data) if data.is_object() => data.clone(),
+            _ => value,
+        }
+    } else {
+        let message = value
+            .get("error")
+            .and_then(|e| {
+                e.as_str()
+                    .map(str::to_owned)
+                    .or_else(|| e.get("message").and_then(Value::as_str).map(str::to_owned))
+            })
+            .or_else(|| {
+                value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "Cline request failed".to_owned());
+        json!({"error": {"message": message}})
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CLINE_BASE: &str = "https://api.cline.bot/api/v1";
+
+    fn completion() -> Value {
+        json!({"id":"gen_1","object":"chat.completion","model":"deepseek/deepseek-v4.1-flash",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}})
+    }
+
+    #[test]
+    fn whole_replies_lose_the_success_envelope() {
+        let out = unwrap_envelope(CLINE_BASE, json!({"success": true, "data": completion()}));
+        assert_eq!(out["object"], "chat.completion");
+        assert_eq!(out["choices"][0]["message"]["content"], "pong");
+        assert!(out.get("success").is_none(), "{out}");
+    }
+
+    #[test]
+    fn other_hosts_and_plain_bodies_pass_through() {
+        let enveloped = json!({"success": true, "data": completion()});
+        assert_eq!(
+            unwrap_envelope("https://api.openai.com/v1", enveloped.clone()),
+            enveloped
+        );
+        let plain = completion();
+        assert_eq!(unwrap_envelope(CLINE_BASE, plain.clone()), plain);
+        let data_less = json!({"success": true});
+        assert_eq!(unwrap_envelope(CLINE_BASE, data_less.clone()), data_less);
+    }
+
+    #[test]
+    fn refusals_become_agent_errors() {
+        let out = unwrap_envelope(
+            CLINE_BASE,
+            json!({"success": false, "error": "Insufficient balance"}),
+        );
+        assert_eq!(out, json!({"error": {"message": "Insufficient balance"}}));
+        let nested = unwrap_envelope(
+            CLINE_BASE,
+            json!({"success": false, "error": {"message": "quota spent"}}),
+        );
+        assert_eq!(nested, json!({"error": {"message": "quota spent"}}));
+        let top = unwrap_envelope(CLINE_BASE, json!({"success": false, "message": "nope"}));
+        assert_eq!(top, json!({"error": {"message": "nope"}}));
+        let bare = unwrap_envelope(CLINE_BASE, json!({"success": false}));
+        assert_eq!(bare, json!({"error": {"message": "Cline request failed"}}));
+    }
 
     #[test]
     fn cline_hosts_match_through_case_port_path_and_subdomains() {
