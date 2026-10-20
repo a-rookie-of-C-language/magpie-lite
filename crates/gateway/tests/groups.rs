@@ -1808,6 +1808,7 @@ struct FlakyMember {
     asked: Arc<AtomicUsize>,
     fail_first_stream: bool,
     credit_first: bool,
+    rate_limited_first: bool,
 }
 
 async fn flaky_chat(State(member): State<FlakyMember>, Json(body): Json<Value>) -> Response {
@@ -1817,6 +1818,17 @@ async fn flaky_chat(State(member): State<FlakyMember>, Json(body): Json<Value>) 
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(json!({"error": {"message": "insufficient credit balance, please recharge"}})),
+        )
+            .into_response();
+    }
+    if n == 0 && member.rate_limited_first {
+        // A short rate limit names when the key is back: the replan
+        // waits out the Retry-After (floored at the round's pause)
+        // instead of ending on it.
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", "1"), ("content-type", "application/json")],
+            Json(json!({"error": {"type": "rate_limit_error", "message": "slow down"}})),
         )
             .into_response();
     }
@@ -1867,11 +1879,13 @@ async fn flaky_gateway(
     patience_s: Option<i64>,
     fail_first_stream: bool,
     credit_first: bool,
+    rate_limited_first: bool,
 ) -> (String, Arc<AtomicUsize>) {
     let member = FlakyMember {
         asked: Arc::new(AtomicUsize::new(0)),
         fail_first_stream,
         credit_first,
+        rate_limited_first,
     };
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -1953,7 +1967,7 @@ async fn flaky_ask(gateway: String, model: &str, stream: bool) -> (StatusCode, S
 /// reference's replan, #1418).
 #[tokio::test]
 async fn a_transient_overload_is_asked_again_and_served() {
-    let (gw, asked) = flaky_gateway(None, false, false).await;
+    let (gw, asked) = flaky_gateway(None, false, false, false).await;
     let (status, body) = flaky_ask(gw, "group/g", false).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("hello"), "{body}");
@@ -1968,7 +1982,7 @@ async fn a_transient_overload_is_asked_again_and_served() {
 /// nothing visible, so nothing was lost (the reference's replan, #1418).
 #[tokio::test]
 async fn a_held_stream_overload_is_asked_again_and_served() {
-    let (gw, asked) = flaky_gateway(None, true, false).await;
+    let (gw, asked) = flaky_gateway(None, true, false, false).await;
     let (status, body) = flaky_ask(gw, "group/g", true).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("hello"), "{body}");
@@ -1983,7 +1997,7 @@ async fn a_held_stream_overload_is_asked_again_and_served() {
 /// asked again (the reference's `busy`, #1418).
 #[tokio::test]
 async fn a_credit_429_stands_without_being_asked_again() {
-    let (gw, asked) = flaky_gateway(None, false, true).await;
+    let (gw, asked) = flaky_gateway(None, false, true, false).await;
     let (status, body) = flaky_ask(gw, "group/g", false).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
     assert_eq!(
@@ -1998,7 +2012,7 @@ async fn a_credit_429_stands_without_being_asked_again() {
 /// #1418).
 #[tokio::test]
 async fn an_overload_beyond_patience_stands_on_the_first_answer() {
-    let (gw, asked) = flaky_gateway(Some(1), false, false).await;
+    let (gw, asked) = flaky_gateway(Some(1), false, false, false).await;
     let (status, body) = flaky_ask(gw, "group/g", false).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(
@@ -2013,12 +2027,167 @@ async fn an_overload_beyond_patience_stands_on_the_first_answer() {
 /// group behavior, #1418).
 #[tokio::test]
 async fn a_direct_provider_keeps_fail_fast_on_transient_overload() {
-    let (gw, asked) = flaky_gateway(None, false, false).await;
+    let (gw, asked) = flaky_gateway(None, false, false, false).await;
     let (status, body) = flaky_ask(gw, "solo/mock-model", false).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(
         asked.load(Ordering::SeqCst),
         1,
         "the direct ask never reached the vendor again"
+    );
+}
+
+/// A short 429 names its Retry-After: the group waits it out (floored
+/// at the round's pause) and is served on the ask again, instead of
+/// ending on the limit (the reference's replan, #1418).
+#[tokio::test]
+async fn a_rate_limit_retry_after_is_honored_within_patience() {
+    let (gw, asked) = flaky_gateway(None, false, false, true).await;
+    let (status, body) = flaky_ask(gw, "group/g", false).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("hello"), "{body}");
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        2,
+        "the rate-limited round reached the vendor again"
+    );
+}
+
+fn named_provider(id: &str, url: String, model: &str) -> ProviderConfig {
+    ProviderConfig {
+        id: id.into(),
+        name: id.into(),
+        protocol: Protocol::Chat,
+        base_url: url,
+        api_key: "fixture-key".into(),
+        api_keys: Vec::new(),
+        models: vec![model.into()],
+        contexts: Default::default(),
+        fallback: Vec::new(),
+        key_cooldown_ms: None,
+        capabilities: Default::default(),
+        routing: RoutingPolicy::Order,
+        weights: Vec::new(),
+        affinity: Default::default(),
+        max_concurrency: None,
+        max_rpm: None,
+        queue_limit: None,
+        queue_wait_s: None,
+        key_generation: 0,
+        key_limits: Vec::new(),
+    }
+}
+
+/// Two members behind one mock: `model-a` refuses the request outright,
+/// `model-b` is overloaded. Each records its own asks.
+#[derive(Clone)]
+struct MixedMember {
+    asked_a: Arc<AtomicUsize>,
+    asked_b: Arc<AtomicUsize>,
+}
+
+async fn mixed_chat(State(member): State<MixedMember>, Json(body): Json<Value>) -> Response {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    if model == "model-a" {
+        member.asked_a.fetch_add(1, Ordering::SeqCst);
+        // Final: no such thing served here, however often it is asked.
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": {"message": "not found"}})),
+        )
+            .into_response();
+    }
+    member.asked_b.fetch_add(1, Ordering::SeqCst);
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": {"message": "overloaded"}})),
+    )
+        .into_response()
+}
+
+/// A group whose first member refuses outright and whose second is
+/// overloaded: the round had a final failure, so nothing is asked again
+/// and the overload stands (the reference's replan replans only
+/// all-passing rounds, #1418).
+#[tokio::test]
+async fn a_mixed_final_and_transient_round_stands_without_replan() {
+    let member = MixedMember {
+        asked_a: Arc::new(AtomicUsize::new(0)),
+        asked_b: Arc::new(AtomicUsize::new(0)),
+    };
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn({
+        let member = member.clone();
+        async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(mixed_chat))
+                    .with_state(member),
+            )
+            .await
+            .unwrap()
+        }
+    });
+    let url = format!("http://{addr}/v1");
+    let config = Config {
+        provider: vec![
+            named_provider("pa", url.clone(), "model-a"),
+            named_provider("pb", url, "model-b"),
+        ],
+        group: vec![GroupConfig {
+            id: "g".into(),
+            name: "G".into(),
+            routes: vec!["pa/model-a".into(), "pb/model-b".into()],
+            rules: Vec::new(),
+            classifier: String::new(),
+            effort: String::new(),
+            levels: Vec::new(),
+            pick: String::new(),
+            auto: false,
+            weights: Vec::new(),
+            routing: RoutingPolicy::Order,
+            first_token_timeout_ms: 0,
+            affinity: Default::default(),
+            patience_s: None,
+        }],
+        ..Config::default()
+    };
+    let state = Arc::new(AppState {
+        agents: None,
+        config: ConfigStore::new(config, None),
+        http: magpie_gateway::upstream::http_client().unwrap(),
+        requests: Arc::new(Mutex::new(magpie_gateway::usage::RequestLog::default())),
+        key_rotation: magpie_gateway::KeyRotator::default(),
+        affinity: magpie_gateway::AffinityStore::default(),
+        lanes: magpie_gateway::lanes::Lanes::default(),
+        rpms: magpie_gateway::lanes::Rpms::default(),
+    });
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn({
+        let state = state.clone();
+        async move { axum::serve(listener, build_router(state)).await.unwrap() }
+    });
+    let (status, body) = flaky_ask(format!("http://{addr}"), "group/g", false).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        member.asked_a.load(Ordering::SeqCst),
+        1,
+        "the refusing member was asked once"
+    );
+    assert_eq!(
+        member.asked_b.load(Ordering::SeqCst),
+        1,
+        "the overloaded member was never asked again"
     );
 }
