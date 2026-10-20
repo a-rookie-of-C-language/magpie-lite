@@ -1278,6 +1278,9 @@ pub struct ConfigSnapshot {
     pub providers: Vec<ProviderConfigSnapshot>,
     /// Named route chains.
     pub groups: Vec<GroupConfigSnapshot>,
+    /// The user turned off the groups magpie finds on its own: none is
+    /// listed or served, while the groups made or changed stay.
+    pub no_auto_groups: bool,
 }
 
 /// Whether a switch is off, for fields the file omits when unset.
@@ -1651,6 +1654,7 @@ impl Config {
             stream_keepalive_max_silence_ms: self.stream_keepalive_max_silence_ms,
             stream_responses_hold_timeout_ms: self.stream_responses_hold_timeout_ms,
             stream_loop_guard: self.stream_loop_guard,
+            no_auto_groups: self.no_auto_groups,
             providers: self
                 .provider
                 .iter()

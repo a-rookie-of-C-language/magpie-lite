@@ -696,7 +696,7 @@
             </section>
 
             <section class="panel" aria-labelledby="groups-title">
-              <div class="panel-header"><h2 id="groups-title">Routing groups</h2><button id="group-new" type="button" class="button secondary">New group</button></div>
+              <div class="panel-header"><h2 id="groups-title">Routing groups</h2><div><button id="group-found" type="button" class="button secondary">Found groups: on</button> <button id="group-new" type="button" class="button secondary">New group</button></div></div>
               <form id="group-editor" class="group-editor" hidden>
                 <h3 id="group-editor-title">New routing group</h3>
                 <div class="field"><label for="group-id">Group ID</label><input id="group-id" class="token-input" required pattern="[A-Za-z0-9_-]+" placeholder="daily-coding" aria-describedby="group-id-help"><p id="group-id-help" class="group-help">Letters, digits, hyphens and underscores. Agents use group/&lt;id&gt;.</p></div>
@@ -830,6 +830,7 @@
       groupEffort: document.getElementById("group-effort"),
       groupRules: document.getElementById("group-rules"),
       groupProviders: document.getElementById("group-providers"),
+      groupFound: document.getElementById("group-found"),
       groupNew: document.getElementById("group-new"),
       groupSave: document.getElementById("group-save"),
       groupCancel: document.getElementById("group-cancel"),
@@ -877,6 +878,10 @@
     let routingSnapshot = null;
     let configRevision = null;
     let managementBusy = false;
+    // Whether the latest /config says magpie stopped finding groups on
+    // its own; null until the first load, so the switch never toggles
+    // blind.
+    let foundGroupsOff = null;
     let statsQuery = null;
     let dataRevision = 0;
     let sessionRevision = 0;
@@ -1117,7 +1122,8 @@
       renderAgentModelOptions(configuration);
       elements.groupProviders.textContent = `Configured providers: ${(configuration.providers || []).map(p => p.id).join(", ") || "none"}`;
       renderRoutingProviders(configuration.providers || []);
-      renderRoutingGroups(configuration.groups || []);
+      foundGroupsOff = configuration.no_auto_groups === true;
+      renderRoutingGroups(configuration.groups || [], foundGroupsOff);
     }
 
     function renderAgentModelOptions(configuration) {
@@ -1345,9 +1351,20 @@
       }
     }
 
-    function renderRoutingGroups(groups) {
+    function renderRoutingGroups(groups, foundOff) {
       clear(elements.groupList);
       elements.groupEmpty.hidden = groups.length !== 0;
+      // The finding switch lives in the panel header: off, nothing
+      // magpie found is listed, hidden or served, while hand-made groups
+      // stay, and a request for a found one goes to its model from the
+      // first provider serving it.
+      const off = foundOff === true;
+      elements.groupFound.textContent = off ? "Found groups: off" : "Found groups: on";
+      elements.groupFound.setAttribute("aria-pressed", String(!off));
+      elements.groupFound.disabled = managementBusy || foundGroupsOff === null;
+      elements.groupFound.title = off
+        ? "Magpie stopped finding groups on its own. Only the groups you made or changed are listed; a request for a found one goes to its model from one provider."
+        : "Magpie finds a group for a model several providers serve. Turning it off lists and serves none of them.";
       for (const group of groups) {
         const li = document.createElement("li");
         li.className = "group-item";
@@ -1838,6 +1855,7 @@
       elements.groupEditor.setAttribute("aria-busy", String(busy));
       for (const control of elements.groupEditor.elements) control.disabled = busy;
       elements.groupNew.disabled = busy;
+      elements.groupFound.disabled = busy;
       elements.signOut.disabled = busy;
       for (const button of elements.groupList.querySelectorAll("button")) button.disabled = busy;
       elements.groupSave.textContent = busy ? label : "Save group";
@@ -1884,6 +1902,15 @@
       await mutateGroup(`/config/groups/${encodeURIComponent(group.id)}`, "DELETE", null, group.auto ? "Group hidden; bring it back from its card." : "Group deleted and saved.");
     }
 
+    // The reference flips finding from the groups route; lite keeps the
+    // same switch on PUT /config/found-groups, with no agent reseat:
+    // agents set to a found one keep working through its first provider.
+    async function toggleFoundGroups() {
+      if (managementBusy || foundGroupsOff === null) return;
+      const on = foundGroupsOff;
+      await mutateGroup("/config/found-groups", "PUT", { on }, on ? "Found groups are on again." : "Found groups are off; only the groups you made or changed are listed.");
+    }
+
     // A removed found group comes back as the user's own: saving it with
     // its id unhides it (a group written with a found id is theirs).
     async function bringBackGroup(group) {
@@ -1921,6 +1948,7 @@
     }
 
     elements.groupNew.addEventListener("click", () => openGroupEditor());
+    elements.groupFound.addEventListener("click", toggleFoundGroups);
     elements.groupCancel.addEventListener("click", closeGroupEditor);
     elements.groupRouting.addEventListener("change", groupRoutingChanged);
     elements.groupEditor.addEventListener("keydown", event => {

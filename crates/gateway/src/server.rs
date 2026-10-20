@@ -111,6 +111,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/config/groups/{id}",
             put(update_group).delete(delete_group),
         )
+        .route("/config/found-groups", put(update_found_groups))
         // Every route above proves it knows the configured local token
         // before a request can reach a provider or read statistics. The
         // health probe and secret-free login page below are added after
@@ -572,6 +573,60 @@ fn group_update_response(
         Ok(snapshot) => config_response(status, snapshot),
         Err((status, message)) => group_error(status, &message),
     }
+}
+
+/// Decode a found-groups switch body: `{"on": true}` turns finding back
+/// on, `{"on": false}` turns it off (the reference's `found` action).
+fn decode_found_groups(bytes: &[u8]) -> Result<bool, &'static str> {
+    let body: Value =
+        serde_json::from_slice(bytes).map_err(|_| "expected JSON with an `on` boolean")?;
+    body.get("on")
+        .and_then(Value::as_bool)
+        .ok_or("expected JSON with an `on` boolean")
+}
+
+/// Turn the groups magpie finds on its own off or on: off, none is
+/// listed or served, while the groups made or changed stay, and a
+/// request for a found one goes to its model from the first provider
+/// serving it, so agents set to one keep working (the reference's
+/// `found` action, without its agent reseat).
+async fn update_found_groups(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Response {
+    let expected = match expected_config_revision(&headers) {
+        Ok(value) => value,
+        Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
+    };
+    let request = match idempotency_request(&state.config, &headers, "found-groups.update", &bytes)
+    {
+        Ok(value) => value,
+        Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
+    };
+    let on = match decode_found_groups(&bytes) {
+        Ok(value) => value,
+        Err(message) => return group_error(StatusCode::BAD_REQUEST, message),
+    };
+    let result = if let Some(request) = request {
+        state
+            .config
+            .update_idempotent(expected, request, move |config| {
+                config.no_auto_groups = !on;
+                Ok::<(), (StatusCode, String)>(())
+            })
+            .await
+            .map(|(snapshot, _)| snapshot)
+    } else {
+        state
+            .config
+            .update_if_revision(expected, move |config| {
+                config.no_auto_groups = !on;
+                Ok::<(), (StatusCode, String)>(())
+            })
+            .await
+    };
+    group_update_response(result, StatusCode::OK)
 }
 
 async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {

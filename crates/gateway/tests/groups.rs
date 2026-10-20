@@ -1142,6 +1142,92 @@ async fn vendors_spelling_one_model_apart_share_one_served_group() {
 }
 
 #[tokio::test]
+async fn found_groups_switch_turns_finding_off_and_on() {
+    async fn snapshot(url: &str) -> Value {
+        Client::new()
+            .get(format!("{url}/config"))
+            .bearer_auth("magpie-lite")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+    async fn switch(url: &str, revision: Option<u64>, body: Value) -> (StatusCode, Value) {
+        let mut request = Client::new()
+            .put(format!("{url}/config/found-groups"))
+            .bearer_auth("magpie-lite");
+        if let Some(revision) = revision {
+            request = request.header("If-Match", revision.to_string());
+        }
+        let reply = request.json(&body).send().await.unwrap();
+        let status = reply.status();
+        let snapshot: Value = reply.json().await.unwrap_or(Value::Null);
+        (status, snapshot)
+    }
+    async fn listed(url: &str, id: &str) -> bool {
+        let models: Value = Client::new()
+            .get(format!("{url}/v1/models"))
+            .bearer_auth("magpie-lite")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == id)
+    }
+    async fn ask(url: &str, model: &str) -> StatusCode {
+        Client::new()
+            .post(format!("{url}/v1/chat/completions"))
+            .bearer_auth("magpie-lite")
+            .json(&json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "Hi"}],
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    }
+    let gw = gateway_with_shared_model().await;
+    let url = &gw.url;
+    let first = snapshot(url).await;
+    assert_eq!(first["no_auto_groups"], false);
+    let revision = first["revision"].as_u64().unwrap();
+    assert!(listed(url, "auto/shared").await);
+    // Not a boolean: refused, and the file is unchanged.
+    let (status, _) = switch(url, Some(revision), json!({"on": "x"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(!Config::load(&gw.path).unwrap().no_auto_groups);
+    // Off: the snapshot says so, the found ref leaves the catalog, and
+    // a request for it still serves from the first provider's seat.
+    let (status, off) = switch(url, Some(revision), json!({"on": false})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(off["no_auto_groups"], true);
+    assert!(off["revision"].as_u64().unwrap() > revision);
+    assert!(Config::load(&gw.path).unwrap().no_auto_groups);
+    assert!(!listed(url, "auto/shared").await);
+    assert_eq!(ask(url, "auto/shared").await, StatusCode::OK);
+    assert_eq!(gw.last.lock().unwrap().as_ref().unwrap()["model"], "shared");
+    // A stale revision loses to the flip above.
+    let (status, _) = switch(url, Some(revision), json!({"on": true})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    // On again, at the fresh revision: listed and served as a group.
+    let fresh = off["revision"].as_u64().unwrap();
+    let (status, on) = switch(url, Some(fresh), json!({"on": true})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(on["no_auto_groups"], false);
+    assert!(listed(url, "auto/shared").await);
+    assert_eq!(ask(url, "auto/shared").await, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn manual_group_sends_every_request_to_its_pick_and_rules_wait() {
     async fn ask(gw: &Gateway, content: &str) -> StatusCode {
         Client::new()
