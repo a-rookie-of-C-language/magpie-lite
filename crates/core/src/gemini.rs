@@ -575,11 +575,20 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
     let mut contents = pair_function_turns(contents, &answered, &answered_name, INTERRUPTED_NOTE);
     // A conversation ending with the model's turn is turned away
     // ("Requests ending with a model turn are not supported"): a user
-    // turn goes after it.
+    // turn goes after it. When the conversation is an agent compacting
+    // it with the ask in its system prompt, "Continue." reads as going
+    // on with the task and the summary isn't written, so the turn asks
+    // for the summary the system prompt asks for instead (the
+    // reference's `compactLastText`/`modelLastAsk`, `ce11b180`).
     if contents.last().and_then(|c| c["role"].as_str()) == Some("model") {
+        let ask = if crate::compact::compacting(req) {
+            "Write the summary of the conversation above that the system prompt asks for."
+        } else {
+            "Continue."
+        };
         contents.push(json!({
             "role": "user",
-            "parts": [{"text": "Continue."}],
+            "parts": [{"text": ask}],
         }));
     }
     out.insert("contents".into(), Value::Array(contents));

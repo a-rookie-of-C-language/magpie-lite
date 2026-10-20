@@ -787,48 +787,12 @@ fn work_dir_in(text: &str, dir: &mut String, pos: &mut usize) {
 
 // ---- the agent compacting ------------------------------------------------
 
-/// The agents' own compaction prompts (the reference's `compactSystems`).
-const COMPACT_SYSTEMS: [&str; 5] = [
-    "You are a helpful AI assistant tasked with summarizing conversations.",
-    "You are a context summarization agent.",
-    "You are a context summarization assistant.",
-    "You are a specialized system component responsible for distilling chat history into a structured XML <state_snapshot>",
-    "You are the component that summarizes a conversation when its context window is about to overflow.",
-];
-
-/// In the last user message of a compaction request (`compactAsks`).
-const COMPACT_ASKS: [&str; 3] = [
-    "Your task is to create a detailed summary of the conversation so far",
-    "You are performing a CONTEXT CHECKPOINT COMPACTION.",
-    "You are now given a task to compact this conversation context",
-];
-
-/// Whether `req` is an agent compacting its conversation (`compacting`).
+/// Whether `req` is an agent compacting its conversation (the
+/// reference's `compacting`): the tables live in `magpie_core::compact`
+/// beside the Gemini encoder, which reads the same answer for the user
+/// turn it puts after a model-ending compaction history.
 pub fn compacting(req: &CompletionRequest) -> bool {
-    let system: String = req
-        .system
-        .iter()
-        .map(|p| p.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    if COMPACT_SYSTEMS.iter().any(|p| system.contains(p)) {
-        return true;
-    }
-    for m in req.messages.iter().rev() {
-        if m.role != Role::User {
-            continue;
-        }
-        for p in &m.parts {
-            if p.kind() != PartKind::Text {
-                continue;
-            }
-            if COMPACT_ASKS.iter().any(|a| p.text.contains(a)) {
-                return true;
-            }
-        }
-        break;
-    }
-    false
+    magpie_core::compact::compacting(req)
 }
 
 // ---- the agent behind a User-Agent ---------------------------------------

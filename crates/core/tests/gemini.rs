@@ -387,3 +387,55 @@ fn gemini_finish_reasons_distinguish_stops_length_and_filters() {
     }]}));
     assert!(matches!(events.as_slice(), [StreamEvent::TextDelta { .. }]));
 }
+
+fn model_last_request(system: &str) -> magpie_core::ir::CompletionRequest {
+    magpie_core::ir::CompletionRequest {
+        model: "mock/mock-model".into(),
+        system: if system.is_empty() {
+            Vec::new()
+        } else {
+            vec![magpie_core::ir::Part::text(system)]
+        },
+        messages: vec![
+            magpie_core::ir::Message {
+                role: magpie_core::ir::Role::User,
+                parts: vec![magpie_core::ir::Part::text("what came before")],
+            },
+            magpie_core::ir::Message {
+                role: magpie_core::ir::Role::Assistant,
+                parts: vec![magpie_core::ir::Part::text("half an answer")],
+            },
+        ],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn ordinary_history_ending_with_the_model_gets_continue() {
+    let encoded = gemini::encode_request(&model_last_request(""), "mock-model").unwrap();
+    let contents = encoded["contents"].as_array().unwrap();
+    assert_eq!(contents.last().unwrap()["role"], "user");
+    assert_eq!(
+        contents.last().unwrap()["parts"][0]["text"],
+        "Continue.",
+        "going on with the task"
+    );
+}
+
+#[test]
+fn compacting_history_ending_with_the_model_asks_for_the_summary() {
+    // The compaction ask lives in the system prompt (Gemini CLI's own):
+    // "Continue." would read as going on with the task and no summary
+    // would be written (the reference's `compactLastText`, `ce11b180`).
+    let encoded = gemini::encode_request(
+        &model_last_request("You are a specialized system component responsible for distilling chat history into a structured XML <state_snapshot>"),
+        "mock-model",
+    )
+    .unwrap();
+    let contents = encoded["contents"].as_array().unwrap();
+    assert_eq!(contents.last().unwrap()["role"], "user");
+    assert_eq!(
+        contents.last().unwrap()["parts"][0]["text"],
+        "Write the summary of the conversation above that the system prompt asks for."
+    );
+}
