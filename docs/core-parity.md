@@ -2,7 +2,7 @@
 
 Updated: 2026-10-20. Reference checkout: `D:\code\magpie` at `dee5c9d7`
 (one sponsors-link commit past `2374ffe1`, no gateway change); `origin/main`
-triaged through `dee5c9d7` (twentieth pass: origin/main still static — fetched again, nothing new; Cline free-model daily limit ported (`model_rest.rs` per-model rest with refusal replay, `cline::free_limit_rest` Cline-host gate, both quota-branch hooks and the routes-loop skip; other vendors' same words and plain Cline rate limits still rest the key; 5 + 2 unit + 3 loopback in `cline_free_limit.rs`); nineteenth pass: origin/main still static — fetched again, nothing new; Cline upstream pin extended to GLM (`clineMakers` table deepseek→deepseek, glm→zai; `cline-free/` never pinned, client `providerOptions` kept; CLI/console label now names both makers; 1 new + 2 updated pin unit tests); eighteenth pass: Cline whole-reply envelope ported (`unwrap_envelope` in `cline.rs`, whole-reply hook in `server.rs`: `success:true` goes on as the completion for agents reading the Chat API, `success:false` as the agent error shape, other shapes/hosts and streams untouched; 3 unit + 3 wire loopback in `cline_envelope.rs`); seventeenth pass: sponsors page only, nothing portable; describe-via-seer completed end to end — explicit `vision = provider/model` with `PUT /config/vision` revision/idempotency, `magpie-lite vision [provider/model|off]` CLI, console Image-recognition field with missing hint, `describe.rs` 8 unit + `vision_describe.rs` 5 loopback (hit/unset/missing/failure-rest/HTTP); sixteenth pass: origin/main still static — fetched again, nothing new; Cline upstream pinning ported (pin_upstream provider opt-in, providerOptions body pin, CLI/HTTP/console, 5 unit + 3 loopback); fifteenth pass: origin/main still static — fetched again, nothing new; Cline capability preset added (Chat + streaming, tools/vision unknown); fourteenth pass: origin/main still static — fetched, nothing new; Cline vendor headers ported (`crates/gateway/src/cline.rs`, `crates/gateway/tests/cline_headers.rs`): the desktop app's six headers ride on Cline-host sends and catalog checks, other vendors untouched; thirteenth pass: workspace-wide `-D warnings` green — mechanical lints fixed, structural ones scoped-allowed; twelfth pass: Codex client tool-search relay ported (docs/tool-search.md); eleventh pass: no new upstream commits; unportable file_id images refused; tenth pass: no new upstream commits; text-only image gating added; ninth pass: no new upstream commits; user-sent image loopback evidence added; eighth pass: the RPM cancel ordering fix is
+triaged through `dee5c9d7` (twenty-first pass: origin/main still static — fetched again, nothing new; backfilled `c60a5181`'s 401 truth table for Zen's dropped free models into `model_retired`'s unit test (the behavior already matched; bad-key / other-API / other-status negatives and plain-body / gateway-reworded positives) plus a group loopback (`zen_unsupported_model_sits_out_alone`: the 401 retires that model and the mate answers); triaged and set aside `fa5ef88d` (Chat→Anthropic translated sampling retry already ported), `d155ab16` (relay-only item-id tidy; lite translates, nothing to port), `5f73537f`/`440fded2`/`81a24cf8` (ChatGPT-account relay, 400-line Gemini path, 75-file GUI sweep — no lite surface or too big); twentieth pass: origin/main still static — fetched again, nothing new; Cline free-model daily limit ported (`model_rest.rs` per-model rest with refusal replay, `cline::free_limit_rest` Cline-host gate, both quota-branch hooks and the routes-loop skip; other vendors' same words and plain Cline rate limits still rest the key; 5 + 2 unit + 3 loopback in `cline_free_limit.rs`); nineteenth pass: origin/main still static — fetched again, nothing new; Cline upstream pin extended to GLM (`clineMakers` table deepseek→deepseek, glm→zai; `cline-free/` never pinned, client `providerOptions` kept; CLI/console label now names both makers; 1 new + 2 updated pin unit tests); eighteenth pass: Cline whole-reply envelope ported (`unwrap_envelope` in `cline.rs`, whole-reply hook in `server.rs`: `success:true` goes on as the completion for agents reading the Chat API, `success:false` as the agent error shape, other shapes/hosts and streams untouched; 3 unit + 3 wire loopback in `cline_envelope.rs`); seventeenth pass: sponsors page only, nothing portable; describe-via-seer completed end to end — explicit `vision = provider/model` with `PUT /config/vision` revision/idempotency, `magpie-lite vision [provider/model|off]` CLI, console Image-recognition field with missing hint, `describe.rs` 8 unit + `vision_describe.rs` 5 loopback (hit/unset/missing/failure-rest/HTTP); sixteenth pass: origin/main still static — fetched again, nothing new; Cline upstream pinning ported (pin_upstream provider opt-in, providerOptions body pin, CLI/HTTP/console, 5 unit + 3 loopback); fifteenth pass: origin/main still static — fetched again, nothing new; Cline capability preset added (Chat + streaming, tools/vision unknown); fourteenth pass: origin/main still static — fetched, nothing new; Cline vendor headers ported (`crates/gateway/src/cline.rs`, `crates/gateway/tests/cline_headers.rs`): the desktop app's six headers ride on Cline-host sends and catalog checks, other vendors untouched; thirteenth pass: workspace-wide `-D warnings` green — mechanical lints fixed, structural ones scoped-allowed; twelfth pass: Codex client tool-search relay ported (docs/tool-search.md); eleventh pass: no new upstream commits; unportable file_id images refused; tenth pass: no new upstream commits; text-only image gating added; ninth pass: no new upstream commits; user-sent image loopback evidence added; eighth pass: the RPM cancel ordering fix is
 ported as a drop guard, the rest still nothing portable: two Go gateway
 allocation optimizations and a GUI Routing canvas fix;
 `routing-context-fold` stays GUI-only, `agent-connect`/`ui-previews`
@@ -1103,3 +1103,30 @@ hook would lay down; the gate is covered by the `cline.rs` unit
 tests against the real host names. `cargo clippy --workspace
 --all-targets -- -D warnings` is green and `cargo test --workspace`
 stays green (58 result lines, 0 failures).
+
+### Upstream refresh, twenty-first pass (Zen 401 truth table, `c60a5181`)
+
+Origin/main is still static at `dee5c9d7` (fetched again, nothing
+new), so this pass backfills instead of chasing: `c60a5181` taught
+the reference's `modelRetired` Zen's 401 for a dropped free model
+("Model X is not supported", and only that — not a bad key, not a
+model served on another API, not another status). Lite's
+`model_retired` already read it the same way (the regex even covers
+the backslashed bodies the reference reads decoded), so the pass
+adds the reference's truth table as unit rows — AuthError and
+`for format anthropic` negatives, the 403 negative, the plain-body
+and gateway-reworded positives — plus a group loopback
+(`zen_unsupported_model_sits_out_alone` in `crates/gateway/tests/e2e.rs`):
+a scripted Zen 401s the first member and answers the second, and the
+group serves the mate after retiring the dropped model, with both
+asks reaching the vendor (the account doesn't rest as though its key
+were refused). Same sweep triaged `fa5ef88d` (the Chat→Anthropic
+translated sampling retry is already ported, with its translated-path
+loopback), `d155ab16` (relay-only item-id tidy; lite translates its
+Responses streams, so rotating upstream ids never reach the client),
+and set aside `5f73537f` (ChatGPT-account Codex relay),
+`440fded2` (400-line Gemini pending-call path) and `81a24cf8`
+(75-file found-group rename across GUI/site) as no-surface or too
+big for this pass. `cargo clippy --workspace --all-targets
+-D warnings` is green and `cargo test --workspace` stays green
+(58 result lines, 0 failures).

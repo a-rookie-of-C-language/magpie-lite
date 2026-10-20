@@ -1474,6 +1474,137 @@ async fn retired_model_leaves_the_catalog_until_it_answers() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// One provider, two free models, Zen's scripted answers: the dropped
+/// model is refused 401, the mate answers.
+async fn spawn_zen_pair(replies: Vec<(u16, Value)>) -> (String, Arc<Mutex<usize>>) {
+    let (upstream, requests) = spawn_scripted(replies).await;
+    let config = Config {
+        port: 0,
+        token: "magpie-lite".into(),
+        key_cooldown_ms: 60_000,
+        stream_first_content_timeout_ms: Config::default().stream_first_content_timeout_ms,
+        stream_idle_timeout_ms: Config::default().stream_idle_timeout_ms,
+        stream_keepalive_interval_ms: Config::default().stream_keepalive_interval_ms,
+        stream_keepalive_max_silence_ms: Config::default().stream_keepalive_max_silence_ms,
+        stream_responses_hold_timeout_ms: Config::default().stream_responses_hold_timeout_ms,
+        stream_loop_guard: Config::default().stream_loop_guard,
+        history_path: None,
+        default_provider: "zen".into(),
+        hidden_auto_groups: Vec::new(),
+        no_auto_groups: false,
+        vision: None,
+        provider: vec![ProviderConfig {
+            id: "zen".into(),
+            name: "Zen".into(),
+            protocol: Protocol::Chat,
+            base_url: format!("{upstream}/v1"),
+            api_key: "zen-key".into(),
+            api_keys: Vec::new(),
+            models: vec!["zen-a".into(), "zen-b".into()],
+            contexts: Default::default(),
+            outputs: Default::default(),
+            fallback: Vec::new(),
+            key_cooldown_ms: None,
+            capabilities: Default::default(),
+            routing: RoutingPolicy::Order,
+            weights: Vec::new(),
+            affinity: Default::default(),
+            max_concurrency: None,
+            max_rpm: None,
+            queue_limit: None,
+            queue_wait_s: None,
+            key_generation: 0,
+            pin_upstream: false,
+            key_limits: Vec::new(),
+        }],
+        group: vec![GroupConfig {
+            id: "zen-pair".into(),
+            name: "Zen pair".into(),
+            routes: vec!["zen/zen-a".into(), "zen/zen-b".into()],
+            rules: Vec::new(),
+            classifier: String::new(),
+            effort: String::new(),
+            levels: Vec::new(),
+            pick: String::new(),
+            auto: false,
+            weights: Vec::new(),
+            routing: RoutingPolicy::Order,
+            first_token_timeout_ms: 0,
+            affinity: Default::default(),
+            patience_s: None,
+        }],
+    };
+    let requests_state = request_log(&config);
+    let state = Arc::new(AppState {
+        agents: None,
+        config: magpie_gateway::ConfigStore::new(config, None),
+        http: magpie_gateway::upstream::http_client().unwrap(),
+        requests: requests_state,
+        key_rotation: magpie_gateway::KeyRotator::default(),
+        affinity: magpie_gateway::AffinityStore::default(),
+        lanes: magpie_gateway::lanes::Lanes::default(),
+        rpms: magpie_gateway::lanes::Rpms::default(),
+    });
+    let app = build_router(state);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), requests)
+}
+
+/// A free model Zen serves no more sits out alone (c60a5181): its 401
+/// "Model … is not supported" retires that model and the group's next
+/// member answers, instead of the whole account resting as though its
+/// key were refused.
+#[tokio::test]
+async fn zen_unsupported_model_sits_out_alone() {
+    let _path = init_retired_for_test("zen-alone");
+    let (gw, requests) = spawn_zen_pair(vec![
+        (
+            401,
+            json!({"type":"error","error":{"type":"ModelError","message":"Model zen-a is not supported"}}),
+        ),
+        (
+            200,
+            json!({"id":"chatcmpl-zen","object":"chat.completion","model":"zen-b",
+                "choices":[{"index":0,"message":{"role":"assistant","content":"mate served"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}),
+        ),
+    ])
+    .await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": "group/zen-pair",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "mate served");
+    assert_eq!(
+        *requests.lock().unwrap(),
+        2,
+        "the dropped model and its mate were both asked"
+    );
+    assert!(model_is_retired(
+        "zen",
+        "zen-a",
+        std::time::SystemTime::now()
+    ));
+    assert!(!model_is_retired(
+        "zen",
+        "zen-b",
+        std::time::SystemTime::now()
+    ));
+}
+
 async fn edge_blocked_chat() -> Response {
     (
         StatusCode::METHOD_NOT_ALLOWED,

@@ -33,7 +33,9 @@ fn unserved_words() -> &'static Regex {
 /// OpenCode Zen's 401 for a model that left its free list: the key is
 /// still good, but the model is gone. The vendor's full JSON error is
 /// `{"type":"error","error":{"type":"ModelError","message":"Model
-/// glm-5-free is not supported"}}`.
+/// glm-5-free is not supported"}}` (the reference's `zenModelGone`,
+/// c60a5181). Anything without the code — a bad key, a model served on
+/// another API, another status — retires nothing.
 fn zen_model_gone() -> &'static Regex {
     static ZEN: OnceLock<Regex> = OnceLock::new();
     ZEN.get_or_init(|| {
@@ -282,6 +284,36 @@ mod tests {
         assert!(!model_retired(
             401,
             &json!({"error": {"message": "bad key"}})
+        ));
+        // Zen's own words for a bad key, and for a model served on
+        // another API, retire nothing (c60a5181).
+        assert!(!model_retired(
+            401,
+            &json!({"type":"error","error":{"type":"AuthError","message":"Invalid API key."}})
+        ));
+        assert!(!model_retired(
+            401,
+            &json!({"type":"error","error":{"type":"ModelError","message":"Model grok-4.7 is not supported for format anthropic"}})
+        ));
+        assert!(!model_retired(401, &json!({"message": "Invalid API key."})));
+        // The code on another status is not Zen's model-gone.
+        assert!(!model_retired(
+            403,
+            &json!({"error": {"type": "ModelError", "message": "Model glm-5-free is not supported"}})
+        ));
+        // The words read in a plain body, and in the message the
+        // gateway puts them into, retire all the same.
+        assert!(model_retired(
+            401,
+            &json!("Model glm-5-free is not supported")
+        ));
+        assert!(model_retired(
+            401,
+            &json!({"error": {"code": null, "message": "OpenCode Zen Free: Model glm-5-free is not supported", "param": null, "type": "authentication_error"}})
+        ));
+        assert!(!model_retired(
+            401,
+            &json!("Model grok-4.7 is not supported for format anthropic")
         ));
         // Quota wording wins even on a retirement-shaped 410.
         assert!(!model_retired(
