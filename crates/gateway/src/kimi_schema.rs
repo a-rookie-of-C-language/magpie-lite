@@ -201,7 +201,7 @@ fn kimi_schema_type(root: &Value, schema: &Value) -> Option<Value> {
     for kind in [
         "string", "number", "integer", "boolean", "object", "array", "null",
     ] {
-        if types.iter().any(|seen| *seen == kind) {
+        if types.contains(&kind) {
             names.push(kind);
         }
     }

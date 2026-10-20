@@ -352,10 +352,10 @@ impl ProviderConfig {
     /// An entry of 0 lifts the provider's limit off that key.
     pub fn lane_limit_for_key(&self, key: &str) -> u32 {
         let pool = self.api_key_pool();
-        if let Some(slot) = pool.iter().position(|k| k == key) {
-            if let Some(limit) = self.key_limits.get(slot) {
-                return *limit;
-            }
+        if let Some(slot) = pool.iter().position(|k| k == key)
+            && let Some(limit) = self.key_limits.get(slot)
+        {
+            return *limit;
         }
         self.lane_limit()
     }
@@ -2074,19 +2074,19 @@ impl Config {
             let (pid, m) = self.auto_stand_in(model)?;
             return self.resolve_provider(&format!("{pid}/{m}"));
         }
-        if let Some(rest) = model.strip_prefix("auto/") {
-            if self.auto_refs_on() {
-                // A found ref names a found group or nothing: hidden and
-                // single-seat models don't route under it.
-                if let Some(group) = self.found_group(rest) {
-                    return group
-                        .routes
-                        .iter()
-                        .find_map(|route| self.resolve_provider(&self.member_effort(route).0));
-                }
-                let (pid, m) = self.auto_stand_in(model)?;
-                return self.resolve_provider(&format!("{pid}/{m}"));
+        if let Some(rest) = model.strip_prefix("auto/")
+            && self.auto_refs_on()
+        {
+            // A found ref names a found group or nothing: hidden and
+            // single-seat models don't route under it.
+            if let Some(group) = self.found_group(rest) {
+                return group
+                    .routes
+                    .iter()
+                    .find_map(|route| self.resolve_provider(&self.member_effort(route).0));
             }
+            let (pid, m) = self.auto_stand_in(model)?;
+            return self.resolve_provider(&format!("{pid}/{m}"));
             // Otherwise a provider id'd `auto` may serve it as its own
             // model: resolve below as provider/model.
         }

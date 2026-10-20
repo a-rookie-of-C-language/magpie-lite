@@ -50,11 +50,11 @@ pub(crate) fn rewrite_patterns(
 ) -> bool {
     let mut changed = false;
     walk(value, in_schema, &mut |schema| {
-        if let Some(Value::String(pattern)) = schema.get_mut("pattern") {
-            if let Some(rewritten) = fix(pattern) {
-                *pattern = rewritten;
-                changed = true;
-            }
+        if let Some(Value::String(pattern)) = schema.get_mut("pattern")
+            && let Some(rewritten) = fix(pattern)
+        {
+            *pattern = rewritten;
+            changed = true;
         }
     });
     changed

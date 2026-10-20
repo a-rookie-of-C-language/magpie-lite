@@ -1064,9 +1064,8 @@ fn give_way_to_free_lanes(state: &AppState, routes: &mut Vec<UpstreamRoute>) {
             continue;
         }
         let mut found = None;
-        for j in (i + 1)..routes.len() {
+        for (j, m) in routes.iter().enumerate().skip(i + 1) {
             let (j_who, j_provider, j_group) = {
-                let m = &routes[j];
                 let who = m
                     .api_keys
                     .first()
@@ -2191,7 +2190,7 @@ async fn send_with_fallback(
                         model: route.model.clone(),
                         route_index,
                         route: *slot,
-                        key: key,
+                        key,
                         resting: state.key_rotation.cooling(
                             &route.provider.id,
                             route.provider.key_generation,
@@ -2567,13 +2566,11 @@ async fn send_with_fallback(
                                 route.provider.protocol.as_str(),
                                 &crate::continuation::prefill_refused_field(&route.model),
                             ))
-                    {
-                        if let Some(next) =
+                        && let Some(next) =
                             crate::continuation::user_last_body(route.provider.protocol, &body)
-                        {
-                            body = next;
-                            turn_after = true;
-                        }
+                    {
+                        body = next;
+                        turn_after = true;
                     }
                     if let Some(room) = room_cap {
                         // The reply asked for with the prompt passed the

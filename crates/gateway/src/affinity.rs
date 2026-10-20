@@ -565,7 +565,7 @@ fn snapshot(state: &State) -> HashMap<String, SavedStick> {
             )
         })
         .collect();
-    kept.sort_by(|a, b| b.1.at.cmp(&a.1.at));
+    kept.sort_by_key(|a| std::cmp::Reverse(a.1.at));
     kept.truncate(STICKS_KEPT);
     kept.into_iter().collect()
 }
@@ -732,11 +732,11 @@ impl AffinityStore {
                 }
             }
             "new-turn" if rotate => {
-                if let Some(at) = at {
-                    if let Some(index) = after(seats, at) {
-                        first = Some((seats[index].route, seats[index].key));
-                        first_route = Some(seats[index].route_index);
-                    }
+                if let Some(at) = at
+                    && let Some(index) = after(seats, at)
+                {
+                    first = Some((seats[index].route, seats[index].key));
+                    first_route = Some(seats[index].route_index);
                 }
             }
             "first" if rotate => {

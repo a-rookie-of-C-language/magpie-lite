@@ -44,10 +44,9 @@ pub(crate) fn reply_left(message: &str) -> Option<u64> {
         // "at least N input tokens".
         let prompt = captured(parts.get(2)).or_else(|| captured(parts.get(3)));
         (window, prompt)
-    } else if let Some(parts) = input_plus_reply().captures(message) {
-        (captured(parts.get(2)), captured(parts.get(1)))
     } else {
-        return None;
+        let parts = input_plus_reply().captures(message)?;
+        (captured(parts.get(2)), captured(parts.get(1)))
     };
     let (window, prompt) = (window?, prompt?);
     if window == 0 || prompt == 0 || prompt >= window {

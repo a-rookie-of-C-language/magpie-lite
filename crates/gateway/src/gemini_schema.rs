@@ -142,48 +142,48 @@ fn gemini_schema_in(schema: &mut Map<String, Value>, depth: usize) {
 
     // An enum's type comes from its values; one of mixed values is
     // dropped rather than refused.
-    if let Some(Value::Array(values)) = schema.get("enum").cloned() {
-        if !typed {
-            let mut kinds = std::collections::BTreeSet::new();
-            let mut kept = Vec::new();
-            for v in values {
-                match &v {
-                    Value::Null => {
-                        schema.insert("nullable".into(), json!(true));
-                        continue;
-                    }
-                    Value::String(_) => {
-                        kinds.insert("string");
-                    }
-                    Value::Bool(_) => {
-                        kinds.insert("boolean");
-                    }
-                    Value::Number(n) => {
-                        if n.is_f64() {
-                            kinds.insert("number");
-                        } else {
-                            kinds.insert("integer");
-                        }
-                    }
-                    _ => {
-                        kinds.insert("other");
-                    }
+    if let Some(Value::Array(values)) = schema.get("enum").cloned()
+        && !typed
+    {
+        let mut kinds = std::collections::BTreeSet::new();
+        let mut kept = Vec::new();
+        for v in values {
+            match &v {
+                Value::Null => {
+                    schema.insert("nullable".into(), json!(true));
+                    continue;
                 }
-                kept.push(v);
-            }
-            let one = match kinds.len() {
-                1 => kinds.iter().next().copied(),
-                2 if kinds.contains("integer") && kinds.contains("number") => Some("number"),
-                _ => None,
-            };
-            match one {
-                Some(kind) if kind != "other" => {
-                    schema.insert("type".into(), json!(kind));
-                    schema.insert("enum".into(), Value::Array(kept));
+                Value::String(_) => {
+                    kinds.insert("string");
+                }
+                Value::Bool(_) => {
+                    kinds.insert("boolean");
+                }
+                Value::Number(n) => {
+                    if n.is_f64() {
+                        kinds.insert("number");
+                    } else {
+                        kinds.insert("integer");
+                    }
                 }
                 _ => {
-                    schema.remove("enum");
+                    kinds.insert("other");
                 }
+            }
+            kept.push(v);
+        }
+        let one = match kinds.len() {
+            1 => kinds.iter().next().copied(),
+            2 if kinds.contains("integer") && kinds.contains("number") => Some("number"),
+            _ => None,
+        };
+        match one {
+            Some(kind) if kind != "other" => {
+                schema.insert("type".into(), json!(kind));
+                schema.insert("enum".into(), Value::Array(kept));
+            }
+            _ => {
+                schema.remove("enum");
             }
         }
     }

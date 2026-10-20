@@ -446,7 +446,7 @@ pub fn turn_before(req: &CompletionRequest) -> (String, String) {
     }
     let user = from
         .as_ref()
-        .map(|(_, u)| cut_middle(&u, PRIOR_CAP * 3 / 4, PRIOR_CAP / 4))
+        .map(|(_, u)| cut_middle(u, PRIOR_CAP * 3 / 4, PRIOR_CAP / 4))
         .unwrap_or_default();
     let kept: Vec<char> = reply.chars().collect();
     let reply = if kept.len() > PRIOR_CAP {

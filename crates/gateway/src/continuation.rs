@@ -322,12 +322,12 @@ impl Continuation {
     /// Whether the continuation's ask goes to a different path: DeepSeek
     /// serves its prefix mode under /beta, beside the /v1 the base
     /// carries (the reference's `req.Resume` path rewrite).
-    pub(crate) fn base_url<'a>(&self, provider: &'a ProviderConfig) -> String {
+    pub(crate) fn base_url(&self, provider: &ProviderConfig) -> String {
         let base = provider.base_url.trim_end_matches('/');
-        if self.mode == "prefix" {
-            if let Some(root) = base.strip_suffix("/v1") {
-                return format!("{root}/beta");
-            }
+        if self.mode == "prefix"
+            && let Some(root) = base.strip_suffix("/v1")
+        {
+            return format!("{root}/beta");
         }
         base.to_owned()
     }

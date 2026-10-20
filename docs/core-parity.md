@@ -1052,9 +1052,15 @@ pass keeps the shared core warning-clean under the current toolchain
 (clippy 1.98: `byte_char_slices`, `question_mark`, `collapsible_if` in
 `crates/core/src/responses.rs`; `cargo clippy -p magpie-core
 --all-targets -- -D warnings` green, `cargo test -p magpie-core`
-green). Gateway-wide `-D warnings` stays red on pre-existing lints in
-untouched files (`server.rs`, `affinity.rs`, `classify.rs`,
-`config.rs`, `continuation.rs`, schemas, `rules.rs`,
-`reply_room.rs`, `tool_schema.rs`, plus test-only
-`type_complexity`/`needless_lifetimes`): signature and structural
+green, `cargo test -p magpie-gateway` green — 29 targets, 0 failures).
+Gateway `-D warnings` went from 21 lib errors to 6: the mechanical,
+zero-behavior-change lints are fixed (`collapsible_if`,
+`redundant_field_names`, `needless_borrow`, `needless_lifetimes`,
+`needless_range_loop`, `manual_contains`, `question_mark`,
+`while_let_loop`, `unnecessary_sort_by` across `server.rs`,
+`affinity.rs`, `classify.rs`, `config.rs`, `continuation.rs`,
+`gemini_schema.rs`, `kimi_schema.rs`, `reply_room.rs`, `rules.rs`,
+`tool_schema.rs`). The remaining 6 are structural and pre-existing
+(`too_many_arguments` x4, `type_complexity`, `result_large_err` in
+`server.rs`/`affinity.rs`/`rules.rs`): signature and structural
 refactors with behavior risk, deliberately left alone.

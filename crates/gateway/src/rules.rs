@@ -767,8 +767,7 @@ fn work_dir_in(text: &str, dir: &mut String, pos: &mut usize) {
     // OpenCode's, only within its <env>
     let mut rest = text;
     let mut off = 0usize;
-    loop {
-        let Some(i) = rest.find("<env>") else { break };
+    while let Some(i) = rest.find("<env>") {
         let Some(j) = rest[i..].find("</env>") else {
             break;
         };
