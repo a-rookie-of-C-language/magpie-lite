@@ -2,7 +2,8 @@
 
 Updated: 2026-10-20. Reference checkout: `D:\code\magpie` at `79160455`
 (30 commits past the prior baseline `b641868e`); `origin/main`
-triaged through `d9c6a60d` (sixth pass, still nothing portable:
+triaged through `588f87a1` (seventh pass, still nothing portable:
+two Go gateway allocation optimizations and a GUI Routing canvas fix;
 `routing-context-fold` stays GUI-only, `agent-connect`/`ui-previews`
 need real CLIs);
 implementation: `D:\code\magpie-lite`.
@@ -984,3 +985,31 @@ and Settings Privacy UI, `3806014a` Chinese-name masking): no gateway
 routing, group, effort or catalog surface, so nothing to port. Lite
 has no masking pipeline, plugin system, updater or desktop Settings;
 subscriptions, cloud sync and platform integrations stay out of scope.
+
+### Upstream refresh, seventh pass (`d9c6a60d..588f87a1`)
+
+3 commits, all performance fixes for a busy sandbox gateway (yg6888 on
+X, ~1 GB RSS with 29 accounts in a group and three agents sending at
+once): no gateway routing, group, effort or catalog behaviour change,
+so nothing to port.
+
+- `bdf4d7a9`: a Chat request relayed as sent is decoded looking for a
+  silent assistant turn only when a cheap in-place prescan
+  (`anySilentAssistant`) finds one. Lite has no byte-relay path —
+  every request is rebuilt from the IR through the Chat encoder —
+  and its `ed0335f7` port (`crates/core/src/chat/silent.rs`) already
+  prescans with `.any(silent_assistant)` and returns the messages
+  unchanged when none is silent. Same fast path, nothing to port.
+- `68133754`: the request body is held until the request's context
+  ends so `json.RawMessage` values decoded from it share its bytes
+  (capped at 16x, bounded at 64 bodies), and the conversation-id and
+  image walks scan the turns in place with an early out when there is
+  no image. All Go `encoding/json` specific: lite reads the body once
+  through axum `Bytes` into owning serde_json `Value`s, has no
+  per-reader turn re-decodes and no id/image walkers, and its IR
+  carries no images yet. Nothing to port; revisit the early-out scan
+  if images ever ride the IR.
+- `588f87a1`: the GUI Routing page measures each flight path only
+  when its `d` changes, caches sampled points, and shares one
+  `Intl.NumberFormat` per language. Desktop GUI canvas surface; lite's
+  console has no Routing flight visualization. Nothing to port.
