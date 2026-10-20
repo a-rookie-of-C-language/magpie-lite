@@ -4825,6 +4825,64 @@ mod tests {
         }
     }
 
+    /// A request aborted while waiting for minute room gives its reserved
+    /// place back: the agent going ends the wait first, so the minute
+    /// holds only the request that ran its course (the reference's
+    /// `stop()` before `giveBack`, `2374ffe1`).
+    #[tokio::test]
+    async fn aborted_minute_wait_returns_its_reserved_place() {
+        let upstream = test_server(Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                Json(json!({"choices":[{"message":{"role":"assistant","content":"ok"}}]}))
+            }),
+        ))
+        .await;
+        let mut solo = provider("solo", &upstream.url, "mock-model");
+        solo.max_rpm = Some(1);
+        solo.queue_wait_s = Some(120);
+        let state = Arc::new(AppState {
+            agents: None,
+            config: ConfigStore::new(
+                Config {
+                    provider: vec![solo],
+                    default_provider: "solo".into(),
+                    ..Config::default()
+                },
+                None,
+            ),
+            http: upstream::http_client().unwrap(),
+            requests: Arc::new(Mutex::new(crate::usage::RequestLog::default())),
+            key_rotation: Default::default(),
+            affinity: AffinityStore::default(),
+            lanes: lanes::Lanes::default(),
+            rpms: lanes::Rpms::default(),
+        });
+        let body = || {
+            Bytes::from(
+                json!({"model":"solo/mock-model","stream":false,"messages":[{"role":"user","content":"hi"}]})
+                    .to_string(),
+            )
+        };
+        let wire = || ClientWire::Chat {
+            include_usage: true,
+        };
+        // One request consumes the minute at once.
+        proxy(state.clone(), HeaderMap::default(), body(), wire()).await;
+        let who = crate::affinity::who_of("solo", "private-test-key");
+        assert_eq!(state.rpms.used(&who), 1);
+        // A second parks for the room; aborting it is its agent going.
+        let parked = tokio::spawn(proxy(state.clone(), HeaderMap::default(), body(), wire()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while state.rpms.used(&who) != 2 && std::time::Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(state.rpms.used(&who), 2);
+        parked.abort();
+        assert!(parked.await.unwrap_err().is_cancelled());
+        assert_eq!(state.rpms.used(&who), 1);
+    }
+
     /// A state with no provider for the model, so a decoded request is refused
     /// after routing and no upstream is contacted.
     fn decode_counting_state() -> Arc<AppState> {

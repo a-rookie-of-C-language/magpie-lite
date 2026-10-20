@@ -11,8 +11,10 @@
 //!
 //! Both are keyed by the candidate's `who` — the key, else the provider —
 //! as the reference's `candidate.who()` does. The whole registry lives in
-//! `AppState`, so a `LaneGuard`/`RpmTicket` dropped on cancellation or
-//! shutdown gives its place back through an `Arc` that outlives the request.
+//! `AppState`, so a `LaneGuard` dropped on cancellation or shutdown gives
+//! its slot back through an `Arc` that outlives the request; a minute
+//! place reserved by `Rpms::wait` goes back through a guard the wait
+//! itself holds.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -260,8 +262,12 @@ impl Rpms {
     /// how long it waited, or an `RpmError` when the wait would be longer
     /// than `longest`. A `limit` of 0 counts nothing.
     ///
-    /// Cancellation is safe: the caller holds the reserved `Instant` in an
-    /// `RpmTicket`; dropping it calls `give_back` and the place is returned.
+    /// Cancellation is safe: the wait holds its reservation in a guard
+    /// that gives the place back when the wait is dropped — the agent
+    /// going while it waits for room ends the wait first, so once the
+    /// place is back nothing is left waiting for it (the reference's
+    /// `stop()` before `giveBack`, `2374ffe1`). A wait that runs its
+    /// course disarms the guard and keeps its count.
     pub async fn wait(
         &self,
         who: &str,
@@ -276,7 +282,14 @@ impl Rpms {
         if delay.is_zero() {
             return Ok(Duration::ZERO);
         }
+        let guard = WaitGuard {
+            rpms: self.clone(),
+            who: who.to_owned(),
+            at,
+            armed: true,
+        };
         tokio::time::sleep(delay).await;
+        guard.disarm();
         Ok(delay)
     }
 
@@ -345,6 +358,31 @@ impl Rpms {
     }
 }
 
+/// The place a minute wait reserved, returned when the wait is dropped
+/// before its room comes: the agent went, so the wait ends first and its
+/// place goes back. A wait that runs its course disarms the guard and
+/// keeps its count.
+struct WaitGuard {
+    rpms: Rpms,
+    who: String,
+    at: Instant,
+    armed: bool,
+}
+
+impl WaitGuard {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WaitGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.rpms.give_back(&self.who, self.at);
+        }
+    }
+}
+
 /// A request turned away for a wait longer than it may keep.
 #[derive(Debug)]
 pub struct RpmError {
@@ -391,5 +429,46 @@ pub fn rpm_longest(provider: &crate::config::ProviderConfig) -> Duration {
         wait
     } else {
         RPM_LONGEST
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A wait dropped while parked for minute room returns its reserved
+    /// place: the agent going while it waits ends the wait first, so a
+    /// later request finds the room the gone one no longer needs (the
+    /// reference's `stop()` before `giveBack`, `2374ffe1`).
+    #[tokio::test]
+    async fn a_wait_dropped_mid_minute_returns_its_place() {
+        let rpms = Rpms::default();
+        // One request consumes the minute at once.
+        assert!(
+            rpms.wait("who", 1, Duration::from_secs(120))
+                .await
+                .unwrap()
+                .is_zero()
+        );
+        assert_eq!(rpms.used("who"), 1);
+        // A second parks for the room; its agent going drops the wait
+        // once the place is reserved.
+        let parked = tokio::spawn({
+            let rpms = rpms.clone();
+            async move { rpms.wait("who", 1, Duration::from_secs(120)).await }
+        });
+        for _ in 0..1000 {
+            if rpms.used("who") == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(rpms.used("who"), 2);
+        parked.abort();
+        assert!(parked.await.unwrap_err().is_cancelled());
+        assert_eq!(rpms.used("who"), 1);
+        // The minute is still full from the first request, which ran its
+        // course; only the gone waiter's place went back.
+        assert!(!rpms.free("who", 1));
     }
 }
