@@ -1142,6 +1142,26 @@ async fn create_on_a_known_vendor_host_prefills_capabilities() {
     assert_eq!(capabilities["tools"], json!(true));
     assert_eq!(capabilities["vision"], json!(false));
 
+    let mut cline = provider(&gw, "cline");
+    cline["base_url"] = json!("https://api.cline.bot/api/v1");
+    assert_eq!(
+        edit(&gw, Method::POST, "/config/providers", cline)
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    let cline_caps = snapshot(&gw, "/config").await["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["id"] == "cline")
+        .unwrap()["capabilities"]
+        .clone();
+    assert_eq!(cline_caps["supported_protocols"], json!(["chat"]));
+    assert_eq!(cline_caps["streaming"], json!(true));
+    assert_eq!(cline_caps["tools"], Value::Null);
+    assert_eq!(cline_caps["vision"], Value::Null);
+
     let mut relay = provider(&gw, "relay");
     relay["base_url"] = json!("https://relay.example.com/v1");
     assert_eq!(

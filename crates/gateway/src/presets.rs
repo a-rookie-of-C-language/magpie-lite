@@ -101,6 +101,17 @@ const PRESETS: &[Preset] = &[
         tools: Some(true),
         vision: None,
     },
+    // The Cline API speaks OpenAI Chat Completions (the reference's
+    // `clinepass` preset, `Chat: "https://api.cline.bot/api/v1"`) and
+    // answers streamed asks (its probe asks streamed). Tools and image
+    // input are unconfirmed, so they stay unknown rather than guessed.
+    Preset {
+        host: "api.cline.bot",
+        protocols: &[Protocol::Chat],
+        streaming: Some(true),
+        tools: None,
+        vision: None,
+    },
 ];
 
 /// The host a base URL is served from, lowercased, without port or
@@ -236,6 +247,18 @@ mod tests {
         let deepseek =
             preset_capabilities("https://api.deepseek.com/v1", Protocol::Chat).expect("preset");
         assert_eq!(deepseek.vision, Some(false));
+    }
+
+    #[test]
+    fn cline_prefills_chat_and_streaming_only() {
+        // The Cline API speaks Chat and answers streamed asks; tools and
+        // image input are unconfirmed, so they stay unknown.
+        let cline =
+            preset_capabilities("https://api.cline.bot/api/v1", Protocol::Chat).expect("preset");
+        assert_eq!(cline.supported_protocols, vec![Protocol::Chat]);
+        assert_eq!(cline.streaming, Some(true));
+        assert_eq!(cline.tools, None);
+        assert_eq!(cline.vision, None);
     }
 
     #[test]
