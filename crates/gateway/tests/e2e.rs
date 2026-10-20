@@ -3288,6 +3288,221 @@ async fn anthropic_x_api_key_and_public_health_probe_work() {
     assert_eq!(body["status"], "ok");
 }
 
+/// An Anthropic upstream that answers whole and keeps the last body it saw.
+#[derive(Clone)]
+struct CaptureAnthropicUpstream {
+    last_request: Arc<Mutex<Option<Value>>>,
+}
+
+async fn capture_anthropic_messages(
+    State(mock): State<CaptureAnthropicUpstream>,
+    body: axum::body::Bytes,
+) -> Response {
+    let v: Value = serde_json::from_slice(&body).expect("upstream body is JSON");
+    *mock.last_request.lock().unwrap() = Some(v);
+    Json(json!({
+        "id": "msg-capture", "type": "message", "role": "assistant",
+        "model": "mock-model",
+        "content": [{"type": "text", "text": "hello"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    }))
+    .into_response()
+}
+
+async fn spawn_capture_anthropic() -> (String, Arc<Mutex<Option<Value>>>) {
+    let mock = CaptureAnthropicUpstream {
+        last_request: Arc::new(Mutex::new(None)),
+    };
+    let last_request = mock.last_request.clone();
+    let app = Router::new()
+        .route("/v1/messages", post(capture_anthropic_messages))
+        .with_state(mock);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), last_request)
+}
+
+/// A gateway whose only provider `mock` speaks `protocol` and serves
+/// `models`: the shared spawner only offers `mock-model`, while the
+/// billing-line keep path needs a Claude name on the wire.
+async fn spawn_gateway_with_models(
+    upstream_base: String,
+    protocol: Protocol,
+    models: Vec<String>,
+) -> String {
+    let provider = ProviderConfig {
+        id: "mock".to_string(),
+        name: "Mock".to_string(),
+        protocol,
+        base_url: if protocol == Protocol::Anthropic {
+            upstream_base.clone()
+        } else {
+            format!("{upstream_base}/v1")
+        },
+        api_key: "test-key".into(),
+        api_keys: Vec::new(),
+        models,
+        contexts: Default::default(),
+        fallback: Vec::new(),
+        key_cooldown_ms: None,
+        capabilities: Default::default(),
+        routing: RoutingPolicy::Rotate,
+        weights: Vec::new(),
+        affinity: Default::default(),
+        max_concurrency: None,
+        max_rpm: None,
+        queue_limit: None,
+        queue_wait_s: None,
+        key_generation: 0,
+        key_limits: Vec::new(),
+    };
+    let config = Config {
+        port: 0,
+        token: "magpie-lite".into(),
+        key_cooldown_ms: 60_000,
+        stream_first_content_timeout_ms: Config::default().stream_first_content_timeout_ms,
+        stream_idle_timeout_ms: Config::default().stream_idle_timeout_ms,
+        stream_keepalive_interval_ms: Config::default().stream_keepalive_interval_ms,
+        stream_keepalive_max_silence_ms: Config::default().stream_keepalive_max_silence_ms,
+        stream_responses_hold_timeout_ms: Config::default().stream_responses_hold_timeout_ms,
+        stream_loop_guard: Config::default().stream_loop_guard,
+        history_path: None,
+        default_provider: "mock".into(),
+        hidden_auto_groups: Vec::new(),
+        no_auto_groups: false,
+        provider: vec![provider],
+        group: Vec::new(),
+    };
+    let requests = request_log(&config);
+    let state = Arc::new(AppState {
+        agents: None,
+        config: magpie_gateway::ConfigStore::new(config, None),
+        http: magpie_gateway::upstream::http_client().unwrap(),
+        requests,
+        key_rotation: magpie_gateway::KeyRotator::default(),
+        affinity: magpie_gateway::AffinityStore::default(),
+        lanes: magpie_gateway::lanes::Lanes::default(),
+        rpms: magpie_gateway::lanes::Rpms::default(),
+    });
+    let app = build_router(state);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+/// Claude Code's per-turn system block, as #1600 shows it: the billing
+/// line first, its id changing every turn, then the prompt.
+fn claude_code_system(cch: &str) -> Value {
+    json!([
+        {"type": "text", "text": format!("x-anthropic-billing-header: cc_version=2.1.114.aff; cc_entrypoint=sdk-cli; cch={cch};")},
+        {"type": "text", "text": "You are a Claude agent."},
+        {"type": "text", "text": "\nMore instructions."},
+    ])
+}
+
+async fn anthropic_turn(gw: &str, model: &str, cch: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{gw}/v1/messages"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": model,
+            "max_tokens": 100,
+            "system": claude_code_system(cch),
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// A vendor's model reads the billing line as the prompt's first words,
+/// so its cache would miss from byte 0 on every turn (#1600): on every
+/// API the line stays out, and two turns that differ only in its id send
+/// the same prompt (the reference's `billing_line.go`).
+#[tokio::test]
+async fn billing_line_is_left_out_for_a_chat_vendor() {
+    let (upstream, last) = spawn_mock().await;
+    let gw = spawn_gateway(upstream).await;
+    let mut prompts = Vec::new();
+    for cch in ["9ebf3", "1778e"] {
+        let resp = anthropic_turn(&gw, "mock/mock-model", cch).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "{}",
+            resp.text().await.unwrap()
+        );
+        let upstream_req = last.lock().unwrap().clone().expect("upstream was called");
+        prompts.push(
+            upstream_req["messages"][0]["content"]
+                .as_str()
+                .expect("chat system text")
+                .to_owned(),
+        );
+    }
+    // Both turns reached the vendor with the same prompt, line-free.
+    assert_eq!(prompts[0], prompts[1], "the line id leaked into the prompt");
+    let system = &prompts[0];
+    assert!(!system.contains("billing-header"), "{system}");
+    assert_eq!(system, "You are a Claude agent.\n\nMore instructions.");
+}
+
+/// The same line on Anthropic's own API to a vendor's model goes the
+/// same way: the prompt a Claude-named anyone else serves starts clean.
+#[tokio::test]
+async fn billing_line_is_left_out_for_a_vendor_model_on_anthropic() {
+    let (upstream, last) = spawn_capture_anthropic().await;
+    let gw = spawn_gateway_with_protocol(upstream, Protocol::Anthropic).await;
+    let resp = anthropic_turn(&gw, "mock/mock-model", "0218c").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "{}",
+        resp.text().await.unwrap()
+    );
+    let upstream_req = last.lock().unwrap().clone().expect("upstream was called");
+    let system = upstream_req["system"]
+        .as_str()
+        .expect("anthropic system text");
+    assert!(!system.contains("billing-header"), "{system}");
+    assert_eq!(system, "You are a Claude agent.\n\nMore instructions.");
+}
+
+/// A Claude model asked on Anthropic's Messages API keeps the line: it
+/// is Anthropic's own billing metadata there, not first-word noise.
+#[tokio::test]
+async fn billing_line_is_kept_for_claude_on_anthropic() {
+    let (upstream, last) = spawn_capture_anthropic().await;
+    let gw = spawn_gateway_with_models(
+        upstream,
+        Protocol::Anthropic,
+        vec!["claude-sonnet-4-5-20250929".to_string()],
+    )
+    .await;
+    let resp = anthropic_turn(&gw, "mock/claude-sonnet-4-5-20250929", "0218c").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "{}",
+        resp.text().await.unwrap()
+    );
+    let upstream_req = last.lock().unwrap().clone().expect("upstream was called");
+    let system = upstream_req["system"]
+        .as_str()
+        .expect("anthropic system text");
+    assert!(
+        system.starts_with("x-anthropic-billing-header: cc_version=2.1.114.aff;"),
+        "{system}"
+    );
+}
+
 #[tokio::test]
 async fn refused_optional_field_is_retried_without_it_and_then_omitted() {
     let error = json!({

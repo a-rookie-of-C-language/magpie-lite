@@ -2450,25 +2450,29 @@ async fn send_with_fallback(
                     } else {
                         send
                     };
-                    let mut body =
-                        match upstream::build_request(&route.provider, send, &route.model) {
-                            Ok(body) => body,
-                            Err(error) => {
-                                // A local conversion error is not a bad credential or
-                                // upstream outage. Skip the entire key pool, with no
-                                // cooldown or network call, and try a compatible route.
-                                // Do not count a credential attempt: no HTTP request was sent.
-                                round_passing = false;
-                                if route_index != last_route {
-                                    continue 'routes;
-                                }
-                                return Err((
-                                    ProxyFailure::new(StatusCode::BAD_REQUEST, error.to_string()),
-                                    candidate,
-                                    decision.clone(),
-                                ));
+                    let mut body = match upstream::build_request(
+                        &route.provider,
+                        send,
+                        &route.model,
+                        matches!(wire, ClientWire::Anthropic),
+                    ) {
+                        Ok(body) => body,
+                        Err(error) => {
+                            // A local conversion error is not a bad credential or
+                            // upstream outage. Skip the entire key pool, with no
+                            // cooldown or network call, and try a compatible route.
+                            // Do not count a credential attempt: no HTTP request was sent.
+                            round_passing = false;
+                            if route_index != last_route {
+                                continue 'routes;
                             }
-                        };
+                            return Err((
+                                ProxyFailure::new(StatusCode::BAD_REQUEST, error.to_string()),
+                                candidate,
+                                decision.clone(),
+                            ));
+                        }
+                    };
                     // A vendor that turned an optional field away once gets a
                     // request without it from the start.
                     if body.as_object().is_some() {
@@ -3225,6 +3229,7 @@ async fn reask_stream(
     liveness: &StreamLiveness,
     pause: Duration,
     continuation: Option<&crate::continuation::Continuation>,
+    client_anthropic: bool,
 ) -> Result<UpstreamEvents, String> {
     tracker.begin_reask();
     tokio::time::sleep(pause).await;
@@ -3239,8 +3244,13 @@ async fn reask_stream(
         Some(cont) => cont.request(creq),
         None => creq.clone(),
     };
-    let mut body = upstream::build_request(&candidate.provider, &request, &candidate.model)
-        .map_err(|error| error.to_string())?;
+    let mut body = upstream::build_request(
+        &candidate.provider,
+        &request,
+        &candidate.model,
+        client_anthropic,
+    )
+    .map_err(|error| error.to_string())?;
     if let Some(cont) = continuation {
         cont.mark(&mut body);
     }
@@ -3925,6 +3935,7 @@ pub(crate) async fn proxy_parsed(
                             &liveness,
                             Duration::from_secs(1),
                             Some(&cont),
+                            matches!(wire, ClientWire::Anthropic),
                         ).await {
                             Ok(next_events) => {
                                 events = next_events;
@@ -4004,6 +4015,7 @@ pub(crate) async fn proxy_parsed(
                             &liveness,
                             pause,
                             None,
+                            matches!(wire, ClientWire::Anthropic),
                         ).await {
                             Ok(next_events) => {
                                 events = next_events;

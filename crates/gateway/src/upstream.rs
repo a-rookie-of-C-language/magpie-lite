@@ -7,6 +7,8 @@ use serde_json::{Value, json};
 
 use crate::config::{Protocol, ProviderConfig};
 
+use crate::billing::{drops_billing_line, strip_billing_line};
+
 /// A configured HTTP client (connection pooling, no total timeout: streams
 /// may run for a long while).
 pub fn http_client() -> anyhow::Result<reqwest::Client> {
@@ -21,7 +23,21 @@ pub fn build_request(
     p: &ProviderConfig,
     req: &CompletionRequest,
     model: &str,
+    client_anthropic: bool,
 ) -> magpie_core::Result<Value> {
+    // Claude Code's billing line, which changes every turn, to a vendor's
+    // model or another API's Claude: its prompt cache would miss from the
+    // first byte, so the line goes on only to a Claude model asked on
+    // Anthropic's Messages API (the reference's `billing_line.go`, #1600).
+    let stripped;
+    let req = if client_anthropic && drops_billing_line(p.protocol, model) {
+        let mut copy = req.clone();
+        strip_billing_line(&mut copy.system);
+        stripped = copy;
+        &stripped
+    } else {
+        req
+    };
     let mut body = match p.protocol {
         Protocol::Chat => chat::encode_request(req, model),
         Protocol::Anthropic => anthropic::encode_request(req, model),
@@ -424,8 +440,13 @@ mod search_tests {
             "https://openrouter.ai/api/v1",
             "https://OPENROUTER.AI:443/api/v1",
         ] {
-            let out =
-                build_request(&provider(Protocol::Chat, url), &search_request(), "up").unwrap();
+            let out = build_request(
+                &provider(Protocol::Chat, url),
+                &search_request(),
+                "up",
+                false,
+            )
+            .unwrap();
             assert_eq!(out["plugins"], json!([{"id":"web"}]));
             assert!(out.get("web_search_options").is_none());
         }
@@ -434,8 +455,13 @@ mod search_tests {
             "https://example.invalid/openrouter.ai/v1",
             "https://api.openai.com/v1",
         ] {
-            let out =
-                build_request(&provider(Protocol::Chat, url), &search_request(), "up").unwrap();
+            let out = build_request(
+                &provider(Protocol::Chat, url),
+                &search_request(),
+                "up",
+                false,
+            )
+            .unwrap();
             assert!(out.get("plugins").is_none());
             assert_eq!(out["web_search_options"], json!({}));
         }
@@ -450,7 +476,8 @@ mod search_tests {
             build_request(
                 &provider(Protocol::Chat, "https://openrouter.ai/api/v1"),
                 &request,
-                "up"
+                "up",
+                false,
             )
             .is_err()
         );
@@ -458,6 +485,7 @@ mod search_tests {
             &provider(Protocol::Chat, "https://api.openai.com/v1"),
             &request,
             "up",
+            false,
         )
         .unwrap();
         assert_eq!(out["web_search_options"]["search_context_size"], "low");
@@ -470,8 +498,13 @@ mod search_tests {
             ("https://api.x.ai.evil.invalid/v1", true),
             ("https://api.openai.com/v1", true),
         ] {
-            let out = build_request(&provider(Protocol::Responses, url), &search_request(), "up")
-                .unwrap();
+            let out = build_request(
+                &provider(Protocol::Responses, url),
+                &search_request(),
+                "up",
+                false,
+            )
+            .unwrap();
             assert_eq!(out["tools"][0]["type"], "web_search");
             assert_eq!(out.get("include").is_some(), has_include);
         }
@@ -503,7 +536,8 @@ mod search_tests {
             "https://api.openai.com/v1",
             "https://api.deepseek.com.evil.invalid/v1",
         ] {
-            let out = build_request(&provider(Protocol::Chat, host), &request, "up").unwrap();
+            let out =
+                build_request(&provider(Protocol::Chat, host), &request, "up", false).unwrap();
             assert_eq!(out["max_tokens"], 700);
         }
     }
@@ -517,7 +551,7 @@ mod search_tests {
             (Protocol::Chat, "https://openrouter.ai/api/v1"),
             (Protocol::Responses, "https://api.openai.com/v1"),
         ] {
-            let out = build_request(&provider(protocol, url), &request, "up").unwrap();
+            let out = build_request(&provider(protocol, url), &request, "up", false).unwrap();
             for key in ["plugins", "tools", "web_search_options", "include"] {
                 assert!(out.get(key).is_none());
             }
@@ -536,6 +570,7 @@ mod search_tests {
             &provider(Protocol::Anthropic, "https://relay.example/v1"),
             &request,
             "grok-4.6",
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -547,6 +582,7 @@ mod search_tests {
             &provider(Protocol::Anthropic, "https://api.x.ai/v1"),
             &request,
             "my-alias",
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -560,7 +596,7 @@ mod search_tests {
             ("https://api.x.ai.evil.invalid/v1", "claude-sonnet-5"),
         ] {
             let other =
-                build_request(&provider(Protocol::Anthropic, url), &request, model).unwrap();
+                build_request(&provider(Protocol::Anthropic, url), &request, model, true).unwrap();
             assert_eq!(
                 other["tools"][0]["input_schema"]["properties"]["x"]["pattern"],
                 r"^[^\s[\]]+$"
@@ -580,6 +616,7 @@ mod search_tests {
             &provider(Protocol::Chat, "https://api.deepseek.com/v1"),
             &request,
             "up",
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -591,7 +628,8 @@ mod search_tests {
             "https://api.openai.com/v1",
             "https://api.deepseek.com.evil.invalid/v1",
         ] {
-            let other = build_request(&provider(Protocol::Chat, url), &request, "up").unwrap();
+            let other =
+                build_request(&provider(Protocol::Chat, url), &request, "up", false).unwrap();
             assert_eq!(
                 other["tools"][0]["function"]["parameters"]["properties"]["content"]["pattern"],
                 r"^[^\0]*$"
@@ -610,6 +648,7 @@ mod search_tests {
             &provider(Protocol::Chat, "https://api.moonshot.ai/v1"),
             &request,
             "kimi-k2.5",
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -623,6 +662,7 @@ mod search_tests {
             &provider(Protocol::Chat, "https://api.moonshot.ai/v1"),
             &request,
             "kimi-k2-0905-preview",
+            false,
         )
         .unwrap();
         assert_eq!(ranged["temperature"], 0.1);
@@ -632,6 +672,7 @@ mod search_tests {
             &provider(Protocol::Chat, "https://api.openai.com/v1"),
             &request,
             "kimi-k2.5",
+            false,
         )
         .unwrap();
         assert!(
@@ -676,7 +717,8 @@ mod search_tests {
                 "tools":[{"type":"function","function":{"name":"t","parameters":schema}}],
             });
             let request = chat::decode_request(&client).unwrap();
-            let out = build_request(&provider(protocol, base_url), &request, "kimi-k3").unwrap();
+            let out =
+                build_request(&provider(protocol, base_url), &request, "kimi-k3", false).unwrap();
             let schema = out
                 .pointer("/tools/0/function/parameters")
                 .or_else(|| out.pointer("/tools/0/parameters"))
@@ -722,6 +764,7 @@ mod search_tests {
             &provider(Protocol::Chat, "https://api.openai.com/v1"),
             &request,
             "kimi-k3",
+            false,
         )
         .unwrap();
         assert!(
@@ -743,6 +786,7 @@ mod search_tests {
             &provider(Protocol::Chat, "https://openrouter.ai/api/v1"),
             &request,
             "up",
+            false,
         )
         .unwrap();
         let x = &out["tools"][0]["function"]["parameters"]["properties"]["x"];
@@ -753,6 +797,7 @@ mod search_tests {
             &provider(Protocol::Chat, "https://api.openai.com/v1"),
             &request,
             "up",
+            false,
         )
         .unwrap();
         assert_eq!(

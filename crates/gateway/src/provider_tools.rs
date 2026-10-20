@@ -320,7 +320,8 @@ async fn probe(provider: &ProviderConfig, model: &str) -> ToolResult<()> {
         max_tokens: Some(64),
         ..Default::default()
     };
-    let body = upstream::build_request(provider, &request, model)
+    // Probes are synthetic: no agent wire, so no billing line to strip.
+    let body = upstream::build_request(provider, &request, model, false)
         .map_err(|_| failed("request cannot be encoded for this provider"))?;
     let mut remaining = BYTE_LIMIT;
     let mut last_error = failed("no provider credentials were attempted");
