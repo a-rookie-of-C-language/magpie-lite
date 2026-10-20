@@ -1095,7 +1095,17 @@
 
     function routeSummary(request) {
       const route = request.provider ? `${request.provider} / ${request.upstream_model}` : "—";
-      return route + classifiedSummary(request.classified);
+      return route + classifiedSummary(request.classified) + triesSummary(request);
+    }
+
+    function triesSummary(request) {
+      const tries = request.tries || [];
+      if (tries.length === 0) return "";
+      const legs = tries.map(t => {
+        const at = t.effort ? `@${t.effort}` : "";
+        return `${t.provider}/${t.model}${at}`;
+      });
+      return ` · tries: ${legs.join(" → ")}`;
     }
 
     function renderUsage(usage) {
