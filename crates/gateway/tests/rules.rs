@@ -696,6 +696,7 @@ fn provider(id: &str, upstream: &str, model: &str) -> ProviderConfig {
         models: vec![model.into()],
         contexts: Default::default(),
         outputs: Default::default(),
+        free_models: Default::default(),
         fallback: Vec::new(),
         key_cooldown_ms: None,
         capabilities: Default::default(),

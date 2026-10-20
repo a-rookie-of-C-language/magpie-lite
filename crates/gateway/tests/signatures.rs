@@ -200,6 +200,7 @@ async fn fixture(protocol: Protocol, mode: Mode) -> Fixture {
         models: vec!["native-model".into()],
         contexts: Default::default(),
         outputs: Default::default(),
+        free_models: Default::default(),
         fallback: vec!["backup/native-model".into()],
         key_cooldown_ms: None,
         routing: RoutingPolicy::Rotate,

@@ -253,6 +253,11 @@ enum ProviderCommand {
         /// unnamed limit headed for Anthropic's API is filled with it.
         #[arg(long = "output", value_parser = parse_output)]
         outputs: Vec<(String, u64)>,
+        /// A model this provider serves at no cost to its allowance or
+        /// credits, as you declare it; repeat for each. `free_first`
+        /// routing spends these before the paid models.
+        #[arg(long = "free-model", num_args = 1..)]
+        free_models: Vec<String>,
         /// Fallback routes, tried in order when this provider is rate limited, out of quota, or down.
         #[arg(long = "fallback")]
         fallback: Vec<String>,
@@ -417,6 +422,7 @@ async fn main() -> Result<()> {
                 models,
                 contexts,
                 outputs,
+                free_models,
                 fallback,
                 key_cooldown_ms,
                 routing,
@@ -445,6 +451,7 @@ async fn main() -> Result<()> {
                     models,
                     contexts: contexts.into_iter().collect(),
                     outputs: outputs.into_iter().collect(),
+                    free_models,
                     fallback,
                     key_cooldown_ms,
                     routing,
@@ -509,6 +516,9 @@ async fn main() -> Result<()> {
                         }
                         if let Some(limit) = p.outputs.get(m) {
                             println!("               ↳ max output {limit} tokens");
+                        }
+                        if p.free_model(m) {
+                            println!("               ↳ free");
                         }
                     }
                     for route in &p.fallback {

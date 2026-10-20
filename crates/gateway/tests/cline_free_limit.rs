@@ -94,6 +94,7 @@ async fn gateway(id: &str, upstream: &str, models: &[&str]) -> String {
             models: models.iter().map(|model| model.to_string()).collect(),
             contexts: Default::default(),
             outputs: Default::default(),
+            free_models: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),

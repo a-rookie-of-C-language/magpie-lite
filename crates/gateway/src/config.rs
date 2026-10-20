@@ -146,6 +146,13 @@ pub struct ProviderConfig {
     /// here has no user-set limit.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub outputs: BTreeMap<String, u64>,
+    /// Models this provider serves at no cost to its allowance or credits,
+    /// as the user declares them. Lite keeps no vendor catalog to read a
+    /// `Free` word or a price from, so this stands in for the reference's
+    /// `catalog.Model.Free` and $0 `ListPrice`; the `free_first` routing
+    /// spends these seats first. A model absent here is not free.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub free_models: Vec<String>,
     /// Where a request goes when this provider cannot take it — out of
     /// quota, rate limited, overloaded, or down — tried in order, before
     /// any of the reply has been sent: models as agents pick them.
@@ -281,6 +288,13 @@ impl ProviderConfig {
                 "max outputs need a non-empty model id with no whitespace and a limit above zero"
             );
         }
+        if self
+            .free_models
+            .iter()
+            .any(|model| model.is_empty() || model.chars().any(char::is_whitespace))
+        {
+            anyhow::bail!("free models need non-empty model ids with no whitespace");
+        }
         if self.weights.iter().any(|weight| *weight > MAX_KEY_WEIGHT) {
             anyhow::bail!("key weights cannot be above {MAX_KEY_WEIGHT}");
         }
@@ -344,6 +358,16 @@ impl ProviderConfig {
     /// alias.
     pub fn output_of(&self, model: &str) -> u64 {
         self.outputs.get(model).copied().unwrap_or(0)
+    }
+
+    /// Whether the user declared `model` free on this provider: its vendor
+    /// serves it at no cost to the allowance or credits. Absent means not
+    /// free — the reference's `FreeModel` needs a `Free` word or a $0 list
+    /// price, and lite's declared list stands in for both.
+    pub fn free_model(&self, model: &str) -> bool {
+        self.free_models
+            .iter()
+            .any(|free| free.eq_ignore_ascii_case(model))
     }
 
     /// How many requests may be out at once on one of its keys, 0 for no
@@ -522,7 +546,10 @@ impl KeyRotator {
         state.served.retain(|slot, _| *slot < keys.len());
 
         let ordered = match routing {
-            RoutingPolicy::Order => (0..keys.len()).collect::<Vec<_>>(),
+            // Every key of one provider serves the same model, so a free
+            // model is free on all of them or none: free-first has no
+            // distinction to make inside a pool and stays in order.
+            RoutingPolicy::Order | RoutingPolicy::FreeFirst => (0..keys.len()).collect::<Vec<_>>(),
             // Manual picks a whole group member, never a key: a provider
             // read as manual still tries its keys in order.
             RoutingPolicy::Manual => (0..keys.len()).collect::<Vec<_>>(),
@@ -645,9 +672,23 @@ impl KeyRotator {
         routes: &[String],
         weights: &[u32],
         pick: &str,
+        free: &[bool],
     ) -> Vec<(usize, String)> {
         if routes.is_empty() {
             return Vec::new();
+        }
+        if policy == RoutingPolicy::FreeFirst {
+            // The reference's `FreeFirst`: declared-free routes go first,
+            // then the rest, each tier in listed order. It weighs one tier
+            // only, so it takes no scheduling state, and a pool with
+            // nothing declared free comes back in listed order.
+            return (0..routes.len())
+                .filter(|index| free.get(*index).copied().unwrap_or(false))
+                .chain(
+                    (0..routes.len()).filter(|index| !free.get(*index).copied().unwrap_or(false)),
+                )
+                .map(|index| (index, routes[index].clone()))
+                .collect();
         }
         if policy == RoutingPolicy::Manual {
             // A manual group sends every request to its picked member
@@ -683,7 +724,9 @@ impl KeyRotator {
         }
 
         let indices = match state.policy {
+            // Free-first returned above without touching scheduling state.
             RoutingPolicy::Order => (0..routes.len()).collect::<Vec<_>>(),
+            RoutingPolicy::FreeFirst => unreachable!("free-first groups return before scheduling"),
             RoutingPolicy::Rotate => {
                 let start = state.cursor % routes.len();
                 state.cursor = (start + 1) % routes.len();
@@ -875,6 +918,12 @@ pub enum RoutingPolicy {
     Rotate,
     /// Prefer routes with fewer attempts in this gateway process.
     Usage,
+    /// Spend routes whose model the user declared free before the ones that
+    /// cost allowance or credits, each tier in listed order (the
+    /// reference's `FreeFirst`). A pool with no declared free model behaves
+    /// as `order`.
+    #[serde(rename = "free_first")]
+    FreeFirst,
     /// Spread a provider's requests over its keys by each key's weight,
     /// smoothly, as NGINX's smooth weighted round robin does: keys weighing
     /// 3 and 1 take three requests to one, holding the ratio over every few
@@ -894,6 +943,7 @@ impl RoutingPolicy {
             Self::Order => "order",
             Self::Rotate => "rotate",
             Self::Usage => "usage",
+            Self::FreeFirst => "free_first",
             Self::Weighted => "weight",
             Self::Manual => "manual",
         }
@@ -908,10 +958,11 @@ impl std::str::FromStr for RoutingPolicy {
             "order" => Ok(Self::Order),
             "rotate" | "round_robin" => Ok(Self::Rotate),
             "usage" | "least_used" => Ok(Self::Usage),
+            "free_first" | "free" | "free-first" => Ok(Self::FreeFirst),
             "weight" | "weighted" => Ok(Self::Weighted),
             "manual" => Ok(Self::Manual),
             _ => Err(format!(
-                "unknown routing policy `{value}`; expected order, rotate, usage, weight or manual"
+                "unknown routing policy `{value}`; expected order, rotate, usage, free_first, weight or manual"
             )),
         }
     }
@@ -1295,6 +1346,10 @@ pub struct ProviderConfigSnapshot {
     /// here has no user-set limit.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub outputs: BTreeMap<String, u64>,
+    /// Models the user declared free on this provider, for the `free_first`
+    /// routing. A model absent here is not free.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub free_models: Vec<String>,
     /// Number of effective key slots, not the keys themselves.
     pub key_count: usize,
     /// Number of configured credentials (zero means no upstream authentication).
@@ -1375,6 +1430,10 @@ pub struct GroupConfigSnapshot {
     /// Per-route weights, parallel to the route chain, for the `weight` policy.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub weights: Vec<u32>,
+    /// Per-route free flags, parallel to the route chain, for `free_first`:
+    /// whether the user declared that route's model free on its provider.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub free: Vec<bool>,
     /// Route selection policy.
     pub routing: RoutingPolicy,
     /// Set when magpie found the group rather than the user writing it.
@@ -1828,6 +1887,7 @@ impl Config {
                     models: p.models.clone(),
                     contexts: p.contexts.clone(),
                     outputs: p.outputs.clone(),
+                    free_models: p.free_models.clone(),
                     key_count: p.api_key_pool().len(),
                     credential_count: p
                         .api_key_pool()
@@ -1864,6 +1924,7 @@ impl Config {
                     auto: g.auto,
                     hidden: false,
                     weights: g.route_weights(),
+                    free: self.member_frees(g),
                     routing: g.routing,
                     first_token_timeout_ms: g.first_token_timeout_ms,
                     affinity: g.affinity,
@@ -1881,6 +1942,7 @@ impl Config {
                     auto: true,
                     hidden: false,
                     weights: g.route_weights(),
+                    free: self.member_frees(g),
                     routing: g.routing,
                     first_token_timeout_ms: g.first_token_timeout_ms,
                     affinity: g.affinity,
@@ -1901,6 +1963,7 @@ impl Config {
                             auto: true,
                             hidden: true,
                             weights: g.route_weights(),
+                            free: self.member_frees(g),
                             routing: g.routing,
                             first_token_timeout_ms: g.first_token_timeout_ms,
                             affinity: g.affinity,
@@ -2182,6 +2245,26 @@ impl Config {
         self.resolve_provider(&base).map(|(p, m)| (p, m, effort))
     }
 
+    /// The per-route free flags of a group, parallel to its routes, as the
+    /// `free_first` routing and the console read them.
+    pub fn member_frees(&self, group: &GroupConfig) -> Vec<bool> {
+        group
+            .routes
+            .iter()
+            .map(|route| self.member_is_free(route))
+            .collect()
+    }
+
+    /// Whether the member a group route names serves its model free, as the
+    /// user declared it: the `free_first` routing spends those seats first.
+    /// A route naming no known provider is not free, which keeps it with
+    /// the paid tier exactly as the reference does for an unknown model.
+    pub fn member_is_free(&self, route: &str) -> bool {
+        let (base, _) = self.member_effort(route);
+        self.resolve_provider(&base)
+            .is_some_and(|(provider, model)| provider.free_model(&model))
+    }
+
     /// Spell a group's members the way sending parses them, before
     /// validation: each route trimmed, a fixed effort lowercased
     /// (`mock/m:HIGH` is `mock/m:high`). Rules name their member as
@@ -2337,6 +2420,7 @@ base_url = "http://127.0.0.1:1/v1"
             models: vec!["mock".into()],
             contexts: Default::default(),
             outputs: Default::default(),
+            free_models: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),
@@ -2375,6 +2459,7 @@ base_url = "http://127.0.0.1:1/v1"
             models: vec!["mock".into()],
             contexts: Default::default(),
             outputs: Default::default(),
+            free_models: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),
@@ -2421,6 +2506,7 @@ base_url = "http://127.0.0.1:1/v1"
             models: Vec::new(),
             contexts: Default::default(),
             outputs: Default::default(),
+            free_models: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),
@@ -2467,6 +2553,7 @@ base_url = "http://127.0.0.1:1/v1"
             models: Vec::new(),
             contexts: Default::default(),
             outputs: Default::default(),
+            free_models: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             routing: RoutingPolicy::Rotate,
@@ -2506,6 +2593,7 @@ base_url = "http://127.0.0.1:1/v1"
             models: Vec::new(),
             contexts: Default::default(),
             outputs: Default::default(),
+            free_models: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             routing: RoutingPolicy::Rotate,
@@ -2540,6 +2628,7 @@ base_url = "http://127.0.0.1:1/v1"
             models: Vec::new(),
             contexts: Default::default(),
             outputs: Default::default(),
+            free_models: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             routing: RoutingPolicy::Rotate,
@@ -2835,6 +2924,7 @@ base_url = "http://127.0.0.1:1/v1"
                 models: vec![],
                 contexts: Default::default(),
                 outputs: Default::default(),
+                free_models: Default::default(),
                 fallback: vec![],
                 key_cooldown_ms: None,
                 capabilities: Default::default(),
@@ -2879,6 +2969,7 @@ base_url = "http://127.0.0.1:1/v1"
             models: vec!["mock-model".into()],
             contexts: Default::default(),
             outputs: Default::default(),
+            free_models: Default::default(),
             fallback: vec!["backup/other".into()],
             key_cooldown_ms: Some(1_200),
             capabilities: Default::default(),
@@ -3067,6 +3158,7 @@ affinity = "session"
             models: vec!["model".into()],
             contexts: Default::default(),
             outputs: Default::default(),
+            free_models: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),
@@ -3107,11 +3199,230 @@ affinity = "session"
     }
 
     #[test]
+    fn free_first_spends_declared_free_routes_before_paid_ones() {
+        let scheduler = KeyRotator::default();
+        let routes = vec![
+            "paid/one".to_owned(),
+            "free/two".to_owned(),
+            "paid/three".to_owned(),
+            "free/four".to_owned(),
+        ];
+        // Free seats keep their listed order inside the free tier, and so
+        // do the paid ones; the scheduler takes no state, so asking twice
+        // answers the same (the reference's `FreeFirst`).
+        let free = [false, true, false, true];
+        let expected = vec![
+            (1, "free/two".to_owned()),
+            (3, "free/four".to_owned()),
+            (0, "paid/one".to_owned()),
+            (2, "paid/three".to_owned()),
+        ];
+        assert_eq!(
+            scheduler.group_order("daily", RoutingPolicy::FreeFirst, &routes, &[], "", &free),
+            expected
+        );
+        assert_eq!(
+            scheduler.group_order("daily", RoutingPolicy::FreeFirst, &routes, &[], "", &free),
+            expected
+        );
+        // A pool with nothing declared free behaves as ordered.
+        assert_eq!(
+            scheduler
+                .group_order("none", RoutingPolicy::FreeFirst, &routes, &[], "", &[])
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        // A shorter declaration list treats the rest as paid.
+        assert_eq!(
+            scheduler
+                .group_order(
+                    "short",
+                    RoutingPolicy::FreeFirst,
+                    &routes,
+                    &[],
+                    "",
+                    &[false, true]
+                )
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+            vec![1, 0, 2, 3]
+        );
+    }
+
+    #[test]
+    fn free_first_parses_its_aliases_and_round_trips() {
+        for spelling in ["free_first", "free", "free-first"] {
+            assert_eq!(
+                spelling.parse::<RoutingPolicy>().unwrap(),
+                RoutingPolicy::FreeFirst
+            );
+        }
+        assert_eq!(RoutingPolicy::FreeFirst.as_str(), "free_first");
+        // A bare enum is not a TOML value; the policy round-trips inside
+        // the table it actually lives in.
+        let toml = toml::to_string(&ProviderConfig {
+            id: "mock".into(),
+            name: String::new(),
+            protocol: Protocol::Chat,
+            capabilities: Default::default(),
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: String::new(),
+            api_keys: Vec::new(),
+            models: Vec::new(),
+            contexts: Default::default(),
+            outputs: Default::default(),
+            free_models: Vec::new(),
+            fallback: Vec::new(),
+            key_cooldown_ms: None,
+            routing: RoutingPolicy::FreeFirst,
+            weights: Vec::new(),
+            affinity: Affinity::default(),
+            max_concurrency: None,
+            max_rpm: None,
+            queue_limit: None,
+            queue_wait_s: None,
+            key_generation: 0,
+            pin_upstream: false,
+            key_limits: Vec::new(),
+        })
+        .unwrap();
+        assert!(toml.contains("free_first"), "{toml}");
+        let restored: ProviderConfig = toml::from_str(&toml).unwrap();
+        assert_eq!(restored.routing, RoutingPolicy::FreeFirst);
+    }
+
+    #[test]
+    fn snapshot_shows_which_group_routes_are_free() {
+        let mut config = Config {
+            provider: vec![
+                ProviderConfig {
+                    id: "paid".into(),
+                    name: String::new(),
+                    protocol: Protocol::Chat,
+                    capabilities: Default::default(),
+                    base_url: "http://127.0.0.1:1/v1".into(),
+                    api_key: String::new(),
+                    api_keys: Vec::new(),
+                    models: vec!["m".into()],
+                    contexts: Default::default(),
+                    outputs: Default::default(),
+                    free_models: Vec::new(),
+                    fallback: Vec::new(),
+                    key_cooldown_ms: None,
+                    routing: RoutingPolicy::Order,
+                    weights: Vec::new(),
+                    affinity: Affinity::default(),
+                    max_concurrency: None,
+                    max_rpm: None,
+                    queue_limit: None,
+                    queue_wait_s: None,
+                    key_generation: 0,
+                    pin_upstream: false,
+                    key_limits: Vec::new(),
+                },
+                ProviderConfig {
+                    id: "free".into(),
+                    name: String::new(),
+                    protocol: Protocol::Chat,
+                    capabilities: Default::default(),
+                    base_url: "http://127.0.0.1:1/v1".into(),
+                    api_key: String::new(),
+                    api_keys: Vec::new(),
+                    models: vec!["m".into()],
+                    contexts: Default::default(),
+                    outputs: Default::default(),
+                    free_models: vec!["m".into()],
+                    fallback: Vec::new(),
+                    key_cooldown_ms: None,
+                    routing: RoutingPolicy::Order,
+                    weights: Vec::new(),
+                    affinity: Affinity::default(),
+                    max_concurrency: None,
+                    max_rpm: None,
+                    queue_limit: None,
+                    queue_wait_s: None,
+                    key_generation: 0,
+                    pin_upstream: false,
+                    key_limits: Vec::new(),
+                },
+            ],
+            group: vec![GroupConfig {
+                id: "daily".into(),
+                name: String::new(),
+                routes: vec!["paid/m".into(), "free/m".into()],
+                weights: Vec::new(),
+                rules: Vec::new(),
+                classifier: String::new(),
+                effort: String::new(),
+                levels: Vec::new(),
+                pick: String::new(),
+                auto: false,
+                routing: RoutingPolicy::FreeFirst,
+                first_token_timeout_ms: 0,
+                affinity: Affinity::default(),
+                patience_s: None,
+            }],
+            ..Config::default()
+        };
+        config.default_provider = "paid".into();
+        let snapshot = config.snapshot();
+        assert_eq!(snapshot.groups[0].free, vec![false, true]);
+        assert_eq!(snapshot.providers[1].free_models, vec!["m".to_owned()]);
+        // The policy survives a save/load round trip beside the declaration.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        config.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.group[0].routing, RoutingPolicy::FreeFirst);
+        assert_eq!(loaded.provider[1].free_models, vec!["m".to_owned()]);
+    }
+
+    #[test]
+    fn declared_free_models_validate_and_match_case_insensitively() {
+        let mut provider = ProviderConfig {
+            id: "mock".into(),
+            name: String::new(),
+            protocol: Protocol::Chat,
+            capabilities: Default::default(),
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: String::new(),
+            api_keys: Vec::new(),
+            models: Vec::new(),
+            contexts: Default::default(),
+            outputs: Default::default(),
+            free_models: vec!["flash-free".into()],
+            fallback: Vec::new(),
+            key_cooldown_ms: None,
+            routing: RoutingPolicy::Order,
+            weights: Vec::new(),
+            affinity: Affinity::default(),
+            max_concurrency: None,
+            max_rpm: None,
+            queue_limit: None,
+            queue_wait_s: None,
+            key_generation: 0,
+            pin_upstream: false,
+            key_limits: Vec::new(),
+        };
+        provider.validate().unwrap();
+        assert!(provider.free_model("Flash-Free"));
+        assert!(!provider.free_model("paid"));
+
+        provider.free_models = vec!["has space".into()];
+        assert!(provider.validate().is_err());
+        provider.free_models = vec![String::new()];
+        assert!(provider.validate().is_err());
+    }
+
+    #[test]
     fn group_route_scheduler_rotates_and_tracks_usage() {
         let scheduler = KeyRotator::default();
         let routes = vec!["a/one".to_owned(), "b/two".to_owned(), "c/three".to_owned()];
         assert_eq!(
-            scheduler.group_order("daily", RoutingPolicy::Rotate, &routes, &[], ""),
+            scheduler.group_order("daily", RoutingPolicy::Rotate, &routes, &[], "", &[]),
             vec![
                 (0, "a/one".to_owned()),
                 (1, "b/two".to_owned()),
@@ -3119,33 +3430,33 @@ affinity = "session"
             ]
         );
         assert_eq!(
-            scheduler.group_order("daily", RoutingPolicy::Rotate, &routes, &[], "")[0],
+            scheduler.group_order("daily", RoutingPolicy::Rotate, &routes, &[], "", &[])[0],
             (1, "b/two".to_owned())
         );
         assert_eq!(
-            scheduler.group_order("daily", RoutingPolicy::Rotate, &routes, &[], "")[0],
+            scheduler.group_order("daily", RoutingPolicy::Rotate, &routes, &[], "", &[])[0],
             (2, "c/three".to_owned())
         );
 
         let usage = KeyRotator::default();
         assert_eq!(
-            usage.group_order("daily", RoutingPolicy::Usage, &routes, &[], "")[0].0,
+            usage.group_order("daily", RoutingPolicy::Usage, &routes, &[], "", &[])[0].0,
             0
         );
         usage.record_group_attempt("daily", RoutingPolicy::Usage, &routes, &[], 0);
         assert_eq!(
-            usage.group_order("daily", RoutingPolicy::Usage, &routes, &[], "")[0].0,
+            usage.group_order("daily", RoutingPolicy::Usage, &routes, &[], "", &[])[0].0,
             1
         );
         usage.record_group_attempt("daily", RoutingPolicy::Usage, &routes, &[], 1);
         assert_eq!(
-            usage.group_order("daily", RoutingPolicy::Usage, &routes, &[], "")[0].0,
+            usage.group_order("daily", RoutingPolicy::Usage, &routes, &[], "", &[])[0].0,
             2
         );
 
         let changed = vec!["new/route".to_owned(), "other/route".to_owned()];
         assert_eq!(
-            usage.group_order("daily", RoutingPolicy::Usage, &changed, &[], "")[0],
+            usage.group_order("daily", RoutingPolicy::Usage, &changed, &[], "", &[])[0],
             (0, "new/route".to_owned())
         );
     }
@@ -3158,18 +3469,18 @@ affinity = "session"
         let routes = vec!["a/one".to_owned(), "b/two".to_owned()];
         // The pick alone; the other member waits.
         assert_eq!(
-            scheduler.group_order("daily", RoutingPolicy::Manual, &routes, &[], "b/two"),
+            scheduler.group_order("daily", RoutingPolicy::Manual, &routes, &[], "b/two", &[]),
             vec![(1, "b/two".to_owned())]
         );
         // A pick naming nothing in the group is its first route, as
         // `validate` keeps it.
         assert_eq!(
-            scheduler.group_order("daily", RoutingPolicy::Manual, &routes, &[], "z/gone"),
+            scheduler.group_order("daily", RoutingPolicy::Manual, &routes, &[], "z/gone", &[]),
             vec![(0, "a/one".to_owned())]
         );
         assert!(
             scheduler
-                .group_order("gone", RoutingPolicy::Manual, &[], &[], "")
+                .group_order("gone", RoutingPolicy::Manual, &[], &[], "", &[])
                 .is_empty()
         );
     }
@@ -3316,6 +3627,7 @@ affinity = "session"
             models: models.iter().map(|model| model.to_string()).collect(),
             contexts: Default::default(),
             outputs: Default::default(),
+            free_models: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),
@@ -3617,7 +3929,9 @@ affinity = "session"
         let mut firsts = Vec::new();
         for _ in 0..8 {
             firsts.push(
-                scheduler.group_order("daily", RoutingPolicy::Weighted, &routes, &weights, "")[0].0,
+                scheduler.group_order("daily", RoutingPolicy::Weighted, &routes, &weights, "", &[])
+                    [0]
+                .0,
             );
         }
         assert_eq!(firsts.iter().filter(|slot| **slot == 0).count(), 3);
@@ -3627,7 +3941,15 @@ affinity = "session"
         // A changed weight vector starts a fresh schedule, so stale state
         // from the old ratio never leaks into the new one.
         assert_eq!(
-            scheduler.group_order("daily", RoutingPolicy::Weighted, &routes, &[1, 1, 1], "")[0].0,
+            scheduler.group_order(
+                "daily",
+                RoutingPolicy::Weighted,
+                &routes,
+                &[1, 1, 1],
+                "",
+                &[]
+            )[0]
+            .0,
             0
         );
     }
@@ -3665,7 +3987,7 @@ affinity = "session"
         let routes = vec!["a/one".to_owned(), "b/two".to_owned()];
         for _ in 0..4 {
             let order =
-                scheduler.group_order("daily", RoutingPolicy::Weighted, &routes, &[1, 0], "");
+                scheduler.group_order("daily", RoutingPolicy::Weighted, &routes, &[1, 0], "", &[]);
             assert_eq!(order[0].0, 0);
             assert_eq!(order[1].0, 1);
         }
@@ -3684,6 +4006,7 @@ affinity = "session"
             models: Vec::new(),
             contexts: Default::default(),
             outputs: Default::default(),
+            free_models: Default::default(),
             fallback: Vec::new(),
             key_cooldown_ms: None,
             capabilities: Default::default(),

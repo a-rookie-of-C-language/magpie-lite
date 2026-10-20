@@ -94,6 +94,7 @@ fn provider(id: &str, url: String) -> ProviderConfig {
         models: vec!["mock-model".into()],
         contexts: BTreeMap::new(),
         outputs: Default::default(),
+        free_models: Default::default(),
         fallback: Vec::new(),
         key_cooldown_ms: None,
         capabilities: Default::default(),
@@ -112,6 +113,14 @@ fn provider(id: &str, url: String) -> ProviderConfig {
 
 /// A gateway over the providers given, grouped `g` over all of them.
 async fn gateway(providers: Vec<ProviderConfig>) -> (String, Arc<AppState>) {
+    gateway_routed(providers, RoutingPolicy::Order).await
+}
+
+/// A gateway whose group `g` is routed `policy`.
+async fn gateway_routed(
+    providers: Vec<ProviderConfig>,
+    policy: RoutingPolicy,
+) -> (String, Arc<AppState>) {
     let routes = providers
         .iter()
         .map(|p| format!("{}/mock-model", p.id))
@@ -144,7 +153,7 @@ async fn gateway(providers: Vec<ProviderConfig>) -> (String, Arc<AppState>) {
             pick: String::new(),
             auto: false,
             weights: Vec::new(),
-            routing: RoutingPolicy::Order,
+            routing: policy,
             first_token_timeout_ms: 0,
             affinity: Default::default(),
             patience_s: None,
@@ -493,4 +502,45 @@ async fn gateway_with_fallback(
         async move { axum::serve(listener, build_router(state)).await.unwrap() }
     });
     (format!("http://{addr}"), state)
+}
+
+/// Free first spends the member whose model the user declared free before
+/// the one that spends allowance, even when the paid member is listed
+/// first and would answer: the reference's `FreeFirst` (#3054). The free
+/// member is asked, the paid one is not; with nothing declared free the
+/// same group behaves as ordered.
+#[tokio::test]
+async fn free_first_spends_the_declared_free_member_before_the_paid_one() {
+    let paid = Member::new(Duration::ZERO);
+    let free = Member::new(Duration::ZERO);
+    let mut paid_provider = provider("paid", upstream(paid.clone()).await);
+    let mut free_provider = provider("free", upstream(free.clone()).await);
+    free_provider.free_models = vec!["mock-model".into()];
+    paid_provider.free_models = Vec::new();
+
+    let (url, _state) = gateway_routed(
+        vec![paid_provider.clone(), free_provider.clone()],
+        RoutingPolicy::FreeFirst,
+    )
+    .await;
+    let (status, _, body) = ask(url.clone(), "group/g").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(free.asked(), 1);
+    assert_eq!(paid.asked(), 0);
+
+    // Nothing declared free: the pool behaves as ordered and the paid
+    // member, listed first, answers.
+    let paid = Member::new(Duration::ZERO);
+    let other = Member::new(Duration::ZERO);
+    let paid_provider = provider("paid", upstream(paid.clone()).await);
+    let other_provider = provider("other", upstream(other.clone()).await);
+    let (url, _state) = gateway_routed(
+        vec![paid_provider, other_provider],
+        RoutingPolicy::FreeFirst,
+    )
+    .await;
+    let (status, _, body) = ask(url, "group/g").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(paid.asked(), 1);
+    assert_eq!(other.asked(), 0);
 }

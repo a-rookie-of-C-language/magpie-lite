@@ -191,6 +191,7 @@ fn provider(protocol: Protocol, url: String, model: &str) -> ProviderConfig {
         models: vec![model.into()],
         contexts: BTreeMap::new(),
         outputs: Default::default(),
+        free_models: Default::default(),
         fallback: Vec::new(),
         key_cooldown_ms: None,
         capabilities: Default::default(),

@@ -1328,12 +1328,18 @@ fn prepare(
             // affinity and usage count them as one group.
             let group_id = group.id.clone();
             let levels = group.levels.clone();
+            let free: Vec<bool> = group
+                .routes
+                .iter()
+                .map(|route| config.member_is_free(route))
+                .collect();
             let routes = key_rotation.group_order(
                 &group_id,
                 group.routing,
                 &group.routes,
                 &group.route_weights(),
                 &group.pick,
+                &free,
             );
             let Some((route_index, route)) =
                 routes.first().map(|(index, route)| (*index, route.clone()))
@@ -4986,6 +4992,7 @@ mod tests {
             models: vec![model.into()],
             contexts: Default::default(),
             outputs: Default::default(),
+            free_models: Default::default(),
             fallback: vec![],
             key_cooldown_ms: None,
             capabilities: Default::default(),

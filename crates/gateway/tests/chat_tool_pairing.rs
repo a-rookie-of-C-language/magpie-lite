@@ -244,6 +244,7 @@ async fn fixture() -> Fixture {
             models: vec!["mock-model".into()],
             contexts: Default::default(),
             outputs: Default::default(),
+            free_models: Default::default(),
             fallback: vec![],
             key_cooldown_ms: None,
             routing: RoutingPolicy::Rotate,

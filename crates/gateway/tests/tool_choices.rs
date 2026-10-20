@@ -290,6 +290,7 @@ impl Fixture {
                 models: vec!["up-model".into()],
                 contexts: Default::default(),
                 outputs: Default::default(),
+                free_models: Default::default(),
                 fallback: if index == 0 && protocols.len() > 1 {
                     vec!["p1/up-model".into()]
                 } else {

@@ -313,6 +313,7 @@ impl Fixture {
             models: vec!["up-model".into()],
             contexts: Default::default(),
             outputs: Default::default(),
+            free_models: Default::default(),
             fallback: vec![],
             key_cooldown_ms: None,
             capabilities: Default::default(),
@@ -3789,7 +3790,7 @@ async fn group_first_token_final_means_last_scheduled_candidate_not_last_configu
         if policy == RoutingPolicy::Rotate {
             f.state
                 .key_rotation
-                .group_order("daily", policy, &routes, &weights, "");
+                .group_order("daily", policy, &routes, &weights, "", &[]);
         } else {
             f.state
                 .key_rotation

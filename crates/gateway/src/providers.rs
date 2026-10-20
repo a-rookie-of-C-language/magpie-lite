@@ -37,6 +37,9 @@ pub(crate) struct ProviderEdit {
     contexts: Option<BTreeMap<String, u64>>,
     /// Omitted on update to preserve the existing Max outputs; `{}` clears them.
     outputs: Option<BTreeMap<String, u64>>,
+    /// Omitted on update to preserve the existing free models; `[]` clears them.
+    #[serde(default)]
+    free_models: Option<Vec<String>>,
     #[serde(default)]
     fallback: Vec<String>,
     key_cooldown_ms: Option<u64>,
@@ -99,6 +102,9 @@ impl ProviderEdit {
         let outputs = self
             .outputs
             .unwrap_or_else(|| existing.map(|p| p.outputs.clone()).unwrap_or_default());
+        let free_models = self
+            .free_models
+            .unwrap_or_else(|| existing.map(|p| p.free_models.clone()).unwrap_or_default());
         let affinity = self
             .affinity
             .unwrap_or_else(|| existing.map(|p| p.affinity).unwrap_or_default());
@@ -125,6 +131,7 @@ impl ProviderEdit {
             models: self.models,
             contexts,
             outputs,
+            free_models,
             fallback: self.fallback,
             key_cooldown_ms: self.key_cooldown_ms,
             routing,

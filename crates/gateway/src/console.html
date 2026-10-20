@@ -664,9 +664,10 @@
                 <div class="field"><label for="provider-models">Model IDs</label><textarea id="provider-models" class="token-input" placeholder="deepseek-chat&#10;deepseek-reasoner" aria-describedby="provider-models-help"></textarea><p id="provider-models-help" class="group-help">One upstream model ID per line. Listed models appear in the agent catalog; explicit provider/model routes also work for unlisted models.</p></div>
                 <div class="field"><label for="provider-contexts">Context windows (optional)</label><textarea id="provider-contexts" class="token-input" placeholder="deepseek-chat=131072&#10;deepseek-reasoner=65536" aria-describedby="provider-contexts-help"></textarea><p id="provider-contexts-help" class="group-help">One model=window in tokens per line. A routing group leaves out a member whose known window cannot hold the request, instead of asking it and failing there. A model without a window is always tried.</p></div>
                 <div class="field"><label for="provider-outputs">Max outputs (optional)</label><textarea id="provider-outputs" class="token-input" placeholder="claude-sonnet-4-5=32000&#10;gpt-5-mini=16384" aria-describedby="provider-outputs-help"></textarea><p id="provider-outputs-help" class="group-help">One model=limit in tokens per line. A request naming more is lowered to it on any route, and an unnamed limit headed for Anthropic's API is filled with it. A model without a limit is sent as the agent asked.</p></div>
+                <div class="field"><label for="provider-free-models">Free models (optional)</label><textarea id="provider-free-models" class="token-input" placeholder="deepseek-v4.1-flash&#10;glm-5.3" aria-describedby="provider-free-models-help"></textarea><p id="provider-free-models-help" class="group-help">One model ID per line. Declare the models this vendor serves at no cost to your allowance or credits; the Free first routing spends them before the paid ones. A model not listed here counts as paid.</p></div>
                 <div class="field"><label for="provider-key-mode">API keys</label><select id="provider-key-mode" class="token-input" aria-describedby="provider-key-help"><option value="keep">Keep existing keys</option><option value="replace">Replace key pool</option><option value="clear">No upstream authentication</option></select><p id="provider-key-help" class="group-help">Saved keys are never displayed. Choose Replace to rotate credentials, or No upstream authentication for a local service.</p></div>
                 <div id="provider-keys-field" class="field" hidden><label for="provider-keys">New key pool</label><textarea id="provider-keys" class="token-input" autocomplete="off" spellcheck="false" aria-describedby="provider-keys-help"></textarea><p id="provider-keys-help" class="group-help">One API key per line, in rotation order. These values are sent when you save, discover models or test a connection.</p></div>
-                <div class="field"><label for="provider-routing">Key routing</label><select id="provider-routing" class="token-input" aria-describedby="provider-routing-help"><option value="rotate">Rotate</option><option value="order">Ordered</option><option value="usage">Least used</option><option value="weight">Weighted</option></select><p id="provider-routing-help" class="group-help">Rotate spreads requests across the key pool, the default. Ordered always starts at the first key. Least used prefers the key that served the fewest tokens lately. Weighted spreads by each key's weight.</p></div>
+                <div class="field"><label for="provider-routing">Key routing</label><select id="provider-routing" class="token-input" aria-describedby="provider-routing-help"><option value="rotate">Rotate</option><option value="order">Ordered</option><option value="usage">Least used</option><option value="free_first">Free first</option><option value="weight">Weighted</option></select><p id="provider-routing-help" class="group-help">Rotate spreads requests across the key pool, the default. Ordered always starts at the first key. Least used prefers the key that served the fewest tokens lately. Free first keeps keys in order (one provider serves one model). Weighted spreads by each key's weight.</p></div>
                 <div class="field"><label for="provider-affinity">Conversation affinity</label><select id="provider-affinity" class="token-input" aria-describedby="provider-affinity-help"><option value="auto">Auto</option><option value="session">Whole session</option><option value="turn">Within a turn</option><option value="off">Off</option></select><p id="provider-affinity-help" class="group-help">Keep a conversation on the key that answered it so the vendor's prompt cache keeps hitting. Auto follows the key routing: rotate spreads load, everything else sticks by conversation.</p></div>
                 <div id="provider-weights-field" class="field" hidden><label for="provider-weights">Key weights</label><textarea id="provider-weights" class="token-input" placeholder="3&#10;1&#10;4" aria-describedby="provider-weights-help"></textarea><p id="provider-weights-help" class="group-help">One weight per key slot, in pool order, each a whole number from 0 to 1000. A missing or zero weight counts as 1.</p></div>
                 <div class="field"><label for="provider-limits">Per-key concurrency limits (optional)</label><textarea id="provider-limits" class="token-input" placeholder="5&#10;2" aria-describedby="provider-limits-help"></textarea><p id="provider-limits-help" class="group-help">One limit per key slot, in pool order, each a whole number from 0 to 1000 (0 for no limit on that key). A missing entry takes Max concurrency per key.</p></div>
@@ -717,7 +718,7 @@
                 <div class="field"><label for="group-id">Group ID</label><input id="group-id" class="token-input" required pattern="[A-Za-z0-9_-]+" placeholder="daily-coding" aria-describedby="group-id-help"><p id="group-id-help" class="group-help">Letters, digits, hyphens and underscores. Agents use group/&lt;id&gt;.</p></div>
                 <div class="field"><label for="group-name">Display name (optional)</label><input id="group-name" class="token-input" placeholder="Daily coding"></div>
                 <div class="field"><label for="group-routes">Routes in fallback order</label><textarea id="group-routes" class="token-input" required placeholder="deepseek/deepseek-chat&#10;kimi/moonshot-v1-128k" aria-describedby="group-routes-help"></textarea><p id="group-routes-help" class="group-help">One provider/model per line. The selected policy chooses the starting route; remaining routes are fallback candidates. A route can fix an effort on its member with a :level suffix (low, medium, high, ...): kimi/moonshot-v1-128k:high asks for high.</p><p id="group-providers" class="group-help"></p></div>
-                <div class="field"><label for="group-routing">Route policy</label><select id="group-routing" class="token-input" aria-describedby="group-routing-help"><option value="order">Ordered</option><option value="rotate">Rotate</option><option value="usage">Least used</option><option value="weight">Weighted</option><option value="manual">Manual</option></select><p id="group-routing-help" class="group-help">Ordered always starts at the first route. Rotate advances the starting route per request. Least used prefers routes with fewer attempts in this gateway process. Weighted spreads by each route's weight. Manual sends every request to the picked member; the others, and the rules, wait until another member is picked.</p></div>
+                <div class="field"><label for="group-routing">Route policy</label><select id="group-routing" class="token-input" aria-describedby="group-routing-help"><option value="order">Ordered</option><option value="rotate">Rotate</option><option value="usage">Least used</option><option value="free_first">Free first</option><option value="weight">Weighted</option><option value="manual">Manual</option></select><p id="group-routing-help" class="group-help">Ordered always starts at the first route. Rotate advances the starting route per request. Least used prefers routes with fewer attempts in this gateway process. Free first spends the routes whose model you declared free on its provider, then the rest, each in listed order. Weighted spreads by each route's weight. Manual sends every request to the picked member; the others, and the rules, wait until another member is picked.</p></div>
                 <div id="group-pick-field" class="field" hidden><label for="group-pick">Manual pick</label><input id="group-pick" class="token-input" list="agent-model-options" placeholder="deepseek/deepseek-chat" aria-describedby="group-pick-help" spellcheck="false"><p id="group-pick-help" class="group-help">One of the routes above, sent every request while the policy is manual. Blank keeps the first route; changing it later is one click on the group card.</p></div>
                 <div id="group-weights-field" class="field" hidden><label for="group-weights">Route weights</label><textarea id="group-weights" class="token-input" placeholder="3&#10;1&#10;4" aria-describedby="group-weights-help"></textarea><p id="group-weights-help" class="group-help">One weight per route, in route order, each a whole number from 0 to 1000. A missing weight counts as 1; 0 makes the route fallback-only.</p></div>
                 <div class="field"><label for="group-affinity">Conversation affinity</label><select id="group-affinity" class="token-input" aria-describedby="group-affinity-help"><option value="auto">Auto</option><option value="session">Whole session</option><option value="turn">Within a turn</option><option value="off">Off</option></select><p id="group-affinity-help" class="group-help">Keep a conversation on the route that answered it so the vendor's prompt cache keeps hitting. Auto follows the route policy: rotate spreads load, everything else sticks by conversation.</p></div>
@@ -806,8 +807,9 @@
       providerCapVision: document.getElementById("provider-cap-vision"),
       providerUrl: document.getElementById("provider-url"),
       providerModels: document.getElementById("provider-models"),
-  providerContexts: document.getElementById("provider-contexts"),
+      providerContexts: document.getElementById("provider-contexts"),
       providerOutputs: document.getElementById("provider-outputs"),
+      providerFreeModels: document.getElementById("provider-free-models"),
       providerKeyMode: document.getElementById("provider-key-mode"),
       providerKeysField: document.getElementById("provider-keys-field"),
       providerKeys: document.getElementById("provider-keys"),
@@ -1520,10 +1522,12 @@
         }
         const label = text("span", group.name || group.id, "model-owner");
         const weights = group.routing === "weight" ? ` · weights: ${(group.weights || []).join(", ")}` : "";
+        const freeCount = (group.free || []).filter(Boolean).length;
+        const free = group.routing === "free_first" ? ` · free: ${freeCount}/${(group.routes || []).length}` : "";
         const picked = group.routing === "manual" ? ` → ${group.pick || (group.routes || [])[0] || "—"}` : "";
         const found = group.auto ? " · found" : "";
         const patience = group.patience_s == null ? "" : ` · patience: ${group.patience_s < 0 ? "off" : group.patience_s + "s"}`;
-        const policy = text("span", `Policy: ${group.routing || "order"}${picked}${weights} · affinity: ${group.affinity || "auto"}${patience}${found}`, "model-owner");
+        const policy = text("span", `Policy: ${group.routing || "order"}${picked}${weights}${free} · affinity: ${group.affinity || "auto"}${patience}${found}`, "model-owner");
         if (group.auto) policy.title = "Magpie found this group: one model served by several providers. Editing it makes it yours; deleting hides it until brought back.";
         const rules = text("span", ruleSummary(group.rules || []), "model-owner");
         if (group.classifier) rules.textContent += ` · classifier: ${group.classifier}`;
@@ -1853,6 +1857,7 @@ ot folder ${rule.exceptFolders.join("|")}`);
       elements.providerModels.value = (provider?.models || []).join("\n");
       elements.providerContexts.value = Object.entries(provider?.contexts || {}).map(([model, window]) => model + "=" + window).join("\n");
       elements.providerOutputs.value = Object.entries(provider?.outputs || {}).map(([model, limit]) => model + "=" + limit).join("\n");
+      elements.providerFreeModels.value = (provider?.free_models || []).join("\n");
       elements.providerFallback.value = (provider?.fallback || []).join("\n");
       elements.providerRouting.value = provider?.routing || "rotate";
       elements.providerAffinity.value = provider?.affinity || "auto";
@@ -1884,6 +1889,7 @@ ot folder ${rule.exceptFolders.join("|")}`);
       elements.providerEditor.reset();
       elements.providerContexts.value = "";
       elements.providerOutputs.value = "";
+      elements.providerFreeModels.value = "";
       elements.providerKeys.value = "";
       elements.providerDiscoveredModels.replaceChildren();
       keyModeChanged();
@@ -2038,6 +2044,7 @@ ot folder ${rule.exceptFolders.join("|")}`);
         models: lines(elements.providerModels.value),
         contexts,
         outputs,
+        free_models: lines(elements.providerFreeModels.value),
         fallback: lines(elements.providerFallback.value),
         key_cooldown_ms: cooldown === "" ? null : Number(cooldown),
         max_concurrency: maxConcurrency.value,
