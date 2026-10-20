@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
@@ -21,6 +21,7 @@ use magpie_core::ir::{CompletionRequest, CompletionResponse, PartKind, Signature
 use magpie_core::stream::SignatureTarget;
 use magpie_core::stream::{SseParser, StreamEvent};
 use magpie_core::{anthropic, chat, gemini, responses};
+use regex::Regex;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -911,7 +912,51 @@ fn lane_failure(
 
 /// How many times a busy group's members are asked again at most,
 /// whatever patience is left (the reference's `replanRounds`, #1418).
-const MAX_REPLAN_ROUNDS: u32 = 6;
+/// The pauses alone (2s, 4s, 8s, 16s, then 30s) add up to the longest
+/// patience in 11 rounds, so a group set to wait 240s waits 240s.
+const MAX_REPLAN_ROUNDS: u32 = 12;
+
+/// Whether a vendor's answer is one a moment may mend: overloaded,
+/// unavailable, timed out, or a rate limit that isn't the plan's or the
+/// money's (the reference's `busy`, #1418). A proxy refusal, quota used
+/// up, response protection, a retired or refusing model, a blocked edge,
+/// or a conversation too long fails the same however often it is asked.
+fn busy(status: reqwest::StatusCode, body: &Value) -> bool {
+    let code = status.as_u16();
+    match code {
+        408 | 500 | 502 | 503 | 504 | 529 => {
+            !protection_refused(code, body)
+                && !credit_words().is_match(&body.to_string().to_lowercase())
+                && !model_retired(code, body)
+                && !model_refused(code, body)
+                && !shape_refused(code, body)
+                && !prompt_refused(code, body)
+                && !zdr_refused(code, body)
+                && !edge_blocked(body)
+                && !context_overflowed(code, body)
+        }
+        // A 429 naming the plan's credit or a spent balance stands; a
+        // short rate limit may be over in a moment.
+        429 => !credit_words().is_match(&body.to_string().to_lowercase()),
+        _ => false,
+    }
+}
+
+/// How a vendor says the money is gone, not that the moment is busy
+/// (the reference's `creditWords` with its `brokeWords`, #1418).
+fn credit_words() -> &'static Regex {
+    static CREDIT: OnceLock<Regex> = OnceLock::new();
+    CREDIT.get_or_init(|| {
+        Regex::new(r#"(?i)insufficient.?(balance|credit|fund)|balance|credit|billing|payment|arrear|overdue|suspended|insufficient_quota|余额|欠费|充值|账户.*(不足|停)"#)
+            .expect("credit words regex")
+    })
+}
+
+/// How long to wait before asking busy members again, longer each round:
+/// 2s, 4s, 8s, 16s, then 30s (the reference's `replan` pause, #1418).
+fn replan_pause(rounds: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(2u64.saturating_mul(1u64 << rounds.min(4)).min(30))
+}
 
 /// Wait, within `deadline`, for a lane slot or minute room on any route's
 /// key: polling `candidate_ready` the way the reference's replan waits
@@ -2193,11 +2238,13 @@ async fn send_with_fallback(
     // key in turn.
     let mut forbade: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // A group whose every member is busy asks them again as slots free,
-    // within its patience, instead of ending the turn on the first
-    // round's refusals (the reference's replan, #1418). Only rounds where
-    // no vendor was asked replan: a vendor's answer stands. A direct
-    // provider keeps today's fail-fast.
+    // A group whose every member failed in a way that passes — busy, or
+    // a vendor's transient overload — is asked again, within its
+    // patience, instead of ending the turn on the last one's error (the
+    // reference's replan, #1418). Only rounds where nothing stands
+    // replan: a final answer (a refusal, the plan's credit, a bad
+    // request) ends the turn however it is asked. A direct provider
+    // keeps today's fail-fast.
     let patience = group_plan
         .as_ref()
         .and_then(|plan| config.group(&plan.id))
@@ -2205,8 +2252,10 @@ async fn send_with_fallback(
         .unwrap_or(std::time::Duration::ZERO);
     let mut wait_from: Option<std::time::Instant> = None;
     let mut rounds = 0u32;
-    // Set false at each round's top, true once a vendor is asked.
-    let mut round_sent: bool;
+    // True at each round's top, false once a member fails in a way that
+    // stands: only an all-passing round is asked again.
+    // Set at each round's top, true unless a member fails finally.
+    let mut round_passing: bool;
 
     'replan: loop {
         let mut round_routes = routes.clone();
@@ -2214,7 +2263,7 @@ async fn send_with_fallback(
         // in (the reference asks laneMate again every round, #892).
         give_way_to_free_lanes(state, &mut round_routes);
         let last_route = round_routes.len().saturating_sub(1);
-        round_sent = false;
+        round_passing = true;
         'routes: for (route_index, route) in round_routes.into_iter().enumerate() {
             if let (Some(group_id), Some(group_route_index)) =
                 (&route.group_id, route.group_route_index)
@@ -2285,7 +2334,7 @@ async fn send_with_fallback(
                         // Every member busy and none asked: wait for a slot
                         // to free and ask the round again, while the group's
                         // patience lasts (the reference's replan, #1418).
-                        if !round_sent
+                        if round_passing
                             && rounds < MAX_REPLAN_ROUNDS
                             && patience > std::time::Duration::ZERO
                         {
@@ -2327,7 +2376,7 @@ async fn send_with_fallback(
                     // Every member busy and none asked: wait for a slot to
                     // free and ask the round again, while the group's patience
                     // lasts (the reference's replan, #1418).
-                    if !round_sent
+                    if round_passing
                         && rounds < MAX_REPLAN_ROUNDS
                         && patience > std::time::Duration::ZERO
                     {
@@ -2405,6 +2454,7 @@ async fn send_with_fallback(
                                 // upstream outage. Skip the entire key pool, with no
                                 // cooldown or network call, and try a compatible route.
                                 // Do not count a credential attempt: no HTTP request was sent.
+                                round_passing = false;
                                 if route_index != last_route {
                                     continue 'routes;
                                 }
@@ -2521,9 +2571,6 @@ async fn send_with_fallback(
                         )),
                         queued_ms,
                     );
-                    // A vendor saw this round: its answer stands, and no
-                    // later all-busy round asks the group again.
-                    round_sent = true;
                     let first_token =
                         GroupFirstToken::new(if creq.stream && route_index != last_route {
                             route
@@ -2572,6 +2619,7 @@ async fn send_with_fallback(
                                 ));
                             }
                             // No response headers: an endpoint timeout is not a bad key.
+                            round_passing = false;
                             break 'keys;
                         }
                         Ok(Err(e)) => {
@@ -2587,6 +2635,7 @@ async fn send_with_fallback(
                             }
                             // A connection-level failure belongs to the endpoint, not
                             // to one credential, so try the next route directly.
+                            round_passing = false;
                             break 'keys;
                         }
                     };
@@ -2653,6 +2702,7 @@ async fn send_with_fallback(
                                     && !stream_refusal::has_answer(protocol, &value, true))
                             {
                                 tracker.record_attempt(&route.provider.id, *key_slot, "refusal");
+                                round_passing = false;
                                 if route_index != last_route {
                                     break 'keys;
                                 }
@@ -2762,6 +2812,7 @@ async fn send_with_fallback(
                                 // Dropping prefetch cancels the held response. Slow starts
                                 // belong to this route, not a credential: skip its other
                                 // keys without cooldown. Only non-final routes have a cap.
+                                round_passing = false;
                                 break 'keys;
                             }
                         };
@@ -2777,6 +2828,7 @@ async fn send_with_fallback(
                             );
                             if failure.kind == FailureKind::Refusal {
                                 drop(events);
+                                round_passing = false;
                                 if route_index != last_route {
                                     break 'keys;
                                 }
@@ -2812,6 +2864,7 @@ async fn send_with_fallback(
                                 && (attempt + 1 < route.api_keys.len() || route_index != last_route)
                             {
                                 drop(events);
+                                round_passing = false;
                                 break 'keys;
                             }
                             if attempt + 1 < route.api_keys.len()
@@ -2832,7 +2885,33 @@ async fn send_with_fallback(
                                         std::time::SystemTime::now(),
                                     );
                                 }
+                                round_passing =
+                                    round_passing && busy(failure.status, &failure.body);
                                 break 'keys;
+                            }
+                            // The last member failed in a way that passes:
+                            // ask every member again after a pause, within
+                            // the group's patience (the reference's replan,
+                            // #1418). A streaming agent sees nothing yet:
+                            // the held prefetch is dropped unsent.
+                            if route_index == last_route
+                                && failure.kind == FailureKind::Upstream
+                                && round_passing
+                                && busy(failure.status, &failure.body)
+                                && rounds < MAX_REPLAN_ROUNDS
+                                && patience > std::time::Duration::ZERO
+                            {
+                                let now = std::time::Instant::now();
+                                let start = *wait_from.get_or_insert(now);
+                                let floor = replan_pause(rounds);
+                                let pause =
+                                    floor.max(quota_cooldown(&headers, Some(&failure.body), floor));
+                                if now + pause <= start + patience {
+                                    drop(events);
+                                    tokio::time::sleep(pause).await;
+                                    rounds += 1;
+                                    continue 'replan;
+                                }
                             }
                         } else {
                             tracker.record_attempt(&route.provider.id, *key_slot, "ok");
@@ -2867,6 +2946,7 @@ async fn send_with_fallback(
                     };
                     if stream_refusal::policy_error(&error.body) {
                         tracker.record_attempt(&route.provider.id, *key_slot, "refusal");
+                        round_passing = false;
                         if route_index != last_route {
                             break 'keys;
                         }
@@ -3050,6 +3130,7 @@ async fn send_with_fallback(
                         && !forbade.insert(route.provider.id.clone())
                         && (attempt + 1 < route.api_keys.len() || route_index != last_route)
                     {
+                        round_passing = false;
                         break 'keys;
                     }
                     if attempt + 1 < route.api_keys.len() && key_retryable_status(status) {
@@ -3065,6 +3146,7 @@ async fn send_with_fallback(
                                 std::time::SystemTime::now(),
                             );
                         }
+                        round_passing = round_passing && busy(status, &error.body);
                         break 'keys;
                     }
                     if edge_blocked(&error.body) || edge_blocked_text(&detail) {
@@ -3084,6 +3166,25 @@ async fn send_with_fallback(
                             asked,
                             detail,
                         );
+                    }
+                    // The last member failed in a way that passes: ask
+                    // every member again after a pause, within the group's
+                    // patience (the reference's replan, #1418).
+                    if route_index == last_route
+                        && round_passing
+                        && busy(status, &error.body)
+                        && rounds < MAX_REPLAN_ROUNDS
+                        && patience > std::time::Duration::ZERO
+                    {
+                        let now = std::time::Instant::now();
+                        let start = *wait_from.get_or_insert(now);
+                        let floor = replan_pause(rounds);
+                        let pause = floor.max(quota_cooldown(&headers, Some(&error.body), floor));
+                        if now + pause <= start + patience {
+                            tokio::time::sleep(pause).await;
+                            rounds += 1;
+                            continue 'replan;
+                        }
                     }
                     let status =
                         StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -4796,5 +4897,57 @@ mod tests {
             .unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["error"]["status"], "INVALID_ARGUMENT");
+    }
+
+    /// A vendor's momentary failure passes; a final answer stands (the
+    /// reference's `busy`, #1418).
+    #[test]
+    fn busy_passes_transient_vendor_failures_only() {
+        let plain = || json!({"error": {"message": "boom"}});
+        for status in [408, 500, 502, 503, 504, 529] {
+            assert!(
+                busy(StatusCode::from_u16(status).unwrap(), &plain()),
+                "status {status} passes"
+            );
+        }
+        // Final answers fail the same however often they are asked.
+        let standing: Vec<(u16, Value)> = vec![
+            (
+                503,
+                json!({"error": {"message": "response protection is unavailable"}}),
+            ),
+            (
+                503,
+                json!({"error": {"message": "insufficient credit balance"}}),
+            ),
+            (429, json!({"error": {"code": "insufficient_quota"}})),
+            (
+                429,
+                json!({"error": {"message": "balance exhausted, please recharge"}}),
+            ),
+            (404, json!({"error": {"message": "not found"}})),
+            (400, json!({"error": {"message": "bad request"}})),
+        ];
+        for (status, body) in standing {
+            assert!(
+                !busy(StatusCode::from_u16(status).unwrap(), &body),
+                "status {status} stands: {body}"
+            );
+        }
+        // A short rate limit passes; the money gone stands.
+        assert!(busy(
+            StatusCode::TOO_MANY_REQUESTS,
+            &json!({"error": {"type": "rate_limit_error", "message": "slow down"}})
+        ));
+    }
+
+    /// Pauses grow 2s, 4s, 8s, 16s, then stay at 30s (the reference's
+    /// replan pause, #1418).
+    #[test]
+    fn replan_pause_grows_then_holds() {
+        let secs: Vec<u64> = (0..8)
+            .map(|rounds| replan_pause(rounds).as_secs())
+            .collect();
+        assert_eq!(secs, vec![2, 4, 8, 16, 30, 30, 30, 30]);
     }
 }

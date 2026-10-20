@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::body::Body;
+use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, extract::State, routing::post};
 use magpie_gateway::{
     AppState, Config, ConfigStore, GroupConfig, Protocol, ProviderConfig, RoutingPolicy,
@@ -1795,5 +1797,228 @@ async fn a_group_out_of_patience_answers_429_while_busy() {
         asked.load(Ordering::SeqCst),
         2,
         "the refused request never went upstream"
+    );
+}
+
+/// A vendor that is overloaded once, then serves: records the ask,
+/// answers 503 (a held SSE overload for stream asks when told to, or a
+/// credit 429), then hello.
+#[derive(Clone)]
+struct FlakyMember {
+    asked: Arc<AtomicUsize>,
+    fail_first_stream: bool,
+    credit_first: bool,
+}
+
+async fn flaky_chat(State(member): State<FlakyMember>, Json(body): Json<Value>) -> Response {
+    let n = member.asked.fetch_add(1, Ordering::SeqCst);
+    let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    if n == 0 && member.credit_first {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": {"message": "insufficient credit balance, please recharge"}})),
+        )
+            .into_response();
+    }
+    if n == 0 {
+        if streaming && member.fail_first_stream {
+            // A held stream failure: nothing visible went out, so the
+            // round may be asked again within patience.
+            return Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Body::from(
+                    "data: {\"error\":{\"code\":503,\"message\":\"overloaded\"}}\n\n",
+                ))
+                .unwrap();
+        }
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": {"message": "overloaded"}})),
+        )
+            .into_response();
+    }
+    if streaming {
+        return Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from(concat!(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n",
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            )))
+            .unwrap();
+    }
+    Json(json!({
+        "id": "chatcmpl-mock",
+        "object": "chat.completion",
+        "model": "mock-model",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "hello"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    }))
+    .into_response()
+}
+
+/// A gateway whose only group `g` holds one flaky member, with the
+/// patience given.
+async fn flaky_gateway(
+    patience_s: Option<i64>,
+    fail_first_stream: bool,
+    credit_first: bool,
+) -> (String, Arc<AtomicUsize>) {
+    let member = FlakyMember {
+        asked: Arc::new(AtomicUsize::new(0)),
+        fail_first_stream,
+        credit_first,
+    };
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn({
+        let member = member.clone();
+        async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(flaky_chat))
+                    .with_state(member),
+            )
+            .await
+            .unwrap()
+        }
+    });
+    let config = Config {
+        provider: vec![patient_provider(format!("http://{addr}/v1"))],
+        group: vec![GroupConfig {
+            id: "g".into(),
+            name: "G".into(),
+            routes: vec!["solo/mock-model".into()],
+            rules: Vec::new(),
+            classifier: String::new(),
+            effort: String::new(),
+            levels: Vec::new(),
+            pick: String::new(),
+            auto: false,
+            weights: Vec::new(),
+            routing: RoutingPolicy::Order,
+            first_token_timeout_ms: 0,
+            affinity: Default::default(),
+            patience_s,
+        }],
+        ..Config::default()
+    };
+    let state = Arc::new(AppState {
+        agents: None,
+        config: ConfigStore::new(config, None),
+        http: magpie_gateway::upstream::http_client().unwrap(),
+        requests: Arc::new(Mutex::new(magpie_gateway::usage::RequestLog::default())),
+        key_rotation: magpie_gateway::KeyRotator::default(),
+        affinity: magpie_gateway::AffinityStore::default(),
+        lanes: magpie_gateway::lanes::Lanes::default(),
+        rpms: magpie_gateway::lanes::Rpms::default(),
+    });
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn({
+        let state = state.clone();
+        async move { axum::serve(listener, build_router(state)).await.unwrap() }
+    });
+    (format!("http://{addr}"), member.asked)
+}
+
+async fn flaky_ask(gateway: String, model: &str, stream: bool) -> (StatusCode, String) {
+    let resp = Client::new()
+        .post(format!("{gateway}/v1/chat/completions"))
+        .bearer_auth("magpie-lite")
+        .json(&json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": stream,
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    (status, body)
+}
+
+/// A group whose only member answers 503 once serves on the ask again
+/// within its patience, instead of ending on the overload (the
+/// reference's replan, #1418).
+#[tokio::test]
+async fn a_transient_overload_is_asked_again_and_served() {
+    let (gw, asked) = flaky_gateway(None, false, false).await;
+    let (status, body) = flaky_ask(gw, "group/g", false).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("hello"), "{body}");
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        2,
+        "the overloaded round reached the vendor again"
+    );
+}
+
+/// A held stream overload asks the round again too: the prefetch held
+/// nothing visible, so nothing was lost (the reference's replan, #1418).
+#[tokio::test]
+async fn a_held_stream_overload_is_asked_again_and_served() {
+    let (gw, asked) = flaky_gateway(None, true, false).await;
+    let (status, body) = flaky_ask(gw, "group/g", true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("hello"), "{body}");
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        2,
+        "the overloaded stream reached the vendor again"
+    );
+}
+
+/// The money gone is final: a credit 429 stands without the round being
+/// asked again (the reference's `busy`, #1418).
+#[tokio::test]
+async fn a_credit_429_stands_without_being_asked_again() {
+    let (gw, asked) = flaky_gateway(None, false, true).await;
+    let (status, body) = flaky_ask(gw, "group/g", false).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        1,
+        "the credit refusal never reached the vendor again"
+    );
+}
+
+/// A pause past the group's patience stands on the first answer: the
+/// wait never outlasts what the group allows (the reference's replan,
+/// #1418).
+#[tokio::test]
+async fn an_overload_beyond_patience_stands_on_the_first_answer() {
+    let (gw, asked) = flaky_gateway(Some(1), false, false).await;
+    let (status, body) = flaky_ask(gw, "group/g", false).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        1,
+        "the out-of-patience overload never reached the vendor again"
+    );
+}
+
+/// A direct provider keeps today's fail-fast on a transient overload:
+/// no group, no patience, no ask again (the reference's replan is a
+/// group behavior, #1418).
+#[tokio::test]
+async fn a_direct_provider_keeps_fail_fast_on_transient_overload() {
+    let (gw, asked) = flaky_gateway(None, false, false).await;
+    let (status, body) = flaky_ask(gw, "solo/mock-model", false).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        1,
+        "the direct ask never reached the vendor again"
     );
 }
