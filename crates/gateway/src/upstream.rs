@@ -178,6 +178,11 @@ pub async fn send_at(
         }
     };
     req = authenticate(req, p.protocol, api_key);
+    // The Cline API answers its free models 403 without the desktop
+    // app's headers (the reference's `ClineClient`, `cline.go`). The
+    // headers ride on the effective base, so a continuation's base
+    // override decides too; any other host's request is untouched.
+    req = crate::cline::apply_cline_headers(req, base);
 
     let resp = req.json(body).send().await?;
     Ok(resp)

@@ -4,6 +4,7 @@ pub mod affinity;
 pub mod agents;
 mod billing;
 pub mod classify;
+pub mod cline;
 pub mod config;
 pub mod config_store;
 mod continuation;

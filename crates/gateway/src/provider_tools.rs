@@ -176,7 +176,11 @@ async fn catalog(
                 cursor,
             )]);
         }
-        let response = upstream::authenticate(request, provider.protocol, key)
+        // A Cline catalog check is answered like the desktop app's own
+        // asks; any other host's request is untouched (`cline.go`).
+        let request = upstream::authenticate(request, provider.protocol, key);
+        let request = crate::cline::apply_cline_headers(request, &provider.base_url);
+        let response = request
             .send()
             .await
             .map_err(|error| (network(error), false))?;
