@@ -2,7 +2,7 @@
 
 Updated: 2026-10-20. Reference checkout: `D:\code\magpie` at `79160455`
 (30 commits past the prior baseline `b641868e`); `origin/main`
-triaged through `2374ffe1` (twelfth pass: Codex client tool-search relay ported (docs/tool-search.md); eleventh pass: no new upstream commits; unportable file_id images refused; tenth pass: no new upstream commits; text-only image gating added; ninth pass: no new upstream commits; user-sent image loopback evidence added; eighth pass: the RPM cancel ordering fix is
+triaged through `2374ffe1` (thirteenth pass: origin/main static, nothing portable; magpie-core now `-D warnings` clean under the current clippy; gateway-wide `-D warnings` stays red on pre-existing lints; twelfth pass: Codex client tool-search relay ported (docs/tool-search.md); eleventh pass: no new upstream commits; unportable file_id images refused; tenth pass: no new upstream commits; text-only image gating added; ninth pass: no new upstream commits; user-sent image loopback evidence added; eighth pass: the RPM cancel ordering fix is
 ported as a drop guard, the rest still nothing portable: two Go gateway
 allocation optimizations and a GUI Routing canvas fix;
 `routing-context-fold` stays GUI-only, `agent-connect`/`ui-previews`
@@ -1044,3 +1044,17 @@ a Responses-client × Chat/Anthropic/Gemini/Responses-upstream JSON/SSE
 loopback test (`crates/gateway/tests/tool_search.rs`). History id
 normalization, ChatGPT-backend detection, and gateway-executed search
 are intentionally not ported; see docs/tool-search.md.
+
+### Upstream refresh, thirteenth pass (`2374ffe1`, static)
+
+No new upstream commits; `origin/main` still ends at `2374ffe1`. The
+pass keeps the shared core warning-clean under the current toolchain
+(clippy 1.98: `byte_char_slices`, `question_mark`, `collapsible_if` in
+`crates/core/src/responses.rs`; `cargo clippy -p magpie-core
+--all-targets -- -D warnings` green, `cargo test -p magpie-core`
+green). Gateway-wide `-D warnings` stays red on pre-existing lints in
+untouched files (`server.rs`, `affinity.rs`, `classify.rs`,
+`config.rs`, `continuation.rs`, schemas, `rules.rs`,
+`reply_room.rs`, `tool_schema.rs`, plus test-only
+`type_complexity`/`needless_lifetimes`): signature and structural
+refactors with behavior risk, deliberately left alone.

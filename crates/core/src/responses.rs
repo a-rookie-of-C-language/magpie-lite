@@ -108,7 +108,7 @@ impl CustomInputStream {
                         self.last_key = String::new();
                         // `key` still holds the closing quote it ended on.
                         if let Ok(key) = serde_json::from_slice::<String>(
-                            &[&[b'"'][..], self.key.as_slice()].concat(),
+                            &[b"\"".as_slice(), self.key.as_slice()].concat(),
                         ) {
                             self.last_key = key;
                         }
@@ -215,9 +215,7 @@ fn unescape(bytes: &[u8]) -> Option<(String, usize)> {
                     if bytes.len() < 12 {
                         return None;
                     }
-                    let Some(second) = hex4(&bytes[8..12]) else {
-                        return None;
-                    };
+                    let second = hex4(&bytes[8..12])?;
                     if !(0xDC00..0xE000).contains(&second) {
                         return Some(("\u{FFFD}".to_owned(), 6));
                     }
@@ -1605,10 +1603,10 @@ impl ResponsesStreamDecoder {
             "response.function_call_arguments.done" => {
                 let index = output_index(v);
                 let done = v.get("arguments").and_then(Value::as_str);
-                if let (Some(call), Some(arguments)) = (self.calls.get_mut(&index), done) {
-                    if !arguments.is_empty() {
-                        call.full = arguments.to_owned();
-                    }
+                if let (Some(call), Some(arguments)) = (self.calls.get_mut(&index), done)
+                    && !arguments.is_empty()
+                {
+                    call.full = arguments.to_owned();
                 }
                 Vec::new()
             }
