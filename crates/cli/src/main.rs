@@ -284,8 +284,8 @@ enum ProviderCommand {
         /// Seconds a request may wait in a key's queue or for room in its minute.
         #[arg(long)]
         queue_wait_s: Option<u32>,
-        /// Pin DeepSeek models to DeepSeek's own API on a Cline host
-        /// (`providerOptions.gateway.only` on the Chat body).
+        /// Pin DeepSeek and GLM models to their maker's own API on a Cline host
+        /// (`providerOptions.gateway.only` on the Chat body: DeepSeek's, Z.ai's).
         #[arg(long)]
         pin_upstream: bool,
         /// Make this the provider for models that name none.
@@ -515,7 +515,7 @@ async fn main() -> Result<()> {
                         println!("               ↳ fallback {route}");
                     }
                     if p.pin_upstream {
-                        println!("               ↳ pin DeepSeek models to DeepSeek's API");
+                        println!("               ↳ pin DeepSeek and GLM models to their own API");
                     }
                 }
             }

@@ -67,14 +67,22 @@ pub fn apply_cline_headers(
     request
 }
 
-/// Pin a DeepSeek model to DeepSeek's own API on the Cline API: a Chat
-/// request for one from a pinning provider carries
-/// `providerOptions.gateway.only: ["deepseek"]`, which Cline's AI
-/// gateway reads to serve the model from that host alone (the
-/// reference's `clinePin`, as ClinePass + ProviderPin set it). Anything
-/// else — another protocol, an unpinned provider, another host, a
-/// free model (served where Cline puts it), a non-DeepSeek model, or a
-/// body already naming `providerOptions` — goes through untouched.
+/// The start of a model name and its maker's own upstream on Cline's AI
+/// gateway (Vercel's AI Gateway, whose provider slugs these are).
+const MAKERS: [(&str, &str); 2] = [
+    ("deepseek", "deepseek"),
+    ("glm", "zai"), // sdytman on Discord: GLM only through Z.ai
+];
+
+/// Pin a DeepSeek or GLM model to its maker's own API on the Cline API:
+/// a Chat request for one from a pinning provider carries
+/// `providerOptions.gateway.only: ["deepseek"]` (GLM: `["zai"]`), which
+/// Cline's AI gateway reads to serve the model from that host alone
+/// (the reference's `clinePin`, as ClinePass + ProviderPin set it).
+/// Anything else — another protocol, an unpinned provider, another
+/// host, a free model (served where Cline puts it), another maker's
+/// model, or a body already naming `providerOptions` — goes through
+/// untouched.
 pub fn pin_to_upstream(
     mut body: Value,
     base_url: &str,
@@ -88,10 +96,10 @@ pub fn pin_to_upstream(
     if model.starts_with("cline-free/") {
         return body;
     }
-    let name = model.rsplit('/').next().unwrap_or(model);
-    if !name.to_lowercase().starts_with("deepseek") {
+    let name = model.rsplit('/').next().unwrap_or(model).to_lowercase();
+    let Some((_, upstream)) = MAKERS.iter().find(|(prefix, _)| name.starts_with(prefix)) else {
         return body;
-    }
+    };
     let Some(object) = body.as_object_mut() else {
         return body;
     };
@@ -100,7 +108,7 @@ pub fn pin_to_upstream(
     }
     object.insert(
         "providerOptions".into(),
-        json!({"gateway": {"only": ["deepseek"]}}),
+        json!({"gateway": {"only": [upstream]}}),
     );
     body
 }
@@ -279,8 +287,12 @@ mod tests {
         json!({"model": model, "messages": [{"role": "user", "content": "hi"}]})
     }
 
+    fn pinned_to(body: &Value, upstream: &str) -> bool {
+        body.get("providerOptions") == Some(&json!({"gateway": {"only": [upstream]}}))
+    }
+
     fn pinned(body: &Value) -> bool {
-        body.get("providerOptions") == Some(&json!({"gateway": {"only": ["deepseek"]}}))
+        pinned_to(body, "deepseek")
     }
 
     #[test]
@@ -302,8 +314,22 @@ mod tests {
     }
 
     #[test]
+    fn glm_models_pin_to_zai_on_a_pinning_cline_provider() {
+        for model in ["glm-5.3", "cline-pass/glm-5.3", "GLM-5.3"] {
+            let out = pin_to_upstream(
+                chat_body(model),
+                "https://api.cline.bot/api/v1",
+                true,
+                true,
+                model,
+            );
+            assert!(pinned_to(&out, "zai"), "{model}");
+        }
+    }
+
+    #[test]
     fn pinning_leaves_everything_else_untouched() {
-        // Free models are served where Cline puts them; other models,
+        // Free models are served where Cline puts them; other makers,
         // hosts, protocols and unpinned providers never pin.
         let cases = [
             (
@@ -313,7 +339,13 @@ mod tests {
                 true,
             ),
             (
-                "cline-pass/glm-5.3",
+                "cline-free/glm-5.3",
+                "https://api.cline.bot/api/v1",
+                true,
+                true,
+            ),
+            (
+                "cline-pass/qwen-max",
                 "https://api.cline.bot/api/v1",
                 true,
                 true,
@@ -334,7 +366,10 @@ mod tests {
         ];
         for (model, base, enabled, chat) in cases {
             let out = pin_to_upstream(chat_body(model), base, enabled, chat, model);
-            assert!(!pinned(&out), "{model} {base} {enabled} {chat}");
+            assert!(
+                !pinned(&out) && !pinned_to(&out, "zai"),
+                "{model} {base} {enabled} {chat}"
+            );
         }
     }
 
