@@ -2,7 +2,7 @@
 
 Updated: 2026-10-20. Reference checkout: `D:\code\magpie` at `79160455`
 (30 commits past the prior baseline `b641868e`); `origin/main`
-triaged through `2374ffe1` (eleventh pass: no new upstream commits; unportable file_id images refused; tenth pass: no new upstream commits; text-only image gating added; ninth pass: no new upstream commits; user-sent image loopback evidence added; eighth pass: the RPM cancel ordering fix is
+triaged through `2374ffe1` (twelfth pass: Codex client tool-search relay ported (docs/tool-search.md); eleventh pass: no new upstream commits; unportable file_id images refused; tenth pass: no new upstream commits; text-only image gating added; ninth pass: no new upstream commits; user-sent image loopback evidence added; eighth pass: the RPM cancel ordering fix is
 ported as a drop guard, the rest still nothing portable: two Go gateway
 allocation optimizations and a GUI Routing canvas fix;
 `routing-context-fold` stays GUI-only, `agent-connect`/`ui-previews`
@@ -1029,3 +1029,18 @@ dropped wait ends first and gives its place back, a wait that runs
 its course disarms the guard and keeps its count. Covered by a unit
 test (parked waiter aborted, `used` 2 → 1) and an aborted-handler
 loopback test, both red without the guard.
+
+### Upstream refresh, twelfth pass (`2374ffe1`, static)
+
+No new upstream commits; the pass ports the Codex client tool-search
+relay (`internal/gateway/toolsearch.go`, `responses.go` `callTo` /
+`searchFound` / `searchTidy` / `itemPrefix`, `toolsearch_test.go`,
+`search_call_ids_test.go`). Lite decodes the `tool_search` declaration
+as a plain function and its call/output history as a call/result with
+found tools flattened, and encodes model calls back as `tool_search_call`
+with `tsc_` ids and object arguments on non-streaming and streaming
+Responses paths. Covered by `responses::tool_search_tests` (3 unit) and
+a Responses-client × Chat/Anthropic/Gemini/Responses-upstream JSON/SSE
+loopback test (`crates/gateway/tests/tool_search.rs`). History id
+normalization, ChatGPT-backend detection, and gateway-executed search
+are intentionally not ported; see docs/tool-search.md.

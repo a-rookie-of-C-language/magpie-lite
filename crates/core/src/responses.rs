@@ -409,6 +409,7 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
 
     let mut messages: Vec<Message> = Vec::new();
     let input = v.get("input").unwrap_or(&Value::Null);
+    let mut found = Vec::new();
     match input {
         Value::String(s) => messages.push(Message {
             role: Role::User,
@@ -416,13 +417,20 @@ pub fn decode_request(v: &Value) -> Result<CompletionRequest> {
         }),
         Value::Array(items) => {
             for item in items {
-                decode_input_item(item, &mut messages)?;
+                decode_input_item(item, &mut messages, &mut found)?;
             }
         }
         _ => {}
     }
 
-    let tools = decode_tools(v.get("tools").and_then(Value::as_array))?;
+    let mut tools = decode_tools(v.get("tools").and_then(Value::as_array))?;
+    // A search result names the tools the model may call now; offer them
+    // under flat names, once, without disturbing client declarations.
+    for tool in found {
+        if !tools.iter().any(|t| t.name == tool.name) {
+            tools.push(tool);
+        }
+    }
 
     Ok(CompletionRequest {
         model,
@@ -502,6 +510,41 @@ fn set_call_namespace(item: &mut Value, namespace: &str) {
 /// request. History alone never marks a tool custom; declarations do.
 fn is_custom_call(tools: &[Tool], name: &str) -> bool {
     tools.iter().any(|tool| tool.name == name && tool.custom)
+}
+
+/// Whether the current request offers Codex's client-execution tool search.
+/// History alone never marks it; only a non-custom declaration does.
+fn has_tool_search(tools: &[Tool]) -> bool {
+    tools
+        .iter()
+        .any(|tool| tool.name == "tool_search" && !tool.custom)
+}
+
+/// Arguments for the tool_search_call Codex runs, as an object.
+/// Upstream carries the search as a plain function with a JSON string;
+/// Codex runs it with the parsed object, wrapping anything else so
+/// nothing is lost.
+fn search_arguments(args: &Value) -> Value {
+    match args {
+        Value::Object(_) => args.clone(),
+        Value::String(s) => parse_search_string(s),
+        Value::Null => json!({}),
+        _ => json!({"input": args.to_string()}),
+    }
+}
+
+/// Parse streamed or string search arguments into the object Codex runs.
+fn parse_search_string(s: &str) -> Value {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return json!({});
+    }
+    if trimmed.starts_with('{')
+        && let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed)
+    {
+        return Value::Object(map);
+    }
+    json!({"input": s.to_owned()})
 }
 
 /// Decode a streamed Responses function-call identity into the shared IR.
@@ -660,6 +703,37 @@ fn decode_tools(tools: Option<&Vec<Value>>) -> Result<Vec<Tool>> {
                     }
                 }
             }
+            // Codex's client-execution tool search. The model is offered it
+            // as the plain function it is; a call back to it is rendered as
+            // the tool_search_call Codex runs. Lite never serves the ChatGPT
+            // backend, so every Responses upstream gets the function form.
+            "tool_search" => {
+                if tool
+                    .get("execution")
+                    .and_then(Value::as_str)
+                    .is_some_and(|execution| execution != "client")
+                {
+                    continue;
+                }
+                if !seen.insert("tool_search".to_owned()) {
+                    return Err(CoreError::Invalid {
+                        field: "tools",
+                        detail: "duplicate tool name".into(),
+                    });
+                }
+                out.push(Tool {
+                    name: "tool_search".to_owned(),
+                    namespace: None,
+                    description: tool
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    parameters: tool.get("parameters").cloned().unwrap_or_else(|| json!({})),
+                    custom: false,
+                    strict: false,
+                });
+            }
             _ => {}
         }
     }
@@ -691,8 +765,107 @@ fn native_reasoning(p: &Part) -> Option<Value> {
         .cloned()
 }
 
+/// What a Codex tool search's result tells the model: the tools it may
+/// call now, by the flat names they are offered under.
+fn search_found_text(names: &[String]) -> String {
+    if names.is_empty() {
+        "No tools matched the search.".to_owned()
+    } else {
+        format!(
+            "These tools are now available to call: {}",
+            names.join(", ")
+        )
+    }
+}
+
+/// Tools a Codex tool search found, offered under flat `ns__name` names
+/// with `defer_loading` dropped. Unlike client declarations these come
+/// from vendor output: unparseable or duplicate entries are skipped,
+/// never request errors.
+fn push_found_tools(items: Option<&Vec<Value>>, found: &mut Vec<Tool>) {
+    for item in items.into_iter().flatten() {
+        match item.get("type").and_then(Value::as_str) {
+            Some("function") => {
+                let Some(name) = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                else {
+                    continue;
+                };
+                if found.iter().any(|tool| tool.name == name) {
+                    continue;
+                }
+                found.push(Tool {
+                    name: name.to_owned(),
+                    namespace: None,
+                    description: item
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    parameters: item.get("parameters").cloned().unwrap_or_else(|| json!({})),
+                    custom: false,
+                    strict: false,
+                });
+            }
+            Some("namespace") => {
+                let (Some(namespace), Some(nested)) = (
+                    item.get("name").and_then(Value::as_str),
+                    item.get("tools").and_then(Value::as_array),
+                ) else {
+                    continue;
+                };
+                if namespace.is_empty() {
+                    continue;
+                }
+                for child in nested {
+                    if child.get("type").and_then(Value::as_str) != Some("function") {
+                        continue;
+                    }
+                    let Some(child_name) = child
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.is_empty())
+                    else {
+                        continue;
+                    };
+                    let name = flat_name(namespace, child_name);
+                    if found.iter().any(|tool| tool.name == name) {
+                        continue;
+                    }
+                    found.push(Tool {
+                        name,
+                        namespace: Some(namespace.to_owned()),
+                        description: child
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        parameters: child
+                            .get("parameters")
+                            .cloned()
+                            .unwrap_or_else(|| json!({})),
+                        custom: false,
+                        strict: false,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// One item of a Responses `input` array onto the message list.
-fn decode_input_item(item: &Value, messages: &mut Vec<Message>) -> Result<()> {
+///
+/// Tools a Codex tool search found ride in its output, not in `tools`;
+/// they are collected into `found` and merged into the request's tools by
+/// the caller.
+fn decode_input_item(
+    item: &Value,
+    messages: &mut Vec<Message>,
+    found: &mut Vec<Tool>,
+) -> Result<()> {
     let ty = item.get("type").and_then(Value::as_str).unwrap_or_default();
     match ty {
         "message" | "" => {
@@ -830,6 +1003,43 @@ fn decode_input_item(item: &Value, messages: &mut Vec<Message>) -> Result<()> {
             messages.push(Message {
                 role: Role::User,
                 parts: vec![result],
+            });
+        }
+        // Codex runs its tool search itself ("execution": "client"): the
+        // search and its result read as a call and its result, and the
+        // tools found are offered to the model under flat names.
+        "tool_search_call" => {
+            let args = match item.get("arguments") {
+                Some(Value::String(s)) => {
+                    serde_json::from_str(s).unwrap_or(Value::String(s.clone()))
+                }
+                Some(arguments) => arguments.clone(),
+                None => json!({}),
+            };
+            messages.push(Message {
+                role: Role::Assistant,
+                parts: vec![Part::tool_call(
+                    item.get("call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    "tool_search",
+                    args,
+                )],
+            });
+        }
+        "tool_search_output" => {
+            let before = found.len();
+            push_found_tools(item.get("tools").and_then(Value::as_array), found);
+            let names: Vec<String> = found[before..].iter().map(|t| t.name.clone()).collect();
+            messages.push(Message {
+                role: Role::User,
+                parts: vec![Part::tool_result(
+                    item.get("call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    search_found_text(&names),
+                    false,
+                )],
             });
         }
         "reasoning" => messages.push(Message {
@@ -1305,7 +1515,13 @@ fn encode_response_with_bindings(
             PartKind::ToolCall => {
                 let namespace = bindings.resolve(&p.name, p.namespace.as_deref());
                 let name = wire_name(&p.name, namespace);
-                if is_custom_call(tools, &p.name) {
+                // The model called Codex's client-execution tool search: it
+                // goes back as the tool_search_call Codex runs, with its
+                // arguments as an object. Upstream bodies always carry the
+                // function form (lite never serves the ChatGPT backend).
+                if p.name == "tool_search" && p.namespace.is_none() && has_tool_search(tools) {
+                    output.push(json!({"type":"tool_search_call","id":format!("tsc_{}", response_id()),"call_id":p.id,"execution":"client","arguments":search_arguments(&p.args),"status":"completed"}));
+                } else if is_custom_call(tools, &p.name) {
                     let mut call = json!({"type":"custom_tool_call","id":format!("ctc_{}", response_id()),"call_id":p.id,"name":name,"input":custom_input(&p.args),"status":"completed"});
                     if let Some(namespace) = namespace {
                         set_call_namespace(&mut call, namespace);
@@ -1854,6 +2070,8 @@ struct ToolItem {
     namespace: Option<String>,
     /// Whether this call belongs to a declared custom (free-form) tool.
     custom: bool,
+    /// Whether this call is Codex's client-execution tool search.
+    search: bool,
     args: String,
     /// Reads a custom tool's input out of its function-shaped arguments.
     input: CustomInputStream,
@@ -1878,6 +2096,7 @@ pub struct ResponsesStreamEncoder {
     tools: HashMap<usize, ToolItem>,
     namespaces: NamespaceBindings,
     customs: HashSet<String>,
+    search: bool,
     output: Vec<Value>,
     usage: Usage,
     stop_reason: Option<StopReason>,
@@ -1900,6 +2119,7 @@ impl ResponsesStreamEncoder {
             tools: HashMap::new(),
             namespaces: NamespaceBindings::default(),
             customs: HashSet::new(),
+            search: false,
             output: Vec::new(),
             usage: Usage::default(),
             stop_reason: None,
@@ -1918,6 +2138,7 @@ impl ResponsesStreamEncoder {
             .filter(|tool| tool.custom)
             .map(|tool| tool.name.clone())
             .collect();
+        encoder.search = has_tool_search(&req.tools);
         encoder
     }
 
@@ -2197,7 +2418,17 @@ impl ResponsesStreamEncoder {
                 out.push_str(&self.close_message());
                 out.push_str(&self.close_reasoning());
                 let custom = self.customs.contains(name);
-                let item_id = self.next_id(if custom { "ctc" } else { "fc" });
+                // The model called Codex's client-execution tool search: it
+                // goes back as the tool_search_call Codex runs. Deltas stay
+                // function-shaped, as the relayed upstream stream keeps them.
+                let search = name == "tool_search" && namespace.is_none() && self.search && !custom;
+                let item_id = self.next_id(if custom {
+                    "ctc"
+                } else if search {
+                    "tsc"
+                } else {
+                    "fc"
+                });
                 let output_index = self.next_index;
                 self.next_index += 1;
                 let valid_namespace = self
@@ -2212,6 +2443,7 @@ impl ResponsesStreamEncoder {
                         call_id: id.clone(),
                         name: wire.clone(),
                         namespace: valid_namespace.clone(),
+                        search,
                         custom,
                         args: String::new(),
                         input: CustomInputStream::default(),
@@ -2219,7 +2451,12 @@ impl ResponsesStreamEncoder {
                         output_index,
                     },
                 );
-                let item = if custom {
+                let item = if search {
+                    json!({
+                        "id": item_id, "type": "tool_search_call", "call_id": id,
+                        "execution": "client", "arguments": {}, "status": "in_progress"
+                    })
+                } else if custom {
                     let mut item = json!({
                         "id": item_id, "type": "custom_tool_call", "call_id": id,
                         "name": wire, "input": "", "status": "in_progress"
@@ -2265,6 +2502,19 @@ impl ResponsesStreamEncoder {
             }
             StreamEvent::ToolCallEnd { index } => {
                 let tool = self.tools.remove(index)?;
+                if tool.search {
+                    let done = json!({
+                        "id": tool.id, "type": "tool_search_call", "call_id": tool.call_id,
+                        "execution": "client", "arguments": parse_search_string(&tool.args),
+                        "status": "completed",
+                    });
+                    self.output.push(done.clone());
+                    let out = event(
+                        "response.output_item.done",
+                        json!({"output_index": tool.output_index, "item": done}),
+                    );
+                    return Some(out);
+                }
                 let (done, input_done) = if tool.custom {
                     let input = serde_json::from_str::<Value>(&tool.args)
                         .map(|args| custom_input(&args))
@@ -2355,5 +2605,127 @@ impl ResponsesStreamEncoder {
                 Some(out)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_search_tests {
+    use super::*;
+    use crate::ir::{Message, Role};
+
+    fn search_tool() -> Value {
+        json!({
+            "type": "tool_search",
+            "execution": "client",
+            "description": "search",
+            "parameters": {"type": "object"}
+        })
+    }
+
+    fn search_request() -> CompletionRequest {
+        CompletionRequest {
+            model: "m".into(),
+            messages: Vec::new(),
+            tools: vec![Tool {
+                name: "tool_search".into(),
+                namespace: None,
+                description: "search".into(),
+                parameters: json!({"type": "object"}),
+                custom: false,
+                strict: false,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn decodes_search_declaration_call_and_output() {
+        let req = decode_request(&json!({
+            "model": "m",
+            "tools": [search_tool()],
+            "input": [
+                {"type": "tool_search_call", "call_id": "s1",
+                 "execution": "client", "arguments": {"query": "cal"}},
+                {"type": "tool_search_output", "call_id": "s1",
+                 "status": "completed", "execution": "client", "tools": [
+                    {"type": "function", "name": "run",
+                     "description": "d", "parameters": {"type": "object"}},
+                    {"type": "namespace", "name": "mcp__cal",
+                     "description": "c", "tools": [
+                        {"type": "function", "name": "create",
+                         "description": "e", "parameters": {"type": "object"}}
+                    ]}
+                ]}
+            ]
+        }))
+        .unwrap();
+        assert!(req.tools.iter().any(|t| t.name == "tool_search"));
+        assert!(req.tools.iter().any(|t| t.name == "run"));
+        assert!(
+            req.tools
+                .iter()
+                .any(|t| t.name == "mcp__cal__create"
+                    && t.namespace.as_deref() == Some("mcp__cal"))
+        );
+        assert_eq!(req.messages.len(), 2);
+        assert_eq!(req.messages[0].parts[0].name, "tool_search");
+        assert_eq!(req.messages[0].parts[0].id, "s1");
+        assert!(req.messages[1].parts[0].text.contains("mcp__cal__create"));
+    }
+
+    #[test]
+    fn encodes_search_call_with_tsc_id_and_object_arguments() {
+        let req = search_request();
+        let resp = CompletionResponse {
+            model: "m".into(),
+            message: Message {
+                role: Role::Assistant,
+                parts: vec![Part::tool_call(
+                    "s1",
+                    "tool_search",
+                    json!({"query": "mail"}),
+                )],
+            },
+            stop: StopReason::EndTurn,
+            usage: Usage::default(),
+        };
+        let body = encode_response_for_request(&resp, &req);
+        let item = &body["output"][0];
+        assert_eq!(item["type"], "tool_search_call");
+        assert_eq!(item["call_id"], "s1");
+        assert_eq!(item["execution"], "client");
+        assert_eq!(item["arguments"], json!({"query": "mail"}));
+        assert!(item["id"].as_str().unwrap().starts_with("tsc_"));
+        assert!(item.get("name").is_none());
+    }
+
+    #[test]
+    fn streams_search_call_with_tsc_id_and_object_arguments() {
+        let req = search_request();
+        let mut encoder = ResponsesStreamEncoder::for_request("m", &req);
+        let mut frames = String::new();
+        for event in [
+            StreamEvent::Start { model: "m".into() },
+            StreamEvent::ToolCallStart {
+                index: 0,
+                id: "s1".into(),
+                name: "tool_search".into(),
+                namespace: None,
+            },
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                args: "{\"query\":\"mail\"}".into(),
+            },
+            StreamEvent::ToolCallEnd { index: 0 },
+            StreamEvent::Done,
+        ] {
+            if let Some(frame) = encoder.encode(&event) {
+                frames.push_str(&frame);
+            }
+        }
+        assert!(frames.contains("tool_search_call"), "{frames}");
+        assert!(frames.contains("tsc_"), "{frames}");
+        assert!(!frames.contains("function_call_arguments.done"), "{frames}");
+        assert!(frames.contains("mail"), "{frames}");
     }
 }
