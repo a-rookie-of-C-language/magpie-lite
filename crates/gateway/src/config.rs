@@ -1229,7 +1229,8 @@ pub struct ProviderConfigSnapshot {
     /// Requests allowed out at once per key; null for no limit.
     pub max_concurrency: Option<u32>,
     /// Effective per-key concurrency limits, parallel to the key pool:
-    /// each slot's own entry, else `max_concurrency`.
+    /// each slot's configured override; a missing entry takes
+    /// `max_concurrency` when routing (see `lane_limit_for_key`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub key_limits: Vec<u32>,
     /// Requests allowed per rolling minute per key; null for no limit.
@@ -1734,7 +1735,7 @@ impl Config {
                     weights: p.key_weights(),
                     affinity: p.affinity,
                     max_concurrency: p.max_concurrency,
-                    key_limits: p.key_lane_limits(),
+                    key_limits: p.key_limits.clone(),
                     max_rpm: p.max_rpm,
                     queue_limit: p.queue_limit,
                     queue_wait_s: p.queue_wait_s,
