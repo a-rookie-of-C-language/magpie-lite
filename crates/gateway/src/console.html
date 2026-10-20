@@ -1148,7 +1148,13 @@
 
     function routeSummary(request) {
       const route = request.provider ? `${request.provider} / ${request.upstream_model}` : "—";
-      return route + classifiedSummary(request.classified) + triesSummary(request);
+      return route + classifiedSummary(request.classified) + ruleTraceSummary(request.rule) + triesSummary(request);
+    }
+
+    function ruleTraceSummary(trace) {
+      if (!trace) return "";
+      const then = (trace.then || []).length ? ` then ${(trace.then || []).join(", ")}` : "";
+      return ` · rule ${trace.rule} → ${trace.use}${then}`;
     }
 
     function triesSummary(request) {

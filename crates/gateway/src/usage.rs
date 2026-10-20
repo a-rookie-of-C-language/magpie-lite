@@ -72,6 +72,10 @@ pub struct RequestRecord {
     /// lines predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classified: Option<crate::rules::Classified>,
+    /// Which rule put the request's member first; absent when none
+    /// matched. Older history lines predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<crate::rules::RuleTrace>,
 }
 
 /// One upstream send: which member was asked, at which reasoning level
@@ -448,6 +452,7 @@ impl RequestTracker {
                 latency_ms: 0,
                 usage: UsageSnapshot::default(),
                 classified: None,
+                rule: None,
             },
             usage: Usage::default(),
             reask_usage: Usage::default(),
@@ -459,6 +464,12 @@ impl RequestTracker {
     /// and said, for the request's record.
     pub fn set_classified(&mut self, classified: Option<crate::rules::Classified>) {
         self.record.classified = classified;
+    }
+
+    /// Which rule put the request's member first, for the request's
+    /// record; `None` when none matched.
+    pub fn set_rule_trace(&mut self, trace: Option<crate::rules::RuleTrace>) {
+        self.record.rule = trace;
     }
 
     /// Record a concrete upstream attempt without waiting for the full reply.
@@ -605,6 +616,7 @@ mod tests {
                 cache_write: None,
             },
             classified: None,
+            rule: None,
         }
     }
 

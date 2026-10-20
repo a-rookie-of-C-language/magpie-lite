@@ -2071,6 +2071,9 @@ async fn send_with_fallback(
                     first.effort = crate::rules::fit_level(&hit.use_effort);
                 }
             }
+            // Which rule put the member first goes on the request's
+            // record (`RuleTrace`); none matched means no rule moves it.
+            tracker.set_rule_trace(hit.trace());
         }
     }
     // The turn's requests ask their model for its pick, where the agent

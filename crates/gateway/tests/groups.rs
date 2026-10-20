@@ -1351,6 +1351,79 @@ async fn a_manual_pick_can_name_a_bare_model_id() {
 }
 
 #[tokio::test]
+async fn recent_requests_name_the_rule_that_matched() {
+    async fn ask(gw: &Gateway, model: &str) -> StatusCode {
+        Client::new()
+            .post(format!("{}/v1/chat/completions", gw.url))
+            .bearer_auth("magpie-lite")
+            .json(&json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "Hello there, how are you doing today?"}],
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    }
+    async fn stats(gw: &Gateway) -> Value {
+        Client::new()
+            .get(format!("{}/stats", gw.url))
+            .bearer_auth("magpie-lite")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+    let gw = gateway(false).await;
+    // A rule on one token fires for any real message; a second group
+    // names a threshold no message reaches.
+    let mut matched = group("traced", "first");
+    matched["routes"] = json!(["mock/first", "mock/second"]);
+    matched["rules"] = json!([{"use": "mock/second", "tokens": 1}]);
+    assert_eq!(
+        edit(&gw, Method::POST, "/config/groups", matched)
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    let mut quiet = group("quiet", "first");
+    quiet["routes"] = json!(["mock/first", "mock/second"]);
+    quiet["rules"] = json!([{"use": "mock/second", "tokens": 100000000}]);
+    assert_eq!(
+        edit(&gw, Method::POST, "/config/groups", quiet)
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(ask(&gw, "group/traced").await, StatusCode::OK);
+    assert_eq!(ask(&gw, "group/quiet").await, StatusCode::OK);
+    let recent = stats(&gw).await["recent_requests"].clone();
+    let recent = recent.as_array().expect("recent requests");
+    let traced = recent
+        .iter()
+        .find(|record| record["requested_model"] == "group/traced")
+        .expect("traced record");
+    assert_eq!(traced["provider"], "mock");
+    assert_eq!(traced["upstream_model"], "second");
+    assert_eq!(
+        traced["rule"],
+        json!({"rule": 1, "use": "mock/second", "when": ["tokens ≥ 1"]})
+    );
+    let quiet = recent
+        .iter()
+        .find(|record| record["requested_model"] == "group/quiet")
+        .expect("quiet record");
+    assert_eq!(quiet["upstream_model"], "first");
+    assert!(
+        quiet.get("rule").is_none_or(|rule| rule.is_null()),
+        "no rule matched: {}",
+        quiet["rule"]
+    );
+}
+
+#[tokio::test]
 async fn found_group_request_level_round_trip() {
     async fn ask(url: &str, model: &str) -> StatusCode {
         Client::new()

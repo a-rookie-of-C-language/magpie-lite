@@ -1050,6 +1050,38 @@ pub struct RuleHit {
     pub small: Vec<String>,
 }
 
+impl RuleHit {
+    /// The trace for the request's record: which rule matched, from 1;
+    /// `None` when none matched (a bare turn, a held turn with no rule, or
+    /// one nothing moves).
+    pub fn trace(&self) -> Option<RuleTrace> {
+        self.n.map(|n| RuleTrace {
+            rule: n + 1,
+            use_: self.use_.clone(),
+            then: self.then.clone(),
+            when: self.when.clone(),
+        })
+    }
+}
+
+/// Which rule put a request's member first, told on the request's record
+/// (the reference's `Route.Rule`, narrowed to what the record tells).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RuleTrace {
+    /// The rule that matched, from 1, as the console numbers rules and the
+    /// server names them (`rule {n}`).
+    pub rule: usize,
+    /// The member it puts first.
+    #[serde(rename = "use")]
+    pub use_: String,
+    /// The members the rules after it that also match send to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub then: Vec<String>,
+    /// The member's conditions, as the group card lists them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub when: Vec<String>,
+}
+
 /// What the classifier was asked as a turn began, and said (`Classified`).
 /// Told on the request's record; a group whose classifier fails says so
 /// on its card through [`crate::classify::failures`].
