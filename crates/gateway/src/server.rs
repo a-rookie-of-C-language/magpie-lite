@@ -2343,6 +2343,9 @@ async fn send_with_fallback(
                             if now - start < patience
                                 && wait_for_room(state, &routes, start + patience).await
                             {
+                                tracker.note_replan(
+                                    now.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                                );
                                 rounds += 1;
                                 continue 'replan;
                             }
@@ -2385,6 +2388,7 @@ async fn send_with_fallback(
                         if now - start < patience
                             && wait_for_room(state, &routes, start + patience).await
                         {
+                            tracker.note_replan(now.elapsed().as_millis().min(u64::MAX as u128) as u64);
                             rounds += 1;
                             continue 'replan;
                         }
@@ -2907,6 +2911,7 @@ async fn send_with_fallback(
                                 let pause =
                                     floor.max(quota_cooldown(&headers, Some(&failure.body), floor));
                                 if now + pause <= start + patience {
+                                    tracker.note_replan(pause.as_millis().min(u64::MAX as u128) as u64);
                                     drop(events);
                                     tokio::time::sleep(pause).await;
                                     rounds += 1;
@@ -3181,6 +3186,7 @@ async fn send_with_fallback(
                         let floor = replan_pause(rounds);
                         let pause = floor.max(quota_cooldown(&headers, Some(&error.body), floor));
                         if now + pause <= start + patience {
+                            tracker.note_replan(pause.as_millis().min(u64::MAX as u128) as u64);
                             tokio::time::sleep(pause).await;
                             rounds += 1;
                             continue 'replan;

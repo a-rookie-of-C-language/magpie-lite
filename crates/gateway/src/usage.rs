@@ -59,6 +59,15 @@ pub struct RequestRecord {
     /// level. Absent on history lines written before it was kept.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tries: Vec<TryRecord>,
+    /// How many times the group's round was asked again within its
+    /// patience — a lane-busy round or a transient vendor overload
+    /// (the reference's replan, #1418). Absent when the first round
+    /// served or stood. Older history lines predate it.
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub replans: u64,
+    /// Milliseconds waited between those rounds. Absent with `replans`.
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub replan_waited_ms: u64,
     /// Whether the agent asked for SSE.
     pub stream: bool,
     /// `ok`, or a short failure kind.
@@ -457,6 +466,8 @@ impl RequestTracker {
                 upstream_model: upstream_model.to_owned(),
                 key_slot,
                 tries: Vec::new(),
+                replans: 0,
+                replan_waited_ms: 0,
                 stream: request.stream,
                 status: "incomplete".to_owned(),
                 latency_ms: 0,
@@ -511,6 +522,13 @@ impl RequestTracker {
             effort: effort.to_owned(),
             queued_ms,
         });
+    }
+
+    /// Note one more round asked again within the group's patience, and
+    /// how long the wait before it was (the reference's replan, #1418).
+    pub fn note_replan(&mut self, waited_ms: u64) {
+        self.record.replans += 1;
+        self.record.replan_waited_ms = self.record.replan_waited_ms.saturating_add(waited_ms);
     }
 
     /// Switch accounting before awaiting a concrete attempt, so cancellation
@@ -625,6 +643,8 @@ mod tests {
             upstream_model: format!("model-{index}"),
             key_slot: index as usize,
             tries: Vec::new(),
+            replans: 0,
+            replan_waited_ms: 0,
             stream: index.is_multiple_of(2),
             status: status.into(),
             latency_ms: index,
@@ -902,6 +922,32 @@ mod tests {
         )
         .unwrap();
         assert!(old.tries.is_empty());
+        // Lines written before replans were kept load without them too.
+        assert_eq!(old.replans, 0);
+        assert_eq!(old.replan_waited_ms, 0);
+    }
+
+    #[test]
+    fn replan_notes_count_rounds_and_wait_and_skip_when_none() {
+        let log = Arc::new(Mutex::new(RequestLog::default()));
+        let request = CompletionRequest {
+            model: "mock/model".into(),
+            ..CompletionRequest::default()
+        };
+        let mut tracker = RequestTracker::new(log, "chat", &request, "mock", "model", 0);
+        tracker.note_replan(2000);
+        tracker.note_replan(4000);
+        assert_eq!(tracker.record.replans, 2);
+        assert_eq!(tracker.record.replan_waited_ms, 6000);
+        let value = serde_json::to_value(&tracker.record).unwrap();
+        assert_eq!(value["replans"], 2);
+        assert_eq!(value["replan_waited_ms"], 6000);
+        // A request whose first round served or stood keeps no trace.
+        let log = Arc::new(Mutex::new(RequestLog::default()));
+        let fresh = RequestTracker::new(log, "chat", &request, "mock", "model", 0);
+        let value = serde_json::to_value(&fresh.record).unwrap();
+        assert!(value.get("replans").is_none());
+        assert!(value.get("replan_waited_ms").is_none());
     }
 
     #[test]

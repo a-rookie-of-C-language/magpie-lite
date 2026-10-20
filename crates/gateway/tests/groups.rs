@@ -1968,13 +1968,31 @@ async fn flaky_ask(gateway: String, model: &str, stream: bool) -> (StatusCode, S
 #[tokio::test]
 async fn a_transient_overload_is_asked_again_and_served() {
     let (gw, asked) = flaky_gateway(None, false, false, false).await;
-    let (status, body) = flaky_ask(gw, "group/g", false).await;
+    let (status, body) = flaky_ask(gw.clone(), "group/g", false).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("hello"), "{body}");
     assert_eq!(
         asked.load(Ordering::SeqCst),
         2,
         "the overloaded round reached the vendor again"
+    );
+    // The ask-again is counted on the request's record, with its wait.
+    let stats: Value = Client::new()
+        .get(format!("{gw}/stats"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stats["recent_requests"][0]["replans"], 1);
+    assert!(
+        stats["recent_requests"][0]["replan_waited_ms"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 2000,
+        "the record counts the 2s pause before asking again"
     );
 }
 
@@ -2028,12 +2046,28 @@ async fn an_overload_beyond_patience_stands_on_the_first_answer() {
 #[tokio::test]
 async fn a_direct_provider_keeps_fail_fast_on_transient_overload() {
     let (gw, asked) = flaky_gateway(None, false, false, false).await;
-    let (status, body) = flaky_ask(gw, "solo/mock-model", false).await;
+    let (status, body) = flaky_ask(gw.clone(), "solo/mock-model", false).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(
         asked.load(Ordering::SeqCst),
         1,
         "the direct ask never reached the vendor again"
+    );
+    // Nothing was asked again, so the record keeps no trace of it.
+    let stats: Value = Client::new()
+        .get(format!("{gw}/stats"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(stats["recent_requests"][0].get("replans").is_none());
+    assert!(
+        stats["recent_requests"][0]
+            .get("replan_waited_ms")
+            .is_none()
     );
 }
 

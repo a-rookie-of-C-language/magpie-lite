@@ -1152,7 +1152,7 @@
 
     function routeSummary(request) {
       const route = request.provider ? `${request.provider} / ${request.upstream_model}` : "—";
-      return route + classifiedSummary(request.classified) + ruleTraceSummary(request.rule) + triesSummary(request);
+      return route + classifiedSummary(request.classified) + ruleTraceSummary(request.rule) + triesSummary(request) + replansSummary(request);
     }
 
     function ruleTraceSummary(trace) {
@@ -1170,6 +1170,12 @@
         return `${t.provider}/${t.model}${at}${queued}`;
       });
       return ` · tries: ${legs.join(" → ")}`;
+    }
+
+    function replansSummary(request) {
+      if (!(request.replans > 0)) return "";
+      const waited = request.replan_waited_ms > 0 ? ` (waited ${fmt(request.replan_waited_ms)} ms)` : "";
+      return ` · replan ×${request.replans}${waited}`;
     }
 
     function renderUsage(usage) {
