@@ -20,6 +20,7 @@ mod model_gone;
 mod object_root;
 mod oneof_schema;
 mod optional_fields;
+pub mod presets;
 mod provider_tools;
 mod providers;
 mod reply_room;

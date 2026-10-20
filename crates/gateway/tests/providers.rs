@@ -1116,3 +1116,96 @@ async fn concurrent_clients_with_one_revision_have_exactly_one_winner() {
     assert_eq!(Config::load(&gw.path).unwrap().provider.len(), 1);
     assert_eq!(snapshot(&gw, "/config").await["revision"], 2);
 }
+
+/// A new provider on a known vendor's host gets that vendor's capability
+/// metadata prefilled; an unknown host keeps the all-unknown default.
+#[tokio::test]
+async fn create_on_a_known_vendor_host_prefills_capabilities() {
+    let gw = gateway().await;
+    let mut body = provider(&gw, "deepseek");
+    body["base_url"] = json!("https://api.deepseek.com/v1");
+    assert_eq!(
+        edit(&gw, Method::POST, "/config/providers", body)
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    let capabilities = snapshot(&gw, "/config").await["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["id"] == "deepseek")
+        .unwrap()["capabilities"]
+        .clone();
+    assert_eq!(capabilities["supported_protocols"], json!(["chat"]));
+    assert_eq!(capabilities["streaming"], json!(true));
+    assert_eq!(capabilities["tools"], json!(true));
+    assert_eq!(capabilities["vision"], json!(false));
+
+    let mut relay = provider(&gw, "relay");
+    relay["base_url"] = json!("https://relay.example.com/v1");
+    assert_eq!(
+        edit(&gw, Method::POST, "/config/providers", relay)
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    let unknown = snapshot(&gw, "/config").await["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["id"] == "relay")
+        .unwrap()["capabilities"]
+        .clone();
+    assert_eq!(unknown["supported_protocols"], json!(["chat"]));
+    assert_eq!(unknown["streaming"], Value::Null);
+    assert_eq!(unknown["tools"], Value::Null);
+    assert_eq!(unknown["vision"], Value::Null);
+}
+
+/// Explicit capabilities beat the vendor preset, and an update that omits
+/// them keeps the stored metadata instead of reapplying the preset.
+#[tokio::test]
+async fn explicit_capabilities_beat_the_preset_and_updates_preserve_it() {
+    let gw = gateway().await;
+    let mut body = provider(&gw, "explicit");
+    body["base_url"] = json!("https://api.deepseek.com/v1");
+    body["capabilities"] = json!({
+        "supported_protocols": ["chat"],
+        "streaming": false,
+    });
+    assert_eq!(
+        edit(&gw, Method::POST, "/config/providers", body.clone())
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    let stored = snapshot(&gw, "/config").await["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["id"] == "explicit")
+        .unwrap()["capabilities"]
+        .clone();
+    assert_eq!(stored["streaming"], json!(false));
+    assert_eq!(stored["tools"], Value::Null);
+
+    let mut update = body.clone();
+    update.as_object_mut().unwrap().remove("capabilities");
+    update["name"] = json!("renamed");
+    assert_eq!(
+        edit(&gw, Method::PUT, "/config/providers/explicit", update)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        snapshot(&gw, "/config").await["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["id"] == "explicit")
+            .unwrap()["capabilities"],
+        stored
+    );
+}

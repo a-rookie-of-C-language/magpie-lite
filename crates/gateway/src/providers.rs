@@ -61,9 +61,15 @@ pub(crate) struct ProviderEdit {
 impl ProviderEdit {
     pub(crate) fn materialize(self, config: &Config) -> ProviderConfig {
         let existing = config.provider(&self.id);
-        let capabilities = self
-            .capabilities
-            .unwrap_or_else(|| existing.map(|p| p.capabilities.clone()).unwrap_or_default());
+        // An omitted object preserves a stored provider's metadata; a new
+        // provider gets its vendor's preset when the host is known.
+        let capabilities = self.capabilities.unwrap_or_else(|| {
+            crate::presets::capabilities_for_add(
+                existing.map(|p| &p.capabilities),
+                &self.base_url,
+                self.protocol,
+            )
+        });
         let (api_key, api_keys) = match self.api_keys {
             Some(keys) => (String::new(), keys),
             None => existing

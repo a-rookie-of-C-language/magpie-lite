@@ -60,6 +60,11 @@ magpie-lite provider add deepseek \
   --models deepseek-chat deepseek-reasoner --default \
   --fallback kimi/moonshot-v1-128k
 
+# known vendors (OpenAI, Anthropic, DeepSeek, Moonshot, Gemini, xAI,
+# OpenRouter, Groq, SiliconFlow, Azure OpenAI) prefill capability
+# metadata -- protocols, streaming, tools, vision -- from the base URL.
+# `provider list` shows it; re-adding keeps customized metadata.
+
 # add a named route chain agents pick as one model
 magpie-lite group add daily-coding \
   --routing weight --route-weight 3 --route-weight 1 --affinity auto \
@@ -410,6 +415,7 @@ Tests are the contract: `crates/core/tests/translation.rs` checks real wire shap
 - A TUI
 - Selective Agent restoration preserving later unrelated edits and richer detection/override semantics
 - Broader provider capability metadata and stream-only/specialized connection probes
+- Stream-only/specialized connection probes (known-vendor capability presets already prefill on add)
 - More routing policies, versioned admin API and separate management authentication
 
 See [core parity tracker](docs/core-parity.md) for implementation evidence and remaining reference gaps.

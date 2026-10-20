@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use magpie_gateway::{
     Affinity, Config, GroupConfig, Protocol, ProviderConfig, RoutingPolicy, Rule, config_path,
+    presets,
 };
 
 #[derive(Parser)]
@@ -421,7 +422,7 @@ async fn main() -> Result<()> {
                     id: id.clone(),
                     name: name.unwrap_or_default(),
                     protocol,
-                    base_url,
+                    base_url: base_url.clone(),
                     api_key: String::new(),
                     api_keys,
                     models,
@@ -432,7 +433,13 @@ async fn main() -> Result<()> {
                     routing,
                     weights: key_weights,
                     key_limits,
-                    capabilities: Default::default(),
+                    // A known vendor's host prefills capability metadata;
+                    // a stored provider's customized metadata is kept.
+                    capabilities: presets::capabilities_for_add(
+                        cfg.provider(&id).map(|p| &p.capabilities),
+                        &base_url,
+                        protocol,
+                    ),
                     affinity,
                     max_concurrency,
                     max_rpm,
@@ -472,6 +479,11 @@ async fn main() -> Result<()> {
                         p.routing.as_str(),
                         p.affinity.as_str()
                     );
+                    if let Some(summary) =
+                        presets::describe_capabilities(&p.capabilities, p.protocol)
+                    {
+                        println!("               ↳ {summary}");
+                    }
                     for m in &p.models {
                         println!("               {}/{}", p.id, m);
                         if let Some(window) = p.contexts.get(m) {
