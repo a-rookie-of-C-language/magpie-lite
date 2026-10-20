@@ -668,6 +668,7 @@
                 <div class="field"><label for="provider-routing">Key routing</label><select id="provider-routing" class="token-input" aria-describedby="provider-routing-help"><option value="rotate">Rotate</option><option value="order">Ordered</option><option value="usage">Least used</option><option value="weight">Weighted</option></select><p id="provider-routing-help" class="group-help">Rotate spreads requests across the key pool, the default. Ordered always starts at the first key. Least used prefers the key that served the fewest tokens lately. Weighted spreads by each key's weight.</p></div>
                 <div class="field"><label for="provider-affinity">Conversation affinity</label><select id="provider-affinity" class="token-input" aria-describedby="provider-affinity-help"><option value="auto">Auto</option><option value="session">Whole session</option><option value="turn">Within a turn</option><option value="off">Off</option></select><p id="provider-affinity-help" class="group-help">Keep a conversation on the key that answered it so the vendor's prompt cache keeps hitting. Auto follows the key routing: rotate spreads load, everything else sticks by conversation.</p></div>
                 <div id="provider-weights-field" class="field" hidden><label for="provider-weights">Key weights</label><textarea id="provider-weights" class="token-input" placeholder="3&#10;1&#10;4" aria-describedby="provider-weights-help"></textarea><p id="provider-weights-help" class="group-help">One weight per key slot, in pool order, each a whole number from 0 to 1000. A missing or zero weight counts as 1.</p></div>
+                <div class="field"><label for="provider-limits">Per-key concurrency limits (optional)</label><textarea id="provider-limits" class="token-input" placeholder="5&#10;2" aria-describedby="provider-limits-help"></textarea><p id="provider-limits-help" class="group-help">One limit per key slot, in pool order, each a whole number from 0 to 1000 (0 for no limit on that key). A missing entry takes Max concurrency per key.</p></div>
                 <div class="editor-grid">
                   <div class="field"><label for="provider-cap-streaming">Streaming support</label><select id="provider-cap-streaming" class="token-input"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></div>
                   <div class="field"><label for="provider-cap-tools">Tools/function calling</label><select id="provider-cap-tools" class="token-input"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></div>
@@ -809,6 +810,7 @@
       providerAffinity: document.getElementById("provider-affinity"),
       providerWeightsField: document.getElementById("provider-weights-field"),
       providerWeights: document.getElementById("provider-weights"),
+      providerLimits: document.getElementById("provider-limits"),
       providerFallback: document.getElementById("provider-fallback"),
       providerCooldown: document.getElementById("provider-cooldown"),
       providerMaxConcurrency: document.getElementById("provider-max-concurrency"),
@@ -1536,10 +1538,12 @@
     function routingSummary(provider) {
       const policy = provider.routing || "rotate";
       const affinity = provider.affinity || "auto";
-      if (policy !== "weight") return `${policy} · affinity: ${affinity}`;
+      const limits = provider.key_limits || [];
+      const limitsText = limits.length ? ` · limits: ${limits.join(", ")}` : "";
+      if (policy !== "weight") return `${policy} · affinity: ${affinity}${limitsText}`;
       const weights = provider.weights || [];
       const weightsText = weights.length ? `weight: ${weights.join(", ")}` : "weight";
-      return `${weightsText} · affinity: ${affinity}`;
+      return `${weightsText} · affinity: ${affinity}${limitsText}`;
     }
 
     function groupRoutingChanged() {
@@ -1811,6 +1815,7 @@
       elements.providerRouting.value = provider?.routing || "rotate";
       elements.providerAffinity.value = provider?.affinity || "auto";
       elements.providerWeights.value = (provider?.weights || []).join("\n");
+      elements.providerLimits.value = (provider?.key_limits || []).join("\n");
       routingChanged();
       elements.providerCooldown.value = provider?.key_cooldown_override_ms ?? "";
       elements.providerMaxConcurrency.value = provider?.max_concurrency ?? "";
@@ -1990,6 +1995,15 @@
         }
         body.weights = weights;
       } else body.weights = [];
+      // Per-key limits apply to every policy; an empty list clears them.
+      const rawLimits = lines(elements.providerLimits.value);
+      const keyLimits = rawLimits.map(Number);
+      if (keyLimits.some(limit => !Number.isSafeInteger(limit) || limit < 0 || limit > 1000)) {
+        elements.providerMessage.textContent = "Per-key limits must be whole numbers from 0 to 1000, one per line.";
+        elements.providerLimits.focus();
+        return;
+      }
+      body.key_limits = keyLimits;
       if (elements.providerKeyMode.value === "replace") {
         body.api_keys = lines(elements.providerKeys.value);
         if (!body.api_keys.length) {

@@ -330,6 +330,33 @@ async fn a_queue_past_its_bound_is_turned_away_with_a_429() {
     assert_eq!(member.asked(), 2, "the refused request never went upstream");
 }
 
+/// A key's own override caps it while the provider stays unlimited: with
+/// no `max_concurrency` and `key_limits` of [1], the key's lane still
+/// queues one and turns the next away with a 429 — the override, not the
+/// provider, set the slot count.
+#[tokio::test]
+async fn a_per_key_override_caps_its_key_while_the_provider_stays_unlimited() {
+    let member = Member::new(Duration::from_millis(600));
+    let mut only = provider("solo", upstream(member.clone()).await);
+    only.key_limits = vec![1];
+    only.queue_limit = Some(1);
+    let (gw, _state) = gateway(vec![only]).await;
+
+    // Occupy the key's one slot and its one queue place.
+    let first = tokio::spawn(ask(gw.clone(), "solo/mock-model"));
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let queued = tokio::spawn(ask(gw.clone(), "solo/mock-model"));
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    // A third is over the bound: a 429 at once.
+    let (status, _headers, body) = ask(gw.clone(), "solo/mock-model").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+
+    drop(first.await.unwrap());
+    drop(queued.await.unwrap());
+    assert_eq!(member.asked(), 2, "the refused request never went upstream");
+}
+
 /// A minute's worth sent on the key, the next waits for room in it; past
 /// the wait it may keep, a 429 with Retry-After is the answer.
 #[tokio::test]
