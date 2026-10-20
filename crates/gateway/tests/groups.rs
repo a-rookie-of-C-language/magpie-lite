@@ -1753,6 +1753,19 @@ async fn patient_ask(gateway: String) -> (StatusCode, Value) {
     )
 }
 
+/// The gateway's recent request records, newest last.
+async fn recent_stats(gateway: &str) -> Value {
+    Client::new()
+        .get(format!("{gateway}/stats"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
 /// A group whose only member is busy asks it again as its slot frees,
 /// within its patience, instead of answering 429 (the reference's
 /// replan, #1418).
@@ -1776,6 +1789,18 @@ async fn a_busy_group_is_asked_again_and_served_within_patience() {
         3,
         "the refused round reached the vendor again"
     );
+    // The lane-busy wait is counted on the record of the request that
+    // waited it out.
+    let stats = recent_stats(&gw).await;
+    let waited = stats["recent_requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|record| {
+            record["replans"].as_u64().unwrap_or(0) >= 1
+                && record["replan_waited_ms"].as_u64().unwrap_or(0) > 0
+        });
+    assert!(waited, "one record counts its lane-busy replan");
 }
 
 /// Patience spent while every member stays busy answers 429: the wait
@@ -2223,5 +2248,14 @@ async fn a_mixed_final_and_transient_round_stands_without_replan() {
         member.asked_b.load(Ordering::SeqCst),
         1,
         "the overloaded member was never asked again"
+    );
+    // No round was asked again, so the record keeps no trace of it.
+    let gw = format!("http://{addr}");
+    let stats = recent_stats(&gw).await;
+    assert!(stats["recent_requests"][0].get("replans").is_none());
+    assert!(
+        stats["recent_requests"][0]
+            .get("replan_waited_ms")
+            .is_none()
     );
 }
