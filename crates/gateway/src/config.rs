@@ -955,6 +955,44 @@ pub struct GroupConfig {
 }
 
 impl GroupConfig {
+    /// The member the user named: its route, or a bare model id one
+    /// member has (the reference's `pickMember`, #317).
+    pub fn pick_member(&self, want: &str) -> anyhow::Result<String> {
+        let want = want.trim();
+        if let Some(member) = self
+            .routes
+            .iter()
+            .find(|route| route.eq_ignore_ascii_case(want))
+        {
+            return Ok(member.clone());
+        }
+        let hits: Vec<&String> = self
+            .routes
+            .iter()
+            .filter(|route| {
+                route
+                    .split_once('/')
+                    .map(|(_, model)| model.eq_ignore_ascii_case(want))
+                    .unwrap_or(false)
+            })
+            .collect();
+        match hits.as_slice() {
+            [one] => Ok((*one).clone()),
+            [] => anyhow::bail!(
+                "{want} is not in the group (its routes: {})",
+                self.routes.join(", ")
+            ),
+            _ => anyhow::bail!(
+                "{want} is {} of the group's routes; name one: {}",
+                hits.len(),
+                hits.iter()
+                    .map(|hit| hit.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
     /// The same rules the CLI and console API enforce.
     /// The group's rules are normalized in place (`cleanRules`): times and
     /// days put the one way, folders checked, unknown members refused.
@@ -990,12 +1028,13 @@ impl GroupConfig {
                 anyhow::bail!("group routes must use non-empty provider/model without whitespace");
             }
         }
-        // A pick taken out of the group is no pick; a manual group without
-        // one sends to its first route (the reference's `Picked`, through
-        // its validation).
+        // A pick names its member, or a bare model id one member has; a
+        // pick naming nothing is no pick, and a manual group without one
+        // sends to its first route (the reference's `pickMember`/`Picked`,
+        // lenient here as stored groups are read, #317).
         self.pick = self.pick.trim().to_owned();
-        if !self.routes.contains(&self.pick) {
-            self.pick.clear();
+        if !self.pick.is_empty() {
+            self.pick = self.pick_member(&self.pick.clone()).unwrap_or_default();
         }
         if self.routing == RoutingPolicy::Manual && self.pick.is_empty() {
             self.pick = self.routes[0].clone();
@@ -2305,6 +2344,58 @@ base_url = "http://127.0.0.1:1/v1"
             RoutingPolicy::Weighted
         );
         assert!("pace".parse::<RoutingPolicy>().is_err());
+    }
+
+    #[test]
+    fn a_manual_pick_names_a_route_or_a_bare_model_id() {
+        fn picked_group(routes: &[&str], pick: &str) -> GroupConfig {
+            GroupConfig {
+                id: "g".into(),
+                name: String::new(),
+                routes: routes.iter().map(|route| route.to_string()).collect(),
+                rules: Vec::new(),
+                classifier: String::new(),
+                effort: String::new(),
+                levels: Vec::new(),
+                pick: pick.into(),
+                auto: false,
+                weights: Vec::new(),
+                routing: RoutingPolicy::Manual,
+                first_token_timeout_ms: 0,
+                affinity: Default::default(),
+            }
+        }
+        let group = picked_group(&["a/one", "b/two"], "");
+        // An exact route, cased any way, and a bare model id one member
+        // has: writes resolve, reads stay lenient.
+        assert_eq!(group.pick_member("b/two").unwrap(), "b/two");
+        assert_eq!(group.pick_member("B/TWO").unwrap(), "b/two");
+        assert_eq!(group.pick_member(" two ").unwrap(), "b/two");
+        // Unknown and ambiguous names are refused at write time.
+        assert!(group.pick_member("ghost").is_err());
+        let same = picked_group(&["a/same", "b/same"], "");
+        assert!(same.pick_member("same").is_err());
+        // But reading stays lenient: a stale pick falls back, a bare one
+        // resolves, and a manual group without one takes its first route.
+        let mut stale = picked_group(&["a/one", "b/two"], "ghost");
+        stale.validate().unwrap();
+        assert_eq!(stale.pick, "a/one");
+        let mut bare = picked_group(&["a/one", "b/two"], "two");
+        bare.validate().unwrap();
+        assert_eq!(bare.pick, "b/two");
+        let mut manual = picked_group(&["a/one", "b/two"], "");
+        manual.validate().unwrap();
+        assert_eq!(manual.pick, "a/one");
+        // Routed otherwise the stale pick just clears, kept for next time
+        // only while it names a member.
+        let mut order = picked_group(&["a/one", "b/two"], "ghost");
+        order.routing = RoutingPolicy::Order;
+        order.validate().unwrap();
+        assert!(order.pick.is_empty());
+        let mut kept = picked_group(&["a/one", "b/two"], "b/two");
+        kept.routing = RoutingPolicy::Order;
+        kept.validate().unwrap();
+        assert_eq!(kept.pick, "b/two");
     }
 
     #[test]

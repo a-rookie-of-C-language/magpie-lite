@@ -174,7 +174,8 @@ enum GroupCommand {
         levels: Vec<String>,
         /// The member a `manual` group sends every request to
         /// (`provider/model`); the others, and the rules, wait until
-        /// another member is picked.
+        /// another member is picked. A bare model id one member has
+        /// names it too; setting a pick makes the group manual.
         #[arg(long, default_value = "")]
         pick: String,
     },
@@ -184,6 +185,15 @@ enum GroupCommand {
     Rm {
         /// Group id.
         id: String,
+    },
+    /// Point a group at another member: every request goes to it, so the
+    /// group is manual from then on (the console re-picks the same way,
+    /// on the group's card).
+    Pick {
+        /// Group id.
+        id: String,
+        /// The member: its route, or a bare model id one member has.
+        member: String,
     },
 }
 
@@ -480,6 +490,12 @@ async fn main() -> Result<()> {
                         first_token_timeout_ms,
                         affinity,
                     };
+                    if !group.pick.is_empty() {
+                        // A pick names its member, and makes the group
+                        // manual (the reference's `pick` field, #317).
+                        group.pick = group.pick_member(&group.pick.clone())?;
+                        group.routing = RoutingPolicy::Manual;
+                    }
                     cfg.clean_member_efforts(&mut group);
                     group.validate()?;
                     group.check_classifier(&cfg)?;
@@ -593,6 +609,24 @@ async fn main() -> Result<()> {
                     } else {
                         anyhow::bail!("no group `{id}`");
                     }
+                }
+                GroupCommand::Pick { id, member } => {
+                    let path = provider_path(&cli.config)?;
+                    let mut cfg = Config::load(&path)?;
+                    // A found group is addressed by its public ref too.
+                    let id = cfg.group_by_ref(&id).map(|g| g.id).unwrap_or(id);
+                    let Some(index) = cfg.group.iter().position(|g| g.id == id) else {
+                        anyhow::bail!("no group `{id}`");
+                    };
+                    // Refused when the member is not in the group; a bare
+                    // model id one member has names it (the reference's
+                    // `pickMember`, #317).
+                    let pick = cfg.group[index].pick_member(&member)?;
+                    cfg.group[index].pick = pick.clone();
+                    cfg.group[index].routing = RoutingPolicy::Manual;
+                    cfg.group[index].validate()?;
+                    save_config(&path, &cfg)?;
+                    println!("group `group/{id}` now sends every request to `{pick}`");
                 }
             }
         }

@@ -909,3 +909,60 @@ async fn manual_group_sends_every_request_to_its_pick_and_rules_wait() {
     assert_eq!(upstream_model(&gw), "first");
     assert_eq!(Config::load(&gw.path).unwrap().group[0].pick, "mock/first");
 }
+
+#[tokio::test]
+async fn a_manual_pick_can_name_a_bare_model_id() {
+    async fn ask(gw: &Gateway, content: &str) -> StatusCode {
+        Client::new()
+            .post(format!("{}/v1/chat/completions", gw.url))
+            .bearer_auth("magpie-lite")
+            .json(&json!({
+                "model": "group/bare",
+                "messages": [{"role": "user", "content": content}],
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    }
+    fn upstream_model(gw: &Gateway) -> String {
+        gw.last
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("upstream was called")["model"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+    let gw = gateway(false).await;
+    // A bare model id one member has names it, stored as its route.
+    let mut body = group("bare", "first");
+    body["routes"] = json!(["mock/first", "mock/second"]);
+    body["routing"] = json!("manual");
+    body["pick"] = json!("second");
+    let created = edit(&gw, Method::POST, "/config/groups", body).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let snapshot: Value = created.json().await.unwrap();
+    assert_eq!(snapshot["groups"][0]["pick"], "mock/second");
+    assert_eq!(
+        ask(&gw, "Hello there, how are you doing today?").await,
+        StatusCode::OK
+    );
+    assert_eq!(upstream_model(&gw), "second");
+    // A pick naming nothing is no pick: the manual group falls back to
+    // its first route.
+    let mut bad = group("bare", "first");
+    bad["routes"] = json!(["mock/first", "mock/second"]);
+    bad["routing"] = json!("manual");
+    bad["pick"] = json!("ghost");
+    let updated = edit(&gw, Method::PUT, "/config/groups/bare", bad).await;
+    assert_eq!(updated.status(), StatusCode::OK);
+    let snapshot: Value = updated.json().await.unwrap();
+    assert_eq!(snapshot["groups"][0]["pick"], "mock/first");
+    assert_eq!(
+        ask(&gw, "Hello there, how are you doing today?").await,
+        StatusCode::OK
+    );
+    assert_eq!(upstream_model(&gw), "first");
+}

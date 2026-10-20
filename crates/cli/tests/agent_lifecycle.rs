@@ -806,3 +806,59 @@ fn group_rules_cli_roundtrip_and_invalid_shapes() {
             .is_empty()
     );
 }
+
+#[test]
+fn group_pick_points_a_manual_group_at_another_member() {
+    let sandbox = Sandbox::new();
+    // --pick takes a bare model id one member has, and makes the group
+    // manual.
+    let output = sandbox.run(&[
+        "group",
+        "add",
+        "daily",
+        "--route",
+        "mock/model",
+        "--route",
+        "mock/other",
+        "--pick",
+        "other",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let group = magpie_gateway::Config::load(&sandbox.config).unwrap().group[0].clone();
+    assert_eq!(group.pick, "mock/other");
+    assert_eq!(group.routing, magpie_gateway::RoutingPolicy::Manual);
+    // Re-point by exact route; routing stays manual.
+    let output = sandbox.run(&["group", "pick", "daily", "mock/model"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let group = magpie_gateway::Config::load(&sandbox.config).unwrap().group[0].clone();
+    assert_eq!(group.pick, "mock/model");
+    assert_eq!(group.routing, magpie_gateway::RoutingPolicy::Manual);
+    let prior = std::fs::read(&sandbox.config).unwrap();
+    // A member outside the group, an unknown group, and a --pick outside
+    // the group all leave the file alone.
+    for args in [
+        vec!["group", "pick", "daily", "mock/ghost"],
+        vec!["group", "pick", "missing", "model"],
+        vec![
+            "group",
+            "add",
+            "daily",
+            "--route",
+            "mock/model",
+            "--pick",
+            "ghost",
+        ],
+    ] {
+        let output = sandbox.run(&args);
+        assert!(!output.status.success(), "{args:?}");
+        assert_eq!(std::fs::read(&sandbox.config).unwrap(), prior, "{args:?}");
+    }
+}
