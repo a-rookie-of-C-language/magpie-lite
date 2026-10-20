@@ -862,3 +862,61 @@ fn group_pick_points_a_manual_group_at_another_member() {
         assert_eq!(std::fs::read(&sandbox.config).unwrap(), prior, "{args:?}");
     }
 }
+
+#[test]
+fn group_auto_switch_reports_and_flips_found_groups() {
+    let sandbox = Sandbox::new();
+    // Blank reports the default: found groups are on.
+    let output = sandbox.run(&["group", "auto"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("found groups are on"), "{stdout}");
+    assert!(
+        !magpie_gateway::Config::load(&sandbox.config)
+            .unwrap()
+            .no_auto_groups
+    );
+    // A bad word leaves the file alone.
+    let prior = std::fs::read(&sandbox.config).unwrap();
+    let output = sandbox.run(&["group", "auto", "maybe"]);
+    assert!(!output.status.success());
+    assert_eq!(std::fs::read(&sandbox.config).unwrap(), prior);
+    // Off sticks, and the list says so.
+    let output = sandbox.run(&["group", "auto", "off"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        magpie_gateway::Config::load(&sandbox.config)
+            .unwrap()
+            .no_auto_groups
+    );
+    let listed = sandbox.run(&["group", "list"]);
+    assert!(listed.status.success());
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("found groups are off"),
+        "{}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+    let output = sandbox.run(&["group", "auto"]);
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("found groups are off"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    // Back on again.
+    let output = sandbox.run(&["group", "auto", "on"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !magpie_gateway::Config::load(&sandbox.config)
+            .unwrap()
+            .no_auto_groups
+    );
+}

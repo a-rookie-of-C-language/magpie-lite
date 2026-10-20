@@ -312,6 +312,7 @@ async fn spawn_gateway_with_providers_and_groups(
         history_path,
         default_provider: provider.first().map(|p| p.id.clone()).unwrap_or_default(),
         hidden_auto_groups: Vec::new(),
+        no_auto_groups: false,
         provider,
         group: if group_routes.is_empty() {
             Vec::new()
@@ -1825,6 +1826,7 @@ async fn spawn_gateway_with_key_pool(primary: String, backup: Option<String>) ->
         history_path: None,
         default_provider: "primary".into(),
         hidden_auto_groups: Vec::new(),
+        no_auto_groups: false,
         provider: providers,
         group: Vec::new(),
     };
@@ -1870,6 +1872,7 @@ async fn spawn_gateway_with_fallback_named(
         history_path: None,
         default_provider: "primary".into(),
         hidden_auto_groups: Vec::new(),
+        no_auto_groups: false,
         provider: vec![
             ProviderConfig {
                 id: primary_id.into(),
@@ -1950,6 +1953,7 @@ async fn spawn_gateway_with_same_provider_group(upstream: String) -> String {
         history_path: None,
         default_provider: "mock".into(),
         hidden_auto_groups: Vec::new(),
+        no_auto_groups: false,
         provider: vec![ProviderConfig {
             id: "mock".into(),
             name: "Mock".into(),
@@ -2050,6 +2054,7 @@ async fn spawn_gateway_with_group_routes(
         history_path: None,
         default_provider: "primary".into(),
         hidden_auto_groups: Vec::new(),
+        no_auto_groups: false,
         provider: vec![
             ProviderConfig {
                 id: "primary".into(),

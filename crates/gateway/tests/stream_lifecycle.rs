@@ -328,6 +328,7 @@ impl Fixture {
             token: "secret-local-token".into(),
             default_provider: "mock".into(),
             hidden_auto_groups: Vec::new(),
+            no_auto_groups: false,
             provider: vec![provider],
             ..Config::default()
         };

@@ -127,6 +127,7 @@ async fn gateway(providers: Vec<ProviderConfig>) -> (String, Arc<AppState>) {
         history_path: None,
         default_provider,
         hidden_auto_groups: Vec::new(),
+        no_auto_groups: false,
         provider: providers,
         group: vec![GroupConfig {
             id: "g".into(),
@@ -336,6 +337,7 @@ async fn gateway_with_fallback(
         history_path: None,
         default_provider: primary.id.clone(),
         hidden_auto_groups: Vec::new(),
+        no_auto_groups: false,
         provider: vec![primary, fallback],
         group: Vec::new(),
     };

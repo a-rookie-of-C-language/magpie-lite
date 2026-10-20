@@ -195,6 +195,14 @@ enum GroupCommand {
         /// The member: its route, or a bare model id one member has.
         member: String,
     },
+    /// Say whether magpie finds groups on its own, or turn that on or
+    /// off: off, none is listed or served, while the groups made or
+    /// changed stay — and a request for a found one goes to its model
+    /// from one provider.
+    Auto {
+        /// `on` or `off`; blank just says.
+        state: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -515,6 +523,11 @@ async fn main() -> Result<()> {
                 }
                 GroupCommand::List => {
                     let cfg = load_config(&cli.config)?;
+                    if cfg.no_auto_groups {
+                        println!(
+                            "found groups are off · only the groups you made or changed; `magpie-lite group auto on` brings the others back"
+                        );
+                    }
                     if cfg.group.is_empty() {
                         println!(
                             "no groups; add one: magpie-lite group add <id> --route provider/model"
@@ -627,6 +640,43 @@ async fn main() -> Result<()> {
                     cfg.group[index].validate()?;
                     save_config(&path, &cfg)?;
                     println!("group `group/{id}` now sends every request to `{pick}`");
+                }
+                GroupCommand::Auto { state } => {
+                    let path = provider_path(&cli.config)?;
+                    let mut cfg = Config::load(&path)?;
+                    let Some(state) = state else {
+                        // Lite classifiers name models, never groups, and
+                        // routes name providers directly, so no user group
+                        // can hold a found one: turning them off orphans
+                        // nothing but agents set to one, whose requests
+                        // still go to its model from one provider.
+                        if cfg.no_auto_groups {
+                            println!(
+                                "found groups are off · only the groups you made or changed; `magpie-lite group auto on` brings the others back"
+                            );
+                        } else {
+                            println!(
+                                "found groups are on · a model two or more providers serve is a group of them (auto-<model>); `magpie-lite group auto off` turns them off"
+                            );
+                        }
+                        return Ok(());
+                    };
+                    let on = match state.to_ascii_lowercase().as_str() {
+                        "on" | "true" | "yes" | "1" => true,
+                        "off" | "false" | "no" | "0" => false,
+                        _ => anyhow::bail!("magpie-lite group auto [on|off]"),
+                    };
+                    cfg.no_auto_groups = !on;
+                    save_config(&path, &cfg)?;
+                    if on {
+                        println!(
+                            "found groups are on · a model two or more providers serve is a group of them again"
+                        );
+                    } else {
+                        println!(
+                            "found groups are off · the groups you made or changed stay; a request for a found one goes to its model from one provider"
+                        );
+                    }
                 }
             }
         }

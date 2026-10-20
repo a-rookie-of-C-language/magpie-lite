@@ -1279,6 +1279,11 @@ pub struct ConfigSnapshot {
     /// Named route chains.
     pub groups: Vec<GroupConfigSnapshot>,
 }
+
+/// Whether a switch is off, for fields the file omits when unset.
+fn is_false(value: &bool) -> bool {
+    !value
+}
 /// Everything the gateway needs to run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -1333,6 +1338,13 @@ pub struct Config {
     /// (the reference's `Group.Hidden`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hidden_auto_groups: Vec<String>,
+    /// The user turned off the groups magpie finds on its own: none is
+    /// listed or served, while the groups made or changed stay, and so do
+    /// the records of those removed, so that turning it back on brings
+    /// the found groups back as they were (the reference's
+    /// `NoAutoGroups`, `magpie group auto off`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_auto_groups: bool,
 }
 
 fn default_port() -> u16 {
@@ -1412,6 +1424,7 @@ impl Default for Config {
             provider: Vec::new(),
             group: Vec::new(),
             hidden_auto_groups: Vec::new(),
+            no_auto_groups: false,
         }
     }
 }
@@ -1723,18 +1736,53 @@ impl Config {
     /// id is theirs, and one they removed stays hidden until brought
     /// back. Retired models leave their provider's seat only.
     pub fn auto_groups(&self) -> Vec<GroupConfig> {
+        if self.no_auto_groups {
+            return Vec::new();
+        }
         self.derived_groups(false)
     }
 
     /// Found groups the user removed but could bring back: still served
     /// by several providers, not theirs, shown last for restoration.
     pub fn hidden_found_groups(&self) -> Vec<GroupConfig> {
+        if self.no_auto_groups {
+            return Vec::new();
+        }
         self.derived_groups(true)
     }
 
-    /// Every group magpie found, before hiding: `hidden_only` keeps just
-    /// the removed ones.
-    fn derived_groups(&self, hidden_only: bool) -> Vec<GroupConfig> {
+    /// The first provider and model behind a found-group ref, while found
+    /// groups are off: a request for one goes to its model from the
+    /// first provider serving it, so an agent set to the group keeps
+    /// working, on one provider (the reference's `AutoStandIn`).
+    pub fn auto_stand_in(&self, reference: &str) -> Option<(String, String)> {
+        if !self.no_auto_groups {
+            return None;
+        }
+        let model = if let Some(id) = reference.strip_prefix("group/") {
+            // A group the user wrote with the id serves as itself, never
+            // as a stand-in.
+            if self.group.iter().any(|g| g.id == id) {
+                return None;
+            }
+            self.found_seats()
+                .into_iter()
+                .find(|(m, _)| format!("auto-{}", auto_slug(m)) == id)
+                .map(|(m, _)| m)?
+        } else if self.auto_refs_on() {
+            reference.strip_prefix("auto/").map(str::to_owned)?
+        } else {
+            return None;
+        };
+        self.found_seats()
+            .into_iter()
+            .find(|(m, _)| m == &model)
+            .and_then(|(_, seats)| seats.into_iter().next())
+    }
+
+    /// Every model the providers serve, in provider order, with its
+    /// seats: one per provider naming it, retired models skipped.
+    fn found_seats(&self) -> Vec<(String, Vec<(String, String)>)> {
         let now = std::time::SystemTime::now();
         let mut order: Vec<String> = Vec::new();
         let mut by: std::collections::BTreeMap<String, Vec<(String, String)>> =
@@ -1753,9 +1801,20 @@ impl Config {
                 }
             }
         }
+        order
+            .into_iter()
+            .map(|m| {
+                let seats = by.remove(&m).unwrap_or_default();
+                (m, seats)
+            })
+            .collect()
+    }
+
+    /// Every group magpie found, before hiding: `hidden_only` keeps just
+    /// the removed ones.
+    fn derived_groups(&self, hidden_only: bool) -> Vec<GroupConfig> {
         let mut out = Vec::new();
-        for m in order {
-            let seats = &by[&m];
+        for (m, seats) in self.found_seats() {
             if seats.len() < 2 {
                 continue;
             }
@@ -1803,21 +1862,30 @@ impl Config {
     /// first provider there is.
     pub fn resolve(&self, model: &str) -> Option<(&ProviderConfig, String)> {
         if let Some(id) = model.strip_prefix("group/") {
-            let group = self.group(id)?;
-            return group
-                .routes
-                .iter()
-                .find_map(|route| self.resolve_provider(&self.member_effort(route).0));
+            if let Some(group) = self.group(id) {
+                return group
+                    .routes
+                    .iter()
+                    .find_map(|route| self.resolve_provider(&self.member_effort(route).0));
+            }
+            // While found groups are off, a request for one goes to its
+            // model from the first provider serving it (the reference's
+            // `AutoStandIn`).
+            let (pid, m) = self.auto_stand_in(model)?;
+            return self.resolve_provider(&format!("{pid}/{m}"));
         }
         if let Some(rest) = model.strip_prefix("auto/") {
             if self.auto_refs_on() {
                 // A found ref names a found group or nothing: hidden and
                 // single-seat models don't route under it.
-                let group = self.found_group(rest)?;
-                return group
-                    .routes
-                    .iter()
-                    .find_map(|route| self.resolve_provider(&self.member_effort(route).0));
+                if let Some(group) = self.found_group(rest) {
+                    return group
+                        .routes
+                        .iter()
+                        .find_map(|route| self.resolve_provider(&self.member_effort(route).0));
+                }
+                let (pid, m) = self.auto_stand_in(model)?;
+                return self.resolve_provider(&format!("{pid}/{m}"));
             }
             // Otherwise a provider id'd `auto` may serve it as its own
             // model: resolve below as provider/model.
@@ -2453,6 +2521,7 @@ base_url = "http://127.0.0.1:1/v1"
         let mut config = Config {
             default_provider: "mock".into(),
             hidden_auto_groups: Vec::new(),
+            no_auto_groups: false,
             key_cooldown_ms: 60_000,
             ..Config::default()
         };
@@ -2603,6 +2672,7 @@ affinity = "session"
         let mut config = Config {
             default_provider: "mock".into(),
             hidden_auto_groups: Vec::new(),
+            no_auto_groups: false,
             ..Config::default()
         };
         config.provider.push(ProviderConfig {
@@ -2985,6 +3055,7 @@ affinity = "session"
         let mut hidden = Config {
             provider: providers(),
             hidden_auto_groups: vec!["auto-same".into()],
+            no_auto_groups: false,
             ..Config::default()
         };
         assert!(hidden.auto_groups().is_empty());
@@ -3012,6 +3083,71 @@ affinity = "session"
         // Saving any group with its id unhides it.
         hidden.hidden_auto_groups.retain(|id| id != "auto-same");
         assert_eq!(hidden.auto_groups().len(), 1);
+    }
+
+    #[test]
+    fn turning_found_groups_off_lists_nothing_but_serves_one_seat() {
+        let providers = || {
+            vec![
+                found_provider("a", &["same"]),
+                found_provider("b", &["same"]),
+            ]
+        };
+        // Off, nothing found is listed, hidden, or catalogued.
+        let off = Config {
+            provider: providers(),
+            no_auto_groups: true,
+            ..Config::default()
+        };
+        assert!(off.auto_groups().is_empty());
+        assert!(off.hidden_found_groups().is_empty());
+        assert!(off.group("auto-same").is_none());
+        assert!(off.found_group("same").is_none());
+        assert!(off.group_by_ref("auto/same").is_none());
+        assert!(!off.catalog().iter().any(|(id, _)| id == "auto/same"));
+        // Either spelling still serves: the first provider's seat.
+        assert_eq!(
+            off.auto_stand_in("auto/same"),
+            Some(("a".to_owned(), "same".to_owned()))
+        );
+        assert_eq!(
+            off.auto_stand_in("group/auto-same"),
+            Some(("a".to_owned(), "same".to_owned()))
+        );
+        let (provider, model) = off.resolve("auto/same").expect("stand-in");
+        assert_eq!(provider.id, "a");
+        assert_eq!(model, "same");
+        let (provider, model) = off.resolve("group/auto-same").expect("stand-in by old id");
+        assert_eq!(provider.id, "a");
+        assert_eq!(model, "same");
+        // A group the user wrote with the id serves as itself, never as
+        // a stand-in.
+        let mut owned = Config {
+            provider: providers(),
+            no_auto_groups: true,
+            ..Config::default()
+        };
+        owned.group.push(GroupConfig {
+            id: "auto-same".into(),
+            name: String::new(),
+            routes: vec!["b/same".to_owned()],
+            rules: Vec::new(),
+            classifier: String::new(),
+            effort: String::new(),
+            levels: Vec::new(),
+            pick: String::new(),
+            auto: false,
+            weights: Vec::new(),
+            routing: RoutingPolicy::Order,
+            first_token_timeout_ms: 0,
+            affinity: Default::default(),
+        });
+        assert!(owned.auto_stand_in("group/auto-same").is_none());
+        let (provider, model) = owned
+            .resolve("group/auto-same")
+            .expect("user group serves itself");
+        assert_eq!(provider.id, "b");
+        assert_eq!(model, "same");
     }
 
     #[test]

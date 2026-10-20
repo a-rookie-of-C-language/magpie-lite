@@ -189,6 +189,7 @@ async fn gateway(
         token: "magpie-lite".into(),
         default_provider: id.into(),
         hidden_auto_groups: Vec::new(),
+        no_auto_groups: false,
         provider: providers,
         group: groups,
         ..Config::default()

@@ -129,6 +129,7 @@ async fn gateway(free: ProviderConfig, paid: ProviderConfig) -> String {
         history_path: None,
         default_provider: "free".into(),
         hidden_auto_groups: Vec::new(),
+        no_auto_groups: false,
         provider: vec![free, paid],
         group: vec![GroupConfig {
             id: "g".into(),

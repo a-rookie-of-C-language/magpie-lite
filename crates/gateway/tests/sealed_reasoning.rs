@@ -213,6 +213,7 @@ async fn fixture(protocol: Protocol, fail: bool) -> Fixture {
         token: TOKEN.into(),
         default_provider: "mock".into(),
         hidden_auto_groups: Vec::new(),
+        no_auto_groups: false,
         history_path: Some(history.clone()),
         provider: vec![provider, backup],
         group: vec![GroupConfig {
