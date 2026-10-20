@@ -1038,6 +1038,110 @@ async fn a_bare_model_id_reaches_its_found_group() {
 }
 
 #[tokio::test]
+async fn vendors_spelling_one_model_apart_share_one_served_group() {
+    async fn ask(url: &str, model: &str) -> StatusCode {
+        Client::new()
+            .post(format!("{url}/v1/chat/completions"))
+            .bearer_auth("magpie-lite")
+            .json(&json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "Hi"}],
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    }
+    // Two vendors list one model apart: one group, each asked for the
+    // id it lists, by whatever spelling the agent uses.
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let first = Arc::new(Mutex::new(None));
+    let second = Arc::new(Mutex::new(None));
+    let (first_url, first_task) = bind(
+        Router::new()
+            .route("/v1/chat/completions", post(mock))
+            .with_state(first.clone()),
+    )
+    .await;
+    let (second_url, second_task) = bind(
+        Router::new()
+            .route("/v1/chat/completions", post(mock))
+            .with_state(second.clone()),
+    )
+    .await;
+    let peer = |id: &str, upstream: &str, model: &str| ProviderConfig {
+        id: id.into(),
+        name: id.into(),
+        protocol: Protocol::Chat,
+        base_url: format!("{upstream}/v1"),
+        api_key: "secret-provider-key".into(),
+        api_keys: Vec::new(),
+        models: vec![model.into()],
+        contexts: Default::default(),
+        fallback: Vec::new(),
+        key_cooldown_ms: None,
+        capabilities: Default::default(),
+        routing: magpie_gateway::RoutingPolicy::Rotate,
+        weights: Vec::new(),
+        affinity: Default::default(),
+        max_concurrency: None,
+        max_rpm: None,
+        queue_limit: None,
+        queue_wait_s: None,
+        key_generation: 0,
+    };
+    let config = Config {
+        provider: vec![
+            peer("mock-a", &first_url, "Claude Opus 5.5"),
+            peer("mock-b", &second_url, "claude-opus-5-5"),
+        ],
+        ..Config::default()
+    };
+    config.save(&path).unwrap();
+    let state = Arc::new(AppState {
+        agents: None,
+        config: ConfigStore::new(config, Some(path.clone())),
+        http: magpie_gateway::upstream::http_client().unwrap(),
+        requests: Arc::new(Mutex::new(magpie_gateway::usage::RequestLog::default())),
+        key_rotation: magpie_gateway::KeyRotator::default(),
+        affinity: magpie_gateway::AffinityStore::default(),
+        lanes: magpie_gateway::lanes::Lanes::default(),
+        rpms: magpie_gateway::lanes::Rpms::default(),
+    });
+    let (url, gateway_task) = bind(build_router(state)).await;
+    let _tasks = vec![first_task, second_task, gateway_task];
+    // Listed once, under the first spelling; either spelling and the
+    // bare one are served, the first vendor asked for its own id.
+    let models: Value = Client::new()
+        .get(format!("{url}/v1/models"))
+        .bearer_auth("magpie-lite")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = models["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"auto/Claude Opus 5.5"), "{ids:?}");
+    assert_eq!(ask(&url, "auto/claude-opus-5-5").await, StatusCode::OK);
+    assert_eq!(
+        first.lock().unwrap().as_ref().unwrap()["model"],
+        "Claude Opus 5.5"
+    );
+    assert_eq!(ask(&url, "claude-opus-5-5").await, StatusCode::OK);
+    assert_eq!(
+        first.lock().unwrap().as_ref().unwrap()["model"],
+        "Claude Opus 5.5"
+    );
+}
+
+#[tokio::test]
 async fn manual_group_sends_every_request_to_its_pick_and_rules_wait() {
     async fn ask(gw: &Gateway, content: &str) -> StatusCode {
         Client::new()

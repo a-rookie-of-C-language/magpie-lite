@@ -1373,6 +1373,79 @@ fn auto_slug(model: &str) -> String {
     slug.trim_end_matches('-').to_owned()
 }
 
+/// A model id as vendors agree on it: lowercase, without any vendor
+/// prefix, a version's dot as `-` (`claude-opus-5.5` is `claude-opus-5-5`,
+/// and so is Fireworks' `p` for the dot), a run of spaces, `_` and `-`
+/// as one `-`, and without the snapshot date some append (`-20260801`,
+/// `@20260801`, Ark's six digits). Anything else stays: a variant after
+/// `:` (`:batch`), `-flash`/`-thinking`, a four-digit release, OpenAI's
+/// dashed dates. Found groups merge on this (the reference's
+/// `sameModel`); the vendor is always asked for the id it lists.
+fn same_model(id: &str) -> String {
+    let mut k = id.to_lowercase();
+    k = k.trim().to_owned();
+    if let Some(i) = k.rfind('/') {
+        k = k[i + 1..].to_owned();
+    }
+    let mut merged = String::with_capacity(k.len());
+    let mut dash = false;
+    for c in k.chars() {
+        if c == '_' || c == '-' || c.is_whitespace() {
+            if !dash && !merged.is_empty() {
+                merged.push('-');
+                dash = true;
+            }
+        } else {
+            merged.push(c);
+            dash = false;
+        }
+    }
+    // `.`/`p` are ASCII, so byte surgery never splits a character.
+    let mut b = merged.into_bytes();
+    for i in 1..b.len().saturating_sub(1) {
+        if (b[i] == b'.' || b[i] == b'p') && b[i - 1].is_ascii_digit() && b[i + 1].is_ascii_digit()
+        {
+            b[i] = b'-';
+        }
+    }
+    let mut k = String::from_utf8(b).expect("same_model keeps UTF-8");
+    let cut = match (k.rfind('-'), k.rfind('@')) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    if let Some(i) = cut
+        && i > 0
+        && snapshot_date(&k[i + 1..])
+    {
+        k.truncate(i);
+    }
+    k
+}
+
+/// Whether `s` is the date a vendor dates a snapshot by: `YYYYMMDD`
+/// from 2000 on, or Ark's `YYMMDD` from 2023 on with a month and a day
+/// that are one (the reference's `snapshotDate`).
+fn snapshot_date(s: &str) -> bool {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    match s.len() {
+        8 => s.starts_with("20"),
+        6 => {
+            let d = s.as_bytes();
+            let (yy, mm, dd) = (
+                (d[0] - b'0') * 10 + (d[1] - b'0'),
+                (d[2] - b'0') * 10 + (d[3] - b'0'),
+                (d[4] - b'0') * 10 + (d[5] - b'0'),
+            );
+            (23..=39).contains(&yy) && (1..=12).contains(&mm) && (1..=31).contains(&dd)
+        }
+        _ => false,
+    }
+}
+
 /// `skip_serializing_if` for found-group markers: files stay quiet unless
 /// magpie found the group.
 fn is_found(found: &bool) -> bool {
@@ -1707,12 +1780,15 @@ impl Config {
         }
     }
 
-    /// The found group for a model id, by the vendors' spelling.
+    /// The found group for a model id, however any vendor spells it.
     pub fn found_group(&self, model: &str) -> Option<GroupConfig> {
         if !self.auto_refs_on() {
             return None;
         }
-        self.auto_groups().into_iter().find(|g| g.name == model)
+        let key = same_model(model);
+        self.auto_groups()
+            .into_iter()
+            .find(|g| same_model(&g.name) == key)
     }
 
     /// Find a routing group by the ref an agent uses: `group/<id>` for a
@@ -1737,10 +1813,11 @@ impl Config {
 
     /// The groups magpie found: one model id served by several providers,
     /// in the order the providers were added (the reference's
-    /// `autoGroups`, without its cross-vendor spelling — lite merges on
-    /// the id the providers list). A group the user wrote with the same
-    /// id is theirs, and one they removed stays hidden until brought
-    /// back. Retired models leave their provider's seat only.
+    /// `autoGroups`): vendors spelling one model apart merge on the id
+    /// they agree on, and the vendor is asked for the id it lists. A
+    /// group the user wrote with the same id is theirs, and one they
+    /// removed stays hidden until brought back. Retired models leave
+    /// their provider's seat only.
     pub fn auto_groups(&self) -> Vec<GroupConfig> {
         if self.no_auto_groups {
             return Vec::new();
@@ -1765,7 +1842,7 @@ impl Config {
         if !self.no_auto_groups {
             return None;
         }
-        let model = if let Some(id) = reference.strip_prefix("group/") {
+        let key = if let Some(id) = reference.strip_prefix("group/") {
             // A group the user wrote with the id serves as itself, never
             // as a stand-in.
             if self.group.iter().any(|g| g.id == id) {
@@ -1773,21 +1850,23 @@ impl Config {
             }
             self.found_seats()
                 .into_iter()
-                .find(|(m, _)| format!("auto-{}", auto_slug(m)) == id)
-                .map(|(m, _)| m)?
+                .find(|(k, _)| format!("auto-{}", auto_slug(k)) == id)
+                .map(|(k, _)| k)?
         } else if self.auto_refs_on() {
-            reference.strip_prefix("auto/").map(str::to_owned)?
+            reference.strip_prefix("auto/").map(same_model)?
         } else {
             return None;
         };
         self.found_seats()
             .into_iter()
-            .find(|(m, _)| m == &model)
+            .find(|(k, _)| k == &key)
             .and_then(|(_, seats)| seats.into_iter().next())
     }
 
-    /// Every model the providers serve, in provider order, with its
-    /// seats: one per provider naming it, retired models skipped.
+    /// Every model the providers serve, in provider order, keyed by the
+    /// id vendors agree on, with its seats: one per provider naming it
+    /// however it spells it, retired models skipped. The display name is
+    /// the first seat's spelling.
     fn found_seats(&self) -> Vec<(String, Vec<(String, String)>)> {
         let now = std::time::SystemTime::now();
         let mut order: Vec<String> = Vec::new();
@@ -1798,10 +1877,11 @@ impl Config {
                 if m.is_empty() || crate::retired::is_retired(&p.id, m, now) {
                     continue;
                 }
-                let seats = by.entry(m.clone()).or_default();
+                let key = same_model(m);
+                let seats = by.entry(key.clone()).or_default();
                 if !seats.iter().any(|(pid, _)| pid == &p.id) {
                     if seats.is_empty() {
-                        order.push(m.clone());
+                        order.push(key.clone());
                     }
                     seats.push((p.id.clone(), m.clone()));
                 }
@@ -1820,11 +1900,11 @@ impl Config {
     /// the removed ones.
     fn derived_groups(&self, hidden_only: bool) -> Vec<GroupConfig> {
         let mut out = Vec::new();
-        for (m, seats) in self.found_seats() {
+        for (key, seats) in self.found_seats() {
             if seats.len() < 2 {
                 continue;
             }
-            let id = format!("auto-{}", auto_slug(&m));
+            let id = format!("auto-{}", auto_slug(&key));
             if self.group.iter().any(|g| g.id == id) {
                 continue;
             }
@@ -1834,7 +1914,7 @@ impl Config {
             }
             out.push(GroupConfig {
                 id,
-                name: m.clone(),
+                name: seats[0].1.clone(),
                 routes: seats
                     .iter()
                     .map(|(pid, model)| format!("{pid}/{model}"))
@@ -2950,6 +3030,25 @@ affinity = "session"
     fn found_groups_serve_a_model_on_several_providers() {
         assert_eq!(auto_slug("Claude Opus 5.5"), "claude-opus-5-5");
         assert_eq!(auto_slug("deepseek-chat"), "deepseek-chat");
+        // Vendors spelling one model apart agree on one id: a version's
+        // dot (Fireworks' `p` too), gap runs as one `-`, no vendor
+        // prefix, no snapshot date. Variants, dated pins and releases
+        // stay their own.
+        assert_eq!(same_model("Claude Opus 5.5"), "claude-opus-5-5");
+        assert_eq!(same_model("claude-opus-5.5"), "claude-opus-5-5");
+        assert_eq!(same_model("anthropic/claude-sonnet-5"), "claude-sonnet-5");
+        assert_eq!(same_model("deepseek-v4p1"), "deepseek-v4-1");
+        assert_eq!(same_model("GPT-6 Sol"), "gpt-6-sol");
+        assert_eq!(same_model("claude-opus-5-5-20260801"), "claude-opus-5-5");
+        assert_eq!(same_model("m@20260801"), "m");
+        assert_eq!(
+            same_model("deepseek-v4-1-flash-260910"),
+            "deepseek-v4-1-flash"
+        );
+        assert_eq!(same_model("qwen3:batch"), "qwen3:batch");
+        assert_eq!(same_model("qwen3-2507"), "qwen3-2507");
+        assert_eq!(same_model("kimi-k2-0905"), "kimi-k2-0905");
+        assert_eq!(same_model("gpt-4o-2024-08-06"), "gpt-4o-2024-08-06");
         let config = Config {
             provider: vec![
                 found_provider("a", &["same", "solo-a"]),
@@ -2996,6 +3095,46 @@ affinity = "session"
             config.fallback_references("auto/same", &config.provider[0]),
             vec!["a/same".to_owned(), "b/same".to_owned()]
         );
+    }
+
+    #[test]
+    fn vendors_spelling_one_model_apart_share_its_found_group() {
+        let config = Config {
+            provider: vec![
+                found_provider("a", &["Claude Opus 5.5"]),
+                found_provider("b", &["claude-opus-5-5"]),
+            ],
+            ..Config::default()
+        };
+        // One group, under the agreed id, named for the first spelling,
+        // each seat keeping the id its vendor lists.
+        let auto = config.auto_groups();
+        assert_eq!(auto.len(), 1);
+        assert_eq!(auto[0].id, "auto-claude-opus-5-5");
+        assert_eq!(auto[0].name, "Claude Opus 5.5");
+        assert_eq!(
+            auto[0].routes,
+            vec![
+                "a/Claude Opus 5.5".to_owned(),
+                "b/claude-opus-5-5".to_owned()
+            ]
+        );
+        // However spelt, the ref names the group, and the vendor is asked
+        // for its own id.
+        assert_eq!(
+            config.found_group("claude-opus-5.5").unwrap().id,
+            auto[0].id
+        );
+        assert_eq!(
+            config.group_by_ref("Claude Opus 5.5").unwrap().id,
+            auto[0].id
+        );
+        let (provider, model) = config.resolve("auto/claude-opus-5.5").expect("route");
+        assert_eq!(provider.id, "a");
+        assert_eq!(model, "Claude Opus 5.5");
+        let (provider, model) = config.resolve("group/auto-claude-opus-5-5").expect("route");
+        assert_eq!(provider.id, "a");
+        assert_eq!(model, "Claude Opus 5.5");
     }
 
     #[test]
