@@ -202,7 +202,7 @@ async fn a_full_lane_queues_the_next_request_until_the_first_is_done() {
     let member = Member::new(Duration::from_millis(300));
     let mut only = provider("solo", upstream(member.clone()).await);
     only.max_concurrency = Some(1);
-    let (gw, _state) = gateway(vec![only]).await;
+    let (gw, state) = gateway(vec![only]).await;
 
     let first = tokio::spawn(ask(gw.clone(), "solo/mock-model"));
     // Let the first reach the vendor before the second queues.
@@ -214,6 +214,13 @@ async fn a_full_lane_queues_the_next_request_until_the_first_is_done() {
     assert_eq!(s1, StatusCode::OK, "{b1}");
     assert_eq!(s2, StatusCode::OK, "{b2}");
     assert_eq!(member.asked(), 2, "both requests reached the one vendor");
+    let recent = state.requests.lock().unwrap().snapshot().recent_requests;
+    assert!(
+        recent
+            .iter()
+            .any(|record| record.tries.iter().any(|try_| try_.queued_ms > 0)),
+        "the send that queued counts its wait on its try"
+    );
 }
 
 /// `/stats` shows live concurrency lanes: while one request holds the
@@ -324,10 +331,42 @@ async fn a_queue_past_its_bound_is_turned_away_with_a_429() {
     // A third is over the bound: a 429 at once.
     let (status, _headers, body) = ask(gw.clone(), "solo/mock-model").await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert!(
+        body.to_string().contains("its queue is full"),
+        "the agent is told why it waited: {body}"
+    );
 
     drop(first.await.unwrap());
     drop(queued.await.unwrap());
     assert_eq!(member.asked(), 2, "the refused request never went upstream");
+}
+
+/// A request that waits as long as it may is turned away telling the agent
+/// how long it waited for a free slot (the reference's `laneMessage`).
+#[tokio::test]
+async fn a_wait_past_what_it_may_keep_names_the_wait() {
+    let member = Member::new(Duration::from_millis(100));
+    let mut only = provider("solo", upstream(member.clone()).await);
+    only.max_concurrency = Some(1);
+    only.queue_limit = Some(1);
+    only.queue_wait_s = Some(1);
+    let (gw, state) = gateway(vec![only]).await;
+
+    // Hold the key's only slot so a routed request waits out its second.
+    let who = magpie_gateway::affinity::who_of("solo", "fixture-key");
+    let _hold = state
+        .lanes
+        .take(&who, 1, 0, Duration::ZERO)
+        .await
+        .expect("hold the lane");
+
+    let (status, _headers, body) = ask(gw.clone(), "solo/mock-model").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert!(
+        body.to_string().contains("for a free slot"),
+        "the agent is told what it waited for: {body}"
+    );
+    assert_eq!(member.asked(), 0, "the refused request never went upstream");
 }
 
 /// A key's own override caps it while the provider stays unlimited: with

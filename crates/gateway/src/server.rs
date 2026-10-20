@@ -894,7 +894,7 @@ impl UpstreamCandidate {
 /// the reference's `laneMessage` words it.
 fn lane_failure(
     provider: &ProviderConfig,
-    error: impl std::fmt::Display,
+    message: String,
     retry_after: Option<u64>,
 ) -> ProxyFailure {
     let label = format!(
@@ -902,8 +902,11 @@ fn lane_failure(
         provider.id,
         provider.models.first().map_or("", |m| m.as_str())
     );
-    let message = format!("{label}: {error}");
-    ProxyFailure::lane(StatusCode::TOO_MANY_REQUESTS, message, retry_after)
+    ProxyFailure::lane(
+        StatusCode::TOO_MANY_REQUESTS,
+        format!("{label}: {message}"),
+        retry_after,
+    )
 }
 
 /// Whether a request for `key` under `provider` would go at once: a slot
@@ -2184,11 +2187,15 @@ async fn send_with_fallback(
             // failed and nobody rests: the next key or member is asked,
             // else the agent is told with a 429 and Retry-After (#892).
             let who = who_of(&route.provider.id, api_key);
+            let limit = route.provider.lane_limit_for_key(api_key);
+            // What the send waits for a slot and minute room counts on
+            // its try, told the agent's way (the reference's `Queued`).
+            let waited = std::time::Instant::now();
             let slot = match state
                 .lanes
                 .take(
                     &who,
-                    route.provider.lane_limit_for_key(api_key),
+                    limit,
                     route.provider.queue_bound(),
                     route.provider.queue_wait(),
                 )
@@ -2196,7 +2203,25 @@ async fn send_with_fallback(
             {
                 Ok(slot) => slot,
                 Err(error) => {
-                    let failure = lane_failure(&route.provider, error, None);
+                    let queued_ms = waited.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                    let reason = match error {
+                        lanes::LaneError::Full => format!(
+                            "its queue is full ({} waiting)",
+                            route.provider.queue_bound()
+                        ),
+                        lanes::LaneError::Waited => format!(
+                            "this one waited {:.1}s for a free slot, as long as it may ({}s)",
+                            queued_ms as f64 / 1000.0,
+                            route.provider.queue_wait().as_secs()
+                        ),
+                    };
+                    let failure = lane_failure(
+                        &route.provider,
+                        format!(
+                            "{limit} requests at once is its limit, and {reason}; try again shortly"
+                        ),
+                        None,
+                    );
                     tracker.record_attempt(&route.provider.id, *key_slot, "queue_refused");
                     if attempt + 1 < route.api_keys.len() {
                         continue 'keys;
@@ -2221,7 +2246,11 @@ async fn send_with_fallback(
             {
                 drop(slot);
                 let retry_after = error.retry_after();
-                let failure = lane_failure(&route.provider, error, Some(retry_after));
+                let failure = lane_failure(
+                    &route.provider,
+                    format!("{error}; try again then"),
+                    Some(retry_after),
+                );
                 tracker.record_attempt(&route.provider.id, *key_slot, "rpm_refused");
                 if attempt + 1 < route.api_keys.len() {
                     continue 'keys;
@@ -2231,6 +2260,7 @@ async fn send_with_fallback(
                 }
                 return Err((failure, candidate, decision.clone()));
             }
+            let queued_ms = waited.elapsed().as_millis().min(u64::MAX as u128) as u64;
             let folds_roots = object_root::folds_roots(&route.provider, &route.model);
             let mut empty_retries = 0;
             let mut optional_retry: Option<Vec<&'static str>> = None;
@@ -2402,6 +2432,7 @@ async fn send_with_fallback(
                         },
                         &body,
                     )),
+                    queued_ms,
                 );
                 let first_token =
                     GroupFirstToken::new(if creq.stream && route_index != last_route {

@@ -92,6 +92,16 @@ pub struct TryRecord {
     /// when the send asked for none, empty when it named none.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub effort: String,
+    /// Milliseconds the send waited for one of its key's slots and room
+    /// in its minute before going; absent when it went at once (the
+    /// reference's `Queued` on each try).
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub queued_ms: u64,
+}
+
+/// Whether a `queued_ms` is absent from a try record.
+fn u64_is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// The level a send went at for its try record: the wire name, `none`
@@ -485,12 +495,21 @@ impl RequestTracker {
     }
 
     /// Note one upstream send: which member was asked, at which level.
-    pub fn push_try(&mut self, provider: &str, model: &str, key_slot: usize, effort: &str) {
+    /// `queued_ms` is how long the send waited for a slot and minute room.
+    pub fn push_try(
+        &mut self,
+        provider: &str,
+        model: &str,
+        key_slot: usize,
+        effort: &str,
+        queued_ms: u64,
+    ) {
         self.record.tries.push(TryRecord {
             provider: provider.to_owned(),
             model: model.to_owned(),
             key_slot,
             effort: effort.to_owned(),
+            queued_ms,
         });
     }
 
@@ -862,9 +881,9 @@ mod tests {
     fn tries_keep_every_send_and_load_history_without_them() {
         let log = Arc::new(Mutex::new(RequestLog::default()));
         let mut tracker = tracker(log.clone());
-        tracker.push_try("primary", "one", 0, "high");
+        tracker.push_try("primary", "one", 0, "high", 0);
         tracker.begin_attempt("backup", "two", 1);
-        tracker.push_try("backup", "two", 1, "low");
+        tracker.push_try("backup", "two", 1, "low", 340);
         tracker.finish("ok", &Usage::default());
 
         let record = &log.lock().unwrap().snapshot().recent_requests[0];
@@ -873,8 +892,10 @@ mod tests {
         assert_eq!(record.tries[0].provider, "primary");
         assert_eq!(record.tries[0].model, "one");
         assert_eq!(record.tries[0].effort, "high");
+        assert_eq!(record.tries[0].queued_ms, 0);
         assert_eq!(record.tries[1].key_slot, 1);
         assert_eq!(record.tries[1].effort, "low");
+        assert_eq!(record.tries[1].queued_ms, 340);
         // History lines written before tries were kept load without them.
         let old: RequestRecord = serde_json::from_str(
             r#"{"started_unix_ms":1,"client_protocol":"chat","requested_model":"m","provider":"p","upstream_model":"u","key_slot":0,"stream":false,"status":"ok","latency_ms":2,"usage":{}}"#,

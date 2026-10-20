@@ -1164,7 +1164,8 @@
       if (tries.length === 0) return "";
       const legs = tries.map(t => {
         const at = t.effort ? `@${t.effort}` : "";
-        return `${t.provider}/${t.model}${at}`;
+        const queued = t.queued_ms > 0 ? ` (queued ${t.queued_ms}ms)` : "";
+        return `${t.provider}/${t.model}${at}${queued}`;
       });
       return ` · tries: ${legs.join(" → ")}`;
     }
