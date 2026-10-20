@@ -6,9 +6,10 @@
 use std::sync::{Arc, Mutex};
 
 use axum::{Json, Router, extract::State, routing::post};
+use magpie_core::effort::Effort;
 use magpie_gateway::rules::{
     Rule, RuleRequest, TimeWindow, agent_of, clean_folder, folder_key, folder_under, match_rule,
-    paused_out, then_uses,
+    paused_out, then_uses, within_levels,
 };
 use magpie_gateway::{
     AppState, Config, ConfigStore, GroupConfig, Protocol, ProviderConfig, RoutingPolicy,
@@ -367,6 +368,7 @@ fn group_validation_cleans_rules_and_refuses_bad_ones() {
         rules: Vec::new(),
         classifier: String::new(),
         effort: String::new(),
+        levels: Vec::new(),
         pick: String::new(),
         auto: false,
         weights: Vec::new(),
@@ -461,6 +463,55 @@ fn group_validation_cleans_rules_and_refuses_bad_ones() {
     assert_eq!(group.rules[0].summary(), "a/one at low when tokens ≥ 1");
 }
 
+#[test]
+fn within_levels_bounds_every_ask_for_a_member_to_the_nearest_offered() {
+    let offered = ["low".to_owned(), "high".to_owned()];
+    // offered stays as asked
+    assert_eq!(within_levels(Effort::Low, &offered), Effort::Low);
+    assert_eq!(within_levels(Effort::High, &offered), Effort::High);
+    // a tie goes up
+    assert_eq!(within_levels(Effort::Medium, &offered), Effort::High);
+    // the nearer wins below and above
+    assert_eq!(within_levels(Effort::XHigh, &offered), Effort::High);
+    assert_eq!(within_levels(Effort::Max, &offered), Effort::High);
+    // one level takes every ask
+    let one = ["high".to_owned()];
+    assert_eq!(within_levels(Effort::Low, &one), Effort::High);
+    assert_eq!(within_levels(Effort::Max, &one), Effort::High);
+    // off and an unnamed ask stay as they are
+    assert_eq!(within_levels(Effort::Off, &offered), Effort::Off);
+    assert_eq!(
+        within_levels(Effort::Unspecified, &offered),
+        Effort::Unspecified
+    );
+    // nothing offered bounds nothing
+    assert_eq!(within_levels(Effort::Medium, &[]), Effort::Medium);
+}
+
+#[test]
+fn group_validation_cleans_levels_and_refuses_bad_ones() {
+    let mut group = GroupConfig {
+        id: "g".into(),
+        name: String::new(),
+        routes: vec!["a/one".to_owned(), "b/two".to_owned()],
+        rules: Vec::new(),
+        classifier: String::new(),
+        effort: String::new(),
+        levels: vec![" HIGH ".into(), "low".into(), "high".into(), String::new()],
+        pick: String::new(),
+        auto: false,
+        weights: Vec::new(),
+        routing: RoutingPolicy::Order,
+        first_token_timeout_ms: 0,
+        affinity: Default::default(),
+    };
+    group.validate().unwrap();
+    assert_eq!(group.levels, vec!["high".to_owned(), "low".to_owned()]);
+
+    group.levels = vec!["ludicrous".into()];
+    assert!(group.validate().is_err());
+}
+
 // ---- end to end -------------------------------------------------------------
 
 struct Gateway {
@@ -544,6 +595,7 @@ async fn gateway(rules: Vec<Rule>) -> Gateway {
             rules,
             classifier: String::new(),
             effort: String::new(),
+            levels: Vec::new(),
             pick: String::new(),
             auto: false,
             weights: Vec::new(),

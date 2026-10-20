@@ -778,6 +778,9 @@ struct UpstreamRoute {
     /// none: asked for whatever the agent asked and whatever the turn
     /// picked. The vendor is asked for `model`, the effort riding here.
     effort: String,
+    /// Reasoning levels the member's group offers: every ask for one is
+    /// sent at the nearest of these. Empty offers everything.
+    levels: Vec<String>,
     api_keys: Vec<(usize, String)>,
     group_id: Option<String>,
     group_route_index: Option<usize>,
@@ -1094,11 +1097,12 @@ fn prepare(
         )
     })?;
 
-    let (provider, upstream_model, fixed_effort, group_plan, group_route_index) =
+    let (provider, upstream_model, fixed_effort, levels, group_plan, group_route_index) =
         if let Some(group) = config.group_by_ref(&creq.model) {
             // Both spellings land on the internal id, so rotation,
             // affinity and usage count them as one group.
             let group_id = group.id.clone();
+            let levels = group.levels.clone();
             let routes = key_rotation.group_order(
                 &group_id,
                 group.routing,
@@ -1132,6 +1136,7 @@ fn prepare(
                 provider,
                 upstream_model,
                 effort,
+                levels,
                 Some(GroupRoutePlan {
                     id: group_id.clone(),
                     routes,
@@ -1149,7 +1154,14 @@ fn prepare(
                     wire.error_body(StatusCode::NOT_FOUND, &message),
                 ));
             };
-            (provider, upstream_model, String::new(), None, None)
+            (
+                provider,
+                upstream_model,
+                String::new(),
+                Vec::new(),
+                None,
+                None,
+            )
         };
     let affinity = if let Some(plan) = group_plan.as_ref() {
         let group = config.group(&plan.id).expect("group just resolved");
@@ -1172,6 +1184,7 @@ fn prepare(
             provider: Arc::new(provider.clone()),
             model: upstream_model,
             effort: fixed_effort,
+            levels,
             api_keys: provider.api_key_pool().into_iter().enumerate().collect(),
             group_id: group_plan.as_ref().map(|plan| plan.id.clone()),
             group_route_index,
@@ -1220,6 +1233,11 @@ fn upstream_routes(
         initial.effort.clone(),
     )]);
 
+    // Members of the group offer its levels, as the initial route does.
+    let group_levels = group_plan
+        .and_then(|plan| config.group(&plan.id))
+        .map(|group| group.levels.clone())
+        .unwrap_or_default();
     let mut fallback_references = group_plan
         .map(|plan| {
             plan.routes
@@ -1257,6 +1275,7 @@ fn upstream_routes(
                 provider: Arc::new(provider.clone()),
                 model,
                 effort,
+                levels: group_levels.clone(),
                 api_keys,
                 group_id: group_plan.map(|plan| plan.id.clone()),
                 group_route_index: Some(route_index),
@@ -1276,6 +1295,7 @@ fn upstream_routes(
                 provider: Arc::new(provider.clone()),
                 model,
                 effort,
+                levels: Vec::new(),
                 api_keys,
                 group_id: None,
                 group_route_index: None,
@@ -2144,6 +2164,21 @@ async fn send_with_fallback(
                     )
                 };
                 let send = fixed.as_ref().unwrap_or(creq);
+                // A group naming levels bounds every reasoning ask for its
+                // members to the nearest offered — the agent's, a fixed
+                // effort, a rule's, or the turn's pick — except off, which
+                // stays off (the reference's `withinLevels`).
+                let bounded;
+                let send = if !route.levels.is_empty()
+                    && let Some(want) = send.effort
+                {
+                    let mut owned = send.clone();
+                    owned.effort = Some(crate::rules::within_levels(want, &route.levels));
+                    bounded = owned;
+                    &bounded
+                } else {
+                    send
+                };
                 let mut body = match upstream::build_request(&route.provider, send, &route.model) {
                     Ok(body) => body,
                     Err(error) => {
@@ -4333,6 +4368,7 @@ mod tests {
                             rules: Vec::new(),
                             classifier: String::new(),
                             effort: String::new(),
+                            levels: Vec::new(),
                             pick: String::new(),
                             auto: false,
                             weights: Vec::new(),

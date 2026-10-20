@@ -1206,6 +1206,47 @@ pub fn fit_level(want: &str) -> String {
     }
 }
 
+/// The effort a member of a group offering `levels` is asked for: `want`
+/// when offered, else the nearest offered — a tie goes up — except off
+/// and an unnamed ask, which stay as they are (the reference's
+/// `withinLevels`, over the levels a group names).
+pub fn within_levels(
+    want: magpie_core::effort::Effort,
+    levels: &[String],
+) -> magpie_core::effort::Effort {
+    use magpie_core::effort::Effort;
+    fn rank(level: Effort) -> Option<i64> {
+        match level {
+            Effort::Low => Some(0),
+            Effort::Medium => Some(1),
+            Effort::High => Some(2),
+            Effort::XHigh => Some(3),
+            Effort::Max => Some(4),
+            Effort::Off | Effort::Unspecified => None,
+        }
+    }
+    let Some(at) = rank(want) else {
+        return want;
+    };
+    let mut best: Option<(Effort, i64)> = None;
+    for level in levels {
+        let Some(parsed) = Effort::parse(level) else {
+            continue;
+        };
+        let Some(i) = rank(parsed) else {
+            continue;
+        };
+        let dist = (i - at).abs();
+        // A tie goes up: the stronger neighbor wins over the weaker one
+        // as far.
+        let up = best.is_none_or(|(_, d): (Effort, i64)| dist < d || (dist == d && i > at));
+        if up {
+            best = Some((parsed, dist));
+        }
+    }
+    best.map(|(level, _)| level).unwrap_or(want)
+}
+
 /// Whether a new turn of a conversation keeps the reasoning its turn before
 /// was asked for, rather than the lower one picked for it now (the
 /// reference's `keepsEffort`, #617). The reasoning is part of what the

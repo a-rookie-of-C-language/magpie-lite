@@ -137,6 +137,7 @@ async fn gateway(free: ProviderConfig, paid: ProviderConfig) -> String {
             rules: Vec::new(),
             classifier: String::new(),
             effort: String::new(),
+            levels: Vec::new(),
             pick: String::new(),
             auto: false,
             weights: Vec::new(),

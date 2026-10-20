@@ -166,6 +166,12 @@ enum GroupCommand {
         /// turn is as it begins.
         #[arg(long, default_value = "")]
         effort: String,
+        /// Reasoning levels the group offers its members (`low`, `medium`,
+        /// `high`, `xhigh`, `max`); every reasoning ask for a member is
+        /// sent at the nearest offered, except off, which stays off.
+        /// Repeat for each level; empty offers everything.
+        #[arg(long = "level", num_args = 1)]
+        levels: Vec<String>,
         /// The member a `manual` group sends every request to
         /// (`provider/model`); the others, and the rules, wait until
         /// another member is picked.
@@ -447,6 +453,7 @@ async fn main() -> Result<()> {
                     rules,
                     classifier,
                     effort,
+                    levels,
                     pick,
                 } => {
                     let path = provider_path(&cli.config)?;
@@ -465,6 +472,7 @@ async fn main() -> Result<()> {
                         rules: parsed,
                         classifier: classifier.trim().to_owned(),
                         effort: effort.trim().to_owned(),
+                        levels,
                         pick: pick.trim().to_owned(),
                         auto: false,
                         weights: route_weights,

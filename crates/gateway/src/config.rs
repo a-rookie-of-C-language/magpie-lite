@@ -923,6 +923,12 @@ pub struct GroupConfig {
     /// requests ask their model for it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub effort: String,
+    /// Reasoning levels the group offers its members: every ask for one —
+    /// the agent's, a fixed effort, a rule's, or the turn's pick — is sent
+    /// at the nearest offered, except off, which stays off (the
+    /// reference's `Group.Levels`). Empty offers everything.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub levels: Vec<String>,
     /// The member a `manual` group sends every request to
     /// (`provider/model`); the others, and the rules, wait until another
     /// member is picked (the reference's `Group.Pick`). Kept while the
@@ -1002,6 +1008,26 @@ impl GroupConfig {
         if !self.effort.is_empty() && self.effort != "auto" {
             anyhow::bail!("effort is \"auto\" or blank, not {:?}", self.effort);
         }
+        // The levels the group offers, cased down and de-duplicated: every
+        // reasoning ask for its members is sent at the nearest of these.
+        let mut levels = Vec::with_capacity(self.levels.len());
+        for level in &self.levels {
+            let level = level.trim().to_ascii_lowercase();
+            if level.is_empty() {
+                continue;
+            }
+            if !crate::rules::EFFORTS.contains(&level.as_str()) {
+                anyhow::bail!(
+                    "levels offer one of {}, not {:?}",
+                    crate::rules::EFFORTS.join(", "),
+                    level
+                );
+            }
+            if !levels.contains(&level) {
+                levels.push(level);
+            }
+        }
+        self.levels = levels;
         self.classifier = self.classifier.trim().to_owned();
         let intents = self.rules.iter().any(|r| !r.intent.is_empty());
         if self.classifier == format!("group/{}", self.id) {
@@ -1158,6 +1184,12 @@ pub struct GroupConfigSnapshot {
     /// How the turn's reasoning is picked: `auto` or blank.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub effort: String,
+    /// Reasoning levels the group offers its members: every ask for one —
+    /// the agent's, a fixed effort, a rule's, or the turn's pick — is sent
+    /// at the nearest offered, except off, which stays off. Empty offers
+    /// everything.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub levels: Vec<String>,
     /// The member a `manual` group sends every request to.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pick: String,
@@ -1539,6 +1571,7 @@ impl Config {
                     rules: g.rules.clone(),
                     classifier: g.classifier.clone(),
                     effort: g.effort.clone(),
+                    levels: g.levels.clone(),
                     pick: g.pick.clone(),
                     auto: g.auto,
                     hidden: false,
@@ -1554,6 +1587,7 @@ impl Config {
                     rules: g.rules.clone(),
                     classifier: g.classifier.clone(),
                     effort: g.effort.clone(),
+                    levels: g.levels.clone(),
                     pick: g.pick.clone(),
                     auto: true,
                     hidden: false,
@@ -1572,6 +1606,7 @@ impl Config {
                             rules: g.rules.clone(),
                             classifier: g.classifier.clone(),
                             effort: g.effort.clone(),
+                            levels: g.levels.clone(),
                             pick: g.pick.clone(),
                             auto: true,
                             hidden: true,
@@ -1703,6 +1738,7 @@ impl Config {
                 rules: Vec::new(),
                 classifier: String::new(),
                 effort: String::new(),
+                levels: Vec::new(),
                 pick: String::new(),
                 auto: true,
                 weights: Vec::new(),
@@ -2357,6 +2393,7 @@ base_url = "http://127.0.0.1:1/v1"
             rules: Vec::new(),
             classifier: String::new(),
             effort: String::new(),
+            levels: Vec::new(),
             pick: String::new(),
             auto: false,
             weights: Vec::new(),
@@ -2393,6 +2430,7 @@ base_url = "http://127.0.0.1:1/v1"
             rules: Vec::new(),
             classifier: String::new(),
             effort: String::new(),
+            levels: Vec::new(),
             pick: String::new(),
             auto: false,
             weights: Vec::new(),
@@ -2504,6 +2542,7 @@ affinity = "session"
             rules: Vec::new(),
             classifier: String::new(),
             effort: String::new(),
+            levels: Vec::new(),
             pick: String::new(),
             auto: false,
             weights: Vec::new(),
@@ -2597,6 +2636,7 @@ affinity = "session"
             rules: Vec::new(),
             classifier: String::new(),
             effort: String::new(),
+            levels: Vec::new(),
             pick: String::new(),
             auto: false,
             weights: Vec::new(),
@@ -2677,6 +2717,7 @@ affinity = "session"
             rules: Vec::new(),
             classifier: String::new(),
             effort: String::new(),
+            levels: Vec::new(),
             pick: "mock/a:HIGH".into(),
             auto: false,
             weights: Vec::new(),
@@ -2701,6 +2742,7 @@ affinity = "session"
             }],
             classifier: String::new(),
             effort: String::new(),
+            levels: Vec::new(),
             pick: String::new(),
             auto: false,
             weights: Vec::new(),
@@ -2829,6 +2871,7 @@ affinity = "session"
             rules: Vec::new(),
             classifier: String::new(),
             effort: String::new(),
+            levels: Vec::new(),
             pick: String::new(),
             auto: false,
             weights: Vec::new(),
@@ -2912,6 +2955,7 @@ affinity = "session"
             rules: Vec::new(),
             classifier: String::new(),
             effort: String::new(),
+            levels: Vec::new(),
             pick: String::new(),
             auto: false,
             weights: vec![3],

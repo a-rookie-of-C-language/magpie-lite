@@ -603,6 +603,18 @@ async fn gateway_with_routes(
     routes: Vec<String>,
     cls: Arc<Mutex<ClsAnswer>>,
 ) -> Gateway {
+    gateway_with_levels(group, judge, rules, effort, routes, Vec::new(), cls).await
+}
+
+async fn gateway_with_levels(
+    group: &str,
+    judge: &str,
+    rules: Vec<Rule>,
+    effort: &str,
+    routes: Vec<String>,
+    levels: Vec<String>,
+    cls: Arc<Mutex<ClsAnswer>>,
+) -> Gateway {
     let a_bodies = Arc::new(Mutex::new(Vec::new()));
     let b_bodies = Arc::new(Mutex::new(Vec::new()));
     let cls_bodies = Arc::new(Mutex::new(Vec::new()));
@@ -622,6 +634,7 @@ async fn gateway_with_routes(
             rules,
             classifier: format!("c/{judge}"),
             effort: effort.into(),
+            levels,
             pick: String::new(),
             auto: false,
             weights: Vec::new(),
@@ -700,6 +713,7 @@ fn an_intent_rule_needs_its_group_classifier() {
         rules: vec![intent_rule("b/two", "bug", &members)],
         classifier: String::new(),
         effort: String::new(),
+        levels: Vec::new(),
         pick: String::new(),
         auto: false,
         weights: Vec::new(),
@@ -730,6 +744,7 @@ fn a_classifier_names_a_model_not_a_group() {
         rules: Vec::new(),
         classifier: "group/g".into(),
         effort: String::new(),
+        levels: Vec::new(),
         pick: String::new(),
         auto: false,
         weights: Vec::new(),
@@ -1054,6 +1069,7 @@ fn effort_auto_needs_its_group_classifier() {
         rules: Vec::new(),
         classifier: String::new(),
         effort: "auto".into(),
+        levels: Vec::new(),
         pick: String::new(),
         auto: false,
         weights: Vec::new(),
@@ -1428,4 +1444,75 @@ async fn a_rule_effort_beats_the_turns_pick() {
     let sent = gw.bodies[0].lock().unwrap()[0].clone();
     assert_eq!(sent["model"], "one");
     assert_eq!(sent["reasoning_effort"], "low");
+}
+
+#[tokio::test]
+async fn a_group_naming_levels_bounds_the_reasoning_its_members_are_asked_for() {
+    // The group offers low and high only: low stays, medium ties up to
+    // high, xhigh comes down to high, and off stays off.
+    let gw = gateway_with_levels(
+        "g-levels",
+        "judge-levels",
+        Vec::new(),
+        "",
+        vec!["a/one".into(), "b/two".into()],
+        vec!["low".into(), "high".into()],
+        Arc::new(Mutex::new(ClsAnswer {
+            status: 200,
+            text: "1".into(),
+        })),
+    )
+    .await;
+    for (session, ask) in [
+        ("s-levels-low", "low"),
+        ("s-levels-medium", "medium"),
+        ("s-levels-xhigh", "xhigh"),
+        ("s-levels-off", "none"),
+    ] {
+        let body = effort_turn(
+            "g-levels",
+            ask,
+            json!([{"role": "user", "content": "redesign the scheduler"}]),
+        );
+        assert_eq!(ask_body(&gw, session, body).await, StatusCode::OK);
+    }
+    assert_eq!(cls_asked(&gw), 0);
+    let sent = gw.bodies[0].lock().unwrap().clone();
+    assert_eq!(sent.len(), 4);
+    assert_eq!(sent[0]["reasoning_effort"], "low");
+    assert_eq!(sent[1]["reasoning_effort"], "high");
+    assert_eq!(sent[2]["reasoning_effort"], "high");
+    assert!(sent[3].get("reasoning_effort").is_none(), "{}", sent[3]);
+}
+
+#[tokio::test]
+async fn a_fixed_effort_is_bounded_by_the_levels_its_group_names() {
+    // The member is fixed at max, but the group offers low and high: the
+    // fixed ask still wins over the agent's, sent at the nearest offered.
+    let gw = gateway_with_levels(
+        "g-levels-fixed",
+        "judge-levels-fixed",
+        Vec::new(),
+        "",
+        vec!["a/one:max".into(), "b/two".into()],
+        vec!["low".into(), "high".into()],
+        Arc::new(Mutex::new(ClsAnswer {
+            status: 200,
+            text: "1".into(),
+        })),
+    )
+    .await;
+    for (session, ask) in [("s-levels-fixed-quiet", ""), ("s-levels-fixed-low", "low")] {
+        let body = effort_turn(
+            "g-levels-fixed",
+            ask,
+            json!([{"role": "user", "content": "redesign the scheduler"}]),
+        );
+        assert_eq!(ask_body(&gw, session, body).await, StatusCode::OK);
+    }
+    assert_eq!(cls_asked(&gw), 0);
+    let sent = gw.bodies[0].lock().unwrap().clone();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0]["reasoning_effort"], "high");
+    assert_eq!(sent[1]["reasoning_effort"], "high");
 }
