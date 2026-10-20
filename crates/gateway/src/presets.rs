@@ -8,9 +8,11 @@
 //! never fails validation: when the preset's protocol list does not
 //! hold the configured protocol, the list stays empty (only the
 //! configured protocol is known) while the vendor's streaming, tools
-//! and vision answers still apply. Like all capability metadata, a
-//! preset is management/UI information: it does not change request
-//! translation and proves no live vendor probe.
+//! and vision answers still apply. Capability metadata is management/UI
+//! information and proves no live vendor probe, except an explicit
+//! `vision: false`: a text-only member is never sent image bytes (a
+//! current user image is refused, older and tool-returned images go on
+//! as an omission note).
 
 use crate::config::{Protocol, ProviderCapabilities};
 

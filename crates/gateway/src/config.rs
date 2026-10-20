@@ -69,6 +69,9 @@ pub struct ProviderCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<bool>,
     /// Whether the provider accepts image or other multimodal input.
+    /// An explicit `false` is enforced per attempt: a current user image
+    /// is refused before any upstream call, older and tool-returned
+    /// images go on as an omission note.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<bool>,
 }

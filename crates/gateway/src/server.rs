@@ -2450,6 +2450,38 @@ async fn send_with_fallback(
                     } else {
                         send
                     };
+                    // A member that takes no images turns a current user
+                    // image away before any upstream call (the reference's
+                    // `textOnlyBody`); older and tool-returned images go on
+                    // as an omission note instead. Groups skip such a member
+                    // for an image-carrying request through the same shape
+                    // as a local conversion error below.
+                    if route.provider.capabilities.vision == Some(false)
+                        && crate::text_only::has_current_user_image(send)
+                    {
+                        round_passing = false;
+                        if route_index != last_route {
+                            continue 'routes;
+                        }
+                        return Err((
+                            ProxyFailure::new(
+                                StatusCode::BAD_REQUEST,
+                                format!(
+                                    "model \"{}/{}\" does not support image input",
+                                    route.provider.id, route.model
+                                ),
+                            ),
+                            candidate,
+                            decision.clone(),
+                        ));
+                    }
+                    let stripped;
+                    let send = if route.provider.capabilities.vision == Some(false) {
+                        stripped = crate::text_only::without_images(send);
+                        &stripped
+                    } else {
+                        send
+                    };
                     let mut body = match upstream::build_request(
                         &route.provider,
                         send,

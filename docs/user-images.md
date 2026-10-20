@@ -37,7 +37,40 @@ preservation, independent downstream answer/usage/terminal assertions, and
 that private image bytes/URLs/text never leak into the downstream wire.
 
 These are synthetic core/loopback fixtures, not live vendor or installed
-Agent compatibility evidence. Text-only model gating (rejecting current-turn
-images, omitting historical ones), describe-via-seer fallback, group routing
-to a vision member, model-generated image output beyond Gemini clients and
+Agent compatibility evidence. Describe-via-seer fallback,
+model-generated image output beyond Gemini clients and
 provider-specific rewrites remain separate work.
+
+## Text-only members
+
+Reference: `internal/gateway/image_input.go` (`textOnlyBody`,
+`hasImage`) and `image_input_test.go` (known text-only rejection, mixed
+group routing, historical/tool omission). A provider that declares
+`capabilities.vision: false` is never sent image bytes. The check runs on
+the shared IR per attempt, not on wire JSON: a user image in the request's
+last message is refused with `400 model "<provider>/<model>" does not
+support image input` before any upstream call; older direct images become
+the text `[Image omitted: this model accepts text only.]`, and
+tool-returned images are dropped with the same note appended to the result
+text. A group skips a text-only member for an image-carrying request and
+serves it from the first member that sees, through the existing
+local-conversion fallback; a direct text-only route answers 400. Unknown
+(`None`) or `true` vision leaves the request untouched. Lite tracks vision
+per provider, where the reference tracks it per model; presets prefill
+`false` for known text-only vendors (e.g. DeepSeek).
+
+### Text-only evidence and limits
+
+`crates/gateway/src/text_only.rs` has 4 unit regressions (current-turn
+detection, tool-result exclusion, omission shape, imageless pass-through).
+`crates/gateway/tests/text_only_images.rs` sends **20 real loopback HTTP
+requests**: a blind (`vision: false`) and a seeing provider behind one
+`mixed` group, four client protocols each. Current-turn user images are
+refused with 400 on the direct blind route with neither upstream touched;
+older-turn and tool-returned images reach the blind upstream as omission
+notes with no image bytes; grouped image requests skip the blind member
+and reach the seeing upstream intact over JSON and SSE.
+
+These are synthetic loopback fixtures. Per-model vision catalogs, paid
+live-vendor evidence, describe-via-seer fallback and subscription-account
+affinity remain outside this contract.
