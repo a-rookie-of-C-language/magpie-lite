@@ -11,6 +11,7 @@ use crate::ir::{
 };
 use crate::stream::StreamEvent;
 use serde_json::{Map, Value, json};
+use std::collections::HashMap;
 
 mod silent;
 mod tool_pairing;
@@ -357,17 +358,54 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
 }
 
 fn decode_usage(v: &Value) -> Usage {
+    let (mut read, mut write) = v
+        .get("prompt_tokens_details")
+        .map(|details| {
+            (
+                details.get("cached_tokens").and_then(Value::as_u64),
+                details.get("cache_write_tokens").and_then(Value::as_u64),
+            )
+        })
+        .unwrap_or_default();
+    // A zero in OpenAI's field is a report too, but some relays put a
+    // positive count only in DeepSeek's or Moonshot's field beside it.
+    for alias in ["prompt_cache_hit_tokens", "cached_tokens"] {
+        if read.unwrap_or(0) == 0
+            && let Some(n) = v.get(alias).and_then(Value::as_u64)
+        {
+            read = Some(n);
+        }
+    }
+    // Chat's prompt_tokens counts what was cached, as OpenAI's does. Only
+    // when neither OpenAI's names nor an alias reported a positive count do
+    // we accept Anthropic's names, whose prompt_tokens counts net input.
+    let whole = if read.unwrap_or(0) == 0 && write.unwrap_or(0) == 0 {
+        let anthropic_read = v.get("cache_read_input_tokens").and_then(Value::as_u64);
+        let anthropic_write = v.get("cache_creation_input_tokens").and_then(Value::as_u64);
+        if anthropic_read.is_some() || anthropic_write.is_some() {
+            read = anthropic_read;
+            write = anthropic_write;
+        }
+        let prompt = v.get("prompt_tokens").and_then(Value::as_u64);
+        prompt.is_none_or(|prompt| prompt >= read.unwrap_or(0) + write.unwrap_or(0))
+    } else {
+        true
+    };
+    let input = v
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .map(|prompt| {
+            if whole {
+                prompt.saturating_sub(read.unwrap_or(0) + write.unwrap_or(0))
+            } else {
+                prompt
+            }
+        });
     Usage {
-        input: v.get("prompt_tokens").and_then(Value::as_u64),
+        input,
         output: v.get("completion_tokens").and_then(Value::as_u64),
-        cache_read: v
-            .get("prompt_tokens_details")
-            .and_then(|d| d.get("cached_tokens"))
-            .and_then(Value::as_u64),
-        cache_write: v
-            .get("prompt_tokens_details")
-            .and_then(|d| d.get("cache_write_tokens"))
-            .and_then(Value::as_u64),
+        cache_read: read,
+        cache_write: write,
         reasoning: v
             .get("completion_tokens_details")
             .and_then(|d| d.get("reasoning_tokens"))
@@ -376,7 +414,11 @@ fn decode_usage(v: &Value) -> Usage {
 }
 
 fn usage_to_json(u: &Usage) -> Value {
-    let input = u.input.unwrap_or(0);
+    let input = u
+        .input
+        .unwrap_or(0)
+        .saturating_add(u.cache_read.unwrap_or(0))
+        .saturating_add(u.cache_write.unwrap_or(0));
     let output = u.output.unwrap_or(0);
     let mut details = Map::new();
     if let Some(read) = u.cache_read {
@@ -438,11 +480,11 @@ pub fn decode_response(v: &Value) -> Result<CompletionResponse> {
             parts.push(Part::tool_call(id, name, args));
         }
     }
-    let stop = choice
-        .get("finish_reason")
-        .and_then(Value::as_str)
-        .map(StopReason::from_chat)
-        .unwrap_or_default();
+    let finish = choice.get("finish_reason").and_then(Value::as_str);
+    let mut stop = finish.map(StopReason::from_chat).unwrap_or_default();
+    if finish == Some("stop") && parts.iter().any(|part| part.kind() == PartKind::ToolCall) {
+        stop = StopReason::ToolUse;
+    }
     let usage = response_usage(v);
     Ok(CompletionResponse {
         model,
@@ -526,12 +568,24 @@ pub fn encode_response(resp: &CompletionResponse) -> Value {
 #[derive(Debug, Default)]
 pub struct ChatStreamDecoder {
     started: bool,
+    /// Each choice's open Chat tool call, so fragments sent without OpenAI's
+    /// required index still address the call the vendor means.
+    open_calls: HashMap<usize, OpenCall>,
+}
+
+/// One choice's open Chat tool-call stream.
+#[derive(Debug, Default)]
+struct OpenCall {
+    open: bool,
+    id: String,
+    index: usize,
+    next: usize,
 }
 
 impl ChatStreamDecoder {
     /// Decode one chunk, including its first assistant opening when supplied.
     pub fn decode(&mut self, value: &Value) -> Vec<StreamEvent> {
-        let mut events = decode_chunk(value);
+        let mut events = self.decode_chunk(value);
         if !self.started
             && value.get("error").is_none()
             && let Some(delta) = value.pointer("/choices/0/delta").filter(|v| v.is_object())
@@ -552,90 +606,135 @@ impl ChatStreamDecoder {
         }
         events
     }
-}
 
-/// Decode one streamed chunk from an OpenAI-compatible upstream into IR
-/// events. `[DONE]` is handled by the caller (it is not JSON).
-pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
-    let mut out = Vec::new();
-    if let Some(u) = v.get("usage")
-        && u.is_object()
-    {
-        out.push(StreamEvent::Usage(decode_usage(u)));
-    }
-    if let Some(error) = v.get("error") {
-        out.push(StreamEvent::Error {
-            message: error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("chat upstream error")
-                .to_owned(),
-            code: error
-                .get("code")
-                .or_else(|| error.get("type"))
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        });
-        return out;
-    }
-    let Some(choice) = v
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|a| a.first())
-    else {
-        return out;
-    };
-    let delta = choice.get("delta").cloned().unwrap_or(Value::Null);
-    if let Some(text) = delta.get("content").and_then(Value::as_str)
-        && !text.is_empty()
-    {
-        out.push(StreamEvent::TextDelta {
-            text: text.to_owned(),
-        });
-    }
-    // DeepSeek-style reasoning deltas; harmless for clients that ignore it.
-    for field in ["reasoning_content", "reasoning"] {
-        if let Some(text) = delta.get(field).and_then(Value::as_str)
+    fn decode_chunk(&mut self, value: &Value) -> Vec<StreamEvent> {
+        let mut out = Vec::new();
+        if let Some(u) = value.get("usage")
+            && u.is_object()
+        {
+            out.push(StreamEvent::Usage(decode_usage(u)));
+        }
+        if let Some(error) = value.get("error") {
+            out.push(StreamEvent::Error {
+                message: error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("chat upstream error")
+                    .to_owned(),
+                code: error
+                    .get("code")
+                    .or_else(|| error.get("type"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            });
+            return out;
+        }
+        let Some(choice) = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+        else {
+            return out;
+        };
+        let choice_index = choice.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let delta = choice.get("delta").cloned().unwrap_or(Value::Null);
+        if let Some(text) = delta.get("content").and_then(Value::as_str)
             && !text.is_empty()
         {
-            out.push(StreamEvent::ThinkingDelta {
+            out.push(StreamEvent::TextDelta {
                 text: text.to_owned(),
             });
         }
-    }
-    if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
-        for c in calls {
-            let index = c.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-            let id = c.get("id").and_then(Value::as_str).unwrap_or_default();
-            let name = c
-                .pointer("/function/name")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if !id.is_empty() || !name.is_empty() {
-                out.push(StreamEvent::ToolCallStart {
-                    index,
-                    id: id.to_owned(),
-                    name: name.to_owned(),
-                    namespace: None,
-                });
-            }
-            if let Some(a) = c.pointer("/function/arguments").and_then(Value::as_str)
-                && !a.is_empty()
+        for field in ["reasoning_content", "reasoning"] {
+            if let Some(text) = delta.get(field).and_then(Value::as_str)
+                && !text.is_empty()
             {
-                out.push(StreamEvent::ToolCallDelta {
-                    index,
-                    args: a.to_owned(),
+                out.push(StreamEvent::ThinkingDelta {
+                    text: text.to_owned(),
                 });
             }
         }
+        if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            let open = self.open_calls.entry(choice_index).or_default();
+            for (position, c) in calls.iter().enumerate() {
+                let index = Self::call_index(open, c, position);
+                let id = c.get("id").and_then(Value::as_str).unwrap_or_default();
+                let name = c
+                    .pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !id.is_empty() || !name.is_empty() {
+                    out.push(StreamEvent::ToolCallStart {
+                        index,
+                        id: id.to_owned(),
+                        name: name.to_owned(),
+                        namespace: None,
+                    });
+                }
+                if let Some(a) = c.pointer("/function/arguments").and_then(Value::as_str)
+                    && !a.is_empty()
+                {
+                    out.push(StreamEvent::ToolCallDelta {
+                        index,
+                        args: a.to_owned(),
+                    });
+                }
+            }
+        }
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str)
+            && !reason.is_empty()
+            && reason != "null"
+        {
+            let open = self
+                .open_calls
+                .get(&choice_index)
+                .is_some_and(|open| open.open);
+            let stop = if reason == "stop" && open {
+                StopReason::ToolUse
+            } else {
+                StopReason::from_chat(reason)
+            };
+            out.push(StreamEvent::Stop(stop));
+        }
+        out
     }
-    if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str)
-        && !reason.is_empty()
-        && reason != "null"
-    {
-        out.push(StreamEvent::Stop(StopReason::from_chat(reason)));
+
+    fn call_index(open: &mut OpenCall, call: &Value, position: usize) -> usize {
+        let id = call.get("id").and_then(Value::as_str).unwrap_or_default();
+        if call.get("index").is_some_and(|v| !v.is_null())
+            && let Some(index) = call.get("index").and_then(Value::as_u64)
+        {
+            let index = index.min(usize::MAX as u64) as usize;
+            open.open = true;
+            open.id = if id.is_empty() {
+                open.id.clone()
+            } else {
+                id.to_owned()
+            };
+            open.index = index;
+            open.next = open.next.max(index.saturating_add(1));
+            return index;
+        }
+        if !open.open || position > 0 || (!id.is_empty() && id != open.id) {
+            open.open = true;
+            if !id.is_empty() {
+                open.id = id.to_owned();
+            }
+            open.index = open.next;
+            open.next = open.next.saturating_add(1);
+        } else if open.id.is_empty() && !id.is_empty() {
+            open.id = id.to_owned();
+        }
+        open.index
     }
-    out
+}
+
+/// Decode one streamed chunk from an OpenAI-compatible upstream into IR
+/// events without cross-chunk tool-call state. `[DONE]` is handled by the
+/// caller (it is not JSON); production paths use `ChatStreamDecoder` so a
+/// vendor omitting `index` still addresses distinct calls correctly.
+pub fn decode_chunk(v: &Value) -> Vec<StreamEvent> {
+    ChatStreamDecoder::default().decode_chunk(v)
 }
 
 fn sse(v: &Value) -> String {
@@ -864,6 +963,184 @@ mod stream_opening_tests {
         }
         assert!(
             matches!(&decoder.decode(&json!({"choices":[{"delta":{"role":"assistant"}}]}))[..], [StreamEvent::Start { model }] if model.is_empty())
+        );
+    }
+
+    fn indexes(events: &[StreamEvent]) -> Vec<(usize, String)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolCallStart { index, id, .. } => Some((*index, id.clone())),
+                StreamEvent::ToolCallDelta { index, args } => Some((*index, args.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn missing_chat_call_indexes_address_separate_calls() {
+        let mut decoder = ChatStreamDecoder::default();
+        let first = json!({"id":"c","model":"m","choices":[{"index":0,"delta":{
+            "tool_calls":[{"id":"call_1","type":"function","function":{"name":"one","arguments":"{\"a\":"}}
+        ]}}]});
+        let second = json!({"id":"c","choices":[{"index":0,"delta":{
+            "tool_calls":[{"function":{"arguments":"1}"}},{"id":"call_2","type":"function","function":{"name":"two","arguments":"{\"b\":2}"}},{"function":{"arguments":"tail"}}]
+        }}]});
+        assert_eq!(
+            indexes(&decoder.decode(&first)),
+            vec![(0, "call_1".into()), (0, "{\"a\":".into())]
+        );
+        assert_eq!(
+            indexes(&decoder.decode(&second)),
+            vec![
+                (0, "1}".into()),
+                (1, "call_2".into()),
+                (1, "{\"b\":2}".into()),
+                (2, "tail".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_chat_call_indexes_drive_missing_fragments() {
+        let mut decoder = ChatStreamDecoder::default();
+        let explicit = json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":4,"id":"call_4"},{"id":"call_5"}]}}]});
+        assert_eq!(
+            indexes(&decoder.decode(&explicit)),
+            vec![(4, "call_4".into()), (5, "call_5".into())]
+        );
+        let missing = json!({"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"{}"}}]}}]});
+        assert_eq!(indexes(&decoder.decode(&missing)), vec![(5, "{}".into())]);
+    }
+
+    #[test]
+    fn openai_details_report_net_input_and_reencode_the_whole_prompt() {
+        let usage = decode_usage(&json!({
+            "prompt_tokens": 352,
+            "completion_tokens": 7,
+            "prompt_tokens_details": {"cached_tokens": 300}
+        }));
+        assert_eq!(
+            usage,
+            Usage {
+                input: Some(52),
+                output: Some(7),
+                cache_read: Some(300),
+                ..Usage::default()
+            }
+        );
+        let chat = usage_to_json(&usage);
+        assert_eq!(chat["prompt_tokens"], 352);
+        assert_eq!(chat["total_tokens"], 359);
+        assert_eq!(chat["prompt_tokens_details"]["cached_tokens"], 300);
+    }
+
+    #[test]
+    fn cache_aliases_take_a_zero_details_field_and_keep_explicit_zeros() {
+        for (alias, value) in [
+            ("prompt_cache_hit_tokens", json!(300)),
+            ("cached_tokens", json!(300)),
+        ] {
+            let mut usage = json!({
+                "prompt_tokens": 352,
+                "prompt_tokens_details": {"cached_tokens": 0}
+            });
+            usage[alias] = value;
+            let decoded = decode_usage(&usage);
+            assert_eq!(decoded.input, Some(52));
+            assert_eq!(decoded.cache_read, Some(300));
+        }
+        assert_eq!(
+            decode_usage(&json!({
+                "prompt_tokens": 352,
+                "prompt_tokens_details": {"cached_tokens": 0},
+                "prompt_cache_hit_tokens": 0
+            }))
+            .cache_read,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn anthropic_relay_names_are_net_input_and_reencode_with_cache_totals() {
+        let usage = decode_usage(&json!({
+            "prompt_tokens": 12,
+            "completion_tokens": 7,
+            "cache_read_input_tokens": 300,
+            "cache_creation_input_tokens": 40
+        }));
+        assert_eq!(
+            usage,
+            Usage {
+                input: Some(12),
+                output: Some(7),
+                cache_read: Some(300),
+                cache_write: Some(40),
+                ..Usage::default()
+            }
+        );
+        let chat = usage_to_json(&usage);
+        assert_eq!(chat["prompt_tokens"], 352);
+        assert_eq!(chat["total_tokens"], 359);
+        assert_eq!(chat["prompt_tokens_details"]["cached_tokens"], 300);
+        assert_eq!(chat["prompt_tokens_details"]["cache_write_tokens"], 40);
+    }
+
+    #[test]
+    fn chat_finish_stop_becomes_tool_use_only_with_calls() {
+        let call = json!({
+            "model": "m",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "c1", "type": "function",
+                        "function": {"name": "run", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        assert_eq!(decode_response(&call).unwrap().stop, StopReason::ToolUse);
+
+        let mut plain = call.clone();
+        plain["choices"][0]["message"]["tool_calls"] = Value::Null;
+        assert_eq!(decode_response(&plain).unwrap().stop, StopReason::EndTurn);
+
+        let mut missing = plain.clone();
+        missing["choices"][0]["finish_reason"] = Value::Null;
+        assert_eq!(decode_response(&missing).unwrap().stop, StopReason::EndTurn);
+
+        let mut length = call;
+        length["choices"][0]["finish_reason"] = json!("length");
+        assert_eq!(
+            decode_response(&length).unwrap().stop,
+            StopReason::MaxTokens
+        );
+    }
+
+    #[test]
+    fn streamed_stop_becomes_tool_use_only_with_an_open_call() {
+        let mut decoder = ChatStreamDecoder::default();
+        decoder.decode(&json!({
+            "choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "id": "c1", "type": "function",
+                "function": {"name": "run", "arguments": "{}"}
+            }]}}]
+        }));
+        assert_eq!(
+            decoder.decode(&json!({
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            })),
+            vec![StreamEvent::Stop(StopReason::ToolUse)]
+        );
+
+        assert_eq!(
+            ChatStreamDecoder::default().decode(&json!({
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            })),
+            vec![StreamEvent::Stop(StopReason::EndTurn)]
         );
     }
 }

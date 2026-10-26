@@ -658,28 +658,48 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
 }
 
 fn decode_usage(v: &Value) -> Usage {
-    let input = get_either(v, "promptTokenCount", "prompt_token_count").and_then(Value::as_u64);
-    let output =
+    let cache_read = get_either(v, "cachedContentTokenCount", "cached_content_token_count")
+        .and_then(Value::as_u64);
+    let input = get_either(v, "promptTokenCount", "prompt_token_count")
+        .and_then(Value::as_u64)
+        .map(|whole| whole.saturating_sub(cache_read.unwrap_or(0)));
+    let candidates =
         get_either(v, "candidatesTokenCount", "candidates_token_count").and_then(Value::as_u64);
+    let reasoning =
+        get_either(v, "thoughtsTokenCount", "thoughts_token_count").and_then(Value::as_u64);
+    let output = match (candidates, reasoning) {
+        (Some(candidates), Some(reasoning)) => Some(candidates.saturating_add(reasoning)),
+        (candidates, reasoning) => candidates.or(reasoning),
+    };
     Usage {
         input,
         output,
-        cache_read: get_either(v, "cachedContentTokenCount", "cached_content_token_count")
-            .and_then(Value::as_u64),
+        cache_read,
         cache_write: None,
-        reasoning: get_either(v, "thoughtsTokenCount", "thoughts_token_count")
-            .and_then(Value::as_u64),
+        reasoning,
     }
 }
 
 fn usage_to_json(u: &Usage) -> Value {
-    let input = u.input.unwrap_or(0);
+    let input = u
+        .input
+        .unwrap_or(0)
+        .saturating_add(u.cache_read.unwrap_or(0));
     let output = u.output.unwrap_or(0);
-    json!({
+    let reasoning = u.reasoning.unwrap_or(0);
+    let candidates = output.saturating_sub(reasoning);
+    let mut usage = json!({
         "promptTokenCount": input,
-        "candidatesTokenCount": output,
-        "totalTokenCount": input + output,
-    })
+        "candidatesTokenCount": candidates,
+        "totalTokenCount": input.saturating_add(output),
+    });
+    if let Some(cache_read) = u.cache_read.filter(|n| *n > 0) {
+        usage["cachedContentTokenCount"] = json!(cache_read);
+    }
+    if let Some(reasoning) = u.reasoning.filter(|n| *n > 0) {
+        usage["thoughtsTokenCount"] = json!(reasoning);
+    }
+    usage
 }
 
 fn stop_from_gemini(s: &str) -> StopReason {

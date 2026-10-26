@@ -1222,17 +1222,23 @@ pub fn encode_request(req: &CompletionRequest, model: &str) -> Result<Value> {
 // ---------------------------------------------------------------- replies
 
 fn decode_usage(v: &Value) -> Usage {
+    let cache_read = v
+        .get("input_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64);
+    let cache_write = v
+        .get("input_tokens_details")
+        .and_then(|d| d.get("cache_write_tokens"))
+        .and_then(Value::as_u64);
+    let input = v
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .map(|whole| whole.saturating_sub(cache_read.unwrap_or(0) + cache_write.unwrap_or(0)));
     Usage {
-        input: v.get("input_tokens").and_then(Value::as_u64),
+        input,
         output: v.get("output_tokens").and_then(Value::as_u64),
-        cache_read: v
-            .get("input_tokens_details")
-            .and_then(|d| d.get("cached_tokens"))
-            .and_then(Value::as_u64),
-        cache_write: v
-            .get("input_tokens_details")
-            .and_then(|d| d.get("cache_write_tokens"))
-            .and_then(Value::as_u64),
+        cache_read,
+        cache_write,
         reasoning: v
             .get("output_tokens_details")
             .and_then(|d| d.get("reasoning_tokens"))
@@ -1241,10 +1247,16 @@ fn decode_usage(v: &Value) -> Usage {
 }
 
 fn usage_to_json(u: &Usage) -> Value {
+    let input = u
+        .input
+        .unwrap_or(0)
+        .saturating_add(u.cache_read.unwrap_or(0))
+        .saturating_add(u.cache_write.unwrap_or(0));
+    let output = u.output.unwrap_or(0);
     let mut usage = json!({
-        "input_tokens": u.input.unwrap_or(0),
-        "output_tokens": u.output.unwrap_or(0),
-        "total_tokens": u.input.unwrap_or(0) + u.output.unwrap_or(0),
+        "input_tokens": input,
+        "output_tokens": output,
+        "total_tokens": input.saturating_add(output),
     });
     let input = u.cache_read.is_some() || u.cache_write.is_some();
     if input {

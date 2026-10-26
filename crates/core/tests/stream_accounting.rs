@@ -59,9 +59,59 @@ fn chat_and_responses_round_trip_cache_write_and_reasoning_usage() {
         "input_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 4},
         "output_tokens_details": {"reasoning_tokens": 2}}});
     let usage = responses::response_usage(&responses_usage);
+    assert_eq!(usage.input, Some(5));
     assert_eq!(usage.cache_read, Some(3));
     assert_eq!(usage.cache_write, Some(4));
     assert_eq!(usage.reasoning, Some(2));
+}
+
+#[test]
+fn responses_and_gemini_cache_totals_keep_the_whole_prompt() {
+    let responses = json!({
+        "usage": {
+            "input_tokens": 12,
+            "output_tokens": 5,
+            "input_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 4}
+        }
+    });
+    let usage = responses::response_usage(&responses);
+    let encoded = responses::encode_response(&magpie_core::ir::CompletionResponse {
+        model: "m".into(),
+        stop: magpie_core::ir::StopReason::EndTurn,
+        usage,
+        ..Default::default()
+    });
+    assert_eq!(encoded["usage"]["input_tokens"], 12);
+    assert_eq!(encoded["usage"]["total_tokens"], 17);
+    assert_eq!(
+        encoded["usage"]["input_tokens_details"],
+        json!({"cached_tokens": 3, "cache_write_tokens": 4})
+    );
+
+    let gemini = json!({
+        "usageMetadata": {
+            "promptTokenCount": 12,
+            "candidatesTokenCount": 3,
+            "thoughtsTokenCount": 2,
+            "cachedContentTokenCount": 4
+        }
+    });
+    let usage = gemini::response_usage(&gemini);
+    assert_eq!(usage.input, Some(8));
+    assert_eq!(usage.output, Some(5));
+    assert_eq!(usage.cache_read, Some(4));
+    assert_eq!(usage.reasoning, Some(2));
+    let encoded = gemini::encode_response(&magpie_core::ir::CompletionResponse {
+        model: "m".into(),
+        stop: magpie_core::ir::StopReason::EndTurn,
+        usage,
+        ..Default::default()
+    });
+    assert_eq!(encoded["usageMetadata"]["promptTokenCount"], 12);
+    assert_eq!(encoded["usageMetadata"]["candidatesTokenCount"], 3);
+    assert_eq!(encoded["usageMetadata"]["thoughtsTokenCount"], 2);
+    assert_eq!(encoded["usageMetadata"]["cachedContentTokenCount"], 4);
+    assert_eq!(encoded["usageMetadata"]["totalTokenCount"], 17);
 }
 
 #[test]
