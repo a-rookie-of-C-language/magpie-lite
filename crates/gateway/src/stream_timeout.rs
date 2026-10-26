@@ -1,6 +1,7 @@
 //! Upstream deadlines and the request-wide Responses opening-event hold budget.
 
 use std::future::Future;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use magpie_core::stream::StreamEvent;
@@ -26,6 +27,64 @@ impl ResponsesHold {
         match self.0 {
             Some(deadline) => tokio::time::sleep_until(deadline).await,
             None => std::future::pending().await,
+        }
+    }
+}
+
+/// Request-wide Responses client event-idle budget. SSE comments, held frames,
+/// and unencoded events do not reset it; only a protocol event that is actually
+/// encoded and sent to the agent does. Retry pauses that would cross this
+/// boundary return the current failure instead of waiting past it.
+pub(crate) struct ResponsesQuiet {
+    limit: Option<Duration>,
+    told: Mutex<Instant>,
+}
+
+impl ResponsesQuiet {
+    pub(crate) fn new(timeout_ms: u64) -> Self {
+        Self {
+            limit: (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms)),
+            told: Mutex::new(Instant::now()),
+        }
+    }
+
+    pub(crate) fn observe_event(&self) {
+        *self.told.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    }
+
+    pub(crate) fn remaining(&self) -> Option<Duration> {
+        let limit = self.limit?;
+        let told = *self.told.lock().unwrap_or_else(|e| e.into_inner());
+        Some(limit.saturating_sub(told.elapsed()))
+    }
+
+    pub(crate) fn too_quiet_after(&self, extra: Duration) -> bool {
+        match self.remaining() {
+            Some(remaining) => extra >= remaining,
+            None => false,
+        }
+    }
+
+    /// Cap a queue/RPM wait so it cannot park past the event-idle boundary.
+    /// A zero configured wait means as long as needed; that still cannot
+    /// outrun this budget. An already-expired budget becomes a 1ms timeout so
+    /// lanes::take does not treat zero as an unbounded wait.
+    pub(crate) fn bound_wait(&self, wait: Duration) -> Duration {
+        match self.remaining() {
+            None => wait,
+            Some(remaining) if remaining.is_zero() => Duration::from_millis(1),
+            Some(remaining) if wait.is_zero() => remaining,
+            Some(remaining) => wait.min(remaining),
+        }
+    }
+
+    pub(crate) fn bound_deadline(&self, deadline: std::time::Instant) -> std::time::Instant {
+        match self.remaining() {
+            Some(remaining) => std::time::Instant::now()
+                .checked_add(remaining)
+                .map(|quiet| deadline.min(quiet))
+                .unwrap_or(deadline),
+            None => deadline,
         }
     }
 }
@@ -569,5 +628,44 @@ mod tests {
             .chunk(tokio::time::sleep(Duration::from_secs(600)))
             .await
             .unwrap();
+    }
+    #[tokio::test(start_paused = true)]
+    async fn responses_quiet_defaults_to_four_minutes_and_resets_on_real_events() {
+        let quiet = ResponsesQuiet::new(240_000);
+        let started = Instant::now();
+        assert_eq!(quiet.remaining(), Some(Duration::from_secs(240)));
+        assert!(!quiet.too_quiet_after(Duration::from_secs(239)));
+        tokio::time::sleep(Duration::from_secs(180)).await;
+        assert!(quiet.too_quiet_after(Duration::from_secs(61)));
+        assert!(!quiet.too_quiet_after(Duration::from_secs(59)));
+        assert_eq!(quiet.remaining(), Some(Duration::from_secs(60)));
+        quiet.observe_event();
+        assert_eq!(quiet.remaining(), Some(Duration::from_secs(240)));
+        assert!(!quiet.too_quiet_after(Duration::from_secs(239)));
+        tokio::time::sleep(Duration::from_secs(240)).await;
+        assert!(quiet.too_quiet_after(Duration::ZERO));
+        assert_eq!(quiet.remaining(), Some(Duration::ZERO));
+        assert_eq!(started.elapsed(), Duration::from_secs(420));
+        assert_eq!(
+            quiet.bound_wait(Duration::from_secs(30)),
+            Duration::from_millis(1)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn responses_quiet_zero_is_disabled_and_extreme_settings_are_safe() {
+        let disabled = ResponsesQuiet::new(0);
+        assert_eq!(disabled.remaining(), None);
+        assert!(!disabled.too_quiet_after(Duration::from_secs(10_000)));
+        assert_eq!(
+            disabled.bound_wait(Duration::from_secs(3)),
+            Duration::from_secs(3)
+        );
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        assert!(!disabled.too_quiet_after(Duration::ZERO));
+
+        let extreme = ResponsesQuiet::new(u64::MAX);
+        assert!(!extreme.too_quiet_after(Duration::from_secs(3600)));
+        assert!(extreme.remaining().is_some());
     }
 }

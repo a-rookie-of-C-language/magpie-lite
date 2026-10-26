@@ -269,7 +269,7 @@ ready-error precedence and real socket disconnect/persisted accounting. Paused
 clock tests cover the default budget, disable/extreme values and retained idle
 and first-content deadlines. This implements the request-level opening-release
 subset of reference `internal/gateway/fallback.go`. Group first-content switching
-is documented separately; queue, slow-final-route and Agent event-idle policies
+is documented separately. Agent event-idle is implemented below; queue and slow-final-route
 remain outside this implementation. Local
 fixtures do not establish live vendor or installed Agent compatibility.
 
@@ -584,11 +584,21 @@ The policy was compared to local reference `internal/gateway/fallback.go`
 This evidence is local HTTP/1.1 and synthetic SSE, not a live vendor, TLS/proxy,
 HTTP/2 or real-Agent validation.
 
+Streaming Responses clients also honor a request-wide Agent event-idle budget,
+reusing `stream_responses_hold_timeout_ms` (default four minutes, zero disables).
+It starts when the request begins. Only protocol events that are encoded and sent
+to the agent reset it; SSE comments, `ReleaseOpening`, held/suppressed frames and
+usage-only metadata do not. A group replan, empty retry or same-candidate reask
+pause that would cross the boundary is skipped so the current failure is returned
+instead of waiting past Codex idle. Expiry releases a real buffered opening event
+and never fabricates `response.created`. Queue waits and RPM waits are capped to
+the remaining budget so they cannot park past it. Two `responses_agent_event_idle_*`
+loopback tests plus paused-clock unit tests cover success-after-failover and a
+replan pause that would outrun the budget.
+
 Queue/slow-final-route behavior, HTTP/2 cancellation conformance and broader
 tool/multimodal conformance remain open. The configurable progress timeout is a
-gateway-local decoded-content policy, not reference event-idle parity; Agent
-event-idle policies and queue/slow-final-route behavior remain distinct and
-unimplemented.
+gateway-local decoded-content policy, distinct from this Responses event-idle port.
 
 ## Safety filtering and refusal routing
 

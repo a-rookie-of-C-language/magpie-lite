@@ -47,7 +47,9 @@ use crate::stream_empty::{EMPTY_REPLY, GeminiReply};
 use crate::stream_keepalive::{self, Keepalive, UpstreamActivity};
 use crate::stream_loop::LoopGuard;
 use crate::stream_refusal::{self, REFUSAL};
-use crate::stream_timeout::{GroupFirstToken, ResponsesHold, StreamClock, StreamTimeout};
+use crate::stream_timeout::{
+    GroupFirstToken, ResponsesHold, ResponsesQuiet, StreamClock, StreamTimeout,
+};
 use crate::tool_loop;
 use crate::unfit_fields;
 use crate::upstream;
@@ -1722,6 +1724,7 @@ impl From<StreamEvent> for UpstreamRead {
 struct StreamLiveness {
     activity: UpstreamActivity,
     responses_hold: ResponsesHold,
+    responses_quiet: ResponsesQuiet,
 }
 
 enum UpstreamReply {
@@ -2444,7 +2447,9 @@ async fn send_with_fallback(
                         &who,
                         limit,
                         route.provider.queue_bound(),
-                        route.provider.queue_wait(),
+                        liveness
+                            .responses_quiet
+                            .bound_wait(route.provider.queue_wait()),
                     )
                     .await
                 {
@@ -2489,7 +2494,13 @@ async fn send_with_fallback(
                             let now = std::time::Instant::now();
                             let start = *wait_from.get_or_insert(now);
                             if now - start < patience
-                                && wait_for_room(state, &routes, start + patience).await
+                                && !liveness.responses_quiet.too_quiet_after(Duration::ZERO)
+                                && wait_for_room(
+                                    state,
+                                    &routes,
+                                    liveness.responses_quiet.bound_deadline(start + patience),
+                                )
+                                .await
                             {
                                 tracker.note_replan(
                                     now.elapsed().as_millis().min(u64::MAX as u128) as u64,
@@ -2506,7 +2517,9 @@ async fn send_with_fallback(
                     .wait(
                         &who,
                         route.provider.rpm_limit(),
-                        lanes::rpm_longest(&route.provider),
+                        liveness
+                            .responses_quiet
+                            .bound_wait(lanes::rpm_longest(&route.provider)),
                     )
                     .await
                 {
@@ -2534,7 +2547,13 @@ async fn send_with_fallback(
                         let now = std::time::Instant::now();
                         let start = *wait_from.get_or_insert(now);
                         if now - start < patience
-                            && wait_for_room(state, &routes, start + patience).await
+                            && !liveness.responses_quiet.too_quiet_after(Duration::ZERO)
+                            && wait_for_room(
+                                state,
+                                &routes,
+                                liveness.responses_quiet.bound_deadline(start + patience),
+                            )
+                            .await
                         {
                             tracker.note_replan(now.elapsed().as_millis().min(u64::MAX as u128) as u64);
                             rounds += 1;
@@ -3021,7 +3040,11 @@ async fn send_with_fallback(
                                         *key_slot,
                                         "empty_reply",
                                     );
-                                    if empty_retries == 0 {
+                                    if empty_retries == 0
+                                        && !liveness
+                                            .responses_quiet
+                                            .too_quiet_after(Duration::from_secs(1))
+                                    {
                                         empty_retries += 1;
                                         tracker.begin_reask();
                                         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -3118,7 +3141,12 @@ async fn send_with_fallback(
                                 }
                                 return Err((ProxyFailure::refusal(), candidate, decision.clone()));
                             }
-                            if failure.kind == FailureKind::EmptyReply && empty_retries == 0 {
+                            if failure.kind == FailureKind::EmptyReply
+                                && empty_retries == 0
+                                && !liveness
+                                    .responses_quiet
+                                    .too_quiet_after(Duration::from_secs(1))
+                            {
                                 drop(events);
                                 empty_retries += 1;
                                 tracker.begin_reask();
@@ -3203,7 +3231,9 @@ async fn send_with_fallback(
                                 let floor = replan_pause(rounds);
                                 let pause =
                                     floor.max(quota_cooldown(&headers, Some(&failure.body), floor));
-                                if now + pause <= start + patience {
+                                if now + pause <= start + patience
+                                    && !liveness.responses_quiet.too_quiet_after(pause)
+                                {
                                     tracker.note_replan(pause.as_millis().min(u64::MAX as u128) as u64);
                                     drop(events);
                                     tokio::time::sleep(pause).await;
@@ -3491,7 +3521,9 @@ async fn send_with_fallback(
                         let start = *wait_from.get_or_insert(now);
                         let floor = replan_pause(rounds);
                         let pause = floor.max(quota_cooldown(&headers, Some(&error.body), floor));
-                        if now + pause <= start + patience {
+                        if now + pause <= start + patience
+                            && !liveness.responses_quiet.too_quiet_after(pause)
+                        {
                             tracker.note_replan(pause.as_millis().min(u64::MAX as u128) as u64);
                             tokio::time::sleep(pause).await;
                             rounds += 1;
@@ -4017,15 +4049,15 @@ pub(crate) async fn proxy_parsed(
     } else {
         (UpstreamActivity::default(), None)
     };
+    let responses_ms = if creq.stream && matches!(wire, ClientWire::Responses) {
+        config.stream_responses_hold_timeout_ms
+    } else {
+        0
+    };
     let liveness = StreamLiveness {
         activity,
-        responses_hold: ResponsesHold::new(
-            if creq.stream && matches!(wire, ClientWire::Responses) {
-                config.stream_responses_hold_timeout_ms
-            } else {
-                0
-            },
-        ),
+        responses_hold: ResponsesHold::new(responses_ms),
+        responses_quiet: ResponsesQuiet::new(responses_ms),
     };
     let model = creq.model.clone();
     let body_bytes = bytes.to_vec();
@@ -4239,6 +4271,7 @@ pub(crate) async fn proxy_parsed(
                             false,
                             stream_retries,
                         )
+                        && !liveness.responses_quiet.too_quiet_after(Duration::from_secs(1))
                     {
                         drop(events);
                         reasked = true;
@@ -4279,6 +4312,7 @@ pub(crate) async fn proxy_parsed(
                                     code: None,
                                 };
                                 if let Some(frame) = encoder.encode(&error) {
+                                    liveness.responses_quiet.observe_event();
                                     yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                                 }
                                 return;
@@ -4311,7 +4345,10 @@ pub(crate) async fn proxy_parsed(
                     let retry_reasoning = item.loop_reasoning && !item.no_continuation && !reasoning_reasked && !emitted_answer;
                     let retry_empty = reask_allowed && item.failure.as_ref().is_some_and(|f| f.kind == FailureKind::EmptyReply)
                         && empty_retries < empty_limit && !emitted_answer;
-                    if retry_reasoning || retry_empty {
+                    let retry_pause = Duration::from_secs(if retry_empty { 1 << empty_retries } else { 1 });
+                    if (retry_reasoning || retry_empty)
+                        && !liveness.responses_quiet.too_quiet_after(retry_pause)
+                    {
                         // Preserve any reasoning already sent; replace only the
                         // internally classified terminal with a bounded
                         // same-candidate reask. Dropping the old stream first
@@ -4325,7 +4362,7 @@ pub(crate) async fn proxy_parsed(
                         usage_since_retry = false;
                         reasoning_reasked |= retry_reasoning;
                         empty_retries += usize::from(retry_empty);
-                        let pause = Duration::from_secs(if retry_empty { 1 << (empty_retries - 1) } else { 1 });
+                        let pause = retry_pause;
                         match reask_stream(
                             &state,
                             &config,
@@ -4348,6 +4385,7 @@ pub(crate) async fn proxy_parsed(
                                     code: None,
                                 };
                                 if let Some(frame) = encoder.encode(&error) {
+                                    liveness.responses_quiet.observe_event();
                                     yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                                 }
                                 return;
@@ -4364,6 +4402,7 @@ pub(crate) async fn proxy_parsed(
                         if matches!(event, StreamEvent::Done) && continued && !usage_since_retry
                             && let Some(frame) = encoder.encode(&StreamEvent::Usage(tracker.total_usage()))
                         {
+                            liveness.responses_quiet.observe_event();
                             yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                         }
                         // Release the HTTP response before yielding the final frame,
@@ -4407,12 +4446,14 @@ pub(crate) async fn proxy_parsed(
                         }
                         tracker.finish(status, &Usage::default());
                         if !suppress_start && let Some(frame) = encoder.encode(&event) {
+                            liveness.responses_quiet.observe_event();
                             yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                         }
                         return;
                     }
                     if !held && !item.usage_hidden && !suppress_start && let Some(frame) = encoder.encode(&event) {
                         usage_since_retry |= matches!(event, StreamEvent::Usage(_));
+                        liveness.responses_quiet.observe_event();
                         yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                     }
                 }

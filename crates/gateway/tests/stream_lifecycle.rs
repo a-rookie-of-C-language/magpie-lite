@@ -3277,6 +3277,89 @@ async fn responses_hold_releases_real_opening_event_before_quiet_upstream_conten
         f.assert_released().await;
     }
 }
+#[tokio::test]
+async fn responses_agent_event_idle_releases_real_opening_then_succeeds_without_leaking_first_failure()
+ {
+    let f = Fixture::with_config(
+        Protocol::Responses,
+        vec![String::new(), opening(Protocol::Responses).into()],
+        Ending::PerSlot(vec![
+            Ending::PacedEof(vec![(
+                Duration::from_millis(50),
+                limited(Protocol::Responses).into(),
+            )]),
+            Ending::PacedEof(vec![(
+                Duration::from_millis(300),
+                prefix(Protocol::Responses) + completion(Protocol::Responses),
+            )]),
+        ]),
+        enable_fast_responses_hold,
+    )
+    .await;
+    let mut response = f.request(Protocol::Responses).await;
+    let opening = responses_opening(&mut response).await;
+    assert!(opening.contains("event: response.created"));
+    let body = opening + &response.text().await.unwrap();
+    assert_eq!(body.matches("event: response.created").count(), 1);
+    assert!(!body.contains("fixture rate limit"), "{body}");
+    assert_completed(&body, Protocol::Responses);
+    assert_eq!(*f.attempts.lock().unwrap(), [0, 1]);
+    assert_eq!(f.record().await["status"], "ok");
+    f.assert_released().await;
+}
+
+#[tokio::test]
+async fn responses_agent_event_idle_skips_replan_pause_that_would_cross_the_quiet_boundary() {
+    use magpie_gateway::{GroupConfig, RoutingPolicy};
+    let f = Fixture::with_config(
+        Protocol::Responses,
+        vec![
+            limited(Protocol::Responses).into(),
+            limited(Protocol::Responses).into(),
+        ],
+        Ending::Eof,
+        |config| {
+            enable_fast_responses_hold(config);
+            config.group.push(GroupConfig {
+                id: "daily".into(),
+                name: "Daily".into(),
+                routes: vec!["mock/up-model".into()],
+                rules: Vec::new(),
+                classifier: String::new(),
+                effort: String::new(),
+                levels: Vec::new(),
+                pick: String::new(),
+                auto: false,
+                weights: Vec::new(),
+                routing: RoutingPolicy::Order,
+                first_token_timeout_ms: 0,
+                affinity: Default::default(),
+                patience_s: Some(60),
+            });
+        },
+    )
+    .await;
+    let began = std::time::Instant::now();
+    let body = tokio::time::timeout(
+        LIMIT,
+        f.request_model(Protocol::Responses, "group/daily")
+            .await
+            .text(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        began.elapsed() < Duration::from_millis(1500),
+        "replan pause crossed event-idle: {:?}",
+        began.elapsed()
+    );
+    assert!(body.contains("fixture rate limit"), "{body}");
+    assert_no_success(&body);
+    assert_eq!(*f.attempts.lock().unwrap(), [0, 1]);
+    assert_eq!(f.record().await["status"], "upstream_stream_error");
+    f.assert_released().await;
+}
 
 #[tokio::test]
 async fn responses_hold_budget_spans_keys_providers_and_groups_without_leaking_abandoned_opening() {
