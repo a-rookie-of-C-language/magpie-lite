@@ -670,7 +670,7 @@ pub fn folder_under(folder: &str, root: &str) -> bool {
 pub fn clean_folder(p: &str) -> Result<String, String> {
     let mut p = p.trim().to_owned();
     let t = p.trim_end_matches(['/', '\\']);
-    if !t.is_empty() && !(t.len() == 2 && t.as_bytes()[1] == b':') {
+    if !(t.is_empty() || t.len() == 2 && t.as_bytes()[1] == b':') {
         p = t.to_owned(); // the root, and a drive's, keep theirs
     }
     let fwd = p.replace('\\', "/");

@@ -59,9 +59,7 @@ impl GroundingState {
             return None;
         }
         let metadata = get_either(candidate, "groundingMetadata", "grounding_metadata")?;
-        if !metadata
-            .as_object()
-            .is_some_and(|object| !object.is_empty())
+        if metadata.as_object().is_none_or(|object| object.is_empty())
             || self.last.as_ref() == Some(metadata)
         {
             return None;
