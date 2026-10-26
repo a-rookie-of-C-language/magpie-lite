@@ -60,6 +60,11 @@ const SESSION_HEADERS: [&str; 6] = [
     "x-claude-code-session-id",
 ];
 
+/// Claude Code subagents reuse the lead session's id; this header alone says
+/// a request belongs to a subagent, so its answer must not replace the lead's
+/// affinity stick.
+const CLAUDE_AGENT_HEADER: &str = "x-claude-code-agent-id";
+
 /// Milliseconds since the Unix epoch, saturating at zero before it.
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -100,6 +105,20 @@ pub fn conversation_id(headers: &HeaderMap, body: &[u8]) -> String {
     // An undecodable body still gets an id: the hash of the whole body.
     let value: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
     conversation_id_from_value(headers, &value, body)
+}
+
+/// The affinity stick key: the conversation, with a Claude Code subagent's
+/// conversation kept apart from its lead's.
+pub(crate) fn stick_key(headers: &HeaderMap, conversation: &str) -> String {
+    let subagent = headers
+        .get(CLAUDE_AGENT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match subagent {
+        Some(agent) => format!("{conversation}|agent:{agent}"),
+        None => conversation.to_owned(),
+    }
 }
 
 /// The same conversation id, using a body its caller already decoded.
@@ -651,6 +670,7 @@ impl AffinityStore {
         seats: &[Seat],
     ) -> Decision {
         let conversation = conversation_id(headers, body);
+        let conversation = stick_key(headers, &conversation);
         self.affine_conversation(scope, mode, rotate, &conversation, request, seats)
     }
 
@@ -844,6 +864,22 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-session-id", "abc".parse().unwrap());
         assert_eq!(conversation_id(&headers, b"{}"), "abc");
+    }
+
+    #[test]
+    fn a_claude_code_subagent_does_not_take_its_leads_stick() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-claude-code-session-id", "s-1".parse().unwrap());
+        let lead = conversation_id(&headers, b"{}");
+        assert_eq!(stick_key(&headers, &lead), lead);
+
+        headers.insert("x-claude-code-agent-id", "agent-1".parse().unwrap());
+        assert_eq!(stick_key(&headers, &lead), format!("{lead}|agent:agent-1"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-claude-code-session-id", "s-1".parse().unwrap());
+        headers.insert("x-claude-code-agent-id", " ".parse().unwrap());
+        assert_eq!(stick_key(&headers, &lead), lead);
     }
 
     #[test]

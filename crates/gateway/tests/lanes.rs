@@ -19,7 +19,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use magpie_gateway::{
-    AppState, Config, ConfigStore, GroupConfig, KeyRotator, Protocol, ProviderConfig,
+    Affinity, AppState, Config, ConfigStore, GroupConfig, KeyRotator, Protocol, ProviderConfig,
     RoutingPolicy, build_router, usage::RequestLog,
 };
 use serde_json::{Value, json};
@@ -113,13 +113,14 @@ fn provider(id: &str, url: String) -> ProviderConfig {
 
 /// A gateway over the providers given, grouped `g` over all of them.
 async fn gateway(providers: Vec<ProviderConfig>) -> (String, Arc<AppState>) {
-    gateway_routed(providers, RoutingPolicy::Order).await
+    gateway_routed(providers, RoutingPolicy::Order, Affinity::Auto).await
 }
 
 /// A gateway whose group `g` is routed `policy`.
 async fn gateway_routed(
     providers: Vec<ProviderConfig>,
     policy: RoutingPolicy,
+    affinity: Affinity,
 ) -> (String, Arc<AppState>) {
     let routes = providers
         .iter()
@@ -155,7 +156,7 @@ async fn gateway_routed(
             weights: Vec::new(),
             routing: policy,
             first_token_timeout_ms: 0,
-            affinity: Default::default(),
+            affinity,
             patience_s: None,
         }],
     };
@@ -184,19 +185,28 @@ fn ask(
     gateway: String,
     model: &str,
 ) -> impl std::future::Future<Output = (StatusCode, reqwest::header::HeaderMap, Value)> {
+    ask_as(gateway, model, &[])
+}
+
+fn ask_as(
+    gateway: String,
+    model: &str,
+    extra: &'static [(&'static str, &'static str)],
+) -> impl std::future::Future<Output = (StatusCode, reqwest::header::HeaderMap, Value)> {
     let gateway = gateway.to_owned();
     let model = model.to_owned();
     async move {
-        let resp = reqwest::Client::new()
+        let mut request = reqwest::Client::new()
             .post(format!("{gateway}/v1/chat/completions"))
             .bearer_auth("magpie-lite")
             .json(&json!({
                 "model": model,
                 "messages": [{"role": "user", "content": "hi"}]
-            }))
-            .send()
-            .await
-            .unwrap();
+            }));
+        for (name, value) in extra {
+            request = request.header(*name, *value);
+        }
+        let resp = request.send().await.unwrap();
         let status = resp.status();
         let headers = resp.headers().clone();
         let body = resp.text().await.unwrap();
@@ -521,6 +531,7 @@ async fn free_first_spends_the_declared_free_member_before_the_paid_one() {
     let (url, _state) = gateway_routed(
         vec![paid_provider.clone(), free_provider.clone()],
         RoutingPolicy::FreeFirst,
+        Affinity::Auto,
     )
     .await;
     let (status, _, body) = ask(url.clone(), "group/g").await;
@@ -537,10 +548,59 @@ async fn free_first_spends_the_declared_free_member_before_the_paid_one() {
     let (url, _state) = gateway_routed(
         vec![paid_provider, other_provider],
         RoutingPolicy::FreeFirst,
+        Affinity::Auto,
     )
     .await;
     let (status, _, body) = ask(url, "group/g").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(paid.asked(), 1);
     assert_eq!(other.asked(), 0);
+}
+
+/// Claude Code sends its session's id with a subagent's requests too, and
+/// only `x-claude-code-agent-id` says the request is a subagent's. Its
+/// answer must not move the lead conversation's affinity stick.
+#[tokio::test]
+async fn a_claude_code_subagent_does_not_move_its_leads_stick() {
+    let lead_first = Member::new(Duration::ZERO);
+    let lead_second = Member::new(Duration::ZERO);
+    let first = provider("first", upstream(lead_first.clone()).await);
+    let second = provider("second", upstream(lead_second.clone()).await);
+    let (gw, _state) = gateway_routed(
+        vec![first, second],
+        RoutingPolicy::Rotate,
+        Affinity::Session,
+    )
+    .await;
+
+    let lead_headers = &[("x-claude-code-session-id", "s-1")];
+    let (status, _, body) = ask_as(gw.clone(), "group/g", lead_headers).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(lead_first.asked(), 1);
+    assert_eq!(lead_second.asked(), 0);
+
+    let subagent_headers = &[
+        ("x-claude-code-session-id", "s-1"),
+        ("x-claude-code-agent-id", "agent-1"),
+    ];
+    let (status, _, body) = ask_as(gw.clone(), "group/g", subagent_headers).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        lead_second.asked(),
+        1,
+        "a subagent opens its own conversation"
+    );
+
+    let (status, _, body) = ask_as(gw, "group/g", lead_headers).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        lead_first.asked(),
+        2,
+        "the lead stays on the member that answered it"
+    );
+    assert_eq!(
+        lead_second.asked(),
+        1,
+        "the subagent's answer does not overwrite the lead's stick"
+    );
 }

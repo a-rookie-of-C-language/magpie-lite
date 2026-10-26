@@ -4010,6 +4010,7 @@ pub(crate) async fn proxy_parsed(
     let model = creq.model.clone();
     let body_bytes = bytes.to_vec();
     let conversation = crate::affinity::conversation_id_from_value(&headers, &body, &body_bytes);
+    let conversation = crate::affinity::stick_key(&headers, &conversation);
     let agent = crate::rules::agent_of(
         headers
             .get(header::USER_AGENT)
