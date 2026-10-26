@@ -1474,7 +1474,8 @@ pub struct ConfigSnapshot {
     pub stream_keepalive_max_silence_ms: u64,
     /// Responses opening-event hold budget across all attempts; zero disables it.
     pub stream_responses_hold_timeout_ms: u64,
-    /// Whether long text/reasoning repetition loops are terminated.
+    /// Whether long text/reasoning repetition loops are terminated and
+    /// repeated cross-turn tool exchanges are answered locally.
     #[serde(default = "default_stream_loop_guard")]
     pub stream_loop_guard: bool,
     /// Upstream routing metadata.
@@ -1528,8 +1529,10 @@ pub struct Config {
     /// Zero disables it. Releasing actual metadata commits the current attempt.
     #[serde(default = "default_stream_responses_hold_timeout_ms")]
     pub stream_responses_hold_timeout_ms: u64,
-    /// Stop streamed text/reasoning that is stuck in a long repetition loop.
-    /// Enabled by default; tool arguments and nonstreaming replies are excluded.
+    /// Stop streamed text/reasoning stuck in a long repetition loop, and
+    /// answer a conversation whose newest tool exchanges repeat the same call
+    /// and result without sending it to a provider. Enabled by default; the
+    /// stream guard excludes tool arguments and nonstreaming replies.
     #[serde(default = "default_stream_loop_guard")]
     pub stream_loop_guard: bool,
     /// The Image recognition model: `provider/model` describes the images

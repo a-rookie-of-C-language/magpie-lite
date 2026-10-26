@@ -72,6 +72,14 @@ pub struct RequestRecord {
     pub stream: bool,
     /// `ok`, or a short failure kind.
     pub status: String,
+    /// Whether the gateway rejected the request locally without asking a
+    /// provider. Absent on older history lines.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rejected: bool,
+    /// Why a locally rejected request was stopped. Absent on older history
+    /// lines and ordinary requests.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
     /// Gateway processing time.
     pub latency_ms: u64,
     /// Provider usage, when reported.
@@ -85,6 +93,10 @@ pub struct RequestRecord {
     /// matched. Older history lines predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule: Option<crate::rules::RuleTrace>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One upstream send: which member was asked, at which reasoning level
@@ -470,6 +482,8 @@ impl RequestTracker {
                 replan_waited_ms: 0,
                 stream: request.stream,
                 status: "incomplete".to_owned(),
+                rejected: false,
+                error: String::new(),
                 latency_ms: 0,
                 usage: UsageSnapshot::default(),
                 classified: None,
@@ -576,6 +590,16 @@ impl RequestTracker {
         let mut log = lock(&self.log);
         log.record(self.record.clone());
     }
+
+    /// Record a request stopped locally without an upstream send.
+    pub fn finish_rejected(&mut self, reason: &str) {
+        if self.finished {
+            return;
+        }
+        self.record.rejected = true;
+        self.record.error = reason.to_owned();
+        self.finish("rejected", &Usage::default());
+    }
 }
 
 impl Drop for RequestTracker {
@@ -647,6 +671,8 @@ mod tests {
             replan_waited_ms: 0,
             stream: index.is_multiple_of(2),
             status: status.into(),
+            rejected: false,
+            error: String::new(),
             latency_ms: index,
             usage: UsageSnapshot {
                 input: Some(index),

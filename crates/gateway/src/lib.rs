@@ -38,6 +38,7 @@ mod stream_refusal;
 mod stream_status;
 mod stream_timeout;
 mod text_only;
+mod tool_loop;
 mod tool_schema;
 mod unfit_fields;
 pub mod upstream;

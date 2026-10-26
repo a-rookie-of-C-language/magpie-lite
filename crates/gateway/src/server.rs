@@ -17,7 +17,10 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use futures::StreamExt;
-use magpie_core::ir::{CompletionRequest, CompletionResponse, PartKind, SignatureProtocol, Usage};
+use magpie_core::ir::{
+    CompletionRequest, CompletionResponse, Message, Part, PartKind, Role, SignatureProtocol,
+    StopReason, Usage,
+};
 use magpie_core::stream::SignatureTarget;
 use magpie_core::stream::{SseParser, StreamEvent};
 use magpie_core::{anthropic, chat, gemini, responses};
@@ -45,6 +48,7 @@ use crate::stream_keepalive::{self, Keepalive, UpstreamActivity};
 use crate::stream_loop::LoopGuard;
 use crate::stream_refusal::{self, REFUSAL};
 use crate::stream_timeout::{GroupFirstToken, ResponsesHold, StreamClock, StreamTimeout};
+use crate::tool_loop;
 use crate::unfit_fields;
 use crate::upstream;
 use crate::usage::{RequestLog, RequestTracker};
@@ -1302,16 +1306,9 @@ type PreparedRoute = (
 fn prepare(
     config: &Config,
     key_rotation: &crate::config::KeyRotator,
-    body: &Value,
+    creq: CompletionRequest,
     wire: ClientWire,
 ) -> Result<PreparedRoute, (StatusCode, Value)> {
-    let creq = wire.decode_request(body).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            wire.error_body(StatusCode::BAD_REQUEST, &e.to_string()),
-        )
-    })?;
-
     // A found ref may ask for an effort on itself (`auto/<model>:<level>`,
     // the reference's `CanonicalRef`): route the stripped base, send at
     // the ask. Other refs pass through untouched; a provider's own
@@ -3983,8 +3980,20 @@ pub(crate) async fn proxy_parsed(
     wire: ClientWire,
 ) -> Response {
     let config = state.config.current();
+    let creq = match wire.decode_request(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            let status = StatusCode::BAD_REQUEST;
+            return err_response(status, wire.error_body(status, &error.to_string()));
+        }
+    };
+    if config.stream_loop_guard
+        && let Some(loop_) = tool_loop::detect(&creq.messages)
+    {
+        return local_tool_loop_response(&state, wire, &creq, loop_);
+    }
     let (creq, initial, group_plan, affinity_scope) =
-        match prepare(&config, &state.key_rotation, &body, wire) {
+        match prepare(&config, &state.key_rotation, creq, wire) {
             Ok(x) => x,
             Err((status, body)) => return err_response(status, body),
         };
@@ -4408,6 +4417,48 @@ pub(crate) async fn proxy_parsed(
         Some(keepalive) => keepalive_response(execute, keepalive, wire, model).await,
         None => execute.await.unwrap_or_else(|error| error.response(wire)),
     }
+}
+
+/// Answer a cross-turn tool loop in the agent's own dialect without asking
+/// a provider. The notice is a normal completed assistant turn, so the user's
+/// next message continues the conversation and resets the exchange scan.
+fn local_tool_loop_response(
+    state: &AppState,
+    wire: ClientWire,
+    request: &CompletionRequest,
+    loop_: tool_loop::ToolLoop,
+) -> Response {
+    let why = loop_.why();
+    let mut tracker = RequestTracker::new(
+        state.requests.clone(),
+        wire.name(),
+        request,
+        "magpie",
+        &request.model,
+        0,
+    );
+    tracker.finish_rejected(&why);
+
+    let reply = CompletionResponse {
+        model: request.model.clone(),
+        message: Message {
+            role: Role::Assistant,
+            parts: vec![Part::text(loop_.notice())],
+        },
+        stop: StopReason::EndTurn,
+        usage: Usage::default(),
+    };
+    if !request.stream {
+        return ok_json(wire.encode_response(&reply, request));
+    }
+
+    let mut encoder = ClientStreamEncoder::for_request(wire, request);
+    let frames = whole_as_stream_events(&reply)
+        .iter()
+        .filter_map(|event| encoder.encode(event))
+        .collect::<Vec<_>>()
+        .concat();
+    sse_response(Body::from(frames))
 }
 
 /// Delay HTTP commitment until a reply or the first comment. A comment exposes
