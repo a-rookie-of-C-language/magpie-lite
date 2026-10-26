@@ -100,25 +100,34 @@ Restart the agent after wiring it. For Zed, also set MAGPIE_LITE_API_KEY to the 
 
 ## Streaming timeouts
 
-The root of `config.toml` accepts two gateway-wide streaming safety limits:
+The root of `config.toml` accepts three gateway-wide streaming safety limits:
 
 ```toml
 stream_first_content_timeout_ms = 600000 # per attempt, includes response headers
 stream_idle_timeout_ms = 300000          # waiting for the next upstream body chunk
+stream_progress_timeout_ms = 0           # decoded content progress; 0 = off
 ```
 
-These are the defaults for old files too. Set either value to `0` to disable it.
+These are the defaults for old files too. Set any value to `0` to disable it.
 Nonempty text/reasoning, native opaque reasoning/signatures or a tool event satisfies the
 first-content limit; model, role, usage, reasoning-item-start metadata and comment
-heartbeats do not extend it. The idle limit resets on
-upstream transport bytes, not downstream backpressure. Before committing a
-stream, timeouts can try a configured fallback/group route (not another key on
-the same endpoint); after commitment they end with one protocol error and keep
-observed partial usage. Header/error-body timeouts return HTTP 504 when no route
-remains and no keepalive has sent HTTP headers; otherwise they become a stream
-error. Each attempt gets a fresh budget. Nonstreaming requests are unchanged.
+heartbeats do not extend it. The idle limit resets on upstream transport bytes,
+not downstream backpressure. The progress limit starts only after the first
+real decoded content and resets only for later content: text, reasoning, sealed
+reasoning, nonempty signatures, tools, images or search. Metadata, usage,
+thinking-start, empty deltas and transport comments (including heartbeats) do
+not reset it. Time spent waiting on a backpressured client is excluded.
 
-Both settings appear in protected GET `/config`; edit the TOML and restart to
+Before committing a stream, first-content and read-idle timeouts can try a
+configured fallback/group route (not another key on the same endpoint); after
+commitment they end with one protocol error and keep observed partial usage.
+The post-content progress timeout never continues, falls back, rotates a key,
+or performs a reasoning-only re-ask. Header/error-body timeouts return HTTP 504
+when no route remains and no keepalive has sent HTTP headers; otherwise they
+become a stream error. Each attempt gets a fresh first-content/read-idle budget.
+Nonstreaming requests are unchanged.
+
+All three settings appear in protected GET `/config`; edit the TOML and restart to
 change them (no timeout-edit API yet). They are not a total-duration limit.
 See `docs/stream-lifecycle.md` for exact policies and remaining reference gaps.
 
@@ -150,9 +159,10 @@ output can trigger a comment after a one-second gap (or the configured interval,
 whichever is shorter). Reaching the silence cap stops comments, not the request;
 new upstream activity resumes them. A fresh fallback attempt starts a fresh
 window. Downstream comments never count as upstream progress or reset the
-first-content/read-idle deadlines, and they cannot satisfy clients that require
-actual protocol events. No background worker is spawned: closing the client
-connection drops pending work and preserves one final accounting record.
+first-content/read-idle/progress deadlines, and they cannot satisfy clients
+that require actual protocol events. No background worker is spawned: closing
+the client connection drops pending work and preserves one final accounting
+record.
 
 ## Responses opening-event hold budget
 
@@ -169,8 +179,8 @@ comment keepalive, because some agents require actual protocol events.
 The budget is shared across key, provider and group retries. Pending headers,
 comments and usage-only input do not fabricate an opening event. Releasing an
 opening commits that attempt: later failures become stream errors, not retries.
-It does not reset first-content or upstream read-idle deadlines. This is not a
-post-content progress policy or a claim of real-Agent compatibility.
+It does not start or reset first-content, upstream read-idle or progress
+deadlines, and it is not a claim of real-Agent compatibility.
 
 ## Repetition-loop protection
 
@@ -361,7 +371,7 @@ both response headers and its held opening. If it produces no content before
 that budget, the gateway cancels it and tries the next group route without
 spending its other keys or applying quota cooldown. The last available route
 (in the selected routing order) and single-member groups have no group cap;
-gateway-wide first-content/read-idle limits still apply. Text, reasoning and
+gateway-wide first-content/read-idle/progress limits still apply. Text, reasoning and
 tool output commit the candidate. Releasing opening metadata via safety bounds
 or the Responses hold budget also commits it, preventing any subsequent replay.
 Usage, comments and empty text do not satisfy the content test. Nonstreaming

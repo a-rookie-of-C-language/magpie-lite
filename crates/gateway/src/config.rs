@@ -1468,6 +1468,8 @@ pub struct ConfigSnapshot {
     pub stream_first_content_timeout_ms: u64,
     /// Streaming upstream read-idle timeout; zero disables it.
     pub stream_idle_timeout_ms: u64,
+    /// Streaming post-content progress timeout; zero disables it.
+    pub stream_progress_timeout_ms: u64,
     /// Downstream SSE comment interval; zero disables keepalive.
     pub stream_keepalive_interval_ms: u64,
     /// Stop comments after this much upstream silence; zero disables keepalive.
@@ -1517,6 +1519,11 @@ pub struct Config {
     /// Zero disables it; downstream backpressure is not upstream read-idle time.
     #[serde(default = "default_stream_idle_timeout_ms")]
     pub stream_idle_timeout_ms: u64,
+    /// Maximum time waiting for new decoded stream content after the first
+    /// real content event. Zero disables it. Transport comments, metadata and
+    /// empty deltas do not reset it; downstream backpressure is not counted.
+    #[serde(default = "default_stream_progress_timeout_ms")]
+    pub stream_progress_timeout_ms: u64,
     /// Interval between downstream SSE comments (except Gemini/nonstream).
     /// Zero disables keepalive without changing upstream timeout policies.
     #[serde(default = "default_stream_keepalive_interval_ms")]
@@ -1679,6 +1686,10 @@ fn default_stream_idle_timeout_ms() -> u64 {
     300_000
 }
 
+fn default_stream_progress_timeout_ms() -> u64 {
+    0
+}
+
 fn default_stream_keepalive_interval_ms() -> u64 {
     15_000
 }
@@ -1708,6 +1719,7 @@ impl Default for Config {
             key_cooldown_ms: default_key_cooldown_ms(),
             stream_first_content_timeout_ms: default_stream_first_content_timeout_ms(),
             stream_idle_timeout_ms: default_stream_idle_timeout_ms(),
+            stream_progress_timeout_ms: default_stream_progress_timeout_ms(),
             stream_keepalive_interval_ms: default_stream_keepalive_interval_ms(),
             stream_keepalive_max_silence_ms: default_stream_keepalive_max_silence_ms(),
             stream_responses_hold_timeout_ms: default_stream_responses_hold_timeout_ms(),
@@ -1867,6 +1879,7 @@ impl Config {
             key_cooldown_ms: self.key_cooldown_ms,
             stream_first_content_timeout_ms: self.stream_first_content_timeout_ms,
             stream_idle_timeout_ms: self.stream_idle_timeout_ms,
+            stream_progress_timeout_ms: self.stream_progress_timeout_ms,
             stream_keepalive_interval_ms: self.stream_keepalive_interval_ms,
             stream_keepalive_max_silence_ms: self.stream_keepalive_max_silence_ms,
             stream_responses_hold_timeout_ms: self.stream_responses_hold_timeout_ms,
@@ -2360,11 +2373,13 @@ mod tests {
         let mut config: Config = toml::from_str("port = 3426").unwrap();
         assert_eq!(config.stream_first_content_timeout_ms, 600_000);
         assert_eq!(config.stream_idle_timeout_ms, 300_000);
+        assert_eq!(config.stream_progress_timeout_ms, 0);
         assert_eq!(config.stream_keepalive_interval_ms, 15_000);
         assert_eq!(config.stream_keepalive_max_silence_ms, 300_000);
         assert_eq!(config.stream_responses_hold_timeout_ms, 240_000);
         config.stream_first_content_timeout_ms = 0;
         config.stream_idle_timeout_ms = 1234;
+        config.stream_progress_timeout_ms = 2345;
         config.stream_keepalive_interval_ms = 0;
         config.stream_keepalive_max_silence_ms = 5678;
         config.stream_responses_hold_timeout_ms = 890;
@@ -2373,6 +2388,7 @@ mod tests {
         let snapshot = restored.snapshot();
         assert_eq!(snapshot.stream_first_content_timeout_ms, 0);
         assert_eq!(snapshot.stream_idle_timeout_ms, 1234);
+        assert_eq!(snapshot.stream_progress_timeout_ms, 2345);
         assert_eq!(snapshot.stream_keepalive_interval_ms, 0);
         assert_eq!(snapshot.stream_keepalive_max_silence_ms, 5678);
         assert_eq!(snapshot.stream_responses_hold_timeout_ms, 890);

@@ -1846,6 +1846,273 @@ async fn zero_timeouts_allow_a_delayed_first_answer() {
     }
 }
 
+fn answer_json(protocol: Protocol) -> String {
+    let ir = magpie_core::ir::CompletionResponse {
+        model: "up-model".into(),
+        message: magpie_core::ir::Message {
+            role: magpie_core::ir::Role::Assistant,
+            parts: vec![magpie_core::ir::Part::text("delayed answer")],
+        },
+        stop: magpie_core::ir::StopReason::EndTurn,
+        usage: magpie_core::ir::Usage {
+            input: Some(7),
+            output: Some(3),
+            ..Default::default()
+        },
+    };
+    match protocol {
+        Protocol::Chat => magpie_core::chat::encode_response(&ir),
+        Protocol::Anthropic => magpie_core::anthropic::encode_response(&ir),
+        Protocol::Responses => magpie_core::responses::encode_response(&ir),
+        Protocol::Gemini => magpie_core::gemini::encode_response(&ir),
+    }
+    .to_string()
+}
+
+#[tokio::test]
+async fn progress_timeout_after_content_never_continues_or_falls_back() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            let f = Fixture::with_config(
+                upstream,
+                vec![prefix(upstream), prefix(upstream) + completion(upstream)],
+                Ending::Heartbeats,
+                |config| {
+                    config.stream_first_content_timeout_ms = 0;
+                    config.stream_idle_timeout_ms = 0;
+                    config.stream_progress_timeout_ms = 150;
+                    configure_timeout_fallback(config, false);
+                },
+            )
+            .await;
+            let body = tokio::time::timeout(LIMIT, f.request(client).await.text())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("progress timeout stayed live: {upstream:?} -> {client:?}")
+                })
+                .unwrap();
+            assert!(body.contains("partial"), "{body}");
+            assert_one_stream_error(&body, client, "upstream stream progress timeout");
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            let record = f.record().await;
+            assert_eq!(record["status"], "upstream_stream_error");
+            assert_partial_usage(&record, upstream);
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn progress_timeout_is_rearmed_only_by_decoded_content() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            let f = Fixture::with_config(
+                upstream,
+                vec![prefix(upstream)],
+                Ending::Paced(vec![
+                    (Duration::from_millis(100), ": heartbeat\n\n".into()),
+                    (
+                        Duration::from_millis(100),
+                        loop_delta(upstream, false, "more"),
+                    ),
+                    (Duration::from_millis(100), ": heartbeat\n\n".into()),
+                    (Duration::from_millis(100), completion(upstream).into()),
+                ]),
+                |config| {
+                    config.stream_first_content_timeout_ms = 0;
+                    config.stream_idle_timeout_ms = 0;
+                    config.stream_progress_timeout_ms = 250;
+                },
+            )
+            .await;
+            let body = tokio::time::timeout(LIMIT, f.request(client).await.text())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("paced stream exceeded LIMIT: {upstream:?} -> {client:?}")
+                })
+                .unwrap();
+            assert!(body.contains("partial") && body.contains("more"), "{body}");
+            assert_completed(&body, client);
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            assert_eq!(f.record().await["status"], "ok");
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn progress_timeout_does_not_start_before_real_content() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            let f = Fixture::with_config(
+                upstream,
+                vec![String::new()],
+                Ending::Paced(vec![
+                    (Duration::from_millis(100), ": heartbeat\n\n".into()),
+                    (Duration::from_millis(100), ": heartbeat\n\n".into()),
+                    (
+                        Duration::from_millis(100),
+                        prefix(upstream) + completion(upstream),
+                    ),
+                ]),
+                |config: &mut Config| {
+                    config.stream_first_content_timeout_ms = 0;
+                    config.stream_idle_timeout_ms = 0;
+                    config.stream_progress_timeout_ms = 150;
+                },
+            )
+            .await;
+            let body = tokio::time::timeout(LIMIT, f.request(client).await.text())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("progress expired before content: {upstream:?} -> {client:?}")
+                })
+                .unwrap();
+            assert!(body.contains("partial"), "{body}");
+            assert_completed(&body, client);
+            assert_eq!(f.record().await["status"], "ok");
+            f.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn progress_timeout_zero_and_nonstream_requests_do_not_enforce() {
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            let disabled = Fixture::with_config(
+                upstream,
+                vec![prefix(upstream)],
+                Ending::Paced(vec![(
+                    Duration::from_millis(300),
+                    completion(upstream).into(),
+                )]),
+                |config| {
+                    config.stream_first_content_timeout_ms = 0;
+                    config.stream_idle_timeout_ms = 0;
+                    config.stream_progress_timeout_ms = 0;
+                },
+            )
+            .await;
+            let body = tokio::time::timeout(LIMIT, disabled.request(client).await.text())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_completed(&body, client);
+            assert_eq!(disabled.record().await["status"], "ok");
+            disabled.assert_released().await;
+
+            let nonstream = Fixture::with_config(
+                upstream,
+                vec![String::new()],
+                Ending::PacedEof(vec![(Duration::from_millis(300), answer_json(upstream))]),
+                |config| {
+                    config.stream_first_content_timeout_ms = 0;
+                    config.stream_idle_timeout_ms = 0;
+                    config.stream_progress_timeout_ms = 150;
+                },
+            )
+            .await;
+            let (path, request) = client_request(client, "mock/up-model", false);
+            let response = tokio::time::timeout(
+                LIMIT,
+                reqwest::Client::new()
+                    .post(format!("{}{path}", nonstream.gateway.url))
+                    .bearer_auth("secret-local-token")
+                    .json(&request)
+                    .send(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.status(), 200);
+            let reply = response.json::<Value>().await.unwrap();
+            let text = match client {
+                Protocol::Chat => reply["choices"][0]["message"]["content"].as_str().unwrap(),
+                Protocol::Anthropic => reply["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|v| v["type"] == "text")
+                    .unwrap()["text"]
+                    .as_str()
+                    .unwrap(),
+                Protocol::Responses => reply["output"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|v| v["type"] == "message")
+                    .unwrap()["content"][0]["text"]
+                    .as_str()
+                    .unwrap(),
+                Protocol::Gemini => reply["candidates"][0]["content"]["parts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|v| v["thought"] != true)
+                    .unwrap()["text"]
+                    .as_str()
+                    .unwrap(),
+            };
+            assert_eq!(text, "delayed answer");
+            assert_eq!(*nonstream.attempts.lock().unwrap(), [0]);
+            assert_eq!(nonstream.record().await["status"], "ok");
+            nonstream.assert_released().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn client_disconnect_cancels_progress_timer_and_persists_one_record() {
+    use tokio::io::AsyncReadExt;
+
+    for upstream in PROTOCOLS {
+        for client in PROTOCOLS {
+            let f = Fixture::with_config(
+                upstream,
+                vec![prefix(upstream)],
+                Ending::Heartbeats,
+                |config| {
+                    config.stream_first_content_timeout_ms = 0;
+                    config.stream_idle_timeout_ms = 0;
+                    config.stream_progress_timeout_ms = 250;
+                },
+            )
+            .await;
+            let history = f.persistent_history();
+            let mut socket = f.socket_request(client, "mock/up-model", true).await;
+            let mut received = Vec::new();
+            tokio::time::timeout(LIMIT, async {
+                while !String::from_utf8_lossy(&received).contains("partial") {
+                    let mut buffer = [0; 4096];
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(n, 0, "socket ended before its partial answer");
+                    received.extend_from_slice(&buffer[..n]);
+                }
+            })
+            .await
+            .expect("no partial answer before disconnect");
+            drop(socket);
+
+            let record = f.record().await;
+            assert_eq!(record["status"], "client_disconnected");
+            assert_partial_usage(&record, upstream);
+            assert_eq!(*f.attempts.lock().unwrap(), [0]);
+            f.assert_released().await;
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            assert_eq!(f.log.lock().unwrap().snapshot().recent_requests.len(), 1);
+            let persisted = std::fs::read_to_string(history.path().join("requests.jsonl")).unwrap();
+            assert_eq!(persisted.lines().count(), 1);
+            assert_eq!(serde_json::from_str::<Value>(&persisted).unwrap(), record);
+            assert!(
+                !persisted.contains("secret-")
+                    && !persisted.contains("private cancellation prompt")
+                    && !persisted.contains("partial")
+            );
+        }
+    }
+}
+
 fn client_request(protocol: Protocol, model: &str, stream: bool) -> (String, Value) {
     match protocol {
         Protocol::Chat => (
@@ -1974,6 +2241,7 @@ impl Fixture {
 fn disable_stream_deadlines(config: &mut Config) {
     config.stream_first_content_timeout_ms = 0;
     config.stream_idle_timeout_ms = 0;
+    config.stream_progress_timeout_ms = 0;
 }
 
 fn assert_pending_record(record: &Value, client: Protocol, stream: bool) {

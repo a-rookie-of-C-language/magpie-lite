@@ -126,6 +126,7 @@ async fn gateway(free: ProviderConfig, paid: ProviderConfig) -> String {
         key_cooldown_ms: 60_000,
         stream_first_content_timeout_ms: Config::default().stream_first_content_timeout_ms,
         stream_idle_timeout_ms: Config::default().stream_idle_timeout_ms,
+        stream_progress_timeout_ms: Config::default().stream_progress_timeout_ms,
         stream_keepalive_interval_ms: Config::default().stream_keepalive_interval_ms,
         stream_keepalive_max_silence_ms: Config::default().stream_keepalive_max_silence_ms,
         stream_responses_hold_timeout_ms: Config::default().stream_responses_hold_timeout_ms,

@@ -1764,6 +1764,10 @@ struct UpstreamEvent {
     /// True only for the loop guard's reasoning terminal. This is an internal
     /// control signal; ordinary vendor errors must never trigger a reask.
     loop_reasoning: bool,
+    /// True only for a post-content progress timeout. Unlike an ordinary
+    /// transport failure, this must end the committed reply without a
+    /// continuation, fallback, key retry or reasoning-only reask.
+    no_continuation: bool,
 }
 impl From<StreamEvent> for UpstreamEvent {
     fn from(event: StreamEvent) -> Self {
@@ -1779,6 +1783,7 @@ impl From<StreamEvent> for UpstreamEvent {
             usage_hidden: false,
             answer_observed: false,
             loop_reasoning: false,
+            no_continuation: false,
         }
     }
 }
@@ -2855,6 +2860,11 @@ async fn send_with_fallback(
                             0
                         },
                         config.stream_idle_timeout_ms,
+                        if creq.stream {
+                            config.stream_progress_timeout_ms
+                        } else {
+                            0
+                        },
                     );
                     let resp = match first_token
                         .wait(clock.headers(upstream::send(
@@ -3552,6 +3562,7 @@ async fn reask_stream(
     let clock = StreamClock::new(
         config.stream_first_content_timeout_ms,
         config.stream_idle_timeout_ms,
+        config.stream_progress_timeout_ms,
     );
     liveness.activity.attempt();
     let response = match clock
@@ -4217,6 +4228,7 @@ pub(crate) async fn proxy_parsed(
                         && cont.possible()
                         && group_plan.is_none()
                         && code.is_none()
+                        && !item.no_continuation
                         && !item.loop_reasoning
                         && !item
                             .failure
@@ -4296,7 +4308,7 @@ pub(crate) async fn proxy_parsed(
                     }
                     cont.add(&event);
 
-                    let retry_reasoning = item.loop_reasoning && !reasoning_reasked && !emitted_answer;
+                    let retry_reasoning = item.loop_reasoning && !item.no_continuation && !reasoning_reasked && !emitted_answer;
                     let retry_empty = reask_allowed && item.failure.as_ref().is_some_and(|f| f.kind == FailureKind::EmptyReply)
                         && empty_retries < empty_limit && !emitted_answer;
                     if retry_reasoning || retry_empty {
@@ -4628,6 +4640,7 @@ fn decode_upstream_data(
             usage_hidden: hidden,
             answer_observed: protocol == Protocol::Gemini && decoders.gemini_reply.has_answer(),
             loop_reasoning: false,
+            no_continuation: false,
         });
     }
     out
@@ -4729,6 +4742,7 @@ fn empty_reply_event() -> UpstreamEvent {
         usage_hidden: false,
         answer_observed: false,
         loop_reasoning: false,
+        no_continuation: false,
     }
 }
 
@@ -4747,6 +4761,7 @@ fn stream_timeout_event(timeout: StreamTimeout) -> UpstreamEvent {
         usage_hidden: false,
         answer_observed: false,
         loop_reasoning: false,
+        no_continuation: timeout == StreamTimeout::Progress,
     }
 }
 
@@ -4839,6 +4854,7 @@ fn upstream_events(
                             usage_hidden: false,
                             answer_observed: false,
                             loop_reasoning: trip.is_reasoning(),
+                            no_continuation: false,
                         }.into();
                         return;
                     }
@@ -4849,6 +4865,7 @@ fn upstream_events(
         match parser.flush() {
             Ok(Some(data)) => {
                 for event in decode_upstream_data(protocol, &data, &mut decoders) {
+                    clock.observe(&event.event);
                     chat_stopped |= protocol == Protocol::Chat && matches!(event.event, StreamEvent::Stop(_));
                     let trip = loop_guard.as_mut().and_then(|guard| guard.observe(&event.event));
                     yield event.into();
@@ -4867,6 +4884,7 @@ fn upstream_events(
                             usage_hidden: false,
                             answer_observed: false,
                             loop_reasoning: trip.is_reasoning(),
+                            no_continuation: false,
                         }.into();
                         return;
                     }

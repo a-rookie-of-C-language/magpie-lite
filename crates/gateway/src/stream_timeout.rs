@@ -61,6 +61,7 @@ impl GroupFirstToken {
 pub(crate) enum StreamTimeout {
     FirstContent,
     Idle,
+    Progress,
     GroupFirstToken,
 }
 
@@ -76,6 +77,7 @@ impl StreamTimeout {
         match self {
             Self::FirstContent => "upstream first-content timeout",
             Self::Idle => "upstream stream idle timeout",
+            Self::Progress => "upstream stream progress timeout",
             Self::GroupFirstToken => "group first-token timeout",
         }
     }
@@ -86,15 +88,19 @@ pub(crate) struct StreamClock {
     first_content: Option<Duration>,
     idle: Option<Duration>,
     remaining_idle: Option<Duration>,
+    progress: Option<Duration>,
+    remaining_progress: Option<Duration>,
 }
 
 impl StreamClock {
-    pub(crate) fn new(first_content_ms: u64, idle_ms: u64) -> Self {
+    pub(crate) fn new(first_content_ms: u64, idle_ms: u64, progress_ms: u64) -> Self {
         Self {
             started: Instant::now(),
             first_content: (first_content_ms > 0).then(|| Duration::from_millis(first_content_ms)),
             idle: (idle_ms > 0).then(|| Duration::from_millis(idle_ms)),
             remaining_idle: None,
+            progress: (progress_ms > 0).then(|| Duration::from_millis(progress_ms)),
+            remaining_progress: None,
         }
     }
 
@@ -102,6 +108,9 @@ impl StreamClock {
         let content = event.is_content();
         if content {
             self.first_content = None;
+            if self.progress.is_some() {
+                self.remaining_progress = self.progress;
+            }
         }
     }
 
@@ -109,7 +118,7 @@ impl StreamClock {
         &self,
         future: impl Future<Output = T>,
     ) -> Result<T, StreamTimeout> {
-        self.wait(future, None).await
+        self.wait(future, None, None).await
     }
 
     pub(crate) async fn chunk<T>(
@@ -118,13 +127,20 @@ impl StreamClock {
     ) -> Result<T, StreamTimeout> {
         // Start a fresh idle interval only when actually waiting for transport.
         // Time spent yielding to a backpressured downstream does not count.
+        let began = Instant::now();
         let idle = self.remaining_idle.take().or(self.idle);
-        self.wait(future, idle).await
+        let progress = self.remaining_progress.take();
+        let result = self.wait(future, idle, progress).await;
+        if result.is_ok() {
+            self.remaining_progress = progress.map(|limit| limit.saturating_sub(began.elapsed()));
+        }
+        result
     }
 
-    /// Interrupt one upstream read to release buffered opening metadata. Carry
-    /// the unused idle budget across the yield, without counting downstream
-    /// backpressure or granting a new full interval for this same read.
+    /// Interrupt one upstream read to release buffered opening metadata. A
+    /// transport chunk resets idle but carries the decoded-content progress
+    /// budget; releasing the opening event carries both. Neither counts
+    /// downstream backpressure or grants a new full interval for this read.
     pub(crate) async fn held_chunk<T>(
         &mut self,
         future: impl Future<Output = T>,
@@ -132,6 +148,7 @@ impl StreamClock {
     ) -> Result<Option<T>, StreamTimeout> {
         let began = Instant::now();
         let idle = self.remaining_idle.take().or(self.idle);
+        let progress = self.remaining_progress.take();
         let result = self
             .wait(
                 async {
@@ -142,10 +159,14 @@ impl StreamClock {
                     }
                 },
                 idle,
+                progress,
             )
             .await;
         if matches!(result, Ok(None)) {
             self.remaining_idle = idle.map(|limit| limit.saturating_sub(began.elapsed()));
+        }
+        if matches!(result, Ok(Some(_)) | Ok(None)) {
+            self.remaining_progress = progress.map(|limit| limit.saturating_sub(began.elapsed()));
         }
         result
     }
@@ -154,16 +175,22 @@ impl StreamClock {
         &self,
         future: impl Future<Output = T>,
         idle: Option<Duration>,
+        progress: Option<Duration>,
     ) -> Result<T, StreamTimeout> {
         let first = self
             .first_content
             .map(|limit| limit.saturating_sub(self.started.elapsed()));
-        let deadline = match (first, idle) {
+        let mut deadline = match (first, idle) {
             (Some(first), Some(idle)) if idle < first => Some((idle, StreamTimeout::Idle)),
             (Some(first), _) => Some((first, StreamTimeout::FirstContent)),
             (None, Some(idle)) => Some((idle, StreamTimeout::Idle)),
             (None, None) => None,
         };
+        if let Some(progress) = progress
+            && deadline.is_none_or(|(remaining, _)| progress < remaining)
+        {
+            deadline = Some((progress, StreamTimeout::Progress));
+        }
         let Some((remaining, reason)) = deadline else {
             return Ok(future.await);
         };
@@ -250,7 +277,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn opening_release_preserves_remaining_idle_and_excludes_yield_backpressure() {
-        let mut clock = StreamClock::new(0, 300);
+        let mut clock = StreamClock::new(0, 300, 0);
         let hold = ResponsesHold::new(120);
         let began = Instant::now();
         assert_eq!(
@@ -268,8 +295,55 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn held_transport_chunk_resets_idle_but_carries_progress() {
+        let hold = ResponsesHold::new(500);
+        let began = Instant::now();
+        let mut clock = StreamClock::new(0, 100, 0);
+        assert_eq!(
+            clock
+                .held_chunk(
+                    async {
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                        Some(())
+                    },
+                    &hold,
+                )
+                .await,
+            Ok(Some(Some(())))
+        );
+        assert_eq!(
+            clock.chunk(std::future::pending::<()>()).await,
+            Err(StreamTimeout::Idle)
+        );
+        assert_eq!(began.elapsed(), Duration::from_millis(140));
+
+        let began = Instant::now();
+        let mut clock = StreamClock::new(0, 1_000, 100);
+        clock.observe(&StreamEvent::TextDelta {
+            text: "answer".into(),
+        });
+        assert_eq!(
+            clock
+                .held_chunk(
+                    async {
+                        tokio::time::sleep(Duration::from_millis(60)).await;
+                        Some(())
+                    },
+                    &hold,
+                )
+                .await,
+            Ok(Some(Some(())))
+        );
+        assert_eq!(
+            clock.chunk(std::future::pending::<()>()).await,
+            Err(StreamTimeout::Progress)
+        );
+        assert_eq!(began.elapsed(), Duration::from_millis(100));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn opening_release_does_not_rearm_the_absolute_first_content_deadline() {
-        let mut clock = StreamClock::new(300, 0);
+        let mut clock = StreamClock::new(300, 0, 0);
         let hold = ResponsesHold::new(120);
         let began = Instant::now();
         assert_eq!(
@@ -296,7 +370,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn first_content_includes_headers_and_cannot_be_extended_by_metadata() {
-        let mut clock = StreamClock::new(100, 80);
+        let mut clock = StreamClock::new(100, 80, 0);
         clock
             .headers(tokio::time::sleep(Duration::from_millis(40)))
             .await
@@ -307,11 +381,11 @@ mod tests {
         clock.observe(&StreamEvent::TextDelta {
             text: String::new(),
         });
-        clock.observe(&StreamEvent::Usage(Default::default()));
         clock
             .chunk(tokio::time::sleep(Duration::from_millis(40)))
             .await
             .unwrap();
+        clock.observe(&StreamEvent::Usage(Default::default()));
         assert_eq!(
             clock.chunk(std::future::pending::<()>()).await,
             Err(StreamTimeout::FirstContent)
@@ -344,7 +418,7 @@ mod tests {
                 args: "{}".into(),
             },
         ] {
-            let mut clock = StreamClock::new(30, 100);
+            let mut clock = StreamClock::new(30, 100, 0);
             clock.observe(&event);
             clock
                 .chunk(tokio::time::sleep(Duration::from_millis(80)))
@@ -370,12 +444,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn idle_can_expire_before_content_and_zero_disables_each_limit() {
         assert_eq!(
-            StreamClock::new(100, 30)
+            StreamClock::new(100, 30, 0)
                 .chunk(std::future::pending::<()>())
                 .await,
             Err(StreamTimeout::Idle)
         );
-        let mut clock = StreamClock::new(0, 30);
+        let mut clock = StreamClock::new(0, 30, 0);
         clock
             .headers(tokio::time::sleep(Duration::from_secs(1)))
             .await
@@ -384,13 +458,115 @@ mod tests {
             clock.chunk(std::future::pending::<()>()).await,
             Err(StreamTimeout::Idle)
         );
-        let mut clock = StreamClock::new(0, 0);
+        let mut clock = StreamClock::new(0, 0, 0);
         clock
             .chunk(tokio::time::sleep(Duration::from_secs(3600)))
             .await
             .unwrap();
-        StreamClock::new(u64::MAX, u64::MAX)
+        StreamClock::new(u64::MAX, u64::MAX, 0)
             .chunk(std::future::ready(()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_starts_after_content_and_resets_only_for_content() {
+        let mut clock = StreamClock::new(0, 0, 100);
+        clock
+            .chunk(tokio::time::sleep(Duration::from_millis(500)))
+            .await
+            .unwrap();
+        clock.observe(&StreamEvent::Start {
+            model: "fixture".into(),
+        });
+        clock.observe(&StreamEvent::TextDelta {
+            text: String::new(),
+        });
+        clock.observe(&StreamEvent::Usage(Default::default()));
+        clock
+            .chunk(tokio::time::sleep(Duration::from_millis(500)))
+            .await
+            .unwrap();
+
+        let began = Instant::now();
+        clock.observe(&StreamEvent::TextDelta {
+            text: "answer".into(),
+        });
+        clock
+            .chunk(tokio::time::sleep(Duration::from_millis(60)))
+            .await
+            .unwrap();
+        clock
+            .chunk(tokio::time::sleep(Duration::from_millis(40)))
+            .await
+            .unwrap();
+        clock.observe(&StreamEvent::Usage(Default::default()));
+        assert_eq!(
+            clock.chunk(std::future::pending::<()>()).await,
+            Err(StreamTimeout::Progress)
+        );
+        assert_eq!(began.elapsed(), Duration::from_millis(100));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_excludes_downstream_backpressure_and_content_rearms_it() {
+        let mut clock = StreamClock::new(0, 0, 100);
+        clock.observe(&StreamEvent::TextDelta {
+            text: "first".into(),
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        clock
+            .chunk(tokio::time::sleep(Duration::from_millis(80)))
+            .await
+            .unwrap();
+        clock.observe(&StreamEvent::ThinkingDelta {
+            text: "reason".into(),
+        });
+        clock
+            .chunk(tokio::time::sleep(Duration::from_millis(80)))
+            .await
+            .unwrap();
+        assert_eq!(
+            clock.chunk(std::future::pending::<()>()).await,
+            Err(StreamTimeout::Progress)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_uses_earliest_deadline_and_is_independently_disabled() {
+        let mut clock = StreamClock::new(0, 100, 200);
+        clock.observe(&StreamEvent::TextDelta {
+            text: "answer".into(),
+        });
+        assert_eq!(
+            clock.chunk(std::future::pending::<()>()).await,
+            Err(StreamTimeout::Idle)
+        );
+
+        let mut clock = StreamClock::new(0, 200, 100);
+        clock.observe(&StreamEvent::TextDelta {
+            text: "answer".into(),
+        });
+        assert_eq!(
+            clock.chunk(std::future::pending::<()>()).await,
+            Err(StreamTimeout::Progress)
+        );
+
+        let mut clock = StreamClock::new(0, 0, 0);
+        clock.observe(&StreamEvent::TextDelta {
+            text: "answer".into(),
+        });
+        clock
+            .chunk(tokio::time::sleep(Duration::from_secs(3600)))
+            .await
+            .unwrap();
+
+        let mut clock = StreamClock::new(0, 0, u64::MAX);
+        clock.observe(&StreamEvent::TextDelta {
+            text: "answer".into(),
+        });
+        clock
+            .chunk(tokio::time::sleep(Duration::from_secs(600)))
             .await
             .unwrap();
     }

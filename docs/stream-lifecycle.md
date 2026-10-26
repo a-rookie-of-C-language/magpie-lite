@@ -87,12 +87,12 @@ downstream headers; a slow streaming request may send only headers/comments and
 move the still-pending prefetch into the response body. HTTP commitment does not
 commit a candidate. The deadlines below bound a below-budget stall when enabled.
 Real HTTP/1.1 fixtures verify socket-close cancellation both before headers and
-after a comment, even with both deadlines disabled (see Accounting and
+after a comment, even with all three streaming deadlines disabled (see Accounting and
 cancellation).
 
 ## Streaming deadlines
 
-Two gateway-level root TOML settings apply to streaming requests, and are exposed
+Three gateway-level root TOML settings apply to streaming requests, and are exposed
 in the protected secret-free `/config` snapshot:
 
 - `stream_first_content_timeout_ms = 600000` (10 minutes by default): a fresh
@@ -109,8 +109,15 @@ in the protected secret-free `/config` snapshot:
   frames, begin a fresh interval; the first-content budget still prevents an
   endless metadata drip before an answer. Time yielding decoded frames to a
   backpressured client does not count as waiting for upstream transport.
+- `stream_progress_timeout_ms = 0` (disabled by default): maximum wait for new
+  real decoded content after content has begun. It starts at the first text,
+  reasoning, sealed reasoning, nonempty signature, tool, image or search event.
+  Only later real content re-arms it. Start/role/model/usage/thinking-start
+  metadata, empty deltas, ignored SSE comments and partial transport frames do
+  not. The timer runs only while waiting for the next upstream chunk; downstream
+  backpressure does not consume it. It applies only to streaming requests.
 
-Set either to `0` to disable that limit independently. With both disabled, an
+Set any to `0` to disable that limit independently. With all three disabled, an
 upstream may hold a handler indefinitely while its client stays connected. Nonstreaming requests retain the
 previous behavior; these settings are not a total request-duration limit.
 Configuration is pinned for the request, and each fallback attempt gets a fresh
@@ -127,12 +134,17 @@ header/error-body timeout on the last route returns HTTP 504 in the client's
 error envelope if no comment has committed HTTP headers. After a comment it
 becomes one protocol stream error. A timeout of an HTTP-200 SSE response uses
 the existing client stream-error encoder (the transport status is already 200).
+The post-content progress timeout is terminal at its committed stream: it never
+continues, falls back, changes keys, replays or performs a reasoning-only
+re-ask, even though ordinary first-content/read-idle timeouts keep their
+existing pre/post-commit routing rules.
 
 Timers are cooperative and enforced when the handler/event stream is polled;
 they are not a background cancellation service and cannot interrupt blocking
-CPU work or a downstream that never polls again. Idle time is transport silence,
-not a post-content meaningful-progress policy: an endless
-heartbeat stream after content can remain live. Group first-content switching
+CPU work or a downstream that never polls again. Idle time is transport silence.
+When the progress limit is enabled, an endless heartbeat stream after content
+cannot remain live forever: only real decoded content re-arms that deadline.
+Group first-content switching
 is a separate policy described below; disabling its cap on the final route does
 not disable these gateway-wide safety settings.
 
@@ -156,7 +168,7 @@ Abandoned metadata/usage never appears in the selected answer or final record.
 
 The last scheduled candidate (including a single-member group) is exempt from
 the group cap, even when rotate/usage places an earlier configured route last.
-Gateway-wide first-content/read-idle clocks still run. Known non-2xx headers
+Gateway-wide first-content/read-idle/progress clocks still run. Known non-2xx headers
 stop this opening policy before reading the error body; global clocks continue
 to bound that read. Ordinary provider fallback and nonstreaming requests do not
 use the group budget. In-flight requests retain their original configuration.
@@ -165,7 +177,7 @@ Prefetch returning commits the candidate: actual text/reasoning/tool output,
 terminal events, opening event/metadata byte safety bounds, or a real Responses
 opening event released by its request-wide hold budget. Once committed, the
 group timer is discarded; a later slow chunk or error cannot trigger fallback.
-Global first-content/read-idle limits remain independent. Ready transport
+Global first-content/read-idle/progress limits remain independent. Ready transport
 results are preferred over a simultaneously-ready group timer. This is
 cooperative cancellation while futures are polled, not a background watchdog.
 
@@ -221,7 +233,7 @@ by a scheduled comment. Dropping either handler or body cancels the owned work.
 A heartbeat tick must not recreate an upstream header/read timeout.
 
 These are comments, not protocol events: they do not satisfy first-content,
-meaningful-progress or an Agent's event-only idle policy. Responses opening
+configured progress or an Agent's event-only idle policy. Responses opening
 release is a separate policy described below. Group first-content switching is
 documented above; queue and slow-final-route exceptions remain unimplemented; this is not a claim of full
 reference keepalive or real-Agent conformance.
@@ -244,10 +256,11 @@ error to retry safely before any candidate metadata is published.
 Publishing opening metadata commits the selected candidate, even without answer
 content: a later error is delivered once, with selected-candidate accounting and
 no ordinary fallback/replay. The reasoning-only loop re-ask below is limited to
-the same candidate. Release does not satisfy or restart the absolute first-content
-limit. An interrupted upstream read retains its remaining idle budget across
-metadata replay without charging downstream backpressure or receiving a fresh
-full idle interval. Dropping the downstream still cancels the owned upstream.
+the same candidate. Release does not start or restart the absolute first-content
+limit or the post-content progress limit. An interrupted upstream read retains
+its remaining idle and progress budgets across metadata replay without charging
+downstream backpressure or receiving a fresh full interval. Dropping the
+downstream still cancels the owned upstream.
 
 Nine `responses_hold_*` local HTTP tests cover four upstream dialects, shared
 budgets through retries, late-error commitment, independent upstream deadlines,
@@ -256,8 +269,8 @@ ready-error precedence and real socket disconnect/persisted accounting. Paused
 clock tests cover the default budget, disable/extreme values and retained idle
 and first-content deadlines. This implements the request-level opening-release
 subset of reference `internal/gateway/fallback.go`. Group first-content switching
-is documented separately; queue, slow-final-route and post-content event-idle
-policies remain outside this implementation. Local
+is documented separately; queue, slow-final-route and Agent event-idle policies
+remain outside this implementation. Local
 fixtures do not establish live vendor or installed Agent compatibility.
 
 ### Retry classification
@@ -524,7 +537,7 @@ is an explicit handler-abort accounting test, not a real socket test. The five
 `socket_disconnect_*` integration tests now add **160 real HTTP/1.1 cases** using
 the same `axum::serve(build_router(...))` path as the gateway. They send complete
 requests on raw TCP sockets, confirm no response byte or completed log record
-arrives, then close only the downstream socket, with both streaming deadlines
+arrives, then close only the downstream socket, with all three streaming deadlines
 disabled. They cover all four client/upstream dialects, streaming and nonstreaming
 header waits, opening SSE usage, nonstreaming JSON-body waits, non-2xx body waits
 without unintended fallback, and a Chat primary failing over through ordinary/
@@ -543,18 +556,23 @@ frames larger than the per-event budget. These are synthetic protocol fixtures,
 not captured real Agent sessions or paid/live vendor compatibility evidence.
 Paused-clock unit tests verify absolute first-content accounting across header
 and metadata waits, empty-delta handling, independent disable semantics, read-idle
-reset and downstream-backpressure exclusion. Additional real HTTP fixtures cover
-all four upstream by all four client dialects for opening and post-content stalls;
-ordinary/group fallback, first-content caps despite comment heartbeats and after
-metadata commitment, paced completion, reasoning/tool first content, disabled
-limits, and HTTP header/error-body stalls. Drop guards verify release of every
+reset and downstream-backpressure exclusion. Progress-clock fixtures cover
+content-only re-arming, ignored metadata/heartbeats, earliest-deadline selection,
+downstream-backpressure exclusion and independent disable semantics. Additional
+real HTTP fixtures cover all four upstream by all four client dialects for
+opening and post-content stalls; ordinary/group fallback, first-content caps
+despite comment heartbeats and after metadata commitment, paced completion,
+reasoning/tool first content, disabled limits, post-content progress expiry
+without continuation/fallback, progress renewal by real content, pre-content
+exclusion, nonstream exclusion, socket disconnect during a pending progress
+timer, and HTTP header/error-body stalls. Drop guards verify release of every
 attempt, and assertions verify one error/record, selected-route usage and no extra
 same-endpoint key/cooldown spending.
 
 Thirteen `keepalive_*` real-HTTP tests add cross-dialect delayed headers and
 opening metadata, finite key/provider/group retries after comments, fast/late
 HTTP failures, header-timeout fallback, known-error suppression before/after
-comments, unchanged first-content/read-idle deadlines, post-content silence caps,
+comments, unchanged first-content/read-idle/progress deadlines, post-content silence caps,
 ignored upstream heartbeats, one-second active gap, resumption after the cap,
 Gemini/nonstream/zero-setting exclusions, and 48 raw-socket disconnect cases
 after comments with selected-attempt JSONL persistence/reload. Existing terminal
@@ -567,9 +585,10 @@ This evidence is local HTTP/1.1 and synthetic SSE, not a live vendor, TLS/proxy,
 HTTP/2 or real-Agent validation.
 
 Queue/slow-final-route behavior, HTTP/2 cancellation conformance and broader
-tool/multimodal conformance remain open.
-Post-content event-idle/meaningful-progress timeouts are also not implemented;
-they are distinct from the repetition guard and transport-idle limits.
+tool/multimodal conformance remain open. The configurable progress timeout is a
+gateway-local decoded-content policy, not reference event-idle parity; Agent
+event-idle policies and queue/slow-final-route behavior remain distinct and
+unimplemented.
 
 ## Safety filtering and refusal routing
 
